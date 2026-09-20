@@ -7,9 +7,9 @@ The definition of done is mechanical: every required row in [the acceptance matr
 | Phase | Exit condition | State |
 | --- | --- | --- |
 | Ground | Exact T3 release contract, Slack delivery behavior, security boundaries, and failure model are traced to source. | In progress |
-| Sketch | At least two designs are compared; the chosen module map and invariants are recorded. | In progress |
-| Agree | The chosen design matches the user-approved T3-only architecture and adds no unsupported service. | Pending |
-| Implement | End-to-end increments pass unit, integration, restart, security, and operational tests. | Pending |
+| Sketch | At least two designs are compared; the chosen module map and invariants are recorded. | Complete |
+| Agree | The chosen design matches the user-approved T3-only architecture and adds no unsupported service. | Complete |
+| Implement | End-to-end increments pass unit, integration, restart, security, and operational tests. | In progress |
 | Scrap | If repeated implementation friction disproves the design, replace it rather than adding escape hatches. | Armed |
 | Validate | Automated fixtures and explicitly labeled human/live exercises satisfy the GA matrix. | Pending |
 | Release | Signed/tagged artifacts, upgrade, backup/restore, notices, and uninstall are verified. | Pending |

@@ -19,4 +19,12 @@ bun test
 bun run typecheck
 ```
 
+With the pinned T3 server running and an exact-scope service token configured:
+
+```sh
+AGENT_TAG_T3_URL=http://127.0.0.1:37841 \
+AGENT_TAG_T3_TOKEN_FILE=/absolute/path/to/t3-token \
+bun run test:t3
+```
+
 Agent Tag uses T3 as its only execution backend. It does not contain an independent agent loop or provider manager.
