@@ -90,11 +90,21 @@ const turnInterruptCommand = z.object({
   createdAt: isoDateTime,
 });
 
+const approvalRespondCommand = z.object({
+  type: z.literal("thread.approval.respond"),
+  commandId: id,
+  threadId: id,
+  requestId: id,
+  decision: z.enum(["accept", "acceptForSession", "acceptAlways", "decline", "cancel"]),
+  createdAt: isoDateTime,
+});
+
 export const t3CommandSchema = z.discriminatedUnion("type", [
   projectCreateCommand,
   projectDeleteCommand,
   turnStartCommand,
   turnInterruptCommand,
+  approvalRespondCommand,
 ]);
 export type T3Command = z.infer<typeof t3CommandSchema>;
 
@@ -127,6 +137,137 @@ export type T3ServerInfo = z.infer<typeof serverConfigSchema>;
 
 const dispatchResultSchema = z.object({ sequence: z.number().int().nonnegative() });
 export type T3DispatchResult = z.infer<typeof dispatchResultSchema>;
+
+const latestTurnSchema = z
+  .object({
+    turnId: id,
+    state: z.enum(["running", "interrupted", "completed", "error"]),
+    requestedAt: isoDateTime,
+    startedAt: isoDateTime.nullable(),
+    completedAt: isoDateTime.nullable(),
+    assistantMessageId: id.nullable(),
+  })
+  .nullable();
+
+const messageSchema = z.object({
+  id,
+  role: z.enum(["user", "assistant", "system"]),
+  text: z.string(),
+  turnId: id.nullable(),
+  streaming: z.boolean(),
+  createdAt: isoDateTime,
+  updatedAt: isoDateTime,
+});
+
+const activitySchema = z.object({
+  id,
+  tone: z.enum(["info", "tool", "approval", "error"]),
+  kind: id,
+  summary: id,
+  payload: z.unknown(),
+  turnId: id.nullable(),
+  sequence: z.number().int().nonnegative().optional(),
+  createdAt: isoDateTime,
+});
+
+const sessionSchema = z
+  .object({
+    threadId: id,
+    status: z.enum(["idle", "starting", "running", "ready", "interrupted", "stopped", "error"]),
+    providerName: id.nullable(),
+    providerInstanceId: id.optional(),
+    runtimeMode,
+    activeTurnId: id.nullable(),
+    lastError: id.nullable(),
+    updatedAt: isoDateTime,
+  })
+  .nullable();
+
+const threadSnapshotSchema = z.object({
+  snapshotSequence: z.number().int().nonnegative(),
+  thread: z.object({
+    id,
+    projectId: id,
+    title: id,
+    modelSelection,
+    runtimeMode,
+    interactionMode,
+    branch: id.nullable(),
+    worktreePath: id.nullable(),
+    latestTurn: latestTurnSchema,
+    messages: z.array(messageSchema),
+    activities: z.array(activitySchema),
+    session: sessionSchema,
+  }),
+});
+export type T3ThreadSnapshot = z.infer<typeof threadSnapshotSchema>;
+
+const approvalRequestPayloadSchema = z.object({
+  requestId: id,
+  requestKind: z.enum(["command", "file-read", "file-change", "mcp-elicitation"]).optional(),
+  requestType: id.optional(),
+  detail: z.string().optional(),
+  appName: z.string().optional(),
+  options: z
+    .array(
+      z.object({
+        decision: z.enum(["accept", "acceptForSession", "acceptAlways", "decline", "cancel"]),
+        label: id,
+        warning: id.optional(),
+      }),
+    )
+    .optional(),
+});
+
+export interface T3PendingApproval {
+  readonly requestId: string;
+  readonly requestKind: "command" | "file-read" | "file-change" | "mcp-elicitation";
+  readonly detail?: string;
+  readonly appName?: string;
+  readonly options: ReadonlyArray<{
+    readonly decision: "accept" | "acceptForSession" | "acceptAlways" | "decline" | "cancel";
+    readonly label: string;
+    readonly warning?: string;
+  }>;
+}
+
+function legacyRequestKind(requestType: string | undefined): T3PendingApproval["requestKind"] {
+  switch (requestType) {
+    case "file_read_approval":
+      return "file-read";
+    case "file_change_approval":
+    case "apply_patch_approval":
+      return "file-change";
+    case "mcp_elicitation_approval":
+      return "mcp-elicitation";
+    default:
+      return "command";
+  }
+}
+
+export function pendingT3Approvals(snapshot: T3ThreadSnapshot): ReadonlyArray<T3PendingApproval> {
+  const pending = new Map<string, T3PendingApproval>();
+  for (const activity of snapshot.thread.activities) {
+    const parsed = approvalRequestPayloadSchema.safeParse(activity.payload);
+    if (!parsed.success) continue;
+    if (activity.kind === "approval.requested") {
+      pending.set(parsed.data.requestId, {
+        requestId: parsed.data.requestId,
+        requestKind: parsed.data.requestKind ?? legacyRequestKind(parsed.data.requestType),
+        ...(parsed.data.detail === undefined ? {} : { detail: parsed.data.detail }),
+        ...(parsed.data.appName === undefined ? {} : { appName: parsed.data.appName }),
+        options: (parsed.data.options ?? []).map((option) => ({
+          decision: option.decision,
+          label: option.label,
+          ...(option.warning === undefined ? {} : { warning: option.warning }),
+        })),
+      });
+    } else if (activity.kind === "approval.resolved") {
+      pending.delete(parsed.data.requestId);
+    }
+  }
+  return [...pending.values()];
+}
 
 const threadStreamItemSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("synchronized") }),
@@ -213,6 +354,23 @@ export async function dispatchT3Command(input: {
     return dispatchResultSchema.parse(raw);
   }).pipe(Effect.provide(protocolLayer(url)), Effect.scoped);
   return Effect.runPromise(program);
+}
+
+export async function fetchT3ThreadSnapshot(input: {
+  readonly config: T3ConnectionConfig;
+  readonly threadId: string;
+}): Promise<T3ThreadSnapshot> {
+  const threadId = id.parse(input.threadId);
+  const token = await readSecretFile(input.config.tokenFile);
+  const session = await inspectT3Session({ baseUrl: input.config.baseUrl, token });
+  assertRestrictedOrchestrationSession(session);
+  const url = new URL(`/api/orchestration/threads/${encodeURIComponent(threadId)}`, input.config.baseUrl);
+  const response = await fetch(url, {
+    headers: { authorization: `Bearer ${token.exposeToBoundary()}` },
+  });
+  if (!response.ok) throw new Error(`T3 thread snapshot endpoint returned HTTP ${response.status}`);
+  const raw: unknown = await response.json();
+  return threadSnapshotSchema.parse(raw);
 }
 
 function abortEffect(signal: AbortSignal): Effect.Effect<void> {

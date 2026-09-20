@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { t3CommandSchema } from "../src/t3/gateway.ts";
+import { pendingT3Approvals, t3CommandSchema, type T3ThreadSnapshot } from "../src/t3/gateway.ts";
 
 describe("T3 gateway command boundary", () => {
   test("rejects a missing stable command id", () => {
@@ -29,5 +29,47 @@ describe("T3 gateway command boundary", () => {
         createdAt: "2026-09-21T00:00:00.000Z",
       }),
     ).toThrow("Too big");
+  });
+
+  test("reduces resolved approvals out of a thread snapshot", () => {
+    const requestedAt = "2026-09-20T00:00:00.000Z";
+    const snapshot: T3ThreadSnapshot = {
+      snapshotSequence: 3,
+      thread: {
+        id: "thread-1",
+        projectId: "project-1",
+        title: "Fixture",
+        modelSelection: { instanceId: "codex", model: "gpt-5.6-sol" },
+        runtimeMode: "approval-required",
+        interactionMode: "default",
+        branch: "main",
+        worktreePath: "/tmp/fixture",
+        latestTurn: null,
+        messages: [],
+        activities: [
+          {
+            id: "activity-1",
+            tone: "approval",
+            kind: "approval.requested",
+            summary: "Approval requested",
+            payload: { requestId: "request-1", requestKind: "command" },
+            turnId: "turn-1",
+            createdAt: requestedAt,
+          },
+          {
+            id: "activity-2",
+            tone: "info",
+            kind: "approval.resolved",
+            summary: "Approval resolved",
+            payload: { requestId: "request-1" },
+            turnId: "turn-1",
+            createdAt: requestedAt,
+          },
+        ],
+        session: null,
+      },
+    };
+
+    expect(pendingT3Approvals(snapshot)).toEqual([]);
   });
 });
