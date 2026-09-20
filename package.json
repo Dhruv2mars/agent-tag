@@ -5,7 +5,9 @@
   "type": "module",
   "scripts": {
     "test": "bun test",
+    "test:t3": "RUN_T3_INTEGRATION=1 bun test test/t3-live.integration.test.ts",
     "typecheck": "tsc --noEmit",
+    "enroll:t3": "bun run scripts/enroll-t3.ts",
     "verify:t3-pin": "bun run scripts/verify-t3-pin.ts",
     "check": "bun run typecheck && bun test"
   },

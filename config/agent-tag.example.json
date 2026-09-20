@@ -1,0 +1,49 @@
+{
+  "version": 1,
+  "dataDir": "/var/lib/agent-tag",
+  "t3": {
+    "baseUrl": "http://127.0.0.1:37841",
+    "tokenFile": "/var/lib/agent-tag/secrets/t3-token"
+  },
+  "slack": {
+    "workspaceId": "T0EXAMPLE",
+    "appTokenFile": "/var/lib/agent-tag/secrets/slack-app-token",
+    "botTokenFile": "/var/lib/agent-tag/secrets/slack-bot-token"
+  },
+  "access": {
+    "allowedUserIds": ["U0EXAMPLE"],
+    "allowedChannelIds": ["C0EXAMPLE"]
+  },
+  "profiles": [
+    {
+      "id": "engineering",
+      "repositoryRoots": ["/srv/agent-tag/repositories/example"],
+      "defaultProviderInstanceId": "codex",
+      "defaultModel": "gpt-5.6-sol",
+      "runtimeMode": "approval-required",
+      "isolation": {
+        "mode": "trusted-same-user",
+        "acknowledgedSharedMachineAccess": true
+      },
+      "externalWrites": {
+        "mode": "approval-required",
+        "allowedTools": ["github"]
+      },
+      "memory": {
+        "shared": true,
+        "privateDm": false,
+        "retentionDays": 180
+      }
+    }
+  ],
+  "routes": [
+    {
+      "conversationId": "C0EXAMPLE",
+      "profileId": "engineering",
+      "repositoryRoot": "/srv/agent-tag/repositories/example"
+    }
+  ],
+  "limits": {
+    "maxConcurrentTasks": 2
+  }
+}
