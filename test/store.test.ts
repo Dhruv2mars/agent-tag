@@ -21,6 +21,7 @@ function slackEvent(overrides: Partial<SlackEventInput> = {}): SlackEventInput {
     repositoryRoot: "/srv/repos/example",
     text: "Investigate the failure",
     receivedAt: firstAt,
+    sourceOrderKey: "1000.0001",
     ...overrides,
   };
 }
@@ -80,7 +81,7 @@ describe("Agent Tag durable store", () => {
           deliveryId: "delivery-2",
           eventKey: "C1:1000.0002",
           text: "Then run the focused tests",
-          receivedAt: "2026-09-21T00:00:01.000Z",
+          sourceOrderKey: "1000.0002",
         }),
       );
       const claimed = store.claimNextOperation({
@@ -183,7 +184,7 @@ describe("Agent Tag durable store", () => {
     });
   });
 
-  test("reclaims durable Slack outbox messages without changing their client id", async () => {
+  test("quarantines an expired Slack send instead of blindly replaying it", async () => {
     const directory = await mkdtemp(join(tmpdir(), "agent-tag-store-outbox-"));
     const path = join(directory, "agent-tag.sqlite");
     let store = await AgentTagStore.open(path);
@@ -216,27 +217,11 @@ describe("Agent Tag durable store", () => {
       expect(
         store.claimNextOutbox({ workerId: "slack-b", now: beforeExpiry, leaseMs: 10_000 }),
       ).toBeNull();
-      const reclaimed = store.claimNextOutbox({
-        workerId: "slack-b",
-        now: afterExpiry,
-        leaseMs: 10_000,
-      });
-      expect(reclaimed).toMatchObject({
-        outboxId: enqueued.outboxId,
-        clientMessageId: "agent-tag:operation-1:final",
-        attempt: 2,
-      });
-      if (reclaimed === null) throw new Error("expired outbox lease was not reclaimed");
-      store.markOutboxDelivered({
-        outboxId: reclaimed.outboxId,
-        workerId: "slack-b",
-        slackMessageTs: "1000.0002",
-        now: "2026-09-21T00:00:12.000Z",
-      });
+      expect(store.quarantineExpiredOutbox(afterExpiry)).toBe(1);
       expect(
         store.claimNextOutbox({
           workerId: "slack-b",
-          now: "2026-09-21T00:00:13.000Z",
+          now: "2026-09-21T00:00:12.000Z",
           leaseMs: 10_000,
         }),
       ).toBeNull();

@@ -103,4 +103,13 @@ export const STORE_MIGRATIONS: readonly StoreMigration[] = [
       CREATE INDEX audit_log_correlation_idx ON audit_log(correlation_id, created_at);
     `,
   },
+  {
+    version: 2,
+    sql: `
+      ALTER TABLE operations ADD COLUMN source_order_key TEXT NOT NULL DEFAULT '';
+      UPDATE operations SET source_order_key = created_at WHERE source_order_key = '';
+      CREATE INDEX operations_task_order_idx
+        ON operations(task_id, source_order_key, operation_id);
+    `,
+  },
 ];

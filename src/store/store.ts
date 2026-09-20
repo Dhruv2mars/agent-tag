@@ -18,7 +18,6 @@ const operationPayloadSchema = z.object({
 });
 const outboxPayloadSchema = z.object({
   text: z.string(),
-  blocks: z.array(z.unknown()).optional(),
 });
 
 const operationRowSchema = z.object({
@@ -82,6 +81,13 @@ export interface SlackEventInput {
   readonly repositoryRoot: string;
   readonly text: string;
   readonly receivedAt: string;
+  readonly sourceOrderKey?: string;
+}
+
+export interface ActiveTaskBinding {
+  readonly taskId: string;
+  readonly profileId: string;
+  readonly repositoryRoot: string;
 }
 
 export interface IngestReceipt {
@@ -240,6 +246,7 @@ export class AgentTagStore {
       repositoryRoot: requiredId(input.repositoryRoot, "repositoryRoot"),
       text: input.text,
       receivedAt: isoDateTime.parse(input.receivedAt),
+      sourceOrderKey: requiredId(input.sourceOrderKey ?? input.receivedAt, "sourceOrderKey"),
     };
     const ingest = this.#database.transaction((): IngestReceipt => {
       const priorDelivery = deliveryLookupSchema.nullable().parse(
@@ -289,8 +296,8 @@ export class AgentTagStore {
         .query(
           `INSERT INTO operations (
             operation_id, task_id, source_delivery_id, source_event_key, kind, command_id,
-            message_id, payload_json, status, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, 'user-turn', ?, ?, ?, 'pending', ?, ?)`,
+            message_id, payload_json, status, source_order_key, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, 'user-turn', ?, ?, ?, 'pending', ?, ?, ?)`,
         )
         .run(
           operationId,
@@ -300,6 +307,7 @@ export class AgentTagStore {
           commandId,
           messageId,
           JSON.stringify(payload),
+          event.sourceOrderKey,
           event.receivedAt,
           event.receivedAt,
         );
@@ -371,10 +379,10 @@ export class AgentTagStore {
                  SELECT 1 FROM operations earlier
                  WHERE earlier.task_id = o.task_id
                    AND earlier.status IN ('pending', 'inflight')
-                   AND (earlier.created_at < o.created_at OR
-                     (earlier.created_at = o.created_at AND earlier.operation_id < o.operation_id))
+                   AND (earlier.source_order_key < o.source_order_key OR
+                     (earlier.source_order_key = o.source_order_key AND earlier.operation_id < o.operation_id))
                )
-             ORDER BY o.created_at, o.operation_id
+             ORDER BY o.source_order_key, o.operation_id
              LIMIT 1`,
           )
           .get(now),
@@ -540,6 +548,32 @@ export class AgentTagStore {
     bind.immediate();
   }
 
+  findActiveTask(input: {
+    readonly workspaceId: string;
+    readonly conversationId: string;
+    readonly threadTs: string;
+  }): ActiveTaskBinding | null {
+    const schema = z.object({
+      task_id: nonEmpty,
+      profile_id: nonEmpty,
+      repository_root: nonEmpty,
+    });
+    const row = schema.nullable().parse(
+      this.#database
+        .query(
+          `SELECT task_id, profile_id, repository_root FROM tasks
+           WHERE workspace_id = ? AND conversation_id = ? AND thread_ts = ? AND state = 'active'`,
+        )
+        .get(
+          requiredId(input.workspaceId, "workspaceId"),
+          requiredId(input.conversationId, "conversationId"),
+          requiredId(input.threadTs, "threadTs"),
+        ),
+    );
+    if (row === null) return null;
+    return { taskId: row.task_id, profileId: row.profile_id, repositoryRoot: row.repository_root };
+  }
+
   enqueueOutbox(input: SlackOutboxInput): { readonly kind: "accepted" | "duplicate"; readonly outboxId: string } {
     const payload = outboxPayloadSchema.parse(input.payload);
     const createdAt = isoDateTime.parse(input.createdAt);
@@ -600,10 +634,10 @@ export class AgentTagStore {
         this.#database
           .query(
             `SELECT outbox_id FROM slack_outbox
-             WHERE status = 'pending' OR (status = 'inflight' AND lease_expires_at <= ?)
+             WHERE status = 'pending'
              ORDER BY created_at, outbox_id LIMIT 1`,
           )
-          .get(now),
+          .get(),
       );
       if (candidate === null) return null;
       const updated = this.#database
@@ -689,6 +723,86 @@ export class AgentTagStore {
       });
     });
     deliver.immediate();
+  }
+
+  failOutbox(input: {
+    readonly outboxId: string;
+    readonly workerId: string;
+    readonly errorCode: string;
+    readonly retryable: boolean;
+    readonly now: string;
+  }): void {
+    const now = isoDateTime.parse(input.now);
+    const status = input.retryable ? "pending" : "failed";
+    const fail = this.#database.transaction(() => {
+      const result = this.#database
+        .query(
+          `UPDATE slack_outbox SET status = ?, last_error_code = ?, lease_owner = NULL,
+             lease_expires_at = NULL, updated_at = ?
+           WHERE outbox_id = ? AND status = 'inflight' AND lease_owner = ? AND lease_expires_at > ?`,
+        )
+        .run(
+          status,
+          requiredId(input.errorCode, "errorCode"),
+          now,
+          requiredId(input.outboxId, "outboxId"),
+          requiredId(input.workerId, "workerId"),
+          now,
+        );
+      if (result.changes !== 1) {
+        throw new Error("outbox lease is missing, expired, or owned by another worker");
+      }
+      writeAudit(this.#database, {
+        actorType: "worker",
+        actorId: input.workerId,
+        authority: "slack-write",
+        source: input.outboxId,
+        target: input.outboxId,
+        action: "slack.outbox.failed",
+        result: status,
+        correlationId: input.outboxId,
+        metadata: { errorCode: input.errorCode, retryable: input.retryable },
+        createdAt: now,
+      });
+    });
+    fail.immediate();
+  }
+
+  quarantineExpiredOutbox(nowInput: string): number {
+    const now = isoDateTime.parse(nowInput);
+    const quarantine = this.#database.transaction(() => {
+      const expired = this.#database
+        .query<{ outbox_id: string; correlation_id: string }, [string]>(
+          `SELECT outbox_id, correlation_id FROM slack_outbox
+           WHERE status = 'inflight' AND lease_expires_at <= ?`,
+        )
+        .all(now);
+      for (const row of expired) {
+        const outboxId = requiredId(row.outbox_id, "outboxId");
+        const correlationId = requiredId(row.correlation_id, "correlationId");
+        this.#database
+          .query(
+            `UPDATE slack_outbox SET status = 'failed', last_error_code = 'delivery-outcome-unknown',
+               lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+             WHERE outbox_id = ? AND status = 'inflight'`,
+          )
+          .run(now, outboxId);
+        writeAudit(this.#database, {
+          actorType: "service",
+          actorId: "agent-tag",
+          authority: "slack-write",
+          source: outboxId,
+          target: outboxId,
+          action: "slack.outbox.quarantined",
+          result: "delivery-outcome-unknown",
+          correlationId,
+          metadata: {},
+          createdAt: now,
+        });
+      }
+      return expired.length;
+    });
+    return quarantine.immediate();
   }
 
   diagnostics(): {

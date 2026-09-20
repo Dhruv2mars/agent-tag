@@ -6,7 +6,7 @@ Statuses are `PENDING`, `PASS`, `FAIL`, or `BLOCKED`. A test is `PASS` only when
 | --- | --- | --- | --- |
 | SLK-01 | A live Slack mention includes relevant prior thread context and completes through T3. | Human transcript with redacted IDs and T3 thread evidence. | BLOCKED: Slack app setup |
 | SLK-02 | Repeated and overlapping Slack deliveries create one task and one user turn. | Automated retry fixture plus live retry where practical. | PENDING: durable semantic-event fixture passes; Slack adapter and live retry remain |
-| SLK-03 | A second authorized human can steer the same task in preserved order. | Human transcript with two tester identities. | BLOCKED: tester setup |
+| SLK-03 | A second authorized human can steer the same task in preserved order. | Human transcript with two tester identities. | BLOCKED: two-identity ordering fixture passes; live second tester remains |
 | SLK-04 | Approval, rejection, question, answer, and cancellation work in Slack and recover after restart. | Automated crash-point suite and human interaction transcript. | PENDING |
 | SLK-05 | Slack file/image input reaches the authorized task; returned files and PR links are usable. | Human file round trip and draft PR URL. | PENDING |
 | T3-01 | The adapter authenticates to pinned T3 `0.0.42` with only required scopes. | Executable compatibility test against release binary. | PASS: `docs/evidence/2026-09-21-t3-adapter.md` |
@@ -20,7 +20,7 @@ Statuses are `PENDING`, `PASS`, `FAIL`, or `BLOCKED`. A test is `PASS` only when
 | JOB-01 | Reminders and scheduled jobs survive restart and obey cancellation, missed-run, quiet, concurrency, and resource policies. | Fake-clock suite plus restart test. | PENDING |
 | AMB-01 | Ambient participation is opt-in, bounded, quiet when unchanged, and auditable. | Authorization fixtures and one human exercise. | PENDING |
 | DM-01 | DMs and assistant threads separate personal identity/context/credentials from shared channels and state machine privacy limits. | Cross-scope denial tests and human DM exercise. | PENDING |
-| ACL-01 | Workspace, channel, user, profile, repository, tool, memory, and task authority are consistent at every transition. | Table-driven denial suite with audit records. | PENDING |
+| ACL-01 | Workspace, channel, user, profile, repository, tool, memory, and task authority are consistent at every transition. | Table-driven denial suite with audit records. | PENDING: Slack workspace/channel/user/route/thread denials pass; remaining transitions and audit denials remain |
 | REL-01 | In-task serialization, global concurrency bounds, durable outbox, and recovery prevent loss or blind replay. | Deterministic fault-injection suite. | PENDING: SQLite rollback, reopen, expired-lease, ordering, concurrency, and outbox fixtures pass; T3/Slack process crash matrix remains |
 | REL-02 | Machine outage and Socket Mode delivery limits are reported accurately; stalled tasks follow the configured policy. | Outage exercise and operator-visible diagnostics. | PENDING |
 | OPS-01 | Fresh install, onboarding, diagnostics, background service, upgrade/migration, backup/restore, log redaction, and uninstall work. | Clean-host script and captured run log. | PENDING |
