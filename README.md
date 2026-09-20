@@ -1,2 +1,22 @@
-# agent-tag
-An open-source Slack coworker powered by local agents through T3 Code
+# Agent Tag
+
+Agent Tag is an open-source Slack coworker that delegates work to agents running through T3 Code on an organization-controlled machine.
+
+This repository is under active development. It is not yet generally available. See [the acceptance matrix](docs/ga-acceptance.md) for the evidence required before that claim changes.
+
+## Development
+
+Requirements:
+
+- Bun
+- T3 Code `0.0.42`
+- macOS or Linux for background operation
+
+```sh
+bun install
+bun run verify:t3-pin
+bun test
+bun run typecheck
+```
+
+Agent Tag uses T3 as its only execution backend. It does not contain an independent agent loop or provider manager.
