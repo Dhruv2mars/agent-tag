@@ -12,6 +12,7 @@ const receipt = store.ingestSlackEvent({
   conversationId: "C1",
   threadTs: "3000.0001",
   actorUserId: "U1",
+  conversationType: "channel",
   profileId: "engineering",
   repositoryRoot: "/srv/repos/example",
   text: "Hold this lease until the process dies",

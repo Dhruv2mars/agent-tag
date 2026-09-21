@@ -77,6 +77,7 @@ function seedOperation(store: AgentTagStore): {
     conversationId: "C1",
     threadTs: "1000.000001",
     actorUserId: "U1",
+    conversationType: "channel",
     profileId: "engineering",
     repositoryRoot: "/srv/repos/example",
     text: "fixture",

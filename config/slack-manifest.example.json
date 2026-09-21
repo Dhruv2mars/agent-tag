@@ -18,13 +18,14 @@
         "chat:write",
         "files:read",
         "files:write",
-        "groups:history"
+        "groups:history",
+        "im:history"
       ]
     }
   },
   "settings": {
     "event_subscriptions": {
-      "bot_events": ["app_mention", "message.channels", "message.groups"]
+      "bot_events": ["app_mention", "message.channels", "message.groups", "message.im"]
     },
     "interactivity": {
       "is_enabled": true

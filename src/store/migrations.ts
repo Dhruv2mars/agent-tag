@@ -250,4 +250,12 @@ export const STORE_MIGRATIONS: readonly StoreMigration[] = [
         ON ambient_decisions(workspace_id, conversation_id, disposition, created_at);
     `,
   },
+  {
+    version: 9,
+    sql: `
+      ALTER TABLE tasks ADD COLUMN conversation_type TEXT NOT NULL DEFAULT 'channel'
+        CHECK (conversation_type IN ('channel', 'dm'));
+      ALTER TABLE tasks ADD COLUMN owner_user_id TEXT;
+    `,
+  },
 ];

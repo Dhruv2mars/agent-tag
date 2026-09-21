@@ -11,7 +11,7 @@ Actor type: `automated-fixture`
 
 ## Checks run
 
-`bun run check` passed with 40 tests and one intentionally disabled live-T3 suite. The store, coordinator, interaction, service, memory, scheduler, ambient-policy, secret-scan, and Slack ingress fixtures proved:
+`bun run check` passed with 44 tests and one intentionally disabled live-T3 suite. The store, coordinator, interaction, service, memory, scheduler, ambient-policy, secret-scan, and Slack ingress fixtures proved:
 
 1. A Slack retry with the same delivery ID and an overlapping `app_mention`/`message` delivery with a different delivery ID but the same semantic event key created one event, task, and operation. Both duplicates returned the original stable operation, command, and message IDs.
 2. Two turns in one task could not be claimed concurrently. Closing and reopening the database preserved the first lease; after expiry, another worker reclaimed the same operation with the same command and message IDs and a higher attempt number. The second turn became claimable only after the first completed.
@@ -26,5 +26,6 @@ Actor type: `automated-fixture`
 11. A scheduled agent run survived SQLite restart, coalesced missed intervals, obeyed overlap and cancellation policies, and used stable inbox/outbox identities; a one-shot reminder bypassed T3.
 12. Ambient decisions persisted before dispatch and used stable event keys, fingerprints, cooldown, and hourly caps to make retries and quiet outcomes deterministic.
 13. A separately spawned lease holder survived only until `SIGKILL`; a new process respected its unexpired lease and then recovered the same operation, command, and message IDs after expiry.
+14. DM task ownership and conversation type persisted in SQLite, blocked a router bypass by another allowed user, and governed private-memory projection into the T3 turn.
 
 These fixtures exercise the database boundary, process reopen, and one actual process-death boundary. They do not yet prove a kill-at-every-boundary service crash, T3 restart reconciliation, or Slack retry behavior against the live workspace.

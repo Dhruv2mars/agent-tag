@@ -17,6 +17,7 @@ function slackEvent(overrides: Partial<SlackEventInput> = {}): SlackEventInput {
     conversationId: "C1",
     threadTs: "1000.0001",
     actorUserId: "U1",
+    conversationType: "channel",
     profileId: "engineering",
     repositoryRoot: "/srv/repos/example",
     text: "Investigate the failure",

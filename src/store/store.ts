@@ -85,8 +85,12 @@ const operationIdentitySchema = z.object({
 
 const taskLookupSchema = z.object({
   task_id: nonEmpty,
+  profile_id: nonEmpty,
+  repository_root: nonEmpty,
   t3_project_id: nonEmpty.nullable(),
   t3_thread_id: nonEmpty.nullable(),
+  conversation_type: z.enum(["channel", "dm"]),
+  owner_user_id: nonEmpty.nullable(),
 });
 const outboxIdentitySchema = z.object({ outbox_id: nonEmpty });
 const taskExecutionSchema = z.object({
@@ -96,6 +100,8 @@ const taskExecutionSchema = z.object({
   t3_project_id: nonEmpty,
   t3_thread_id: nonEmpty,
   t3_thread_started_at: isoDateTime.nullable(),
+  conversation_type: z.enum(["channel", "dm"]),
+  owner_user_id: nonEmpty.nullable(),
   created_at: isoDateTime,
 });
 const interactionIdentitySchema = z.object({ interaction_id: nonEmpty });
@@ -196,6 +202,7 @@ export interface SlackEventInput {
   readonly conversationId: string;
   readonly threadTs: string;
   readonly actorUserId: string;
+  readonly conversationType: "channel" | "dm";
   readonly profileId: string;
   readonly repositoryRoot: string;
   readonly text: string;
@@ -207,6 +214,8 @@ export interface ActiveTaskBinding {
   readonly taskId: string;
   readonly profileId: string;
   readonly repositoryRoot: string;
+  readonly conversationType: "channel" | "dm";
+  readonly ownerUserId: string | null;
 }
 
 export interface TaskExecutionBinding {
@@ -216,6 +225,8 @@ export interface TaskExecutionBinding {
   readonly projectId: string;
   readonly threadId: string;
   readonly threadStarted: boolean;
+  readonly conversationType: "channel" | "dm";
+  readonly ownerUserId: string | null;
   readonly createdAt: string;
 }
 
@@ -815,18 +826,21 @@ export class AgentTagStore {
     readonly taskId: string;
     readonly workspaceId: string;
     readonly profileId: string;
+    readonly actorUserId: string;
   }): boolean {
     const row = this.#database
-      .query<{ count: number }, [string, string, string]>(
+      .query<{ count: number }, [string, string, string, string]>(
         `SELECT COUNT(*) AS count FROM tasks
-         WHERE task_id = ? AND workspace_id = ? AND profile_id = ? AND state = 'active'`,
+         WHERE task_id = ? AND workspace_id = ? AND profile_id = ? AND state = 'active'
+           AND (conversation_type = 'channel' OR owner_user_id = ?)`,
       )
       .get(
         requiredId(input.taskId, "taskId"),
         requiredId(input.workspaceId, "workspaceId"),
         requiredId(input.profileId, "profileId"),
+        requiredId(input.actorUserId, "actorUserId"),
       );
-    if (row === null) throw new Error("failed to check task memory context");
+    if (row === null) throw new Error("failed to check task context");
     return row.count === 1;
   }
 
@@ -1352,6 +1366,7 @@ export class AgentTagStore {
       conversationId: requiredId(input.conversationId, "conversationId"),
       threadTs: requiredId(input.threadTs, "threadTs"),
       actorUserId: requiredId(input.actorUserId, "actorUserId"),
+      conversationType: z.enum(["channel", "dm"]).parse(input.conversationType),
       profileId: requiredId(input.profileId, "profileId"),
       repositoryRoot: requiredId(input.repositoryRoot, "repositoryRoot"),
       text: input.text,
@@ -1886,11 +1901,13 @@ export class AgentTagStore {
       task_id: nonEmpty,
       profile_id: nonEmpty,
       repository_root: nonEmpty,
+      conversation_type: z.enum(["channel", "dm"]),
+      owner_user_id: nonEmpty.nullable(),
     });
     const row = schema.nullable().parse(
       this.#database
         .query(
-          `SELECT task_id, profile_id, repository_root FROM tasks
+          `SELECT task_id, profile_id, repository_root, conversation_type, owner_user_id FROM tasks
            WHERE workspace_id = ? AND conversation_id = ? AND thread_ts = ? AND state = 'active'`,
         )
         .get(
@@ -1900,7 +1917,13 @@ export class AgentTagStore {
         ),
     );
     if (row === null) return null;
-    return { taskId: row.task_id, profileId: row.profile_id, repositoryRoot: row.repository_root };
+    return {
+      taskId: row.task_id,
+      profileId: row.profile_id,
+      repositoryRoot: row.repository_root,
+      conversationType: row.conversation_type,
+      ownerUserId: row.owner_user_id,
+    };
   }
 
   getTaskExecution(taskIdInput: string): TaskExecutionBinding {
@@ -1908,7 +1931,7 @@ export class AgentTagStore {
       this.#database
         .query(
           `SELECT task_id, profile_id, repository_root, t3_project_id, t3_thread_id,
-                  t3_thread_started_at, created_at
+                  t3_thread_started_at, conversation_type, owner_user_id, created_at
            FROM tasks WHERE task_id = ? AND state = 'active'`,
         )
         .get(requiredId(taskIdInput, "taskId")),
@@ -1920,6 +1943,8 @@ export class AgentTagStore {
       projectId: row.t3_project_id,
       threadId: row.t3_thread_id,
       threadStarted: row.t3_thread_started_at !== null,
+      conversationType: row.conversation_type,
+      ownerUserId: row.owner_user_id,
       createdAt: row.created_at,
     };
   }
@@ -2053,13 +2078,15 @@ export class AgentTagStore {
             `SELECT i.interaction_id, i.response_command_id, i.source_action_id, i.state
              FROM interactions i JOIN tasks t ON t.task_id = i.task_id
              WHERE i.interaction_id = ? AND t.workspace_id = ? AND t.conversation_id = ?
-               AND t.thread_ts = ? AND t.state = 'active'`,
+               AND t.thread_ts = ? AND t.state = 'active'
+               AND (t.conversation_type = 'channel' OR t.owner_user_id = ?)`,
           )
           .get(
             requiredId(input.interactionId, "interactionId"),
             requiredId(input.workspaceId, "workspaceId"),
             requiredId(input.conversationId, "conversationId"),
             requiredId(input.threadTs, "threadTs"),
+            requiredId(input.actorUserId, "actorUserId"),
           ),
       );
       if (row === null) return { kind: "denied" as const };
@@ -2122,6 +2149,7 @@ export class AgentTagStore {
             `SELECT o.operation_id, t.t3_thread_id AS thread_id
              FROM tasks t JOIN operations o ON o.task_id = t.task_id
              WHERE t.task_id = ? AND t.workspace_id = ? AND t.conversation_id = ? AND t.thread_ts = ?
+               AND (t.conversation_type = 'channel' OR t.owner_user_id = ?)
                AND t.state = 'active' AND o.status IN ('pending', 'inflight')
              ORDER BY CASE o.status WHEN 'inflight' THEN 0 ELSE 1 END, o.source_order_key, o.operation_id
              LIMIT 1`,
@@ -2131,6 +2159,7 @@ export class AgentTagStore {
             requiredId(input.workspaceId, "workspaceId"),
             requiredId(input.conversationId, "conversationId"),
             requiredId(input.threadTs, "threadTs"),
+            requiredId(input.actorUserId, "actorUserId"),
           ),
       );
       if (target === null) return { kind: "denied" as const };
@@ -2614,6 +2643,8 @@ export class AgentTagStore {
     readonly workspaceId: string;
     readonly conversationId: string;
     readonly threadTs: string;
+    readonly actorUserId: string;
+    readonly conversationType: "channel" | "dm";
     readonly profileId: string;
     readonly repositoryRoot: string;
     readonly receivedAt: string;
@@ -2621,12 +2652,22 @@ export class AgentTagStore {
     const existing = taskLookupSchema.nullable().parse(
       this.#database
         .query(
-          `SELECT task_id, t3_project_id, t3_thread_id FROM tasks
+          `SELECT task_id, profile_id, repository_root, t3_project_id, t3_thread_id,
+                  conversation_type, owner_user_id FROM tasks
            WHERE workspace_id = ? AND conversation_id = ? AND thread_ts = ?`,
         )
         .get(event.workspaceId, event.conversationId, event.threadTs),
     );
     if (existing !== null) {
+      const expectedOwner = event.conversationType === "dm" ? event.actorUserId : null;
+      if (
+        existing.profile_id !== event.profileId ||
+        existing.repository_root !== event.repositoryRoot ||
+        existing.conversation_type !== event.conversationType ||
+        existing.owner_user_id !== expectedOwner
+      ) {
+        throw new Error("task conversation identity does not match the incoming event");
+      }
       if (existing.t3_project_id === null || existing.t3_thread_id === null) {
         this.#database
           .query(
@@ -2649,8 +2690,8 @@ export class AgentTagStore {
       .query(
         `INSERT INTO tasks (
           task_id, workspace_id, conversation_id, thread_ts, profile_id, repository_root,
-          t3_project_id, t3_thread_id, state, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)`,
+          t3_project_id, t3_thread_id, conversation_type, owner_user_id, state, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)`,
       )
       .run(
         taskId,
@@ -2661,6 +2702,8 @@ export class AgentTagStore {
         event.repositoryRoot,
         projectId,
         threadId,
+        event.conversationType,
+        event.conversationType === "dm" ? event.actorUserId : null,
         event.receivedAt,
         event.receivedAt,
       );

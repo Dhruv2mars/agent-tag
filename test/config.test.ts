@@ -52,4 +52,49 @@ describe("Agent Tag config", () => {
       "route conversation is not in access.allowedChannelIds",
     );
   });
+
+  test("requires DM routes to bind an allowed owner and a private-memory profile", () => {
+    const profile = baseConfig.profiles[0];
+    if (profile === undefined) throw new Error("base profile is missing");
+    expect(() =>
+      agentTagConfigSchema.parse({
+        ...baseConfig,
+        access: { ...baseConfig.access, allowedChannelIds: ["D123"] },
+        routes: [
+          {
+            conversationId: "D123",
+            conversationType: "dm",
+            ownerUserId: "U123",
+            profileId: "engineering",
+            repositoryRoot: "/repos/example",
+          },
+        ],
+      }),
+    ).toThrow("DM route profile must enable privateDm memory isolation");
+    expect(() =>
+      agentTagConfigSchema.parse({
+        ...baseConfig,
+        access: { ...baseConfig.access, allowedChannelIds: ["D123"] },
+        profiles: [{ ...profile, memory: { ...profile.memory, privateDm: true } }],
+        routes: [
+          {
+            conversationId: "D123",
+            conversationType: "dm",
+            ownerUserId: "U999",
+            profileId: "engineering",
+            repositoryRoot: "/repos/example",
+          },
+        ],
+      }),
+    ).toThrow("DM route owner is not in access.allowedUserIds");
+  });
+
+  test("rejects ambiguous duplicate conversation routes", () => {
+    expect(() =>
+      agentTagConfigSchema.parse({
+        ...baseConfig,
+        routes: [...baseConfig.routes, ...baseConfig.routes],
+      }),
+    ).toThrow("route conversation ids must be unique");
+  });
 });

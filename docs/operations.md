@@ -73,6 +73,21 @@ bun run scan:secrets -- --config /absolute/path/to/agent-tag.json /absolute/path
 
 The JSON report names only the file, credential class, and configured canary label. It never returns matched values. The command skips `.git` and `node_modules`. A finding or skipped symbolic link sets a nonzero exit code, so a release check cannot silently claim a partial clean scan. Keep source secret files outside scanned roots when practical; if they are inside, the configured scan excludes those exact files and scans their siblings.
 
+## DM routes
+
+Direct messages are off until an operator adds the DM conversation ID to `access.allowedChannelIds`, enables `memory.privateDm` on the profile, and binds the route to one allowed human:
+
+```json
+{
+  "conversationId": "D0EXAMPLE",
+  "conversationType": "dm",
+  "ownerUserId": "U0EXAMPLE",
+  "profileId": "engineering"
+}
+```
+
+The app manifest includes the `im:history` bot scope and `message.im` subscription. Reinstall the Slack app after changing scopes. Agent Tag accepts unmentioned messages only for the named owner in that exact DM. It does not support group DMs as private single-owner conversations.
+
 ## Schedules
 
 Schedules belong to an existing active Agent Tag task. Create a JSON spec such as:

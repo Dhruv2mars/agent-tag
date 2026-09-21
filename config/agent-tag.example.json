@@ -46,6 +46,7 @@
   "routes": [
     {
       "conversationId": "C0EXAMPLE",
+      "conversationType": "channel",
       "profileId": "engineering",
       "repositoryRoot": "/srv/agent-tag/repositories/example"
     }

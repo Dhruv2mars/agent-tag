@@ -24,6 +24,16 @@ const externalWritesSchema = z.discriminatedUnion("mode", [
   }),
 ]);
 
+const routeBaseSchema = z.object({
+  conversationId: slackId,
+  profileId,
+  repositoryRoot: absolutePath.optional(),
+});
+const routeSchema = z.union([
+  routeBaseSchema.extend({ conversationType: z.literal("channel").default("channel") }),
+  routeBaseSchema.extend({ conversationType: z.literal("dm"), ownerUserId: slackId }),
+]);
+
 const profileSchema = z.object({
   id: profileId,
   repositoryRoots: z.array(absolutePath).min(1),
@@ -69,13 +79,7 @@ export const agentTagConfigSchema = z
       allowedChannelIds: z.array(slackId).min(1),
     }),
     profiles: z.array(profileSchema).min(1),
-    routes: z.array(
-      z.object({
-        conversationId: slackId,
-        profileId,
-        repositoryRoot: absolutePath.optional(),
-      }),
-    ),
+    routes: z.array(routeSchema),
     limits: z.object({
       maxConcurrentTasks: z.number().int().positive().max(32),
       maxActiveSchedules: z.number().int().positive().max(10_000).default(100),
@@ -85,6 +89,14 @@ export const agentTagConfigSchema = z
     const profiles = new Map(config.profiles.map((profile) => [profile.id, profile]));
     if (profiles.size !== config.profiles.length) {
       context.addIssue({ code: "custom", path: ["profiles"], message: "profile ids must be unique" });
+    }
+    const routeConversationIds = new Set(config.routes.map((route) => route.conversationId));
+    if (routeConversationIds.size !== config.routes.length) {
+      context.addIssue({
+        code: "custom",
+        path: ["routes"],
+        message: "route conversation ids must be unique",
+      });
     }
     for (const [index, route] of config.routes.entries()) {
       const profile = profiles.get(route.profileId);
@@ -109,6 +121,35 @@ export const agentTagConfigSchema = z
           code: "custom",
           path: ["routes", index, "conversationId"],
           message: "route conversation is not in access.allowedChannelIds",
+        });
+      }
+      if (route.conversationType === "dm") {
+        if (!route.conversationId.startsWith("D")) {
+          context.addIssue({
+            code: "custom",
+            path: ["routes", index, "conversationId"],
+            message: "DM route conversation id must start with D",
+          });
+        }
+        if (!config.access.allowedUserIds.includes(route.ownerUserId)) {
+          context.addIssue({
+            code: "custom",
+            path: ["routes", index, "ownerUserId"],
+            message: "DM route owner is not in access.allowedUserIds",
+          });
+        }
+        if (profile !== undefined && !profile.memory.privateDm) {
+          context.addIssue({
+            code: "custom",
+            path: ["routes", index, "profileId"],
+            message: "DM route profile must enable privateDm memory isolation",
+          });
+        }
+      } else if (route.conversationId.startsWith("D")) {
+        context.addIssue({
+          code: "custom",
+          path: ["routes", index, "conversationId"],
+          message: "channel route cannot use a DM conversation id",
         });
       }
     }

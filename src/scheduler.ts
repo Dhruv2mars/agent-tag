@@ -108,6 +108,7 @@ export class AgentTagSchedules {
         taskId: context.taskId,
         workspaceId: context.workspaceId,
         profileId: context.profileId,
+        actorUserId: context.actorUserId,
       })
     ) {
       return "task-denied";
@@ -206,6 +207,7 @@ export class ScheduleWorker {
         createdAt: current.toISOString(),
       });
     } else {
+      const task = this.#store.getTaskExecution(schedule.taskId);
       const receipt = this.#store.ingestSlackEvent({
         deliveryId: `schedule:${schedule.scheduleId}:${schedule.dueAt}`,
         eventKey: `schedule:${schedule.scheduleId}:${schedule.dueAt}`,
@@ -213,6 +215,7 @@ export class ScheduleWorker {
         conversationId: schedule.conversationId,
         threadTs: schedule.threadTs,
         actorUserId: schedule.actorUserId,
+        conversationType: task.conversationType,
         profileId: schedule.profileId,
         repositoryRoot: schedule.repositoryRoot,
         text: schedule.prompt,

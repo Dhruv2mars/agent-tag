@@ -64,6 +64,7 @@ describe("scoped memory", () => {
         conversationId: "C1",
         threadTs: "1000.000001",
         actorUserId: "U1",
+        conversationType: "channel",
         profileId: "engineering",
         repositoryRoot: "/srv/repos/engineering",
         text: "fixture",

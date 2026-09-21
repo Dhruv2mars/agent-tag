@@ -561,6 +561,7 @@ if (!enabled) {
             conversationId: "C1",
             threadTs: "1000.000001",
             actorUserId: "U1",
+            conversationType: "channel",
             profileId: "engineering",
             repositoryRoot: workspaceRoot,
             text: "Reply with exactly durable-fixture-ok. Do not call tools, change files, or use the network.",

@@ -87,6 +87,105 @@ async function withRouter(
 }
 
 describe("Slack event ingress", () => {
+  test("binds a DM route to one authorized human and persists its private conversation type", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "agent-tag-slack-dm-"));
+    const store = await AgentTagStore.open(join(directory, "agent-tag.sqlite"));
+    const profile = config.profiles[0];
+    if (profile === undefined) throw new Error("Slack fixture profile is missing");
+    const dmConfig = agentTagConfigSchema.parse({
+      ...config,
+      access: {
+        ...config.access,
+        allowedChannelIds: [...config.access.allowedChannelIds, "D1"],
+      },
+      profiles: [{ ...profile, memory: { ...profile.memory, privateDm: true } }],
+      routes: [
+        ...config.routes,
+        {
+          conversationId: "D1",
+          conversationType: "dm",
+          ownerUserId: "U1",
+          profileId: profile.id,
+        },
+      ],
+    });
+    const router = new SlackEventRouter({ config: dmConfig, store, botUserId: "U0BOT", now: () => receivedAt });
+    try {
+      expect(
+        router.ingest(
+          eventBody({ eventId: "EvDM0", type: "message", channel: "D1", user: "U2", text: "private" }),
+        ),
+      ).toEqual({ kind: "ignored", reason: "dm-owner-denied" });
+      const accepted = router.ingest(
+        eventBody({ eventId: "EvDM1", type: "message", channel: "D1", text: "private request" }),
+      );
+      if (accepted.kind === "ignored") throw new Error(`DM event was ignored: ${accepted.reason}`);
+      expect(store.getTaskExecution(accepted.receipt.taskId)).toMatchObject({
+        conversationType: "dm",
+        ownerUserId: "U1",
+      });
+      expect(
+        store.requestTaskCancellation({
+          taskId: accepted.receipt.taskId,
+          workspaceId: "T1",
+          conversationId: "D1",
+          threadTs: "1000.000001",
+          actorUserId: "U2",
+          sourceActionId: "forged-dm-cancel",
+          now: receivedAt,
+        }),
+      ).toEqual({ kind: "denied" });
+      expect(
+        router.ingest(
+          eventBody({
+            eventId: "EvDM2",
+            type: "message",
+            channel: "D1",
+            user: "U2",
+            ts: "1000.000002",
+            threadTs: "1000.000001",
+            text: "forged steering",
+          }),
+        ),
+      ).toEqual({ kind: "ignored", reason: "dm-owner-denied" });
+      expect(() =>
+        store.ingestSlackEvent({
+          deliveryId: "bypass-dm-owner",
+          eventKey: "D1:1000.000004",
+          workspaceId: "T1",
+          conversationId: "D1",
+          threadTs: "1000.000001",
+          actorUserId: "U2",
+          conversationType: "dm",
+          profileId: profile.id,
+          repositoryRoot: "/srv/repos/example",
+          text: "bypass the router",
+          receivedAt,
+          sourceOrderKey: "1000.000004",
+        }),
+      ).toThrow("task conversation identity does not match the incoming event");
+      expect(
+        router.ingest(
+          eventBody({
+            eventId: "EvDM3",
+            type: "message",
+            channel: "D1",
+            ts: "1000.000003",
+            threadTs: "1000.000001",
+            text: "authorized steering",
+          }),
+        ).kind,
+      ).toBe("accepted");
+      expect(store.diagnostics()).toMatchObject({ events: 2, tasks: 1, operations: 2 });
+    } finally {
+      store.close();
+      if (!directory.startsWith(`${tmpdir()}/agent-tag-slack-dm-`)) {
+        throw new Error(`refusing to remove unexpected fixture path ${directory}`);
+      }
+      await rm(directory, { recursive: true });
+    }
+  });
+
   test("keeps ambient participation opt-in, relevant, bounded, quiet, and auditable", async () => {
     const directory = await mkdtemp(join(tmpdir(), "agent-tag-slack-ambient-"));
     const store = await AgentTagStore.open(join(directory, "agent-tag.sqlite"));

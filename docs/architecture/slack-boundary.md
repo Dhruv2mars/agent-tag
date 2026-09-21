@@ -10,6 +10,8 @@ The canonical semantic key is `channel_id:message_ts`. This collapses a Slack re
 
 The only exception to ignoring unmentioned top-level messages is profile-level ambient opt-in. An ambient profile requires one of its configured keywords, stores a content fingerprint before dispatch, and suppresses unchanged, cooldown, and hourly-limit cases. Ambient input still passes the same workspace, channel, user, route, repository, operation, and T3 boundaries as an explicit mention. The default is disabled.
 
+A DM is never inferred from an arbitrary `D` identifier. Its route must declare `conversationType: "dm"`, name one allowed owner, and use a profile with private DM memory enabled. Unmentioned top-level messages are explicit input in that route. The router and durable task both enforce the owner, and the coordinator derives private-memory visibility from the stored task type. A route change that conflicts with an active task fails closed.
+
 ## Outbound invariant
 
 Slack's supported `chat.postMessage` argument surface does not document an idempotency key. Slack also warns that `fatal_error` and `internal_error` can be returned after some aspect of an operation succeeded: <https://docs.slack.dev/reference/methods/chat.postMessage/>. Agent Tag therefore disables the SDK's automatic HTTP retries. A definite successful response stores Slack's message timestamp. An API error is failed closed. If the process exits while a send is in flight, the expired outbox row is quarantined as `delivery-outcome-unknown`; it is not sent again automatically.

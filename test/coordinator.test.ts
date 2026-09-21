@@ -154,6 +154,87 @@ function interruptedSnapshot(threadId: string): T3ThreadSnapshot {
 }
 
 describe("Agent Tag coordinator", () => {
+  test("projects private memory only when the durable task is a bound DM", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "agent-tag-coordinator-dm-"));
+    const store = await AgentTagStore.open(join(directory, "agent-tag.sqlite"));
+    const profile = config.profiles[0];
+    if (profile === undefined) throw new Error("coordinator fixture profile is missing");
+    const dmConfig = agentTagConfigSchema.parse({
+      ...config,
+      access: { ...config.access, allowedChannelIds: ["D1"] },
+      profiles: [{ ...profile, memory: { ...profile.memory, privateDm: true } }],
+      routes: [
+        {
+          conversationId: "D1",
+          conversationType: "dm",
+          ownerUserId: "U1",
+          profileId: profile.id,
+        },
+      ],
+    });
+    const commands: T3Command[] = [];
+    let threadId = "not-dispatched";
+    const t3: T3CoordinatorGateway = {
+      dispatch: async (command) => {
+        commands.push(command);
+        if (command.type === "thread.turn.start") threadId = command.threadId;
+        return { sequence: commands.length };
+      },
+      fetchThread: async () => completedSnapshot(threadId, "done"),
+    };
+    try {
+      const receipt = store.ingestSlackEvent({
+        deliveryId: "dm-delivery-1",
+        eventKey: "D1:1000.000001",
+        workspaceId: "T1",
+        conversationId: "D1",
+        threadTs: "1000.000001",
+        actorUserId: "U1",
+        conversationType: "dm",
+        profileId: profile.id,
+        repositoryRoot: "/srv/repos/example",
+        text: "private request",
+        receivedAt: now,
+        sourceOrderKey: "1000.000001",
+      });
+      const memory = new AgentTagMemory({ config: dmConfig, store });
+      expect(
+        memory.create({
+          context: {
+            workspaceId: "T1",
+            actorUserId: "U1",
+            profileId: profile.id,
+            taskId: receipt.taskId,
+            conversationType: "dm",
+          },
+          scope: "private",
+          content: "private owner context",
+          sourceType: "slack-dm",
+          sourceId: "D1:999.000001",
+          now,
+        }).kind,
+      ).toBe("accepted");
+      const coordinator = new AgentTagCoordinator({
+        config: dmConfig,
+        store,
+        t3,
+        workerId: "dm-worker",
+        now: () => new Date(now),
+        sleep: async () => {},
+      });
+      expect((await coordinator.processNext()).kind).toBe("completed");
+      const turn = commands.find((command) => command.type === "thread.turn.start");
+      if (turn?.type !== "thread.turn.start") throw new Error("DM turn was not dispatched");
+      expect(turn.message.text).toContain("private owner context");
+    } finally {
+      store.close();
+      if (!directory.startsWith(`${tmpdir()}/agent-tag-coordinator-dm-`)) {
+        throw new Error(`refusing to remove unexpected fixture path ${directory}`);
+      }
+      await rm(directory, { recursive: true });
+    }
+  });
+
   test("maps durable operations to T3 and atomically queues final Slack replies", async () => {
     const directory = await mkdtemp(join(tmpdir(), "agent-tag-coordinator-"));
     const store = await AgentTagStore.open(join(directory, "agent-tag.sqlite"));
@@ -184,6 +265,7 @@ describe("Agent Tag coordinator", () => {
         conversationId: "C1",
         threadTs: "1000.000001",
         actorUserId: "U1",
+        conversationType: "channel",
         profileId: "engineering",
         repositoryRoot: "/srv/repos/example",
         text: "first request",
@@ -255,6 +337,7 @@ describe("Agent Tag coordinator", () => {
         conversationId: "C1",
         threadTs: "1000.000001",
         actorUserId: "U1",
+        conversationType: "channel",
         profileId: "engineering",
         repositoryRoot: "/srv/repos/example",
         text: "second request",
@@ -315,6 +398,7 @@ describe("Agent Tag coordinator", () => {
         conversationId: "C1",
         threadTs: "1000.000001",
         actorUserId: "U1",
+        conversationType: "channel",
         profileId: "engineering",
         repositoryRoot: "/srv/repos/example",
         text: "request",
@@ -363,6 +447,7 @@ describe("Agent Tag coordinator", () => {
         conversationId: "C1",
         threadTs: "1000.000001",
         actorUserId: "U1",
+        conversationType: "channel",
         profileId: "engineering",
         repositoryRoot: "/srv/repos/example",
         text: "request",

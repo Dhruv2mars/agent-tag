@@ -142,6 +142,7 @@ export class AgentTagMemory {
         taskId: context.taskId,
         workspaceId: context.workspaceId,
         profileId: context.profileId,
+        actorUserId: context.actorUserId,
       })
     ) {
       return { kind: "denied", reason: "task-denied" };

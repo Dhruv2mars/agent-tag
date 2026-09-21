@@ -217,7 +217,7 @@ export class AgentTagCoordinator {
         actorUserId: operation.payload.actorUserId,
         profileId: task.profileId,
         taskId: operation.taskId,
-        conversationType: "channel",
+        conversationType: task.conversationType,
       },
       now: this.#now().toISOString(),
     });
