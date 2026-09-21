@@ -231,4 +231,23 @@ export const STORE_MIGRATIONS: readonly StoreMigration[] = [
       CREATE INDEX schedule_runs_schedule_idx ON schedule_runs(schedule_id, due_at);
     `,
   },
+  {
+    version: 8,
+    sql: `
+      CREATE TABLE ambient_decisions (
+        workspace_id TEXT NOT NULL,
+        conversation_id TEXT NOT NULL,
+        event_key TEXT NOT NULL,
+        actor_user_id TEXT NOT NULL,
+        content_fingerprint TEXT NOT NULL,
+        disposition TEXT NOT NULL CHECK (disposition IN ('triggered', 'quiet')),
+        reason TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (workspace_id, event_key)
+      );
+
+      CREATE INDEX ambient_decisions_bounds_idx
+        ON ambient_decisions(workspace_id, conversation_id, disposition, created_at);
+    `,
+  },
 ];

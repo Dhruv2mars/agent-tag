@@ -142,6 +142,7 @@ describe("Agent Tag durable store", () => {
         memoryEntries: 0,
         schedules: 0,
         scheduleRuns: 0,
+        ambientDecisions: 0,
         auditRecords: 2,
       });
       expect((await stat(path)).mode & 0o777).toBe(0o600);

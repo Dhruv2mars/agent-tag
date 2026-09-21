@@ -11,7 +11,7 @@ Actor type: `automated-fixture`
 
 ## Checks run
 
-`bun run check` passed with 35 tests and one intentionally disabled live-T3 suite. The store, coordinator, interaction, service, memory, scheduler, and Slack ingress fixtures proved:
+`bun run check` passed with 36 tests and one intentionally disabled live-T3 suite. The store, coordinator, interaction, service, memory, scheduler, ambient-policy, and Slack ingress fixtures proved:
 
 1. A Slack retry with the same delivery ID and an overlapping `app_mention`/`message` delivery with a different delivery ID but the same semantic event key created one event, task, and operation. Both duplicates returned the original stable operation, command, and message IDs.
 2. Two turns in one task could not be claimed concurrently. Closing and reopening the database preserved the first lease; after expiry, another worker reclaimed the same operation with the same command and message IDs and a higher attempt number. The second turn became claimable only after the first completed.
@@ -24,5 +24,6 @@ Actor type: `automated-fixture`
 9. SQLite produced and integrity-checked a private snapshot, restored it non-destructively, preserved durable counts and audit rows, and refused to overwrite an existing destination.
 10. The fully rendered user turn, including authorized memory, was snapshotted before dispatch. A retry proposing changed memory recovered the original text for the same stable T3 command ID.
 11. A scheduled agent run survived SQLite restart, coalesced missed intervals, obeyed overlap and cancellation policies, and used stable inbox/outbox identities; a one-shot reminder bypassed T3.
+12. Ambient decisions persisted before dispatch and used stable event keys, fingerprints, cooldown, and hourly caps to make retries and quiet outcomes deterministic.
 
 These fixtures exercise the database boundary and process reopen. They do not yet prove a kill-at-every-boundary process crash, T3 restart reconciliation, or Slack retry behavior against the live workspace.

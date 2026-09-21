@@ -36,7 +36,10 @@ export type SlackIngressResult =
         | "bot-event"
         | "message-subtype"
         | "unrouted-channel"
-        | "unbound-thread";
+        | "unbound-thread"
+        | "ambient-disabled"
+        | "ambient-not-relevant"
+        | "ambient-quiet";
     };
 
 export interface SlackEventRouterOptions {
@@ -79,6 +82,8 @@ export class SlackEventRouter {
     if (event.subtype !== undefined) return { kind: "ignored", reason: "message-subtype" };
 
     const threadTs = event.thread_ts ?? event.ts;
+    const eventKey = `${event.channel}:${event.ts}`;
+    const receivedAt = z.iso.datetime().parse(this.#now());
     const binding = this.#store.findActiveTask({
       workspaceId: body.team_id,
       conversationId: event.channel,
@@ -90,11 +95,32 @@ export class SlackEventRouter {
       profileId = binding.profileId;
       repositoryRoot = binding.repositoryRoot;
     } else {
-      if (event.type === "message") return { kind: "ignored", reason: "unbound-thread" };
       const route = this.#config.routes.find((candidate) => candidate.conversationId === event.channel);
       if (route === undefined) return { kind: "ignored", reason: "unrouted-channel" };
       const profile = this.#config.profiles.find((candidate) => candidate.id === route.profileId);
       if (profile === undefined) throw new Error(`validated route references missing profile ${route.profileId}`);
+      const explicitMention = event.text.includes(`<@${this.#botUserId}>`);
+      if (event.type === "message" && event.thread_ts !== undefined) {
+        return { kind: "ignored", reason: "unbound-thread" };
+      }
+      if (event.type === "message" && !explicitMention) {
+        if (!profile.ambient.enabled) return { kind: "ignored", reason: "ambient-disabled" };
+        const normalized = event.text.toLowerCase();
+        if (!profile.ambient.keywords.some((keyword) => normalized.includes(keyword.toLowerCase()))) {
+          return { kind: "ignored", reason: "ambient-not-relevant" };
+        }
+        const decision = this.#store.evaluateAmbient({
+          workspaceId: body.team_id,
+          conversationId: event.channel,
+          eventKey,
+          actorUserId: event.user,
+          text: event.text,
+          cooldownSeconds: profile.ambient.cooldownSeconds,
+          maxTurnsPerHour: profile.ambient.maxTurnsPerHour,
+          now: receivedAt,
+        });
+        if (decision.kind === "quiet") return { kind: "ignored", reason: "ambient-quiet" };
+      }
       profileId = profile.id;
       const selectedRoot = route.repositoryRoot ?? profile.repositoryRoots[0];
       if (selectedRoot === undefined) throw new Error(`validated profile ${profile.id} has no repository root`);
@@ -104,7 +130,7 @@ export class SlackEventRouter {
     const text = event.text.replaceAll(`<@${this.#botUserId}>`, "").trim();
     const receipt = this.#store.ingestSlackEvent({
       deliveryId: body.event_id,
-      eventKey: `${event.channel}:${event.ts}`,
+      eventKey,
       workspaceId: body.team_id,
       conversationId: event.channel,
       threadTs,
@@ -112,7 +138,7 @@ export class SlackEventRouter {
       profileId,
       repositoryRoot,
       text,
-      receivedAt: z.iso.datetime().parse(this.#now()),
+      receivedAt,
       sourceOrderKey: event.ts,
     });
     return { kind: receipt.kind, receipt };

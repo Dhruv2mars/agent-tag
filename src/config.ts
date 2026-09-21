@@ -38,6 +38,14 @@ const profileSchema = z.object({
     privateDm: z.boolean(),
     retentionDays: z.number().int().positive().max(3650),
   }),
+  ambient: z
+    .object({
+      enabled: z.boolean(),
+      keywords: z.array(z.string().trim().min(1).max(64)).max(20),
+      cooldownSeconds: z.number().int().min(60).max(86_400),
+      maxTurnsPerHour: z.number().int().positive().max(60),
+    })
+    .default({ enabled: false, keywords: [], cooldownSeconds: 300, maxTurnsPerHour: 4 }),
 });
 
 export const agentTagConfigSchema = z

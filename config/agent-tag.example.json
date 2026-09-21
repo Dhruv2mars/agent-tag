@@ -34,6 +34,12 @@
         "shared": true,
         "privateDm": false,
         "retentionDays": 180
+      },
+      "ambient": {
+        "enabled": false,
+        "keywords": [],
+        "cooldownSeconds": 300,
+        "maxTurnsPerHour": 4
       }
     }
   ],

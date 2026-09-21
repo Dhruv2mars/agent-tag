@@ -6,7 +6,9 @@ Agent Tag uses Slack Bolt `5.1.0` in Socket Mode. The app token needs `connectio
 
 Bolt acknowledges Events API envelopes before invoking event listeners. Agent Tag's listeners then do one bounded job: validate the untrusted envelope, enforce workspace/channel/user access, resolve the configured profile, and commit a normalized event plus stable operation IDs in one SQLite transaction. No T3 or Slack Web API call occurs on the inbound path.
 
-The canonical semantic key is `channel_id:message_ts`. This collapses a Slack retry and overlapping `app_mention`/`message` subscriptions even when their delivery IDs differ. A top-level `message` event is ignored. A threaded `message` is accepted only when its root maps to an existing active Agent Tag task. The exact Slack timestamp is the per-task order key, so two authorized humans' messages retain Slack order even when received in the same local millisecond.
+The canonical semantic key is `channel_id:message_ts`. This collapses a Slack retry and overlapping `app_mention`/`message` subscriptions even when their delivery IDs differ. A top-level `message` event is ignored by default. A threaded `message` is accepted only when its root maps to an existing active Agent Tag task. The exact Slack timestamp is the per-task order key, so two authorized humans' messages retain Slack order even when received in the same local millisecond.
+
+The only exception to ignoring unmentioned top-level messages is profile-level ambient opt-in. An ambient profile requires one of its configured keywords, stores a content fingerprint before dispatch, and suppresses unchanged, cooldown, and hourly-limit cases. Ambient input still passes the same workspace, channel, user, route, repository, operation, and T3 boundaries as an explicit mention. The default is disabled.
 
 ## Outbound invariant
 

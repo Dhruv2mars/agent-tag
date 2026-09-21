@@ -87,6 +87,82 @@ async function withRouter(
 }
 
 describe("Slack event ingress", () => {
+  test("keeps ambient participation opt-in, relevant, bounded, quiet, and auditable", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "agent-tag-slack-ambient-"));
+    const store = await AgentTagStore.open(join(directory, "agent-tag.sqlite"));
+    const ambientConfig = agentTagConfigSchema.parse({
+      ...config,
+      profiles: config.profiles.map((profile) => ({
+        ...profile,
+        ambient: {
+          enabled: true,
+          keywords: ["incident"],
+          cooldownSeconds: 60,
+          maxTurnsPerHour: 2,
+        },
+      })),
+    });
+    const ingestAt = (time: string, body: unknown) =>
+      new SlackEventRouter({ config: ambientConfig, store, botUserId: "U0BOT", now: () => time }).ingest(body);
+    try {
+      expect(
+        ingestAt(
+          "2026-09-21T00:00:00.000Z",
+          eventBody({ eventId: "EvA1", type: "message", ts: "1000.000010", text: "incident alpha" }),
+        ).kind,
+      ).toBe("accepted");
+      expect(
+        ingestAt(
+          "2026-09-21T00:00:30.000Z",
+          eventBody({ eventId: "EvA2", type: "message", ts: "1000.000020", text: "incident beta" }),
+        ),
+      ).toEqual({ kind: "ignored", reason: "ambient-quiet" });
+      expect(
+        ingestAt(
+          "2026-09-21T00:02:00.000Z",
+          eventBody({ eventId: "EvA3", type: "message", ts: "1000.000030", text: " Incident   Alpha " }),
+        ),
+      ).toEqual({ kind: "ignored", reason: "ambient-quiet" });
+      expect(
+        ingestAt(
+          "2026-09-21T00:02:01.000Z",
+          eventBody({ eventId: "EvA4", type: "message", ts: "1000.000040", text: "incident beta" }),
+        ).kind,
+      ).toBe("accepted");
+      expect(
+        ingestAt(
+          "2026-09-21T00:03:02.000Z",
+          eventBody({ eventId: "EvA5", type: "message", ts: "1000.000050", text: "incident gamma" }),
+        ),
+      ).toEqual({ kind: "ignored", reason: "ambient-quiet" });
+      expect(
+        ingestAt(
+          "2026-09-21T00:04:00.000Z",
+          eventBody({ eventId: "EvA6", type: "message", ts: "1000.000060", text: "ordinary update" }),
+        ),
+      ).toEqual({ kind: "ignored", reason: "ambient-not-relevant" });
+      expect(store.diagnostics()).toMatchObject({
+        ambientDecisions: 5,
+        events: 2,
+        operations: 2,
+      });
+      const decisions = store.listAuditRecords().filter((record) => record.action === "ambient.decided");
+      expect(decisions).toHaveLength(5);
+      expect(decisions.map((record) => record.result)).toEqual(
+        expect.arrayContaining(["triggered", "quiet"]),
+      );
+      expect(decisions.map((record) => record.metadata.reason)).toEqual(
+        expect.arrayContaining(["relevant", "cooldown", "unchanged", "hourly-limit"]),
+      );
+    } finally {
+      store.close();
+      if (!directory.startsWith(`${tmpdir()}/agent-tag-slack-ambient-`)) {
+        throw new Error(`refusing to remove unexpected fixture path ${directory}`);
+      }
+      await rm(directory, { recursive: true });
+    }
+  });
+
   test("collapses overlapping mention and message deliveries into one ordered turn", async () => {
     await withRouter(({ store, router }) => {
       const mention = router.ingest(eventBody({ eventId: "Ev1", type: "app_mention" }));
@@ -183,6 +259,11 @@ describe("Slack event ingress", () => {
       expect(
         router.ingest(eventBody({ eventId: "Ev5", type: "message", subtype: "message_changed" })),
       ).toEqual({ kind: "ignored", reason: "message-subtype" });
+      expect(
+        router.ingest(
+          eventBody({ eventId: "Ev6", type: "message", ts: "1000.000006", text: "incident without opt-in" }),
+        ),
+      ).toEqual({ kind: "ignored", reason: "ambient-disabled" });
       expect(store.diagnostics()).toMatchObject({ events: 0, deliveries: 0, tasks: 0, operations: 0 });
     });
   });
