@@ -82,6 +82,76 @@ function completedSnapshot(threadId: string, text: string): T3ThreadSnapshot {
   };
 }
 
+function waitingSnapshot(threadId: string): T3ThreadSnapshot {
+  const base = completedSnapshot(threadId, "");
+  return {
+    ...base,
+    thread: {
+      ...base.thread,
+      latestTurn: {
+        turnId: "turn-1",
+        state: "running",
+        requestedAt: now,
+        startedAt: now,
+        completedAt: null,
+        assistantMessageId: null,
+      },
+      messages: [],
+      activities: [
+        {
+          id: "activity-approval",
+          tone: "approval",
+          kind: "approval.requested",
+          summary: "Command approval requested",
+          payload: { requestId: "approval-1", requestKind: "command", detail: "run tests" },
+          turnId: "turn-1",
+          createdAt: now,
+        },
+        {
+          id: "activity-question",
+          tone: "approval",
+          kind: "user-input.requested",
+          summary: "Input requested",
+          payload: {
+            requestId: "question-1",
+            responseMode: "message",
+            questions: [
+              {
+                id: "package",
+                header: "Package",
+                question: "Which package?",
+                options: [{ label: "core" }, { label: "web" }],
+                multiSelect: false,
+              },
+            ],
+          },
+          turnId: "turn-1",
+          createdAt: now,
+        },
+      ],
+    },
+  };
+}
+
+function interruptedSnapshot(threadId: string): T3ThreadSnapshot {
+  const base = completedSnapshot(threadId, "");
+  return {
+    ...base,
+    thread: {
+      ...base.thread,
+      latestTurn: {
+        turnId: "turn-1",
+        state: "interrupted",
+        requestedAt: now,
+        startedAt: now,
+        completedAt: now,
+        assistantMessageId: null,
+      },
+      messages: [],
+    },
+  };
+}
+
 describe("Agent Tag coordinator", () => {
   test("maps durable operations to T3 and atomically queues final Slack replies", async () => {
     const directory = await mkdtemp(join(tmpdir(), "agent-tag-coordinator-"));
@@ -133,13 +203,26 @@ describe("Agent Tag coordinator", () => {
           prepareWorktree: { projectCwd: "/srv/repos/example", baseBranch: "main" },
         },
       });
+      const firstProgress = store.claimNextOutbox({ workerId: "slack-a", now, leaseMs: 10_000 });
+      expect(firstProgress?.payload.text).toBe("Agent Tag is working on this request.");
+      expect(firstProgress?.payload.blocks?.[1]).toMatchObject({
+        type: "actions",
+        elements: [{ action_id: "agent-tag.turn.cancel" }],
+      });
+      if (firstProgress === null) throw new Error("first progress reply was not queued");
+      store.markOutboxDelivered({
+        outboxId: firstProgress.outboxId,
+        workerId: "slack-a",
+        slackMessageTs: "1000.000010",
+        now,
+      });
       const firstOutbox = store.claimNextOutbox({ workerId: "slack-a", now, leaseMs: 10_000 });
       expect(firstOutbox?.payload.text).toBe("first-result");
       if (firstOutbox === null) throw new Error("first final reply was not queued");
       store.markOutboxDelivered({
         outboxId: firstOutbox.outboxId,
         workerId: "slack-a",
-        slackMessageTs: "1000.000010",
+        slackMessageTs: "1000.000011",
         now,
       });
 
@@ -163,11 +246,111 @@ describe("Agent Tag coordinator", () => {
       expect(commands[3]).toMatchObject({ type: "thread.turn.start", message: { text: "second request" } });
       if (commands[3]?.type !== "thread.turn.start") throw new Error("second turn was not dispatched");
       expect(commands[3].bootstrap).toBeUndefined();
+      const secondProgress = store.claimNextOutbox({ workerId: "slack-a", now, leaseMs: 10_000 });
+      if (secondProgress === null) throw new Error("second progress reply was not queued");
+      store.markOutboxDelivered({
+        outboxId: secondProgress.outboxId,
+        workerId: "slack-a",
+        slackMessageTs: "1000.000012",
+        now,
+      });
       const secondOutbox = store.claimNextOutbox({ workerId: "slack-a", now, leaseMs: 10_000 });
       expect(secondOutbox?.payload.text).toBe("second-result");
     } finally {
       store.close();
       if (!directory.startsWith(`${tmpdir()}/agent-tag-coordinator-`)) {
+        throw new Error(`refusing to remove unexpected fixture path ${directory}`);
+      }
+      await rm(directory, { recursive: true });
+    }
+  });
+
+  test("durably defers a turn while approvals and questions wait for Slack", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "agent-tag-coordinator-waiting-"));
+    const store = await AgentTagStore.open(join(directory, "agent-tag.sqlite"));
+    let threadId = "not-dispatched";
+    const coordinator = new AgentTagCoordinator({
+      config,
+      store,
+      t3: {
+        dispatch: async (command) => {
+          if (command.type === "thread.turn.start") threadId = command.threadId;
+          return { sequence: 1 };
+        },
+        fetchThread: async () => waitingSnapshot(threadId),
+      },
+      workerId: "worker-a",
+      now: () => new Date(now),
+      sleep: async () => {},
+    });
+    try {
+      store.ingestSlackEvent({
+        deliveryId: "delivery-1",
+        eventKey: "C1:1000.000001",
+        workspaceId: "T1",
+        conversationId: "C1",
+        threadTs: "1000.000001",
+        actorUserId: "U1",
+        profileId: "engineering",
+        repositoryRoot: "/srv/repos/example",
+        text: "request",
+        receivedAt: now,
+        sourceOrderKey: "1000.000001",
+      });
+      expect(await coordinator.processNext()).toMatchObject({
+        kind: "waiting-interaction",
+        approvalCount: 1,
+        questionCount: 1,
+      });
+      expect(await coordinator.processNext()).toEqual({ kind: "idle" });
+      expect(store.diagnostics().outbox).toBe(3);
+    } finally {
+      store.close();
+      if (!directory.startsWith(`${tmpdir()}/agent-tag-coordinator-waiting-`)) {
+        throw new Error(`refusing to remove unexpected fixture path ${directory}`);
+      }
+      await rm(directory, { recursive: true });
+    }
+  });
+
+  test("settles an interrupted T3 turn as a durable cancellation", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "agent-tag-coordinator-cancel-"));
+    const store = await AgentTagStore.open(join(directory, "agent-tag.sqlite"));
+    let threadId = "not-dispatched";
+    const coordinator = new AgentTagCoordinator({
+      config,
+      store,
+      t3: {
+        dispatch: async (command) => {
+          if (command.type === "thread.turn.start") threadId = command.threadId;
+          return { sequence: 1 };
+        },
+        fetchThread: async () => interruptedSnapshot(threadId),
+      },
+      workerId: "worker-a",
+      now: () => new Date(now),
+      sleep: async () => {},
+    });
+    try {
+      store.ingestSlackEvent({
+        deliveryId: "delivery-1",
+        eventKey: "C1:1000.000001",
+        workspaceId: "T1",
+        conversationId: "C1",
+        threadTs: "1000.000001",
+        actorUserId: "U1",
+        profileId: "engineering",
+        repositoryRoot: "/srv/repos/example",
+        text: "request",
+        receivedAt: now,
+        sourceOrderKey: "1000.000001",
+      });
+      expect((await coordinator.processNext()).kind).toBe("cancelled");
+      expect(await coordinator.processNext()).toEqual({ kind: "idle" });
+      expect(store.diagnostics().outbox).toBe(2);
+    } finally {
+      store.close();
+      if (!directory.startsWith(`${tmpdir()}/agent-tag-coordinator-cancel-`)) {
         throw new Error(`refusing to remove unexpected fixture path ${directory}`);
       }
       await rm(directory, { recursive: true });

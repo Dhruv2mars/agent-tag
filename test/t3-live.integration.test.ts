@@ -419,6 +419,18 @@ if (!enabled) {
           });
           const outcome = await coordinator.processNext();
           expect(outcome).toMatchObject({ kind: "completed", operationId: receipt.operationId });
+          const progress = store.claimNextOutbox({
+            workerId: "slack-live-fixture",
+            now: new Date().toISOString(),
+            leaseMs: 10_000,
+          });
+          if (progress === null) throw new Error("durable progress message was not queued");
+          store.markOutboxDelivered({
+            outboxId: progress.outboxId,
+            workerId: "slack-live-fixture",
+            slackMessageTs: "1000.000002",
+            now: new Date().toISOString(),
+          });
           const outbox = store.claimNextOutbox({
             workerId: "slack-live-fixture",
             now: new Date().toISOString(),
@@ -448,6 +460,146 @@ if (!enabled) {
         }
       },
       90_000,
+    );
+
+    test(
+      "rejects a supervised command and interrupts a waiting turn",
+      async () => {
+        const workspaceRoot = await mkdtemp(join(tmpdir(), "agent-tag-t3-control-"));
+        const projectId = crypto.randomUUID();
+        let created = false;
+        try {
+          await writeFile(join(workspaceRoot, "README.md"), "control-fixture\n");
+          await runGit(workspaceRoot, "init", "-b", "main");
+          await runGit(workspaceRoot, "config", "user.name", "Agent Tag Integration");
+          await runGit(workspaceRoot, "config", "user.email", "agent-tag@example.invalid");
+          await runGit(workspaceRoot, "add", "README.md");
+          await runGit(workspaceRoot, "commit", "-m", "test: add control fixture");
+          await dispatchT3Command({
+            config,
+            command: {
+              type: "project.create",
+              commandId: crypto.randomUUID(),
+              projectId,
+              title: "Agent Tag control fixture",
+              workspaceRoot,
+              createdAt: new Date().toISOString(),
+            },
+          });
+          created = true;
+
+          const startTurn = async (threadId: string, title: string): Promise<void> => {
+            const createdAt = new Date().toISOString();
+            await dispatchT3Command({
+              config,
+              command: {
+                type: "thread.turn.start",
+                commandId: crypto.randomUUID(),
+                threadId,
+                message: {
+                  messageId: crypto.randomUUID(),
+                  role: "user",
+                  text: "Run the command cat README.md, then report whether it succeeded. Do not change files or use the network.",
+                  attachments: [],
+                },
+                modelSelection: { instanceId: "codex", model: "gpt-5.6-sol" },
+                titleSeed: title,
+                runtimeMode: "approval-required",
+                interactionMode: "default",
+                bootstrap: {
+                  createThread: {
+                    projectId,
+                    title,
+                    modelSelection: { instanceId: "codex", model: "gpt-5.6-sol" },
+                    runtimeMode: "approval-required",
+                    interactionMode: "default",
+                    branch: "main",
+                    worktreePath: workspaceRoot,
+                    createdAt,
+                  },
+                  runSetupScript: false,
+                },
+                createdAt,
+              },
+            });
+          };
+
+          const rejectedThreadId = crypto.randomUUID();
+          await startTurn(rejectedThreadId, "Agent Tag rejection fixture");
+          let rejectedSnapshot = await waitForSnapshot(
+            rejectedThreadId,
+            (snapshot) => pendingT3Approvals(snapshot).length > 0,
+          );
+          const declined = new Set<string>();
+          const rejectionDeadline = Date.now() + 60_000;
+          while (
+            rejectedSnapshot.thread.latestTurn?.state !== "completed" &&
+            Date.now() < rejectionDeadline
+          ) {
+            for (const approval of pendingT3Approvals(rejectedSnapshot)) {
+              if (declined.has(approval.requestId)) continue;
+              await dispatchT3Command({
+                config,
+                command: {
+                  type: "thread.approval.respond",
+                  commandId: crypto.randomUUID(),
+                  threadId: rejectedThreadId,
+                  requestId: approval.requestId,
+                  decision: "decline",
+                  createdAt: new Date().toISOString(),
+                },
+              });
+              declined.add(approval.requestId);
+            }
+            await Bun.sleep(250);
+            rejectedSnapshot = await fetchT3ThreadSnapshot({ config, threadId: rejectedThreadId });
+          }
+          expect(declined.size).toBeGreaterThan(0);
+          expect(rejectedSnapshot.thread.latestTurn?.state).toBe("completed");
+          expect(pendingT3Approvals(rejectedSnapshot)).toEqual([]);
+
+          const interruptedThreadId = crypto.randomUUID();
+          await startTurn(interruptedThreadId, "Agent Tag interruption fixture");
+          const waiting = await waitForSnapshot(
+            interruptedThreadId,
+            (snapshot) => pendingT3Approvals(snapshot).length > 0,
+          );
+          await dispatchT3Command({
+            config,
+            command: {
+              type: "thread.turn.interrupt",
+              commandId: crypto.randomUUID(),
+              threadId: interruptedThreadId,
+              ...(waiting.thread.latestTurn?.turnId === undefined
+                ? {}
+                : { turnId: waiting.thread.latestTurn.turnId }),
+              createdAt: new Date().toISOString(),
+            },
+          });
+          const interrupted = await waitForSnapshot(
+            interruptedThreadId,
+            (snapshot) => snapshot.thread.latestTurn?.state === "interrupted",
+          );
+          expect(interrupted.thread.latestTurn?.state).toBe("interrupted");
+        } finally {
+          if (created) {
+            await dispatchT3Command({
+              config,
+              command: {
+                type: "project.delete",
+                commandId: crypto.randomUUID(),
+                projectId,
+                force: true,
+              },
+            });
+          }
+          if (!workspaceRoot.startsWith(`${tmpdir()}/agent-tag-t3-control-`)) {
+            throw new Error(`refusing to remove unexpected fixture path ${workspaceRoot}`);
+          }
+          await rm(workspaceRoot, { recursive: true });
+        }
+      },
+      120_000,
     );
   });
 }

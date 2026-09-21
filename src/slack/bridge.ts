@@ -4,6 +4,7 @@ import { z } from "zod";
 import type { AgentTagConfig } from "../config.ts";
 import { readSecretFile } from "../security/secret-file.ts";
 import type { AgentTagStore } from "../store/store.ts";
+import { SlackActionRouter } from "./actions.ts";
 import { SlackEventRouter } from "./events.ts";
 
 const authTestSchema = z.object({
@@ -48,12 +49,26 @@ export class SlackSocketBridge {
       store: input.store,
       botUserId: auth.user_id,
     });
+    const actions = new SlackActionRouter({ config: input.config, store: input.store });
     app.event("app_mention", async ({ body }) => {
       router.ingest(body);
     });
     app.event("message", async ({ body }) => {
       router.ingest(body);
     });
+    for (const actionId of [
+      "agent-tag.approval.accept",
+      "agent-tag.approval.decline",
+      "agent-tag.approval.cancel",
+      "agent-tag.user-input.answer",
+      "agent-tag.user-input.dismiss",
+      "agent-tag.turn.cancel",
+    ]) {
+      app.action(actionId, async ({ ack, body }) => {
+        await ack();
+        actions.ingest(body);
+      });
+    }
     return new SlackSocketBridge(app, input.store);
   }
 
@@ -77,6 +92,7 @@ export class SlackSocketBridge {
         channel: claimed.conversationId,
         thread_ts: claimed.threadTs,
         text: claimed.payload.text,
+        ...(claimed.payload.blocks === undefined ? {} : { blocks: claimed.payload.blocks }),
       });
       const messageTs = z.string().min(1).parse(response.ts);
       this.#store.markOutboxDelivered({

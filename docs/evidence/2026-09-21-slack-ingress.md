@@ -19,5 +19,6 @@ The fixture suite submits unknown Slack-shaped payloads to the same parser/route
 4. A message in an unbound thread was ignored.
 5. Wrong-workspace, unauthorized-channel, unauthorized-user, bot, and message-subtype payloads were rejected before persistence.
 6. An expired in-flight Slack send was quarantined instead of being replayed without a documented Slack idempotency guarantee.
+7. Interactive approval, rejection, question answer/dismissal, and turn-cancel payloads are acknowledged by Bolt before the router validates workspace, channel, user, task, thread, and interaction authority and writes a durable response.
 
 This is not live Slack evidence. App installation, tokens, a real mention/retry, interactive actions, files, and a second human remain required.

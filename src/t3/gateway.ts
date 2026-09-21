@@ -99,12 +99,31 @@ const approvalRespondCommand = z.object({
   createdAt: isoDateTime,
 });
 
+const userInputRespondCommand = z.object({
+  type: z.literal("thread.user-input.respond"),
+  commandId: id,
+  threadId: id,
+  requestId: id,
+  answers: z.record(z.string(), z.unknown()),
+  createdAt: isoDateTime,
+});
+
+const userInputDismissCommand = z.object({
+  type: z.literal("thread.user-input.dismiss"),
+  commandId: id,
+  threadId: id,
+  requestId: id,
+  createdAt: isoDateTime,
+});
+
 export const t3CommandSchema = z.discriminatedUnion("type", [
   projectCreateCommand,
   projectDeleteCommand,
   turnStartCommand,
   turnInterruptCommand,
   approvalRespondCommand,
+  userInputRespondCommand,
+  userInputDismissCommand,
 ]);
 export type T3Command = z.infer<typeof t3CommandSchema>;
 
@@ -231,6 +250,33 @@ export interface T3PendingApproval {
   }>;
 }
 
+const userInputQuestionSchema = z.object({
+  id,
+  header: z.string(),
+  question: z.string(),
+  options: z.array(
+    z.object({
+      label: z.string(),
+      description: z.string().optional(),
+    }),
+  ),
+  multiSelect: z.boolean(),
+  allowCustomAnswer: z.boolean().optional(),
+});
+
+const userInputRequestPayloadSchema = z.object({
+  requestId: id,
+  questions: z.array(userInputQuestionSchema).min(1),
+  responseMode: z.enum(["callback", "message"]).optional(),
+});
+const requestIdPayloadSchema = z.object({ requestId: id });
+
+export interface T3PendingUserInput {
+  readonly requestId: string;
+  readonly questions: ReadonlyArray<z.infer<typeof userInputQuestionSchema>>;
+  readonly dismissible: boolean;
+}
+
 function legacyRequestKind(requestType: string | undefined): T3PendingApproval["requestKind"] {
   switch (requestType) {
     case "file_read_approval":
@@ -264,6 +310,37 @@ export function pendingT3Approvals(snapshot: T3ThreadSnapshot): ReadonlyArray<T3
       });
     } else if (activity.kind === "approval.resolved") {
       pending.delete(parsed.data.requestId);
+    }
+  }
+  return [...pending.values()];
+}
+
+export function pendingT3UserInputs(snapshot: T3ThreadSnapshot): ReadonlyArray<T3PendingUserInput> {
+  const pending = new Map<string, T3PendingUserInput>();
+  for (const activity of snapshot.thread.activities) {
+    if (activity.kind === "user-input.requested") {
+      const parsed = userInputRequestPayloadSchema.safeParse(activity.payload);
+      if (!parsed.success) continue;
+      pending.set(parsed.data.requestId, {
+        requestId: parsed.data.requestId,
+        questions: parsed.data.questions.map((question) => ({
+          id: question.id,
+          header: question.header,
+          question: question.question,
+          options: question.options.map((option) => ({
+            label: option.label,
+            ...(option.description === undefined ? {} : { description: option.description }),
+          })),
+          multiSelect: question.multiSelect,
+          ...(question.allowCustomAnswer === undefined
+            ? {}
+            : { allowCustomAnswer: question.allowCustomAnswer }),
+        })),
+        dismissible: parsed.data.responseMode === "message",
+      });
+    } else if (activity.kind === "user-input.resolved") {
+      const parsed = requestIdPayloadSchema.safeParse(activity.payload);
+      if (parsed.success) pending.delete(parsed.data.requestId);
     }
   }
   return [...pending.values()];

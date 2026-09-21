@@ -118,4 +118,35 @@ export const STORE_MIGRATIONS: readonly StoreMigration[] = [
       ALTER TABLE tasks ADD COLUMN t3_thread_started_at TEXT;
     `,
   },
+  {
+    version: 4,
+    sql: `
+      ALTER TABLE operations ADD COLUMN blocked_until TEXT;
+
+      CREATE TABLE interactions (
+        interaction_id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL REFERENCES tasks(task_id),
+        operation_id TEXT NOT NULL REFERENCES operations(operation_id),
+        thread_id TEXT NOT NULL,
+        request_id TEXT NOT NULL,
+        kind TEXT NOT NULL CHECK (kind IN ('approval', 'user-input', 'cancel')),
+        prompt_json TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('pending', 'response-pending', 'inflight', 'resolved', 'failed')),
+        response_command_id TEXT NOT NULL UNIQUE,
+        response_json TEXT,
+        response_actor_id TEXT,
+        source_action_id TEXT UNIQUE,
+        attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+        lease_owner TEXT,
+        lease_expires_at TEXT,
+        last_error_code TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE (thread_id, request_id, kind)
+      );
+
+      CREATE INDEX interactions_claim_idx ON interactions(state, lease_expires_at, created_at);
+      CREATE INDEX interactions_operation_idx ON interactions(operation_id, created_at);
+    `,
+  },
 ];
