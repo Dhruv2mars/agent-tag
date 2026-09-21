@@ -140,6 +140,8 @@ describe("Agent Tag durable store", () => {
         operations: 1,
         outbox: 0,
         memoryEntries: 0,
+        schedules: 0,
+        scheduleRuns: 0,
         auditRecords: 2,
       });
       expect((await stat(path)).mode & 0o777).toBe(0o600);

@@ -38,6 +38,7 @@ describe("Agent Tag service", () => {
       const calls = {
         coordinator: 0,
         interaction: 0,
+        schedule: 0,
         maintenance: 0,
         delivery: 0,
         bridgeStart: 0,
@@ -61,6 +62,12 @@ describe("Agent Tag service", () => {
           return { kind: calls.maintenance === 1 ? "memory-expired" : "idle" };
         },
       };
+      const schedule: ServiceWorker = {
+        processNext: async () => {
+          calls.schedule += 1;
+          return { kind: calls.schedule === 1 ? "dispatched" : "idle" };
+        },
+      };
       const bridge: ServiceSlackBridge = {
         start: async () => {
           calls.bridgeStart += 1;
@@ -79,13 +86,19 @@ describe("Agent Tag service", () => {
         bridge,
         coordinators: [coordinator],
         interactionWorkers: [interaction],
+        scheduleWorkers: [schedule],
         maintenanceWorkers: [maintenance],
         idleMs: 1,
         logger: (record) => logs.push(record),
       });
       await service.start();
       await eventually(
-        () => calls.coordinator >= 2 && calls.interaction >= 2 && calls.maintenance >= 2 && calls.delivery >= 2,
+        () =>
+          calls.coordinator >= 2 &&
+          calls.interaction >= 2 &&
+          calls.schedule >= 2 &&
+          calls.maintenance >= 2 &&
+          calls.delivery >= 2,
       );
       await service.stop();
 
@@ -93,7 +106,7 @@ describe("Agent Tag service", () => {
       expect(calls.bridgeStop).toBe(1);
       expect(logs.map((record) => record.event)).toContain("service.started");
       expect(logs.map((record) => record.event)).toContain("service.stopped");
-      expect(logs.filter((record) => record.event === "worker.outcome")).toHaveLength(4);
+      expect(logs.filter((record) => record.event === "worker.outcome")).toHaveLength(5);
     });
   });
 

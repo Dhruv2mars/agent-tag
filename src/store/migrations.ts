@@ -187,4 +187,48 @@ export const STORE_MIGRATIONS: readonly StoreMigration[] = [
       ALTER TABLE operations ADD COLUMN resolved_text TEXT;
     `,
   },
+  {
+    version: 7,
+    sql: `
+      CREATE TABLE schedules (
+        schedule_id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL REFERENCES tasks(task_id),
+        workspace_id TEXT NOT NULL,
+        conversation_id TEXT NOT NULL,
+        thread_ts TEXT NOT NULL,
+        actor_user_id TEXT NOT NULL,
+        profile_id TEXT NOT NULL,
+        repository_root TEXT NOT NULL,
+        kind TEXT NOT NULL CHECK (kind IN ('agent', 'reminder')),
+        prompt TEXT NOT NULL,
+        cadence_seconds INTEGER CHECK (cadence_seconds IS NULL OR cadence_seconds >= 60),
+        missed_run_policy TEXT NOT NULL CHECK (missed_run_policy IN ('run-once', 'skip')),
+        misfire_grace_seconds INTEGER NOT NULL CHECK (misfire_grace_seconds >= 0),
+        overlap_policy TEXT NOT NULL CHECK (overlap_policy IN ('skip', 'queue')),
+        state TEXT NOT NULL CHECK (state IN ('active', 'cancelled', 'completed')),
+        next_run_at TEXT NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+        lease_owner TEXT,
+        lease_expires_at TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE INDEX schedules_due_idx ON schedules(state, next_run_at, lease_expires_at);
+
+      CREATE TABLE schedule_runs (
+        run_id TEXT PRIMARY KEY,
+        schedule_id TEXT NOT NULL REFERENCES schedules(schedule_id),
+        due_at TEXT NOT NULL,
+        disposition TEXT NOT NULL CHECK (
+          disposition IN ('dispatched', 'missed-skipped', 'overlap-skipped')
+        ),
+        operation_id TEXT REFERENCES operations(operation_id),
+        created_at TEXT NOT NULL,
+        UNIQUE (schedule_id, due_at)
+      );
+
+      CREATE INDEX schedule_runs_schedule_idx ON schedule_runs(schedule_id, due_at);
+    `,
+  },
 ];

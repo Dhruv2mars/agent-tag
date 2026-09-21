@@ -4,6 +4,7 @@ import type { AgentTagConfig } from "./config.ts";
 import { AgentTagCoordinator } from "./coordinator.ts";
 import { InteractionWorker } from "./interaction-worker.ts";
 import { validateConfiguredProviders } from "./policy/provider.ts";
+import { ScheduleWorker } from "./scheduler.ts";
 import { SlackSocketBridge } from "./slack/bridge.ts";
 import { AgentTagStore } from "./store/store.ts";
 import { inspectT3 } from "./t3/gateway.ts";
@@ -39,6 +40,7 @@ export interface AgentTagServiceOptions {
   readonly bridge: ServiceSlackBridge;
   readonly coordinators: ReadonlyArray<ServiceWorker>;
   readonly interactionWorkers: ReadonlyArray<ServiceWorker>;
+  readonly scheduleWorkers?: ReadonlyArray<ServiceWorker>;
   readonly maintenanceWorkers?: ReadonlyArray<ServiceWorker>;
   readonly idleMs?: number;
   readonly logger?: ServiceLogger;
@@ -72,6 +74,7 @@ export class AgentTagService {
   readonly #bridge: ServiceSlackBridge;
   readonly #coordinators: ReadonlyArray<ServiceWorker>;
   readonly #interactionWorkers: ReadonlyArray<ServiceWorker>;
+  readonly #scheduleWorkers: ReadonlyArray<ServiceWorker>;
   readonly #maintenanceWorkers: ReadonlyArray<ServiceWorker>;
   readonly #idleMs: number;
   readonly #logger: ServiceLogger;
@@ -89,6 +92,7 @@ export class AgentTagService {
     this.#bridge = options.bridge;
     this.#coordinators = options.coordinators;
     this.#interactionWorkers = options.interactionWorkers;
+    this.#scheduleWorkers = options.scheduleWorkers ?? [];
     this.#maintenanceWorkers = options.maintenanceWorkers ?? [];
     this.#idleMs = idleMs;
     this.#logger = options.logger ?? defaultLogger;
@@ -113,6 +117,9 @@ export class AgentTagService {
       ),
       ...this.#interactionWorkers.map((worker, index) =>
         this.#runWorkerLoop(`interaction-${index + 1}`, worker, signal),
+      ),
+      ...this.#scheduleWorkers.map((worker, index) =>
+        this.#runWorkerLoop(`schedule-${index + 1}`, worker, signal),
       ),
       ...this.#maintenanceWorkers.map((worker, index) =>
         this.#runWorkerLoop(`maintenance-${index + 1}`, worker, signal),
@@ -204,6 +211,7 @@ export async function createAgentTagService(input: {
       bridge,
       coordinators,
       interactionWorkers: [new InteractionWorker({ store, t3Config: input.config.t3 })],
+      scheduleWorkers: [new ScheduleWorker({ store })],
       maintenanceWorkers: [
         {
           processNext: async () => {

@@ -45,6 +45,7 @@
     }
   ],
   "limits": {
-    "maxConcurrentTasks": 2
+    "maxConcurrentTasks": 2,
+    "maxActiveSchedules": 100
   }
 }

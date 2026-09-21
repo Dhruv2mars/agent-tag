@@ -70,6 +70,7 @@ export const agentTagConfigSchema = z
     ),
     limits: z.object({
       maxConcurrentTasks: z.number().int().positive().max(32),
+      maxActiveSchedules: z.number().int().positive().max(10_000).default(100),
     }),
   })
   .superRefine((config, context) => {

@@ -2,11 +2,12 @@ import { resolve } from "node:path";
 
 import { loadConfig } from "./config.ts";
 import { createAgentTagService, diagnoseAgentTag } from "./service.ts";
+import { AgentTagSchedules } from "./scheduler.ts";
 import { AgentTagStore } from "./store/store.ts";
 
 function usage(): never {
   throw new Error(
-    "usage: agent-tag <run|doctor|audit|backup> CONFIG [ARG] | agent-tag restore BACKUP NEW_DATA_DIR",
+    "usage: agent-tag <run|doctor|audit|backup> CONFIG [ARG] | agent-tag restore BACKUP NEW_DATA_DIR | agent-tag schedule-<add|list|cancel> CONFIG TASK ACTOR PROFILE [SPEC_OR_ID]",
   );
 }
 
@@ -34,7 +35,15 @@ if (command === "restore") {
     destinationPath: resolve(destinationDirectory, "agent-tag.sqlite"),
   });
 } else {
-  if (command !== "run" && command !== "doctor" && command !== "audit" && command !== "backup") usage();
+  if (
+    command !== "run" &&
+    command !== "doctor" &&
+    command !== "audit" &&
+    command !== "backup" &&
+    command !== "schedule-add" &&
+    command !== "schedule-list" &&
+    command !== "schedule-cancel"
+  ) usage();
   const config = await loadConfig(resolve(configArgument));
   if (command === "doctor") {
     console.log(JSON.stringify(await diagnoseAgentTag(config), null, 2));
@@ -58,6 +67,47 @@ if (command === "restore") {
     const store = await AgentTagStore.open(resolve(config.dataDir, "agent-tag.sqlite"));
     try {
       await store.backupTo(resolve(destination));
+    } finally {
+      store.close();
+    }
+  } else if (command === "schedule-add" || command === "schedule-list" || command === "schedule-cancel") {
+    const taskId = process.argv[4];
+    const actorUserId = process.argv[5];
+    const profileId = process.argv[6];
+    if (taskId === undefined || actorUserId === undefined || profileId === undefined) usage();
+    const store = await AgentTagStore.open(resolve(config.dataDir, "agent-tag.sqlite"));
+    try {
+      const schedules = new AgentTagSchedules({ config, store });
+      const context = {
+        workspaceId: config.slack.workspaceId,
+        actorUserId,
+        profileId,
+        taskId,
+      };
+      if (command === "schedule-list") {
+        console.log(JSON.stringify(schedules.list(context), null, 2));
+      } else if (command === "schedule-add") {
+        const specPath = process.argv[7];
+        if (specPath === undefined) usage();
+        const spec: unknown = await Bun.file(resolve(specPath)).json();
+        console.log(
+          JSON.stringify(
+            schedules.create({ context, spec, now: new Date().toISOString() }),
+            null,
+            2,
+          ),
+        );
+      } else {
+        const scheduleId = process.argv[7];
+        if (scheduleId === undefined) usage();
+        console.log(
+          JSON.stringify(
+            schedules.cancel({ context, scheduleId, now: new Date().toISOString() }),
+            null,
+            2,
+          ),
+        );
+      }
     } finally {
       store.close();
     }

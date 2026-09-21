@@ -57,6 +57,34 @@ bun run restore -- /private/backup/agent-tag.sqlite /new/private/data-directory
 
 Restore validates the source, creates the new directory with mode `0700` when needed, writes `agent-tag.sqlite` with mode `0600`, and refuses to overwrite an existing database. Point a reviewed config at the new directory and run `doctor` before starting it. In-place destructive restore is intentionally unsupported.
 
+## Schedules
+
+Schedules belong to an existing active Agent Tag task. Create a JSON spec such as:
+
+```json
+{
+  "kind": "agent",
+  "prompt": "Run the release check and report only actionable changes.",
+  "runAt": "2026-09-22T04:30:00.000Z",
+  "cadenceSeconds": 86400,
+  "missedRunPolicy": "run-once",
+  "misfireGraceSeconds": 300,
+  "overlapPolicy": "skip"
+}
+```
+
+Then use the task, actor, and profile IDs from the private audit export:
+
+```sh
+bun run schedule:add -- CONFIG TASK_ID USER_ID PROFILE_ID SPEC.json
+bun run schedule:list -- CONFIG TASK_ID USER_ID PROFILE_ID
+bun run schedule:cancel -- CONFIG TASK_ID USER_ID PROFILE_ID SCHEDULE_ID
+```
+
+`kind: "agent"` adds a normal durable T3 operation when due. `kind: "reminder"` sends `Reminder: ...` through the durable Slack outbox without running a provider. Cadence is optional for a one-shot schedule and must be at least 60 seconds when present. Workspace active schedules are capped by `limits.maxActiveSchedules`.
+
+An overdue `run-once` schedule coalesces missed intervals into one run; `skip` records the miss without dispatch. `overlapPolicy: skip` suppresses a recurring agent run while an earlier run from the same schedule is pending or in flight. `queue` preserves every due run behind normal per-task serialization.
+
 ## Host constraints
 
 The verified runtime is macOS arm64 with Bun `1.3.13` and T3 Code `0.0.42`. A macOS user service requires the user to remain logged in; an awake host is required for local T3 and Socket Mode availability. Linux service-manager behavior has not yet been exercised, so it remains outside the passing claim.

@@ -11,9 +11,9 @@ Actor types: `automated-fixture`, `automated-real`
 
 ## Fixture checks
 
-`bun run check` passed with 34 tests and one intentionally disabled live-T3 suite. The service fixture started independent coordinator, interaction, maintenance, and Slack-outbox loops; observed useful work in each; stopped Socket Mode; ended the loops; and closed SQLite. A forced worker exception was contained and retried. A secret canary placed in the exception message did not appear in the structured service records.
+`bun run check` passed with 35 tests and one intentionally disabled live-T3 suite. The service fixture started independent coordinator, interaction, schedule, maintenance, and Slack-outbox loops; observed useful work in each; stopped Socket Mode; ended the loops; and closed SQLite. A forced worker exception was contained and retried. A secret canary placed in the exception message did not appear in the structured service records.
 
-The production service creates `maxConcurrentTasks` coordinator workers while the store enforces both the global bound and per-task serialization. A maintenance worker applies memory retention. Startup quarantines expired in-flight Slack sends before Socket Mode starts. `SIGINT` and `SIGTERM` trigger the same graceful stop path.
+The production service creates `maxConcurrentTasks` coordinator workers while the store enforces both the global bound and per-task serialization. Separate workers dispatch schedules and apply memory retention. Startup quarantines expired in-flight Slack sends before Socket Mode starts. `SIGINT` and `SIGTERM` trigger the same graceful stop path.
 
 Provider-policy fixtures accepted an explicit ready/authenticated provider and model, then failed closed with distinct codes for non-ready, unauthenticated, and missing-model configurations. Production startup applies the same validation to every profile against the live T3 catalog before Slack connects.
 
