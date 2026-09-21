@@ -1,6 +1,7 @@
 import { Database } from "bun:sqlite";
-import { chmod, mkdir } from "node:fs/promises";
-import { dirname, isAbsolute } from "node:path";
+import { constants } from "node:fs";
+import { chmod, copyFile, link, mkdir, open, rm, stat } from "node:fs/promises";
+import { basename, dirname, isAbsolute, join } from "node:path";
 
 import { z } from "zod";
 
@@ -110,6 +111,23 @@ const interactionRowSchema = z.object({
   attempts: z.number().int().nonnegative(),
   lease_expires_at: isoDateTime,
 });
+const auditRowSchema = z.object({
+  audit_id: nonEmpty,
+  actor_type: nonEmpty,
+  actor_id: nonEmpty,
+  authority: nonEmpty,
+  source: nonEmpty,
+  target: nonEmpty,
+  action: nonEmpty,
+  result: nonEmpty,
+  correlation_id: nonEmpty,
+  metadata_json: z.string(),
+  created_at: isoDateTime,
+});
+const auditMetadataSchema = z.record(
+  z.string(),
+  z.union([z.string(), z.number(), z.boolean(), z.null()]),
+);
 
 export type StoreFaultPoint =
   | "ingest.after-operation"
@@ -208,6 +226,25 @@ export interface ClaimedOutboxMessage {
   readonly leaseExpiresAt: string;
 }
 
+export interface AuditRecord {
+  readonly auditId: string;
+  readonly actorType: string;
+  readonly actorId: string;
+  readonly authority: string;
+  readonly source: string;
+  readonly target: string;
+  readonly action: string;
+  readonly result: string;
+  readonly correlationId: string;
+  readonly metadata: Readonly<Record<string, string | number | boolean | null>>;
+  readonly createdAt: string;
+}
+
+export interface AuditCursor {
+  readonly createdAt: string;
+  readonly auditId: string;
+}
+
 function requiredId(value: string, name: string): string {
   const parsed = nonEmpty.safeParse(value);
   if (!parsed.success) throw new Error(`${name} must not be empty`);
@@ -223,6 +260,54 @@ function leaseExpiry(now: string, leaseMs: number): string {
 function parseStoredJson(text: string): unknown {
   const parsed: unknown = JSON.parse(text);
   return parsed;
+}
+
+async function requirePrivateDirectory(path: string): Promise<void> {
+  await mkdir(path, { recursive: true, mode: 0o700 });
+  const metadata = await stat(path);
+  if (!metadata.isDirectory()) throw new Error(`backup parent is not a directory: ${path}`);
+  if ((metadata.mode & 0o077) !== 0) {
+    throw new Error(`backup parent must not grant group or world access: ${path}`);
+  }
+  const uid = process.getuid?.();
+  if (uid !== undefined && metadata.uid !== uid) {
+    throw new Error(`backup parent must be owned by the Agent Tag user: ${path}`);
+  }
+}
+
+function verifyDatabaseFile(path: string): void {
+  const database = new Database(path, { readonly: true, strict: true });
+  try {
+    const row = z.object({ quick_check: z.literal("ok") }).parse(
+      database.query("PRAGMA quick_check").get(),
+    );
+    if (row.quick_check !== "ok") throw new Error("backup integrity check failed");
+  } finally {
+    database.close();
+  }
+}
+
+function temporarySibling(path: string): string {
+  return join(dirname(path), `.${basename(path)}.${crypto.randomUUID()}.tmp`);
+}
+
+async function installPrivateFile(input: {
+  readonly temporaryPath: string;
+  readonly destinationPath: string;
+}): Promise<void> {
+  try {
+    await chmod(input.temporaryPath, 0o600);
+    verifyDatabaseFile(input.temporaryPath);
+    const file = await open(input.temporaryPath, "r");
+    try {
+      await file.sync();
+    } finally {
+      await file.close();
+    }
+    await link(input.temporaryPath, input.destinationPath);
+  } finally {
+    await rm(input.temporaryPath, { force: true });
+  }
 }
 
 function writeAudit(
@@ -309,6 +394,73 @@ export class AgentTagStore {
 
   close(): void {
     this.#database.close();
+  }
+
+  async backupTo(path: string): Promise<void> {
+    if (!isAbsolute(path)) throw new Error("backup path must be absolute");
+    await requirePrivateDirectory(dirname(path));
+    const temporaryPath = temporarySibling(path);
+    try {
+      this.#database.query("VACUUM INTO ?").run(temporaryPath);
+      await installPrivateFile({ temporaryPath, destinationPath: path });
+    } catch (error) {
+      await rm(temporaryPath, { force: true });
+      throw error;
+    }
+  }
+
+  static async restoreBackup(input: {
+    readonly backupPath: string;
+    readonly destinationPath: string;
+  }): Promise<void> {
+    if (!isAbsolute(input.backupPath)) throw new Error("backup path must be absolute");
+    if (!isAbsolute(input.destinationPath)) throw new Error("destination path must be absolute");
+    verifyDatabaseFile(input.backupPath);
+    await requirePrivateDirectory(dirname(input.destinationPath));
+    const temporaryPath = temporarySibling(input.destinationPath);
+    try {
+      await copyFile(input.backupPath, temporaryPath, constants.COPYFILE_EXCL);
+      await installPrivateFile({ temporaryPath, destinationPath: input.destinationPath });
+    } catch (error) {
+      await rm(temporaryPath, { force: true });
+      throw error;
+    }
+  }
+
+  listAuditRecords(input: { readonly after?: AuditCursor; readonly limit?: number } = {}): ReadonlyArray<AuditRecord> {
+    const limit = input.limit ?? 1_000;
+    if (!Number.isSafeInteger(limit) || limit <= 0 || limit > 10_000) {
+      throw new Error("audit export limit must be between 1 and 10000");
+    }
+    const afterCreatedAt = input.after === undefined
+      ? "0000-01-01T00:00:00.000Z"
+      : isoDateTime.parse(input.after.createdAt);
+    const afterAuditId = input.after === undefined ? "" : requiredId(input.after.auditId, "auditId");
+    return this.#database
+      .query(
+        `SELECT audit_id, actor_type, actor_id, authority, source, target, action, result,
+                correlation_id, metadata_json, created_at
+         FROM audit_log
+         WHERE created_at > ? OR (created_at = ? AND audit_id > ?)
+         ORDER BY created_at, audit_id LIMIT ?`,
+      )
+      .all(afterCreatedAt, afterCreatedAt, afterAuditId, limit)
+      .map((raw) => {
+        const row = auditRowSchema.parse(raw);
+        return {
+          auditId: row.audit_id,
+          actorType: row.actor_type,
+          actorId: row.actor_id,
+          authority: row.authority,
+          source: row.source,
+          target: row.target,
+          action: row.action,
+          result: row.result,
+          correlationId: row.correlation_id,
+          metadata: auditMetadataSchema.parse(parseStoredJson(row.metadata_json)),
+          createdAt: row.created_at,
+        };
+      });
   }
 
   ingestSlackEvent(input: SlackEventInput): IngestReceipt {

@@ -31,6 +31,32 @@ The configured `maxConcurrentTasks` creates that many independent coordinator wo
 
 The operator must reconcile quarantined Slack sends in SQLite before retrying or replacing them. An automated reconciliation command is still pending.
 
+## Audit and backup
+
+Export the complete structured audit log as newline-delimited JSON:
+
+```sh
+bun run audit -- /absolute/path/to/agent-tag.json > audit.ndjson
+```
+
+Audit rows contain identity and correlation fields plus bounded transition metadata. They do not contain Slack message bodies. Treat the export as private operational data because its IDs can still be sensitive.
+
+Create a consistent backup while the service is stopped or running:
+
+```sh
+bun run backup -- /absolute/path/to/agent-tag.json /private/backup/agent-tag.sqlite
+```
+
+The destination parent must be owned by the service user with no group or world permissions. SQLite creates a consistent snapshot, Agent Tag runs `quick_check`, installs the mode-`0600` file atomically, and refuses to overwrite an existing path.
+
+Restore into a new data directory:
+
+```sh
+bun run restore -- /private/backup/agent-tag.sqlite /new/private/data-directory
+```
+
+Restore validates the source, creates the new directory with mode `0700` when needed, writes `agent-tag.sqlite` with mode `0600`, and refuses to overwrite an existing database. Point a reviewed config at the new directory and run `doctor` before starting it. In-place destructive restore is intentionally unsupported.
+
 ## Host constraints
 
 The verified runtime is macOS arm64 with Bun `1.3.13` and T3 Code `0.0.42`. A macOS user service requires the user to remain logged in; an awake host is required for local T3 and Socket Mode availability. Linux service-manager behavior has not yet been exercised, so it remains outside the passing claim.

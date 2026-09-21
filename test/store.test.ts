@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtemp, rm, stat } from "node:fs/promises";
+import { chmod, mkdtemp, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -44,6 +44,38 @@ async function withStore(
 }
 
 describe("Agent Tag durable store", () => {
+  test("backs up and restores a consistent store without overwriting a destination", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "agent-tag-store-backup-"));
+    await chmod(directory, 0o700);
+    const sourcePath = join(directory, "source.sqlite");
+    const backupPath = join(directory, "backup.sqlite");
+    const restoredPath = join(directory, "restored.sqlite");
+    const source = await AgentTagStore.open(sourcePath);
+    try {
+      source.ingestSlackEvent(slackEvent());
+      await source.backupTo(backupPath);
+      expect((await stat(backupPath)).mode & 0o777).toBe(0o600);
+      await AgentTagStore.restoreBackup({ backupPath, destinationPath: restoredPath });
+      await expect(
+        AgentTagStore.restoreBackup({ backupPath, destinationPath: restoredPath }),
+      ).rejects.toThrow();
+      const restored = await AgentTagStore.open(restoredPath);
+      try {
+        expect(restored.diagnostics()).toEqual(source.diagnostics());
+        expect(restored.listAuditRecords()).toHaveLength(1);
+        expect(JSON.stringify(restored.listAuditRecords())).not.toContain("Investigate the failure");
+      } finally {
+        restored.close();
+      }
+    } finally {
+      source.close();
+      if (!directory.startsWith(`${tmpdir()}/agent-tag-store-backup-`)) {
+        throw new Error(`refusing to remove unexpected fixture path ${directory}`);
+      }
+      await rm(directory, { recursive: true });
+    }
+  });
+
   test("deduplicates Slack retries and overlapping event deliveries into one operation", async () => {
     await withStore(async ({ store, path }) => {
       const accepted = store.ingestSlackEvent(slackEvent());

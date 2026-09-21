@@ -6,6 +6,9 @@
   "scripts": {
     "start": "bun run src/cli.ts run",
     "doctor": "bun run src/cli.ts doctor",
+    "audit": "bun run src/cli.ts audit",
+    "backup": "bun run src/cli.ts backup",
+    "restore": "bun run src/cli.ts restore",
     "test": "bun test",
     "test:t3": "RUN_T3_INTEGRATION=1 bun test test/t3-live.integration.test.ts",
     "typecheck": "tsc --noEmit",
