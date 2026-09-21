@@ -57,8 +57,21 @@ const operationIdentitySchema = z.object({
   message_id: nonEmpty,
 });
 
-const taskLookupSchema = z.object({ task_id: nonEmpty });
+const taskLookupSchema = z.object({
+  task_id: nonEmpty,
+  t3_project_id: nonEmpty.nullable(),
+  t3_thread_id: nonEmpty.nullable(),
+});
 const outboxIdentitySchema = z.object({ outbox_id: nonEmpty });
+const taskExecutionSchema = z.object({
+  task_id: nonEmpty,
+  profile_id: nonEmpty,
+  repository_root: nonEmpty,
+  t3_project_id: nonEmpty,
+  t3_thread_id: nonEmpty,
+  t3_thread_started_at: isoDateTime.nullable(),
+  created_at: isoDateTime,
+});
 
 export type StoreFaultPoint =
   | "ingest.after-operation"
@@ -88,6 +101,16 @@ export interface ActiveTaskBinding {
   readonly taskId: string;
   readonly profileId: string;
   readonly repositoryRoot: string;
+}
+
+export interface TaskExecutionBinding {
+  readonly taskId: string;
+  readonly profileId: string;
+  readonly repositoryRoot: string;
+  readonly projectId: string;
+  readonly threadId: string;
+  readonly threadStarted: boolean;
+  readonly createdAt: string;
 }
 
 export interface IngestReceipt {
@@ -472,6 +495,120 @@ export class AgentTagStore {
     complete.immediate();
   }
 
+  completeOperationWithOutbox(input: {
+    readonly operationId: string;
+    readonly taskId: string;
+    readonly workerId: string;
+    readonly resultSequence: number;
+    readonly conversationId: string;
+    readonly threadTs: string;
+    readonly text: string;
+    readonly now: string;
+  }): string {
+    const now = isoDateTime.parse(input.now);
+    if (!Number.isSafeInteger(input.resultSequence) || input.resultSequence < 0) {
+      throw new Error("resultSequence must be a non-negative integer");
+    }
+    const complete = this.#database.transaction(() => {
+      const operationId = requiredId(input.operationId, "operationId");
+      const taskId = requiredId(input.taskId, "taskId");
+      const result = this.#database
+        .query(
+          `UPDATE operations SET status = 'succeeded', result_sequence = ?, lease_owner = NULL,
+             lease_expires_at = NULL, updated_at = ?
+           WHERE operation_id = ? AND task_id = ? AND status = 'inflight'
+             AND lease_owner = ? AND lease_expires_at > ?`,
+        )
+        .run(
+          input.resultSequence,
+          now,
+          operationId,
+          taskId,
+          requiredId(input.workerId, "workerId"),
+          now,
+        );
+      if (result.changes !== 1) throw new Error("operation lease is missing, expired, or owned by another worker");
+
+      const clientMessageId = `${operationId}:final`;
+      const prior = outboxIdentitySchema.nullable().parse(
+        this.#database
+          .query("SELECT outbox_id FROM slack_outbox WHERE client_message_id = ?")
+          .get(clientMessageId),
+      );
+      const outboxId = prior?.outbox_id ?? crypto.randomUUID();
+      if (prior === null) {
+        this.#database
+          .query(
+            `INSERT INTO slack_outbox (
+              outbox_id, task_id, correlation_id, conversation_id, thread_ts,
+              client_message_id, payload_json, status, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
+          )
+          .run(
+            outboxId,
+            taskId,
+            operationId,
+            requiredId(input.conversationId, "conversationId"),
+            requiredId(input.threadTs, "threadTs"),
+            clientMessageId,
+            JSON.stringify(outboxPayloadSchema.parse({ text: input.text })),
+            now,
+            now,
+          );
+      }
+      writeAudit(this.#database, {
+        actorType: "worker",
+        actorId: input.workerId,
+        authority: "operation-dispatch",
+        source: operationId,
+        target: taskId,
+        action: "operation.completed",
+        result: "succeeded",
+        correlationId: operationId,
+        metadata: { resultSequence: input.resultSequence },
+        createdAt: now,
+      });
+      writeAudit(this.#database, {
+        actorType: "service",
+        actorId: "agent-tag",
+        authority: "slack-write",
+        source: operationId,
+        target: outboxId,
+        action: "slack.outbox.enqueued",
+        result: "pending",
+        correlationId: operationId,
+        metadata: { clientMessageId },
+        createdAt: now,
+      });
+      return outboxId;
+    });
+    return complete.immediate();
+  }
+
+  renewOperationLease(input: {
+    readonly operationId: string;
+    readonly workerId: string;
+    readonly now: string;
+    readonly leaseMs: number;
+  }): string {
+    const now = isoDateTime.parse(input.now);
+    const expiresAt = leaseExpiry(now, input.leaseMs);
+    const result = this.#database
+      .query(
+        `UPDATE operations SET lease_expires_at = ?, updated_at = ?
+         WHERE operation_id = ? AND status = 'inflight' AND lease_owner = ? AND lease_expires_at > ?`,
+      )
+      .run(
+        expiresAt,
+        now,
+        requiredId(input.operationId, "operationId"),
+        requiredId(input.workerId, "workerId"),
+        now,
+      );
+    if (result.changes !== 1) throw new Error("operation lease is missing, expired, or owned by another worker");
+    return expiresAt;
+  }
+
   failOperation(input: {
     readonly operationId: string;
     readonly workerId: string;
@@ -572,6 +709,38 @@ export class AgentTagStore {
     );
     if (row === null) return null;
     return { taskId: row.task_id, profileId: row.profile_id, repositoryRoot: row.repository_root };
+  }
+
+  getTaskExecution(taskIdInput: string): TaskExecutionBinding {
+    const row = taskExecutionSchema.parse(
+      this.#database
+        .query(
+          `SELECT task_id, profile_id, repository_root, t3_project_id, t3_thread_id,
+                  t3_thread_started_at, created_at
+           FROM tasks WHERE task_id = ? AND state = 'active'`,
+        )
+        .get(requiredId(taskIdInput, "taskId")),
+    );
+    return {
+      taskId: row.task_id,
+      profileId: row.profile_id,
+      repositoryRoot: row.repository_root,
+      projectId: row.t3_project_id,
+      threadId: row.t3_thread_id,
+      threadStarted: row.t3_thread_started_at !== null,
+      createdAt: row.created_at,
+    };
+  }
+
+  markT3ThreadStarted(input: { readonly taskId: string; readonly now: string }): void {
+    const now = isoDateTime.parse(input.now);
+    const result = this.#database
+      .query(
+        `UPDATE tasks SET t3_thread_started_at = COALESCE(t3_thread_started_at, ?), updated_at = ?
+         WHERE task_id = ? AND state = 'active'`,
+      )
+      .run(now, now, requiredId(input.taskId, "taskId"));
+    if (result.changes !== 1) throw new Error("active task not found");
   }
 
   enqueueOutbox(input: SlackOutboxInput): { readonly kind: "accepted" | "duplicate"; readonly outboxId: string } {
@@ -849,18 +1018,36 @@ export class AgentTagStore {
     const existing = taskLookupSchema.nullable().parse(
       this.#database
         .query(
-          "SELECT task_id FROM tasks WHERE workspace_id = ? AND conversation_id = ? AND thread_ts = ?",
+          `SELECT task_id, t3_project_id, t3_thread_id FROM tasks
+           WHERE workspace_id = ? AND conversation_id = ? AND thread_ts = ?`,
         )
         .get(event.workspaceId, event.conversationId, event.threadTs),
     );
-    if (existing !== null) return existing.task_id;
+    if (existing !== null) {
+      if (existing.t3_project_id === null || existing.t3_thread_id === null) {
+        this.#database
+          .query(
+            `UPDATE tasks SET t3_project_id = COALESCE(t3_project_id, ?),
+               t3_thread_id = COALESCE(t3_thread_id, ?), updated_at = ? WHERE task_id = ?`,
+          )
+          .run(
+            `agent-tag-project-${crypto.randomUUID()}`,
+            `agent-tag-thread-${crypto.randomUUID()}`,
+            event.receivedAt,
+            existing.task_id,
+          );
+      }
+      return existing.task_id;
+    }
     const taskId = crypto.randomUUID();
+    const projectId = `agent-tag-project-${crypto.randomUUID()}`;
+    const threadId = `agent-tag-thread-${crypto.randomUUID()}`;
     this.#database
       .query(
         `INSERT INTO tasks (
           task_id, workspace_id, conversation_id, thread_ts, profile_id, repository_root,
-          state, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?)`,
+          t3_project_id, t3_thread_id, state, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)`,
       )
       .run(
         taskId,
@@ -869,6 +1056,8 @@ export class AgentTagStore {
         event.threadTs,
         event.profileId,
         event.repositoryRoot,
+        projectId,
+        threadId,
         event.receivedAt,
         event.receivedAt,
       );

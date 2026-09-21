@@ -5,6 +5,9 @@ import { join } from "node:path";
 
 import { z } from "zod";
 
+import { agentTagConfigSchema } from "../src/config.ts";
+import { AgentTagCoordinator } from "../src/coordinator.ts";
+import { AgentTagStore } from "../src/store/store.ts";
 import {
   dispatchT3Command,
   fetchT3ThreadSnapshot,
@@ -345,6 +348,103 @@ if (!enabled) {
             throw new Error(`refusing to remove unexpected fixture path ${workspaceRoot}`);
           }
           await rm(workspaceRoot, { recursive: true });
+        }
+      },
+      90_000,
+    );
+
+    test(
+      "carries one durable operation through T3 into the Slack outbox",
+      async () => {
+        const workspaceRoot = await mkdtemp(join(tmpdir(), "agent-tag-t3-coordinator-repo-"));
+        const dataDirectory = await mkdtemp(join(tmpdir(), "agent-tag-t3-coordinator-data-"));
+        const store = await AgentTagStore.open(join(dataDirectory, "agent-tag.sqlite"));
+        let projectId: string | null = null;
+        try {
+          await writeFile(join(workspaceRoot, "README.md"), "# Agent Tag coordinator fixture\n");
+          await runGit(workspaceRoot, "init", "-b", "main");
+          await runGit(workspaceRoot, "config", "user.name", "Agent Tag Integration");
+          await runGit(workspaceRoot, "config", "user.email", "agent-tag@example.invalid");
+          await runGit(workspaceRoot, "add", "README.md");
+          await runGit(workspaceRoot, "commit", "-m", "test: add coordinator fixture");
+
+          const serviceConfig = agentTagConfigSchema.parse({
+            version: 1,
+            dataDir: dataDirectory,
+            t3: config,
+            slack: {
+              workspaceId: "T1",
+              appTokenFile: join(dataDirectory, "slack-app-token"),
+              botTokenFile: join(dataDirectory, "slack-bot-token"),
+            },
+            access: { allowedUserIds: ["U1"], allowedChannelIds: ["C1"] },
+            profiles: [
+              {
+                id: "engineering",
+                repositoryRoots: [workspaceRoot],
+                baseBranch: "main",
+                defaultProviderInstanceId: "codex",
+                defaultModel: "gpt-5.6-sol",
+                runtimeMode: "approval-required",
+                isolation: { mode: "trusted-same-user", acknowledgedSharedMachineAccess: true },
+                externalWrites: { mode: "deny" },
+                memory: { shared: true, privateDm: false, retentionDays: 30 },
+              },
+            ],
+            routes: [{ conversationId: "C1", profileId: "engineering" }],
+            limits: { maxConcurrentTasks: 1 },
+          });
+          const receivedAt = new Date().toISOString();
+          const receipt = store.ingestSlackEvent({
+            deliveryId: crypto.randomUUID(),
+            eventKey: `C1:${Date.now()}.000001`,
+            workspaceId: "T1",
+            conversationId: "C1",
+            threadTs: "1000.000001",
+            actorUserId: "U1",
+            profileId: "engineering",
+            repositoryRoot: workspaceRoot,
+            text: "Reply with exactly durable-fixture-ok. Do not call tools, change files, or use the network.",
+            receivedAt,
+            sourceOrderKey: "1000.000001",
+          });
+          const binding = store.getTaskExecution(receipt.taskId);
+          projectId = binding.projectId;
+          const coordinator = new AgentTagCoordinator({
+            config: serviceConfig,
+            store,
+            workerId: `live-${crypto.randomUUID()}`,
+            pollMs: 250,
+            maxWaitMs: 60_000,
+          });
+          const outcome = await coordinator.processNext();
+          expect(outcome).toMatchObject({ kind: "completed", operationId: receipt.operationId });
+          const outbox = store.claimNextOutbox({
+            workerId: "slack-live-fixture",
+            now: new Date().toISOString(),
+            leaseMs: 10_000,
+          });
+          expect(outbox?.payload.text.trim()).toBe("durable-fixture-ok");
+          expect(outbox?.correlationId).toBe(receipt.operationId);
+        } finally {
+          if (projectId !== null) {
+            await dispatchT3Command({
+              config,
+              command: {
+                type: "project.delete",
+                commandId: crypto.randomUUID(),
+                projectId,
+                force: true,
+              },
+            });
+          }
+          store.close();
+          for (const directory of [workspaceRoot, dataDirectory]) {
+            if (!directory.startsWith(`${tmpdir()}/agent-tag-t3-coordinator-`)) {
+              throw new Error(`refusing to remove unexpected fixture path ${directory}`);
+            }
+            await rm(directory, { recursive: true });
+          }
         }
       },
       90_000,

@@ -27,6 +27,7 @@ const externalWritesSchema = z.discriminatedUnion("mode", [
 const profileSchema = z.object({
   id: profileId,
   repositoryRoots: z.array(absolutePath).min(1),
+  baseBranch: z.string().min(1).default("main"),
   defaultProviderInstanceId: providerInstanceId,
   defaultModel: z.string().min(1),
   runtimeMode: z.enum(["approval-required", "auto-accept-edits"]),

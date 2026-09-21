@@ -112,4 +112,10 @@ export const STORE_MIGRATIONS: readonly StoreMigration[] = [
         ON operations(task_id, source_order_key, operation_id);
     `,
   },
+  {
+    version: 3,
+    sql: `
+      ALTER TABLE tasks ADD COLUMN t3_thread_started_at TEXT;
+    `,
+  },
 ];

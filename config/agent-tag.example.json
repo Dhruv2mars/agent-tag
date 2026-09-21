@@ -18,6 +18,7 @@
     {
       "id": "engineering",
       "repositoryRoots": ["/srv/agent-tag/repositories/example"],
+      "baseBranch": "main",
       "defaultProviderInstanceId": "codex",
       "defaultModel": "gpt-5.6-sol",
       "runtimeMode": "approval-required",

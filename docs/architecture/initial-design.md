@@ -72,4 +72,4 @@ The command log is the base. It makes crash points queryable and keeps correctne
 
 ## Next implementation step
 
-Finish the authenticated T3 gateway with real-release probe, capability projection, command dispatch, thread subscription, and stable replay tests.
+Persist pending approvals, questions, and cancellations as explicit interaction state. Slack actions must acknowledge before T3 work, bind to the authorized actor and task, and replay safely after a bridge restart.
