@@ -7,6 +7,7 @@ import { z } from "zod";
 
 import { agentTagConfigSchema } from "../src/config.ts";
 import { AgentTagCoordinator } from "../src/coordinator.ts";
+import { ProviderSelectionError, validateConfiguredProviders } from "../src/policy/provider.ts";
 import { AgentTagStore } from "../src/store/store.ts";
 import {
   dispatchT3Command,
@@ -49,7 +50,10 @@ if (!enabled) {
       let lastSnapshot = await fetchT3ThreadSnapshot({ config, threadId });
       while (!predicate(lastSnapshot) && Date.now() < deadline) {
         if (lastSnapshot.thread.latestTurn?.state === "error") {
-          throw new Error("T3 provider turn entered the error state");
+          const diagnostic = lastSnapshot.thread.session?.lastError?.includes("repeated API errors")
+            ? "provider-api-errors"
+            : "provider-error";
+          throw new Error(`T3 provider turn entered the error state (${diagnostic})`);
         }
         await Bun.sleep(250);
         lastSnapshot = await fetchT3ThreadSnapshot({ config, threadId });
@@ -73,7 +77,63 @@ if (!enabled) {
         auth: { status: "authenticated" },
       });
       expect(codex?.models.map((model) => model.slug)).toContain("gpt-5.6-sol");
-      expect(claude?.models.map((model) => model.slug)).toContain("claude-opus-5");
+      expect(claude?.models.map((model) => model.slug)).toContain("claude-sonnet-4-6");
+
+      const selectionConfig = agentTagConfigSchema.parse({
+        version: 1,
+        dataDir: "/tmp/agent-tag-provider-fixture",
+        t3: config,
+        slack: {
+          workspaceId: "T1",
+          appTokenFile: "/tmp/agent-tag-provider-fixture/slack-app-token",
+          botTokenFile: "/tmp/agent-tag-provider-fixture/slack-bot-token",
+        },
+        access: { allowedUserIds: ["U1"], allowedChannelIds: ["C1", "C2"] },
+        profiles: [
+          {
+            id: "codex-profile",
+            repositoryRoots: ["/tmp/codex-profile"],
+            defaultProviderInstanceId: "codex",
+            defaultModel: "gpt-5.6-sol",
+            runtimeMode: "approval-required",
+            isolation: { mode: "trusted-same-user", acknowledgedSharedMachineAccess: true },
+            externalWrites: { mode: "deny" },
+            memory: { shared: false, privateDm: false, retentionDays: 30 },
+          },
+          {
+            id: "claude-profile",
+            repositoryRoots: ["/tmp/claude-profile"],
+            defaultProviderInstanceId: "claudeAgent",
+            defaultModel: "claude-sonnet-4-6",
+            runtimeMode: "approval-required",
+            isolation: { mode: "trusted-same-user", acknowledgedSharedMachineAccess: true },
+            externalWrites: { mode: "deny" },
+            memory: { shared: false, privateDm: false, retentionDays: 30 },
+          },
+        ],
+        routes: [
+          { conversationId: "C1", profileId: "codex-profile" },
+          { conversationId: "C2", profileId: "claude-profile" },
+        ],
+        limits: { maxConcurrentTasks: 1 },
+      });
+      expect(validateConfiguredProviders(selectionConfig, info)).toHaveLength(2);
+
+      const unsupportedConfig = agentTagConfigSchema.parse({
+        ...selectionConfig,
+        profiles: selectionConfig.profiles.map((profile) =>
+          profile.id === "claude-profile" ? { ...profile, defaultModel: "missing-model" } : profile,
+        ),
+      });
+      try {
+        validateConfiguredProviders(unsupportedConfig, info);
+        throw new Error("expected missing model validation to fail");
+      } catch (error) {
+        expect(error).toBeInstanceOf(ProviderSelectionError);
+        if (!(error instanceof ProviderSelectionError)) throw error;
+        expect(error.code).toBe("model-missing");
+        expect(error.profileId).toBe("claude-profile");
+      }
     });
 
     test("returns the same receipt sequence for a replayed command id", async () => {
@@ -223,6 +283,104 @@ if (!enabled) {
             });
           }
           if (!workspaceRoot.startsWith(`${tmpdir()}/agent-tag-t3-turn-`)) {
+            throw new Error(`refusing to remove unexpected fixture path ${workspaceRoot}`);
+          }
+          await rm(workspaceRoot, { recursive: true });
+        }
+      },
+      150_000,
+    );
+
+    test(
+      "runs an explicit Claude turn and keeps the selected provider and model sticky",
+      async () => {
+        const workspaceRoot = await mkdtemp(join(tmpdir(), "agent-tag-t3-claude-"));
+        const projectId = crypto.randomUUID();
+        const threadId = crypto.randomUUID();
+        let created = false;
+        try {
+          await writeFile(join(workspaceRoot, "README.md"), "# Agent Tag Claude fixture\n");
+          await runGit(workspaceRoot, "init", "-b", "main");
+          await runGit(workspaceRoot, "config", "user.name", "Agent Tag Integration");
+          await runGit(workspaceRoot, "config", "user.email", "agent-tag@example.invalid");
+          await runGit(workspaceRoot, "add", "README.md");
+          await runGit(workspaceRoot, "commit", "-m", "test: add Claude fixture");
+
+          await dispatchT3Command({
+            config,
+            command: {
+              type: "project.create",
+              commandId: crypto.randomUUID(),
+              projectId,
+              title: "Agent Tag Claude fixture",
+              workspaceRoot,
+              createdAt: new Date().toISOString(),
+            },
+          });
+          created = true;
+          const createdAt = new Date().toISOString();
+          await dispatchT3Command({
+            config,
+            command: {
+              type: "thread.turn.start",
+              commandId: crypto.randomUUID(),
+              threadId,
+              message: {
+                messageId: crypto.randomUUID(),
+                role: "user",
+                text: "Reply with exactly claude-fixture-ok. Do not call tools, change files, or use the network.",
+                attachments: [],
+              },
+              modelSelection: { instanceId: "claudeAgent", model: "claude-sonnet-4-6" },
+              titleSeed: "Agent Tag explicit Claude fixture",
+              runtimeMode: "approval-required",
+              interactionMode: "default",
+              bootstrap: {
+                createThread: {
+                  projectId,
+                  title: "Agent Tag explicit Claude fixture",
+                  modelSelection: { instanceId: "claudeAgent", model: "claude-sonnet-4-6" },
+                  runtimeMode: "approval-required",
+                  interactionMode: "default",
+                  branch: "main",
+                  worktreePath: workspaceRoot,
+                  createdAt,
+                },
+                runSetupScript: false,
+              },
+              createdAt,
+            },
+          });
+          const snapshot = await waitForSnapshot(
+            threadId,
+            (candidate) => candidate.thread.latestTurn?.state === "completed",
+            120_000,
+          );
+          expect(snapshot.thread.modelSelection).toEqual({
+            instanceId: "claudeAgent",
+            model: "claude-sonnet-4-6",
+          });
+          expect(snapshot.thread.session).toMatchObject({
+            providerInstanceId: "claudeAgent",
+            lastError: null,
+          });
+          const assistantMessages = snapshot.thread.messages.filter(
+            (message) => message.role === "assistant" && !message.streaming,
+          );
+          expect(assistantMessages.at(-1)?.text.trim()).toBe("claude-fixture-ok");
+        } finally {
+          if (created) {
+            await dispatchT3Command({
+              config,
+              command: {
+                type: "project.delete",
+                commandId: crypto.randomUUID(),
+                projectId,
+                force: true,
+              },
+            });
+          }
+          if (!workspaceRoot.startsWith(`${tmpdir()}/agent-tag-t3-claude-`)) {
             throw new Error(`refusing to remove unexpected fixture path ${workspaceRoot}`);
           }
           await rm(workspaceRoot, { recursive: true });

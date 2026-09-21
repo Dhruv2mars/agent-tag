@@ -10,7 +10,7 @@ Run a live dependency check first:
 bun run doctor -- /absolute/path/to/agent-tag.json
 ```
 
-The check opens and migrates the SQLite store, authenticates with the restricted T3 service token, decodes the provider catalog, and verifies that the Slack bot belongs to the configured workspace. Its JSON output contains aggregate row counts and provider states, not tokens or message text.
+The check opens and migrates the SQLite store, authenticates with the restricted T3 service token, decodes the provider catalog, validates every profile's provider and model, and verifies that the Slack bot belongs to the configured workspace. Missing, disabled, unauthenticated, non-ready, and model-mismatch states fail before Socket Mode or task dispatch. Its JSON output contains aggregate row counts and provider states, not tokens or message text.
 
 Start the service in the foreground:
 

@@ -3,6 +3,7 @@ import { join } from "node:path";
 import type { AgentTagConfig } from "./config.ts";
 import { AgentTagCoordinator } from "./coordinator.ts";
 import { InteractionWorker } from "./interaction-worker.ts";
+import { validateConfiguredProviders } from "./policy/provider.ts";
 import { SlackSocketBridge } from "./slack/bridge.ts";
 import { AgentTagStore } from "./store/store.ts";
 import { inspectT3 } from "./t3/gateway.ts";
@@ -185,6 +186,7 @@ export async function createAgentTagService(input: {
   const store = await AgentTagStore.open(join(input.config.dataDir, "agent-tag.sqlite"));
   const quarantined = store.quarantineExpiredOutbox(now().toISOString());
   try {
+    validateConfiguredProviders(input.config, await inspectT3(input.config.t3));
     const bridge = await SlackSocketBridge.create({ config: input.config, store });
     const coordinators = Array.from(
       { length: input.config.limits.maxConcurrentTasks },
@@ -231,6 +233,7 @@ export async function diagnoseAgentTag(config: AgentTagConfig): Promise<{
       inspectT3(config.t3),
       SlackSocketBridge.create({ config, store }),
     ]);
+    validateConfiguredProviders(config, t3);
     return {
       store: store.diagnostics(),
       t3: {
