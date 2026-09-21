@@ -44,6 +44,49 @@ async function withStore(
 }
 
 describe("Agent Tag durable store", () => {
+  test("snapshots rendered turn text before dispatch and preserves it across retries", async () => {
+    await withStore(({ store }) => {
+      const receipt = store.ingestSlackEvent(slackEvent());
+      const first = store.claimNextOperation({
+        workerId: "worker-a",
+        now: firstAt,
+        leaseMs: 10_000,
+        maxConcurrentTasks: 1,
+      });
+      if (first === null) throw new Error("operation was not claimed");
+      expect(
+        store.resolveOperationTurnText({
+          operationId: receipt.operationId,
+          workerId: "worker-a",
+          proposedText: "first immutable prompt",
+          now: firstAt,
+        }),
+      ).toBe("first immutable prompt");
+      store.failOperation({
+        operationId: receipt.operationId,
+        workerId: "worker-a",
+        errorCode: "InjectedRestart",
+        retryable: true,
+        now: firstAt,
+      });
+      const retry = store.claimNextOperation({
+        workerId: "worker-b",
+        now: beforeExpiry,
+        leaseMs: 10_000,
+        maxConcurrentTasks: 1,
+      });
+      if (retry === null) throw new Error("retry was not claimed");
+      expect(
+        store.resolveOperationTurnText({
+          operationId: receipt.operationId,
+          workerId: "worker-b",
+          proposedText: "changed memory must not alter the replay",
+          now: beforeExpiry,
+        }),
+      ).toBe("first immutable prompt");
+    });
+  });
+
   test("backs up and restores a consistent store without overwriting a destination", async () => {
     const directory = await mkdtemp(join(tmpdir(), "agent-tag-store-backup-"));
     await chmod(directory, 0o700);
@@ -96,6 +139,7 @@ describe("Agent Tag durable store", () => {
         tasks: 1,
         operations: 1,
         outbox: 0,
+        memoryEntries: 0,
         auditRecords: 2,
       });
       expect((await stat(path)).mode & 0o777).toBe(0o600);

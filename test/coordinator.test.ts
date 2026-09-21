@@ -5,6 +5,7 @@ import { join } from "node:path";
 
 import { agentTagConfigSchema } from "../src/config.ts";
 import { AgentTagCoordinator, type T3CoordinatorGateway } from "../src/coordinator.ts";
+import { AgentTagMemory } from "../src/memory.ts";
 import { AgentTagStore } from "../src/store/store.ts";
 import type { T3Command, T3ThreadSnapshot } from "../src/t3/gateway.ts";
 
@@ -176,7 +177,7 @@ describe("Agent Tag coordinator", () => {
       sleep: async () => {},
     });
     try {
-      store.ingestSlackEvent({
+      const receipt = store.ingestSlackEvent({
         deliveryId: "delivery-1",
         eventKey: "C1:1000.000001",
         workspaceId: "T1",
@@ -189,6 +190,23 @@ describe("Agent Tag coordinator", () => {
         receivedAt: now,
         sourceOrderKey: "1000.000001",
       });
+      const memory = new AgentTagMemory({ config, store });
+      expect(
+        memory.create({
+          context: {
+            workspaceId: "T1",
+            actorUserId: "U1",
+            profileId: "engineering",
+            taskId: receipt.taskId,
+            conversationType: "channel",
+          },
+          scope: "task",
+          content: "remember the durable boundary",
+          sourceType: "slack-message",
+          sourceId: "C1:999.000001",
+          now,
+        }).kind,
+      ).toBe("accepted");
       const first = await coordinator.processNext();
       expect(first.kind).toBe("completed");
       expect(commands[0]).toMatchObject({
@@ -203,6 +221,10 @@ describe("Agent Tag coordinator", () => {
           prepareWorktree: { projectCwd: "/srv/repos/example", baseBranch: "main" },
         },
       });
+      if (commands[1]?.type !== "thread.turn.start") throw new Error("first turn was not dispatched");
+      expect(commands[1].message.text).toContain("first request");
+      expect(commands[1].message.text).toContain("remember the durable boundary");
+      expect(commands[1].message.text).toContain("untrusted context");
       const firstProgress = store.claimNextOutbox({ workerId: "slack-a", now, leaseMs: 10_000 });
       expect(firstProgress?.payload.text).toBe("Agent Tag is working on this request.");
       expect(firstProgress?.payload.blocks?.[1]).toMatchObject({
@@ -243,8 +265,10 @@ describe("Agent Tag coordinator", () => {
       const second = await coordinator.processNext();
       expect(second.kind).toBe("completed");
       expect(commands[2]?.type).toBe("project.create");
-      expect(commands[3]).toMatchObject({ type: "thread.turn.start", message: { text: "second request" } });
+      expect(commands[3]).toMatchObject({ type: "thread.turn.start" });
       if (commands[3]?.type !== "thread.turn.start") throw new Error("second turn was not dispatched");
+      expect(commands[3].message.text).toContain("second request");
+      expect(commands[3].message.text).toContain("remember the durable boundary");
       expect(commands[3].bootstrap).toBeUndefined();
       const secondProgress = store.claimNextOutbox({ workerId: "slack-a", now, leaseMs: 10_000 });
       if (secondProgress === null) throw new Error("second progress reply was not queued");

@@ -149,4 +149,42 @@ export const STORE_MIGRATIONS: readonly StoreMigration[] = [
       CREATE INDEX interactions_operation_idx ON interactions(operation_id, created_at);
     `,
   },
+  {
+    version: 5,
+    sql: `
+      CREATE TABLE memory_entries (
+        memory_id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL,
+        scope TEXT NOT NULL CHECK (scope IN ('shared', 'profile', 'task', 'private')),
+        profile_id TEXT,
+        task_id TEXT REFERENCES tasks(task_id),
+        owner_user_id TEXT,
+        content TEXT NOT NULL,
+        source_type TEXT NOT NULL,
+        source_id TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('active', 'forgotten')),
+        version INTEGER NOT NULL DEFAULT 1 CHECK (version > 0),
+        expires_at TEXT NOT NULL,
+        forgotten_at TEXT,
+        created_by TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        CHECK (
+          (scope = 'shared' AND profile_id IS NULL AND task_id IS NULL AND owner_user_id IS NULL) OR
+          (scope = 'profile' AND profile_id IS NOT NULL AND task_id IS NULL AND owner_user_id IS NULL) OR
+          (scope = 'task' AND profile_id IS NULL AND task_id IS NOT NULL AND owner_user_id IS NULL) OR
+          (scope = 'private' AND profile_id IS NOT NULL AND task_id IS NULL AND owner_user_id IS NOT NULL)
+        )
+      );
+
+      CREATE INDEX memory_entries_visibility_idx
+        ON memory_entries(workspace_id, state, scope, profile_id, task_id, owner_user_id, expires_at);
+    `,
+  },
+  {
+    version: 6,
+    sql: `
+      ALTER TABLE operations ADD COLUMN resolved_text TEXT;
+    `,
+  },
 ];

@@ -35,7 +35,14 @@ async function withStore(run: (store: AgentTagStore) => Promise<void>): Promise<
 describe("Agent Tag service", () => {
   test("runs independent coordinator, interaction, and outbox loops and stops cleanly", async () => {
     await withStore(async (store) => {
-      const calls = { coordinator: 0, interaction: 0, delivery: 0, bridgeStart: 0, bridgeStop: 0 };
+      const calls = {
+        coordinator: 0,
+        interaction: 0,
+        maintenance: 0,
+        delivery: 0,
+        bridgeStart: 0,
+        bridgeStop: 0,
+      };
       const coordinator: ServiceWorker = {
         processNext: async () => {
           calls.coordinator += 1;
@@ -46,6 +53,12 @@ describe("Agent Tag service", () => {
         processNext: async () => {
           calls.interaction += 1;
           return { kind: calls.interaction === 1 ? "resolved" : "idle" };
+        },
+      };
+      const maintenance: ServiceWorker = {
+        processNext: async () => {
+          calls.maintenance += 1;
+          return { kind: calls.maintenance === 1 ? "memory-expired" : "idle" };
         },
       };
       const bridge: ServiceSlackBridge = {
@@ -66,18 +79,21 @@ describe("Agent Tag service", () => {
         bridge,
         coordinators: [coordinator],
         interactionWorkers: [interaction],
+        maintenanceWorkers: [maintenance],
         idleMs: 1,
         logger: (record) => logs.push(record),
       });
       await service.start();
-      await eventually(() => calls.coordinator >= 2 && calls.interaction >= 2 && calls.delivery >= 2);
+      await eventually(
+        () => calls.coordinator >= 2 && calls.interaction >= 2 && calls.maintenance >= 2 && calls.delivery >= 2,
+      );
       await service.stop();
 
       expect(calls.bridgeStart).toBe(1);
       expect(calls.bridgeStop).toBe(1);
       expect(logs.map((record) => record.event)).toContain("service.started");
       expect(logs.map((record) => record.event)).toContain("service.stopped");
-      expect(logs.filter((record) => record.event === "worker.outcome")).toHaveLength(3);
+      expect(logs.filter((record) => record.event === "worker.outcome")).toHaveLength(4);
     });
   });
 

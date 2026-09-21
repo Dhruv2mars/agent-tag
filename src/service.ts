@@ -39,6 +39,7 @@ export interface AgentTagServiceOptions {
   readonly bridge: ServiceSlackBridge;
   readonly coordinators: ReadonlyArray<ServiceWorker>;
   readonly interactionWorkers: ReadonlyArray<ServiceWorker>;
+  readonly maintenanceWorkers?: ReadonlyArray<ServiceWorker>;
   readonly idleMs?: number;
   readonly logger?: ServiceLogger;
   readonly now?: () => Date;
@@ -71,6 +72,7 @@ export class AgentTagService {
   readonly #bridge: ServiceSlackBridge;
   readonly #coordinators: ReadonlyArray<ServiceWorker>;
   readonly #interactionWorkers: ReadonlyArray<ServiceWorker>;
+  readonly #maintenanceWorkers: ReadonlyArray<ServiceWorker>;
   readonly #idleMs: number;
   readonly #logger: ServiceLogger;
   readonly #now: () => Date;
@@ -87,6 +89,7 @@ export class AgentTagService {
     this.#bridge = options.bridge;
     this.#coordinators = options.coordinators;
     this.#interactionWorkers = options.interactionWorkers;
+    this.#maintenanceWorkers = options.maintenanceWorkers ?? [];
     this.#idleMs = idleMs;
     this.#logger = options.logger ?? defaultLogger;
     this.#now = options.now ?? (() => new Date());
@@ -110,6 +113,9 @@ export class AgentTagService {
       ),
       ...this.#interactionWorkers.map((worker, index) =>
         this.#runWorkerLoop(`interaction-${index + 1}`, worker, signal),
+      ),
+      ...this.#maintenanceWorkers.map((worker, index) =>
+        this.#runWorkerLoop(`maintenance-${index + 1}`, worker, signal),
       ),
       this.#runOutboxLoop(signal),
     ];
@@ -188,6 +194,7 @@ export async function createAgentTagService(input: {
   try {
     validateConfiguredProviders(input.config, await inspectT3(input.config.t3));
     const bridge = await SlackSocketBridge.create({ config: input.config, store });
+    let nextMemoryExpiryAt = 0;
     const coordinators = Array.from(
       { length: input.config.limits.maxConcurrentTasks },
       () => new AgentTagCoordinator({ config: input.config, store }),
@@ -197,6 +204,17 @@ export async function createAgentTagService(input: {
       bridge,
       coordinators,
       interactionWorkers: [new InteractionWorker({ store, t3Config: input.config.t3 })],
+      maintenanceWorkers: [
+        {
+          processNext: async () => {
+            const current = now();
+            if (current.getTime() < nextMemoryExpiryAt) return { kind: "idle" };
+            nextMemoryExpiryAt = current.getTime() + 60_000;
+            const count = store.expireMemory(current.toISOString());
+            return { kind: count === 0 ? "idle" : "memory-expired" };
+          },
+        },
+      ],
       logger,
       now,
     });
