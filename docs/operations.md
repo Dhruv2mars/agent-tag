@@ -57,6 +57,22 @@ bun run restore -- /private/backup/agent-tag.sqlite /new/private/data-directory
 
 Restore validates the source, creates the new directory with mode `0700` when needed, writes `agent-tag.sqlite` with mode `0600`, and refuses to overwrite an existing database. Point a reviewed config at the new directory and run `doctor` before starting it. In-place destructive restore is intentionally unsupported.
 
+## Secret scan
+
+Scan the Agent Tag checkout for common Slack, GitHub, AWS, Anthropic, and OpenAI credential shapes:
+
+```sh
+bun run scan:secrets -- /absolute/path/to/agent-tag
+```
+
+Add `--config` to load the three configured service credentials as exact canaries and scan the live data directory plus every authorized repository. Extra roots after the config are also scanned:
+
+```sh
+bun run scan:secrets -- --config /absolute/path/to/agent-tag.json /absolute/path/to/agent-tag
+```
+
+The JSON report names only the file, credential class, and configured canary label. It never returns matched values. The command skips `.git` and `node_modules`. A finding or skipped symbolic link sets a nonzero exit code, so a release check cannot silently claim a partial clean scan. Keep source secret files outside scanned roots when practical; if they are inside, the configured scan excludes those exact files and scans their siblings.
+
 ## Schedules
 
 Schedules belong to an existing active Agent Tag task. Create a JSON spec such as:
