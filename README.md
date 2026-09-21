@@ -19,6 +19,20 @@ bun test
 bun run typecheck
 ```
 
+After copying and editing `config/agent-tag.example.json`, validate the database, T3 session, provider catalog, and Slack bot identity without starting Socket Mode:
+
+```sh
+bun run doctor -- /absolute/path/to/agent-tag.json
+```
+
+Run the foreground service with:
+
+```sh
+bun run start -- /absolute/path/to/agent-tag.json
+```
+
+The service writes structured JSON lifecycle records to stdout/stderr and shuts down on `SIGINT` or `SIGTERM`. See [operations](docs/operations.md) for recovery and host constraints.
+
 With the pinned T3 server running and an exact-scope service token configured:
 
 ```sh

@@ -4,6 +4,8 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "start": "bun run src/cli.ts run",
+    "doctor": "bun run src/cli.ts doctor",
     "test": "bun test",
     "test:t3": "RUN_T3_INTEGRATION=1 bun test test/t3-live.integration.test.ts",
     "typecheck": "tsc --noEmit",

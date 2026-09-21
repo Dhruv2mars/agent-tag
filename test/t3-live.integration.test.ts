@@ -354,11 +354,12 @@ if (!enabled) {
     );
 
     test(
-      "carries one durable operation through T3 into the Slack outbox",
+      "reconciles one durable operation through T3 after a store and worker restart",
       async () => {
         const workspaceRoot = await mkdtemp(join(tmpdir(), "agent-tag-t3-coordinator-repo-"));
         const dataDirectory = await mkdtemp(join(tmpdir(), "agent-tag-t3-coordinator-data-"));
-        const store = await AgentTagStore.open(join(dataDirectory, "agent-tag.sqlite"));
+        const storePath = join(dataDirectory, "agent-tag.sqlite");
+        let store = await AgentTagStore.open(storePath);
         let projectId: string | null = null;
         try {
           await writeFile(join(workspaceRoot, "README.md"), "# Agent Tag coordinator fixture\n");
@@ -410,14 +411,41 @@ if (!enabled) {
           });
           const binding = store.getTaskExecution(receipt.taskId);
           projectId = binding.projectId;
-          const coordinator = new AgentTagCoordinator({
+          let simulateRestart = true;
+          const firstCoordinator = new AgentTagCoordinator({
             config: serviceConfig,
             store,
-            workerId: `live-${crypto.randomUUID()}`,
+            t3: {
+              dispatch: (command) => dispatchT3Command({ config, command }),
+              fetchThread: async (threadId) => {
+                if (simulateRestart) {
+                  simulateRestart = false;
+                  const error = new Error("simulated bridge restart");
+                  error.name = "SimulatedBridgeRestart";
+                  throw error;
+                }
+                return fetchT3ThreadSnapshot({ config, threadId });
+              },
+            },
+            workerId: `live-before-restart-${crypto.randomUUID()}`,
             pollMs: 250,
             maxWaitMs: 60_000,
           });
-          const outcome = await coordinator.processNext();
+          expect(await firstCoordinator.processNext()).toMatchObject({
+            kind: "retry-scheduled",
+            operationId: receipt.operationId,
+            errorCode: "SimulatedBridgeRestart",
+          });
+          store.close();
+          store = await AgentTagStore.open(storePath);
+          const restartedCoordinator = new AgentTagCoordinator({
+            config: serviceConfig,
+            store,
+            workerId: `live-after-restart-${crypto.randomUUID()}`,
+            pollMs: 250,
+            maxWaitMs: 60_000,
+          });
+          const outcome = await restartedCoordinator.processNext();
           expect(outcome).toMatchObject({ kind: "completed", operationId: receipt.operationId });
           const progress = store.claimNextOutbox({
             workerId: "slack-live-fixture",
