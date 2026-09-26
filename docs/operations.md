@@ -4,6 +4,8 @@ Agent Tag is currently a foreground Bun service. A service manager may wrap the 
 
 Complete the [Slack setup](slack-setup.md) before running live checks.
 
+Before enabling a provider for other Slack users, complete the [provider access and licensing review](provider-licensing.md). T3 readiness proves connectivity only; it does not prove that a personal subscription or session may be shared.
+
 ## Start and stop
 
 Run a live dependency check first:
