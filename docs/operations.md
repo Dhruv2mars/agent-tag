@@ -2,6 +2,8 @@
 
 Agent Tag is currently a foreground Bun service. A service manager may wrap the documented command, but install, upgrade, backup/restore, and uninstall automation are not complete enough for a GA claim.
 
+Complete the [Slack setup](slack-setup.md) before running live checks.
+
 ## Start and stop
 
 Run a live dependency check first:

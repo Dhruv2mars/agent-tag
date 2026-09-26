@@ -19,4 +19,4 @@ The coordinator fixture created private memory for the DM owner and confirmed th
 
 The example Slack manifest adds `im:history` and `message.im`, matching Slack's official [`message.im` event](https://api.slack.com/events/message.im) and [`im:history` scope](https://api.slack.com/scopes/im%3Ahistory) documentation.
 
-The full local suite passed with 44 tests and one intentionally disabled live-T3 suite. This does not claim a live Slack DM, Slack Assistant thread behavior, group DMs, credential separation outside the existing profile policy, or a human privacy review.
+The full local suite passed with 46 tests and one intentionally disabled live-T3 suite. This does not claim a live Slack DM, Slack Assistant thread behavior, group DMs, credential separation outside the existing profile policy, or a human privacy review.

@@ -4,6 +4,15 @@ import type { AgentTagConfig } from "../config.ts";
 import type { AgentTagStore } from "../store/store.ts";
 
 const slackId = z.string().regex(/^[A-Z][A-Z0-9]+$/);
+const slackActionIdSchema = z.enum([
+  "agent-tag.approval.accept",
+  "agent-tag.approval.decline",
+  "agent-tag.approval.cancel",
+  "agent-tag.user-input.answer",
+  "agent-tag.user-input.dismiss",
+  "agent-tag.turn.cancel",
+]);
+export const SLACK_ACTION_IDS = slackActionIdSchema.options;
 const actionSchema = z.object({
   type: z.literal("block_actions"),
   team: z.object({ id: slackId }),
@@ -13,14 +22,7 @@ const actionSchema = z.object({
   actions: z
     .array(
       z.object({
-        action_id: z.enum([
-          "agent-tag.approval.accept",
-          "agent-tag.approval.decline",
-          "agent-tag.approval.cancel",
-          "agent-tag.user-input.answer",
-          "agent-tag.user-input.dismiss",
-          "agent-tag.turn.cancel",
-        ]),
+        action_id: slackActionIdSchema,
         action_ts: z.string().min(1),
         value: z.string().min(1),
       }),
