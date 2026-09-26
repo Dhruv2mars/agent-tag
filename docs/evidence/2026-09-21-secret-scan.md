@@ -19,6 +19,6 @@ The repository scan command was:
 bun run scan:secrets -- /Users/dhruv2mars/dev/github/agent-tag
 ```
 
-It scanned 67 files and 449,838 bytes, skipped no symbolic links, and found no exact or known-pattern credentials. The scanner omits `.git` and `node_modules`; it scans ignored files such as `.env`, build output, SQLite files, prompts, and artifacts when those files are under a requested root.
+It scanned 67 files and 451,443 bytes, skipped no symbolic links, and found no exact or known-pattern credentials. The scanner omits `.git` and `node_modules`; it scans ignored files such as `.env`, build output, SQLite files, prompts, and artifacts when those files are under a requested root.
 
 This proves the canary and known-pattern scanner behavior and records one clean repository run. It does not prove that the unavailable Slack credentials never leaked, and it does not replace a configured scan of the live data directory and authorized repositories after the Slack app exists.

@@ -14,6 +14,8 @@ bun run doctor -- /absolute/path/to/agent-tag.json
 
 The check opens and migrates the SQLite store, authenticates with the restricted T3 service token, decodes the provider catalog, validates every profile's provider and model, and verifies that the Slack bot belongs to the configured workspace. Missing, disabled, unauthenticated, non-ready, and model-mismatch states fail before Socket Mode or task dispatch. Its JSON output contains aggregate row counts and provider states, not tokens or message text.
 
+The configured data directory must be owned by the Agent Tag user and grant no group or world access. Startup rejects a permissive existing directory because SQLite WAL and shared-memory files live beside the main mode-`0600` database.
+
 Start the service in the foreground:
 
 ```sh

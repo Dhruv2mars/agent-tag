@@ -23,6 +23,8 @@ Invite Agent Tag to each configured public or private channel. No channel-list s
 Create the files before opening them in a trusted editor. Do not put tokens in shell arguments, Git, `.env`, or the JSON config.
 
 ```sh
+install -d -m 700 /var/lib/agent-tag
+install -d -m 700 /var/lib/agent-tag/data
 install -d -m 700 /var/lib/agent-tag/secrets
 install -m 600 /dev/null /var/lib/agent-tag/secrets/slack-app-token
 install -m 600 /dev/null /var/lib/agent-tag/secrets/slack-bot-token
@@ -35,7 +37,7 @@ Paste one token into each matching file. A trailing newline is allowed. Agent Ta
 
 Copy [`config/agent-tag.example.json`](../config/agent-tag.example.json) outside the repository and replace:
 
-- `dataDir` with a private writable directory.
+- `dataDir` with the private writable directory, such as `/var/lib/agent-tag/data` above.
 - The three secret file paths with the files above.
 - `workspaceId` with the Slack workspace ID beginning with `T`.
 - `allowedUserIds` with the humans allowed to direct the coworker.

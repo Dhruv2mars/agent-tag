@@ -399,13 +399,13 @@ function projectMemoryRow(raw: unknown): MemoryRecord {
 async function requirePrivateDirectory(path: string): Promise<void> {
   await mkdir(path, { recursive: true, mode: 0o700 });
   const metadata = await stat(path);
-  if (!metadata.isDirectory()) throw new Error(`backup parent is not a directory: ${path}`);
+  if (!metadata.isDirectory()) throw new Error(`private path is not a directory: ${path}`);
   if ((metadata.mode & 0o077) !== 0) {
-    throw new Error(`backup parent must not grant group or world access: ${path}`);
+    throw new Error(`private directory must not grant group or world access: ${path}`);
   }
   const uid = process.getuid?.();
   if (uid !== undefined && metadata.uid !== uid) {
-    throw new Error(`backup parent must be owned by the Agent Tag user: ${path}`);
+    throw new Error(`private directory must be owned by the Agent Tag user: ${path}`);
   }
 }
 
@@ -492,7 +492,7 @@ export class AgentTagStore {
 
   static async open(path: string, options: StoreOpenOptions = {}): Promise<AgentTagStore> {
     if (!isAbsolute(path)) throw new Error("store path must be absolute");
-    await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+    await requirePrivateDirectory(dirname(path));
     const database = new Database(path, { create: true, strict: true });
     try {
       database.exec("PRAGMA foreign_keys = ON");

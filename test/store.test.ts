@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { chmod, mkdtemp, rm, stat } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -45,6 +45,22 @@ async function withStore(
 }
 
 describe("Agent Tag durable store", () => {
+  test("rejects a data directory readable by another local user", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "agent-tag-store-permissions-"));
+    const dataDirectory = join(directory, "data");
+    try {
+      await mkdir(dataDirectory, { mode: 0o755 });
+      await expect(AgentTagStore.open(join(dataDirectory, "agent-tag.sqlite"))).rejects.toThrow(
+        "private directory must not grant group or world access",
+      );
+    } finally {
+      if (!directory.startsWith(`${tmpdir()}/agent-tag-store-permissions-`)) {
+        throw new Error(`refusing to remove unexpected fixture path ${directory}`);
+      }
+      await rm(directory, { recursive: true });
+    }
+  });
+
   test("snapshots rendered turn text before dispatch and preserves it across retries", async () => {
     await withStore(({ store }) => {
       const receipt = store.ingestSlackEvent(slackEvent());

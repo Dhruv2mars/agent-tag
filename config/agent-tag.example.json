@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "dataDir": "/var/lib/agent-tag",
+  "dataDir": "/var/lib/agent-tag/data",
   "t3": {
     "baseUrl": "http://127.0.0.1:37841",
     "tokenFile": "/var/lib/agent-tag/secrets/t3-token"
