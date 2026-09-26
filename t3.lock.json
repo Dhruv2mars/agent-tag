@@ -1,0 +1,19 @@
+{
+  "version": "0.0.42",
+  "tag": "v0.0.42",
+  "commit": "719a76ca1dbf5490f1aa33ffb9966301e02be9a9",
+  "releasedAt": "2026-09-16T04:59:02Z",
+  "sourceUrl": "https://github.com/pingdotgg/t3code",
+  "releaseUrl": "https://github.com/pingdotgg/t3code/releases/tag/v0.0.42",
+  "effectVersion": "4.0.0-rc.112",
+  "npm": {
+    "package": "t3",
+    "integrity": "sha512-B/BiAR9qwG+smhUj7b+R8V6rAsmYMyj0Sz50/KbBMmAy2DhFJdj4PpcAVNWabFHyyEksVtAxYuWjxEa01zg/sw=="
+  },
+  "artifacts": {
+    "darwin-arm64": {
+      "name": "t3-0.0.42-darwin-arm64.tar.gz",
+      "sha256": "f15b8c4c47092b3d3a4ae2c24b1e1bb93d24a618edbc8aedfc4455a36b76774a"
+    }
+  }
+}
