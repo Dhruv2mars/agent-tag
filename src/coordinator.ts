@@ -30,7 +30,8 @@ export type CoordinatorOutcome =
       readonly approvalCount: number;
       readonly questionCount: number;
     }
-  | { readonly kind: "retry-scheduled"; readonly operationId: string; readonly errorCode: string };
+  | { readonly kind: "retry-scheduled"; readonly operationId: string; readonly errorCode: string }
+  | { readonly kind: "failed"; readonly operationId: string; readonly outboxId: string; readonly errorCode: string };
 
 export interface CoordinatorOptions {
   readonly config: AgentTagConfig;
@@ -75,6 +76,30 @@ function defaultT3Gateway(config: T3ConnectionConfig): T3CoordinatorGateway {
 
 function errorCode(error: unknown): string {
   return error instanceof Error && error.name ? error.name : "T3CoordinatorError";
+}
+
+class CoordinatorFailure extends Error {
+  readonly userMessage: string;
+
+  constructor(code: string, userMessage: string) {
+    super(code);
+    this.name = code;
+    this.userMessage = userMessage;
+  }
+}
+
+function t3TurnFailure(snapshot: T3ThreadSnapshot): CoordinatorFailure {
+  const detail = snapshot.thread.session?.lastError?.toLowerCase() ?? "";
+  if (["usage limit", "rate limit", "quota", "credits"].some((term) => detail.includes(term))) {
+    return new CoordinatorFailure(
+      "T3ProviderLimit",
+      "Agent Tag could not start this request because the configured provider has reached its usage limit. Ask the operator to configure an organization-approved provider, then retry.",
+    );
+  }
+  return new CoordinatorFailure(
+    "T3TurnError",
+    "Agent Tag could not complete this request because T3 reported a provider or runtime error. Ask the operator to inspect service diagnostics.",
+  );
 }
 
 function escapeSlackText(text: string): string {
@@ -191,15 +216,35 @@ export class AgentTagCoordinator {
     try {
       return await this.#run(operation);
     } catch (error) {
-      const code = errorCode(error);
-      this.#store.failOperation({
+      if (!(error instanceof CoordinatorFailure) && operation.attempt < 5) {
+        const now = this.#now();
+        this.#store.failOperation({
+          operationId: operation.operationId,
+          workerId: this.#workerId,
+          errorCode: errorCode(error),
+          retryable: true,
+          blockedUntil: new Date(now.getTime() + 1_000 * 2 ** (operation.attempt - 1)).toISOString(),
+          now: now.toISOString(),
+        });
+        return { kind: "retry-scheduled", operationId: operation.operationId, errorCode: errorCode(error) };
+      }
+      const failure = error instanceof CoordinatorFailure
+        ? error
+        : new CoordinatorFailure(
+            errorCode(error),
+            "Agent Tag could not complete this request after repeated service errors. Ask the operator to inspect service diagnostics.",
+          );
+      const outboxId = this.#store.failOperationWithOutbox({
         operationId: operation.operationId,
+        taskId: operation.taskId,
         workerId: this.#workerId,
-        errorCode: code,
-        retryable: true,
+        errorCode: failure.name,
+        conversationId: operation.payload.conversationId,
+        threadTs: operation.payload.threadTs,
+        text: failure.userMessage,
         now: this.#now().toISOString(),
       });
-      return { kind: "retry-scheduled", operationId: operation.operationId, errorCode: code };
+      return { kind: "failed", operationId: operation.operationId, outboxId, errorCode: failure.name };
     }
   }
 
@@ -364,7 +409,7 @@ export class AgentTagCoordinator {
         };
       }
       const latestTurn = snapshot.thread.latestTurn;
-      if (latestTurn?.state === "error") throw new Error("T3 turn entered the error state");
+      if (latestTurn?.state === "error") throw t3TurnFailure(snapshot);
       if (latestTurn?.state === "interrupted") {
         const outboxId = this.#store.cancelOperationWithOutbox({
           operationId: operation.operationId,

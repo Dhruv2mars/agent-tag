@@ -154,6 +154,64 @@ function interruptedSnapshot(threadId: string): T3ThreadSnapshot {
 }
 
 describe("Agent Tag coordinator", () => {
+  test("settles a provider limit with one durable Slack error and no retry", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "agent-tag-coordinator-limit-"));
+    const store = await AgentTagStore.open(join(directory, "agent-tag.sqlite"));
+    let threadId = "not-dispatched";
+    const coordinator = new AgentTagCoordinator({
+      config,
+      store,
+      t3: {
+        dispatch: async (command) => {
+          if (command.type === "thread.turn.start") threadId = command.threadId;
+          return { sequence: 1 };
+        },
+        fetchThread: async () => {
+          const snapshot = completedSnapshot(threadId, "");
+          return {
+            ...snapshot,
+            thread: {
+              ...snapshot.thread,
+              latestTurn: snapshot.thread.latestTurn === null
+                ? null
+                : { ...snapshot.thread.latestTurn, state: "error" },
+              session: snapshot.thread.session === null
+                ? null
+                : { ...snapshot.thread.session, status: "error", lastError: "usage limit reached" },
+            },
+          };
+        },
+      },
+      workerId: "worker-a",
+      now: () => new Date(now),
+    });
+    try {
+      store.ingestSlackEvent({
+        deliveryId: "delivery-1",
+        eventKey: "C1:1000.000001",
+        workspaceId: "T1",
+        conversationId: "C1",
+        threadTs: "1000.000001",
+        actorUserId: "U1",
+        conversationType: "channel",
+        profileId: "engineering",
+        repositoryRoot: "/srv/repos/example",
+        text: "request",
+        receivedAt: now,
+        sourceOrderKey: "1000.000001",
+      });
+      expect(await coordinator.processNext()).toMatchObject({ kind: "failed", errorCode: "T3ProviderLimit" });
+      expect(await coordinator.processNext()).toEqual({ kind: "idle" });
+      expect(store.diagnostics().outbox).toBe(2);
+    } finally {
+      store.close();
+      if (!directory.startsWith(`${tmpdir()}/agent-tag-coordinator-limit-`)) {
+        throw new Error(`refusing to remove unexpected fixture path ${directory}`);
+      }
+      await rm(directory, { recursive: true });
+    }
+  });
+
   test("projects private memory only when the durable task is a bound DM", async () => {
     const directory = await mkdtemp(join(tmpdir(), "agent-tag-coordinator-dm-"));
     const store = await AgentTagStore.open(join(directory, "agent-tag.sqlite"));

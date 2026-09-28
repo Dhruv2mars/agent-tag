@@ -1,4 +1,4 @@
-import { App, LogLevel } from "@slack/bolt";
+import type { App as SlackApp } from "@slack/bolt";
 import { z } from "zod";
 
 import type { AgentTagConfig } from "../config.ts";
@@ -6,6 +6,7 @@ import { readSecretFile } from "../security/secret-file.ts";
 import type { AgentTagStore } from "../store/store.ts";
 import { SLACK_ACTION_IDS, SlackActionRouter } from "./actions.ts";
 import { SlackEventRouter } from "./events.ts";
+import { installUndiciWebSocketCompat } from "./undici-compat.ts";
 
 const authTestSchema = z.object({
   ok: z.literal(true),
@@ -14,11 +15,11 @@ const authTestSchema = z.object({
 });
 
 export class SlackSocketBridge {
-  readonly #app: App;
+  readonly #app: SlackApp;
   readonly #store: AgentTagStore;
   readonly #workerId = `slack-outbox-${crypto.randomUUID()}`;
 
-  private constructor(app: App, store: AgentTagStore) {
+  private constructor(app: SlackApp, store: AgentTagStore) {
     this.#app = app;
     this.#store = store;
   }
@@ -27,6 +28,8 @@ export class SlackSocketBridge {
     readonly config: AgentTagConfig;
     readonly store: AgentTagStore;
   }): Promise<SlackSocketBridge> {
+    installUndiciWebSocketCompat();
+    const { App, LogLevel } = await import("@slack/bolt");
     const [appToken, botToken] = await Promise.all([
       readSecretFile(input.config.slack.appTokenFile),
       readSecretFile(input.config.slack.botTokenFile),

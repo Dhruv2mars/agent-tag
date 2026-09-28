@@ -1821,20 +1821,25 @@ export class AgentTagStore {
     readonly workerId: string;
     readonly errorCode: string;
     readonly retryable: boolean;
+    readonly blockedUntil?: string;
     readonly now: string;
   }): void {
     const now = isoDateTime.parse(input.now);
     const status = input.retryable ? "pending" : "failed";
+    const blockedUntil = input.retryable && input.blockedUntil !== undefined
+      ? isoDateTime.parse(input.blockedUntil)
+      : null;
     const fail = this.#database.transaction(() => {
       const result = this.#database
         .query(
-          `UPDATE operations SET status = ?, last_error_code = ?, lease_owner = NULL,
+          `UPDATE operations SET status = ?, last_error_code = ?, blocked_until = ?, lease_owner = NULL,
              lease_expires_at = NULL, updated_at = ?
            WHERE operation_id = ? AND status = 'inflight' AND lease_owner = ? AND lease_expires_at > ?`,
         )
         .run(
           status,
           requiredId(input.errorCode, "errorCode"),
+          blockedUntil,
           now,
           requiredId(input.operationId, "operationId"),
           requiredId(input.workerId, "workerId"),
@@ -1850,11 +1855,98 @@ export class AgentTagStore {
         action: "operation.failed",
         result: status,
         correlationId: input.operationId,
-        metadata: { errorCode: input.errorCode, retryable: input.retryable },
+        metadata: { errorCode: input.errorCode, retryable: input.retryable, blockedUntil },
         createdAt: now,
       });
     });
     fail.immediate();
+  }
+
+  failOperationWithOutbox(input: {
+    readonly operationId: string;
+    readonly taskId: string;
+    readonly workerId: string;
+    readonly errorCode: string;
+    readonly conversationId: string;
+    readonly threadTs: string;
+    readonly text: string;
+    readonly now: string;
+  }): string {
+    const now = isoDateTime.parse(input.now);
+    const fail = this.#database.transaction(() => {
+      const operationId = requiredId(input.operationId, "operationId");
+      const taskId = requiredId(input.taskId, "taskId");
+      const result = this.#database
+        .query(
+          `UPDATE operations SET status = 'failed', last_error_code = ?, lease_owner = NULL,
+             lease_expires_at = NULL, updated_at = ?
+           WHERE operation_id = ? AND task_id = ? AND status = 'inflight'
+             AND lease_owner = ? AND lease_expires_at > ?`,
+        )
+        .run(
+          requiredId(input.errorCode, "errorCode"),
+          now,
+          operationId,
+          taskId,
+          requiredId(input.workerId, "workerId"),
+          now,
+        );
+      if (result.changes !== 1) throw new Error("operation lease is missing, expired, or owned by another worker");
+
+      const clientMessageId = `${operationId}:failed`;
+      const prior = outboxIdentitySchema.nullable().parse(
+        this.#database.query("SELECT outbox_id FROM slack_outbox WHERE client_message_id = ?").get(clientMessageId),
+      );
+      const outboxId = prior?.outbox_id ?? crypto.randomUUID();
+      if (prior === null) {
+        this.#database
+          .query(
+            `INSERT INTO slack_outbox (
+              outbox_id, task_id, correlation_id, conversation_id, thread_ts,
+              client_message_id, payload_json, status, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
+          )
+          .run(
+            outboxId,
+            taskId,
+            operationId,
+            requiredId(input.conversationId, "conversationId"),
+            requiredId(input.threadTs, "threadTs"),
+            clientMessageId,
+            JSON.stringify(outboxPayloadSchema.parse({ text: input.text })),
+            now,
+            now,
+          );
+      }
+      writeAudit(this.#database, {
+        actorType: "worker",
+        actorId: input.workerId,
+        authority: "operation-dispatch",
+        source: operationId,
+        target: taskId,
+        action: "operation.failed",
+        result: "failed",
+        correlationId: operationId,
+        metadata: { errorCode: input.errorCode, retryable: false },
+        createdAt: now,
+      });
+      if (prior === null) {
+        writeAudit(this.#database, {
+          actorType: "service",
+          actorId: "agent-tag",
+          authority: "slack-write",
+          source: operationId,
+          target: outboxId,
+          action: "slack.outbox.enqueued",
+          result: "pending",
+          correlationId: operationId,
+          metadata: { clientMessageId },
+          createdAt: now,
+        });
+      }
+      return outboxId;
+    });
+    return fail.immediate();
   }
 
   bindT3Task(input: {

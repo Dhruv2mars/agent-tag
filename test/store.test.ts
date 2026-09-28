@@ -104,6 +104,70 @@ describe("Agent Tag durable store", () => {
     });
   });
 
+  test("fails a terminal operation and enqueues one durable error reply", async () => {
+    await withStore(({ store }) => {
+      const receipt = store.ingestSlackEvent(slackEvent());
+      const claimed = store.claimNextOperation({
+        workerId: "worker-a",
+        now: firstAt,
+        leaseMs: 10_000,
+        maxConcurrentTasks: 1,
+      });
+      if (claimed === null) throw new Error("operation was not claimed");
+
+      const outboxId = store.failOperationWithOutbox({
+        operationId: receipt.operationId,
+        taskId: receipt.taskId,
+        workerId: "worker-a",
+        errorCode: "T3ProviderLimit",
+        conversationId: "C1",
+        threadTs: "1000.0001",
+        text: "The provider is unavailable.",
+        now: firstAt,
+      });
+      expect(outboxId).toMatch(/^[0-9a-f-]{36}$/);
+      expect(store.diagnostics()).toMatchObject({ outbox: 1 });
+
+      const outbox = store.claimNextOutbox({ workerId: "slack-a", now: beforeExpiry, leaseMs: 10_000 });
+      expect(outbox).toMatchObject({ outboxId, clientMessageId: `${receipt.operationId}:failed` });
+      expect(outbox?.payload.text).toBe("The provider is unavailable.");
+      expect(store.claimNextOperation({ workerId: "worker-b", now: beforeExpiry, leaseMs: 10_000, maxConcurrentTasks: 1 })).toBeNull();
+    });
+  });
+
+  test("holds a transient retry until its durable backoff expires", async () => {
+    await withStore(({ store }) => {
+      const receipt = store.ingestSlackEvent(slackEvent());
+      const claimed = store.claimNextOperation({
+        workerId: "worker-a",
+        now: firstAt,
+        leaseMs: 10_000,
+        maxConcurrentTasks: 1,
+      });
+      if (claimed === null) throw new Error("operation was not claimed");
+      store.failOperation({
+        operationId: receipt.operationId,
+        workerId: "worker-a",
+        errorCode: "TransientT3Error",
+        retryable: true,
+        blockedUntil: beforeExpiry,
+        now: firstAt,
+      });
+      expect(store.claimNextOperation({
+        workerId: "worker-b",
+        now: "2026-09-21T00:00:04.000Z",
+        leaseMs: 10_000,
+        maxConcurrentTasks: 1,
+      })).toBeNull();
+      expect(store.claimNextOperation({
+        workerId: "worker-b",
+        now: beforeExpiry,
+        leaseMs: 10_000,
+        maxConcurrentTasks: 1,
+      })).toMatchObject({ operationId: receipt.operationId, attempt: 2 });
+    });
+  });
+
   test("backs up and restores a consistent store without overwriting a destination", async () => {
     const directory = await mkdtemp(join(tmpdir(), "agent-tag-store-backup-"));
     await chmod(directory, 0o700);
