@@ -63,6 +63,6 @@ Mention the app in an allowed channel. Agent Tag should acknowledge work in the 
 
 ## Known live blockers
 
-- Slack installation, tokens, and a human mention have not been exercised in this repository's evidence yet.
+- Live Slack ingress and the same-thread acknowledgement have been exercised. A completed provider reply and independent human acceptance run remain open; see [live Slack evidence](evidence/2026-09-28-slack-live.md).
 - Slack files are not accepted or returned. `files:read` and `files:write` are intentionally absent.
-- Real Codex execution through T3 passes. T3 currently reports Claude as ready and authenticated but real Claude turns fail with `provider-api-errors`; Agent Tag records that provider row as failed rather than falling back.
+- Earlier real Codex execution through T3 passed, but the live Slack turn on 2026-09-26 hit an account usage limit. T3 reported Claude as ready and authenticated while earlier Claude turns failed with `provider-api-errors`; Agent Tag does not silently change providers.
