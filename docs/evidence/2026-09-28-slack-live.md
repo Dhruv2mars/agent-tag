@@ -1,4 +1,4 @@
-# Live Slack ingress and provider failure, 2026-09-26 to 2026-09-28
+# Live Slack ingress, provider failure, and project reuse, 2026-09-26 to 2026-09-29
 
 Actor type: `automated-real` (Agent Tag operator using the authorized Slack account). This is not an independent human acceptance run.
 
@@ -25,4 +25,16 @@ A one-shot reminder was created on the existing authorized private-channel task 
 
 The local `bun run check` gate passed 52 tests, with the separately invoked live T3 integration file skipped. The configured secret scan covered the live Agent Tag data directory and authorized repository: 74 files, no findings, no skipped symlinks. T3's separate userdata/artifacts were not part of that scan.
 
-This evidence supports live Slack ingress, an acknowledgement, durable overlap collapse, a visible terminal-provider failure, and one delivered scheduled reminder. It does not satisfy a completed Slack provider turn, human steering, two-person ordering, or GA.
+At that point, the evidence supported live Slack ingress, an acknowledgement, durable overlap collapse, a visible terminal-provider failure, and one delivered scheduled reminder. It did not yet satisfy a completed Slack provider turn, human steering, two-person ordering, or GA.
+
+## Project reuse and completed turn, 2026-09-28 to 2026-09-29
+
+Build: macOS arm64, Bun `1.3.13`, pinned T3 `0.0.42`, Codex `gpt-5.6-sol`, and Agent Tag code commit `f26bd12`. Actor type: `automated-real`, using the authorized account in the private Slack test channel. This is not an independent human acceptance run.
+
+A fresh mention on September 28 reached Agent Tag but failed before T3 thread creation: T3 rejected a second active project for the same repository root. Agent Tag had assigned a new project ID per Slack task. Commit `f26bd12` reuses the first durable project's ID and original create-command ID for that root while retaining a separate T3 thread and worktree per task. Local tests cover same-root reuse, different-root separation, and distinct-thread dispatch.
+
+After restarting the service with that fix, a second mention at Slack timestamp `1790569788.745569` created a new T3 thread under the existing project. It posted the start acknowledgement and an approval card for a read-only command. The operation remained pending across the overnight service stop. The approval was not answered on the user's behalf; this is not completion evidence for SLK-04.
+
+After restarting T3 and Agent Tag on September 29, a separate no-tool mention at `1790675538.384539` completed in one attempt. The durable operation was `succeeded`; its T3 snapshot was `completed` and `ready`, with a separate worktree, the reused project, and explicit Codex `gpt-5.6-sol` selection. Agent Tag's start and final outbox rows each delivered once. Slack `conversations.replies` independently showed both in the original thread; the final reply exactly matched the requested `AGENT_TAG_LIVE_OK` marker at `1790675547.331829`.
+
+The September 29 `bun run check` gate passed 53 tests, with one opt-in live T3 test skipped. The configured secret scan covered 74 files in the authorized repository and live Agent Tag data directory, with no findings or skipped symlinks. This run proves one end-to-end Slack-to-T3-to-Slack Codex turn and project reuse. It does not prove prior-thread context, a human acceptance transcript, approval recovery, Claude parity, or GA.
