@@ -24,6 +24,14 @@ const externalWritesSchema = z.discriminatedUnion("mode", [
   }),
 ]);
 
+const stalledTurnSchema = z
+  .object({
+    timeoutSeconds: z.number().int().positive().max(86_400),
+    retryDelaySeconds: z.number().int().positive().max(3_600),
+    maxAttempts: z.number().int().positive().max(10),
+  })
+  .default({ timeoutSeconds: 300, retryDelaySeconds: 30, maxAttempts: 5 });
+
 const routeBaseSchema = z.object({
   conversationId: slackId,
   profileId,
@@ -83,6 +91,7 @@ export const agentTagConfigSchema = z
     limits: z.object({
       maxConcurrentTasks: z.number().int().positive().max(32),
       maxActiveSchedules: z.number().int().positive().max(10_000).default(100),
+      stalledTurn: stalledTurnSchema,
     }),
   })
   .superRefine((config, context) => {

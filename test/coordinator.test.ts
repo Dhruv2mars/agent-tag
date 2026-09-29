@@ -143,6 +143,25 @@ function waitingSnapshot(threadId: string): T3ThreadSnapshot {
   };
 }
 
+function runningSnapshot(threadId: string, userMessageId: string): T3ThreadSnapshot {
+  const base = completedSnapshot(threadId, "", userMessageId);
+  return {
+    ...base,
+    thread: {
+      ...base.thread,
+      latestTurn: {
+        turnId: "turn-1",
+        state: "running",
+        requestedAt: now,
+        startedAt: now,
+        completedAt: null,
+        assistantMessageId: null,
+      },
+      messages: base.thread.messages.filter((message) => message.role === "user"),
+    },
+  };
+}
+
 function interruptedSnapshot(threadId: string): T3ThreadSnapshot {
   const base = completedSnapshot(threadId, "");
   return {
@@ -163,6 +182,99 @@ function interruptedSnapshot(threadId: string): T3ThreadSnapshot {
 }
 
 describe("Agent Tag coordinator", () => {
+  test("applies the configured stalled-turn retry and terminal policy", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "agent-tag-coordinator-stall-"));
+    const store = await AgentTagStore.open(join(directory, "agent-tag.sqlite"));
+    const stalledConfig = agentTagConfigSchema.parse({
+      ...config,
+      limits: {
+        ...config.limits,
+        stalledTurn: { timeoutSeconds: 2, retryDelaySeconds: 10, maxAttempts: 2 },
+      },
+    });
+    let currentTime = new Date(now).getTime();
+    let threadId = "not-dispatched";
+    let messageId = "not-dispatched";
+    const turnCommandIds: string[] = [];
+    const coordinator = new AgentTagCoordinator({
+      config: stalledConfig,
+      store,
+      t3: {
+        dispatch: async (command) => {
+          if (command.type === "thread.turn.start") {
+            threadId = command.threadId;
+            messageId = command.message.messageId;
+            turnCommandIds.push(command.commandId);
+          }
+          return { sequence: 1 };
+        },
+        fetchThread: async () => runningSnapshot(threadId, messageId),
+      },
+      workerId: "worker-a",
+      now: () => new Date(currentTime),
+      sleep: async (milliseconds) => {
+        currentTime += milliseconds;
+      },
+    });
+    try {
+      store.ingestSlackEvent({
+        deliveryId: "delivery-1",
+        eventKey: "C1:1000.000001",
+        workspaceId: "T1",
+        conversationId: "C1",
+        threadTs: "1000.000001",
+        actorUserId: "U1",
+        conversationType: "channel",
+        profileId: "engineering",
+        repositoryRoot: "/srv/repos/example",
+        text: "request",
+        receivedAt: now,
+        sourceOrderKey: "1000.000001",
+      });
+
+      expect(await coordinator.processNext()).toMatchObject({
+        kind: "retry-scheduled",
+        errorCode: "T3TurnStalled",
+      });
+      expect(store.operationalStatus(new Date(currentTime).toISOString()).operations).toMatchObject({
+        deferred: 1,
+        stalledRetry: 1,
+        stalledFailed: 0,
+      });
+
+      currentTime += stalledConfig.limits.stalledTurn.retryDelaySeconds * 1_000;
+      expect(await coordinator.processNext()).toMatchObject({
+        kind: "failed",
+        errorCode: "T3TurnStalled",
+      });
+      expect(store.operationalStatus(new Date(currentTime).toISOString()).operations).toMatchObject({
+        stalledRetry: 0,
+        stalledFailed: 1,
+      });
+      expect(turnCommandIds).toHaveLength(2);
+      expect(turnCommandIds[1]).toBe(turnCommandIds[0]);
+      expect(store.diagnostics().outbox).toBe(2);
+      const outboxNow = new Date(currentTime).toISOString();
+      const progress = store.claimNextOutbox({ workerId: "slack-a", now: outboxNow, leaseMs: 10_000 });
+      expect(progress?.payload.text).toBe("Agent Tag is working on this request.");
+      if (progress === null) throw new Error("stalled-turn progress reply was not queued");
+      store.markOutboxDelivered({
+        outboxId: progress.outboxId,
+        workerId: "slack-a",
+        slackMessageTs: "1000.000010",
+        now: outboxNow,
+      });
+      const failure = store.claimNextOutbox({ workerId: "slack-a", now: outboxNow, leaseMs: 10_000 });
+      expect(failure?.payload.text).toContain("configured T3 turn deadline");
+    } finally {
+      store.close();
+      if (!directory.startsWith(`${tmpdir()}/agent-tag-coordinator-stall-`)) {
+        throw new Error(`refusing to remove unexpected fixture path ${directory}`);
+      }
+      await rm(directory, { recursive: true });
+    }
+  });
+
   test("settles a provider limit with one durable Slack error and no retry", async () => {
     const directory = await mkdtemp(join(tmpdir(), "agent-tag-coordinator-limit-"));
     const store = await AgentTagStore.open(join(directory, "agent-tag.sqlite"));

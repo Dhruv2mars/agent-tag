@@ -258,6 +258,8 @@ export interface OperationalStatus {
     readonly deferred: number;
     readonly activeLease: number;
     readonly expiredLease: number;
+    readonly stalledRetry: number;
+    readonly stalledFailed: number;
     readonly oldestReadyAt: string | null;
   };
   readonly interactions: {
@@ -2771,6 +2773,8 @@ export class AgentTagStore {
       deferred: number;
       activeLease: number;
       expiredLease: number;
+      stalledRetry: number;
+      stalledFailed: number;
       oldestReadyAt: string | null;
     }, [string, string, string, string, string]>(
       `SELECT
@@ -2778,6 +2782,8 @@ export class AgentTagStore {
          COUNT(*) FILTER (WHERE status = 'pending' AND blocked_until > ?) AS deferred,
          COUNT(*) FILTER (WHERE status = 'inflight' AND lease_expires_at > ?) AS activeLease,
          COUNT(*) FILTER (WHERE status = 'inflight' AND (lease_expires_at IS NULL OR lease_expires_at <= ?)) AS expiredLease,
+         COUNT(*) FILTER (WHERE status = 'pending' AND last_error_code = 'T3TurnStalled') AS stalledRetry,
+         COUNT(*) FILTER (WHERE status = 'failed' AND last_error_code = 'T3TurnStalled') AS stalledFailed,
          MIN(CASE WHEN status = 'pending' AND (blocked_until IS NULL OR blocked_until <= ?)
              THEN created_at END) AS oldestReadyAt
        FROM operations`,

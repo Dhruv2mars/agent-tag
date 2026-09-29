@@ -88,6 +88,13 @@ class CoordinatorFailure extends Error {
   }
 }
 
+class T3TurnStalled extends Error {
+  constructor() {
+    super("T3 turn exceeded the configured settlement deadline");
+    this.name = "T3TurnStalled";
+  }
+}
+
 function t3TurnFailure(snapshot: T3ThreadSnapshot): CoordinatorFailure {
   const detail = snapshot.thread.session?.lastError?.toLowerCase() ?? "";
   if (["usage limit", "rate limit", "quota", "credits"].some((term) => detail.includes(term))) {
@@ -206,7 +213,7 @@ export class AgentTagCoordinator {
     this.#workerId = options.workerId ?? `t3-worker-${crypto.randomUUID()}`;
     this.#leaseMs = options.leaseMs ?? 30_000;
     this.#pollMs = options.pollMs ?? 500;
-    this.#maxWaitMs = options.maxWaitMs ?? 300_000;
+    this.#maxWaitMs = options.maxWaitMs ?? options.config.limits.stalledTurn.timeoutSeconds * 1_000;
     this.#now = options.now ?? (() => new Date());
     this.#sleep = options.sleep ?? ((milliseconds) => Bun.sleep(milliseconds));
   }
@@ -223,7 +230,20 @@ export class AgentTagCoordinator {
     try {
       return await this.#run(operation);
     } catch (error) {
-      if (!(error instanceof CoordinatorFailure) && operation.attempt < 5) {
+      const stalledTurn = this.#config.limits.stalledTurn;
+      if (error instanceof T3TurnStalled && operation.attempt < stalledTurn.maxAttempts) {
+        const now = this.#now();
+        this.#store.failOperation({
+          operationId: operation.operationId,
+          workerId: this.#workerId,
+          errorCode: error.name,
+          retryable: true,
+          blockedUntil: new Date(now.getTime() + stalledTurn.retryDelaySeconds * 1_000).toISOString(),
+          now: now.toISOString(),
+        });
+        return { kind: "retry-scheduled", operationId: operation.operationId, errorCode: error.name };
+      }
+      if (!(error instanceof CoordinatorFailure) && !(error instanceof T3TurnStalled) && operation.attempt < 5) {
         const now = this.#now();
         this.#store.failOperation({
           operationId: operation.operationId,
@@ -235,7 +255,12 @@ export class AgentTagCoordinator {
         });
         return { kind: "retry-scheduled", operationId: operation.operationId, errorCode: errorCode(error) };
       }
-      const failure = error instanceof CoordinatorFailure
+      const failure = error instanceof T3TurnStalled
+        ? new CoordinatorFailure(
+            error.name,
+            `Agent Tag could not confirm completion after ${stalledTurn.maxAttempts} attempts within the configured T3 turn deadline. Ask the operator to inspect T3 before retrying.`,
+          )
+        : error instanceof CoordinatorFailure
         ? error
         : new CoordinatorFailure(
             errorCode(error),
@@ -463,6 +488,6 @@ export class AgentTagCoordinator {
       }
       await this.#sleep(this.#pollMs);
     }
-    throw new Error("T3 turn did not settle before the coordinator deadline");
+    throw new T3TurnStalled();
   }
 }

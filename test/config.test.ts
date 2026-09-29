@@ -31,6 +31,23 @@ const baseConfig = {
 };
 
 describe("Agent Tag config", () => {
+  test("defaults and validates the stalled-turn policy", () => {
+    expect(agentTagConfigSchema.parse(baseConfig).limits.stalledTurn).toEqual({
+      timeoutSeconds: 300,
+      retryDelaySeconds: 30,
+      maxAttempts: 5,
+    });
+    expect(() =>
+      agentTagConfigSchema.parse({
+        ...baseConfig,
+        limits: {
+          ...baseConfig.limits,
+          stalledTurn: { timeoutSeconds: 0, retryDelaySeconds: 30, maxAttempts: 5 },
+        },
+      }),
+    ).toThrow();
+  });
+
   test("rejects a remote T3 endpoint", () => {
     const input = structuredClone(baseConfig);
     input.t3.baseUrl = "https://t3.example.com";
