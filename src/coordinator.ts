@@ -274,12 +274,12 @@ export class AgentTagCoordinator {
     });
     await this.#t3.dispatch({
       type: "project.create",
-      commandId: `${task.taskId}:project.create`,
+      commandId: `${task.projectOwnerTaskId}:project.create`,
       projectId: task.projectId,
       title: `Agent Tag ${profile.id}`,
       workspaceRoot: task.repositoryRoot,
       defaultModelSelection: modelSelection,
-      createdAt: task.createdAt,
+      createdAt: task.projectCreatedAt,
     });
 
     const turn = await this.#t3.dispatch({

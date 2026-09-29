@@ -421,6 +421,33 @@ describe("Agent Tag coordinator", () => {
       });
       const secondOutbox = store.claimNextOutbox({ workerId: "slack-a", now, leaseMs: 10_000 });
       expect(secondOutbox?.payload.text).toBe("second-result");
+
+      const nextTask = store.ingestSlackEvent({
+        deliveryId: "delivery-3",
+        eventKey: "C1:2000.000001",
+        workspaceId: "T1",
+        conversationId: "C1",
+        threadTs: "2000.000001",
+        actorUserId: "U1",
+        conversationType: "channel",
+        profileId: "engineering",
+        repositoryRoot: "/srv/repos/example",
+        text: "new task in the same repository",
+        receivedAt: now,
+        sourceOrderKey: "2000.000001",
+      });
+      expect((await coordinator.processNext()).kind).toBe("completed");
+      expect(commands[4]).toMatchObject({
+        type: "project.create",
+        commandId: commands[0]?.commandId,
+        projectId: store.getTaskExecution(receipt.taskId).projectId,
+      });
+      expect(commands[5]).toMatchObject({
+        type: "thread.turn.start",
+        threadId: store.getTaskExecution(nextTask.taskId).threadId,
+        bootstrap: { createThread: { projectId: store.getTaskExecution(receipt.taskId).projectId } },
+      });
+      expect(store.getTaskExecution(nextTask.taskId).threadId).not.toBe(store.getTaskExecution(receipt.taskId).threadId);
     } finally {
       store.close();
       if (!directory.startsWith(`${tmpdir()}/agent-tag-coordinator-`)) {

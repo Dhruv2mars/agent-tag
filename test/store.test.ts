@@ -45,6 +45,34 @@ async function withStore(
 }
 
 describe("Agent Tag durable store", () => {
+  test("shares one T3 project per repository while keeping Slack tasks separate", async () => {
+    await withStore(({ store }) => {
+      const first = store.ingestSlackEvent(slackEvent());
+      const second = store.ingestSlackEvent(slackEvent({
+        deliveryId: "delivery-2",
+        eventKey: "C1:2000.0001",
+        threadTs: "2000.0001",
+        sourceOrderKey: "2000.0001",
+      }));
+      const other = store.ingestSlackEvent(slackEvent({
+        deliveryId: "delivery-3",
+        eventKey: "C1:3000.0001",
+        threadTs: "3000.0001",
+        sourceOrderKey: "3000.0001",
+        repositoryRoot: "/srv/repos/other",
+      }));
+      const firstTask = store.getTaskExecution(first.taskId);
+      const secondTask = store.getTaskExecution(second.taskId);
+      const otherTask = store.getTaskExecution(other.taskId);
+      expect(secondTask.taskId).not.toBe(firstTask.taskId);
+      expect(secondTask.threadId).not.toBe(firstTask.threadId);
+      expect(secondTask.projectId).toBe(firstTask.projectId);
+      expect(secondTask.projectOwnerTaskId).toBe(firstTask.taskId);
+      expect(secondTask.projectCreatedAt).toBe(firstTask.createdAt);
+      expect(otherTask.projectId).not.toBe(firstTask.projectId);
+    });
+  });
+
   test("rejects a data directory readable by another local user", async () => {
     const directory = await mkdtemp(join(tmpdir(), "agent-tag-store-permissions-"));
     const dataDirectory = join(directory, "data");

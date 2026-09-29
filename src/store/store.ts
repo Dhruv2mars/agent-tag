@@ -223,6 +223,8 @@ export interface TaskExecutionBinding {
   readonly profileId: string;
   readonly repositoryRoot: string;
   readonly projectId: string;
+  readonly projectOwnerTaskId: string;
+  readonly projectCreatedAt: string;
   readonly threadId: string;
   readonly threadStarted: boolean;
   readonly conversationType: "channel" | "dm";
@@ -2028,11 +2030,21 @@ export class AgentTagStore {
         )
         .get(requiredId(taskIdInput, "taskId")),
     );
+    const projectOwner = z.object({ task_id: nonEmpty, created_at: isoDateTime }).parse(
+      this.#database
+        .query(
+          `SELECT task_id, created_at FROM tasks WHERE t3_project_id = ?
+           ORDER BY rowid LIMIT 1`,
+        )
+        .get(row.t3_project_id),
+    );
     return {
       taskId: row.task_id,
       profileId: row.profile_id,
       repositoryRoot: row.repository_root,
       projectId: row.t3_project_id,
+      projectOwnerTaskId: projectOwner.task_id,
+      projectCreatedAt: projectOwner.created_at,
       threadId: row.t3_thread_id,
       threadStarted: row.t3_thread_started_at !== null,
       conversationType: row.conversation_type,
@@ -2767,7 +2779,7 @@ export class AgentTagStore {
                t3_thread_id = COALESCE(t3_thread_id, ?), updated_at = ? WHERE task_id = ?`,
           )
           .run(
-            `agent-tag-project-${crypto.randomUUID()}`,
+            this.#projectIdForRoot(event.repositoryRoot),
             `agent-tag-thread-${crypto.randomUUID()}`,
             event.receivedAt,
             existing.task_id,
@@ -2776,7 +2788,7 @@ export class AgentTagStore {
       return existing.task_id;
     }
     const taskId = crypto.randomUUID();
-    const projectId = `agent-tag-project-${crypto.randomUUID()}`;
+    const projectId = this.#projectIdForRoot(event.repositoryRoot);
     const threadId = `agent-tag-thread-${crypto.randomUUID()}`;
     this.#database
       .query(
@@ -2800,6 +2812,19 @@ export class AgentTagStore {
         event.receivedAt,
       );
     return taskId;
+  }
+
+  #projectIdForRoot(repositoryRoot: string): string {
+    const existing = z.object({ t3_project_id: nonEmpty }).nullable().parse(
+      this.#database
+        .query(
+          `SELECT t3_project_id FROM tasks
+           WHERE repository_root = ? AND t3_project_id IS NOT NULL
+           ORDER BY rowid LIMIT 1`,
+        )
+        .get(repositoryRoot),
+    );
+    return existing?.t3_project_id ?? `agent-tag-project-${crypto.randomUUID()}`;
   }
 
   #insertDelivery(
