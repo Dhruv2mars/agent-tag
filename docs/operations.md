@@ -37,6 +37,18 @@ The configured `maxConcurrentTasks` creates that many independent coordinator wo
 
 The operator must reconcile quarantined Slack sends in SQLite before retrying or replacing them. An automated reconciliation command is still pending.
 
+## Inspect work during an outage
+
+Run `status` even when T3 is down:
+
+```sh
+bun run status -- /absolute/path/to/agent-tag.json
+```
+
+`status` opens the local store. It does not contact T3 or Slack. It reports counts, not task IDs or message text. `ready` operations can run now; `deferred` operations have a future retry or interaction time. `activeLease` means a worker owns the work, while `expiredLease` means the next worker can recover it. `awaitingHuman` counts unanswered approvals and questions. `outcomeUnknown` counts Slack sends that need manual reconciliation. Check `oldestReadyAt` when ready work is not moving. Run `doctor` after restoring T3 and Slack access.
+
+This status covers only events already stored by Agent Tag. [Slack's Events API](https://docs.slack.dev/apis/events-api/) is best effort, and [Socket Mode requires an acknowledgement](https://docs.slack.dev/apis/events-api/using-socket-mode/). A sleeping or disconnected host may miss events that never enter the local store; `status` cannot detect those gaps. After an outage, compare the affected Slack threads with the Agent Tag audit log before claiming recovery. No automatic timeout or configured stall policy exists yet.
+
 ## Audit and backup
 
 Export the complete structured audit log as newline-delimited JSON:
