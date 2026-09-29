@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, feat/t3-slack-spike]
+    branches: [main]
   pull_request:
 
 permissions:
