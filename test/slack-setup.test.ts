@@ -7,6 +7,13 @@ import { agentTagConfigSchema } from "../src/config.ts";
 import { SLACK_ACTION_IDS } from "../src/slack/actions.ts";
 
 const manifestSchema = z.object({
+  features: z.object({
+    app_home: z.object({
+      home_tab_enabled: z.boolean(),
+      messages_tab_enabled: z.boolean(),
+      messages_tab_read_only_enabled: z.boolean(),
+    }),
+  }),
   oauth_config: z.object({
     scopes: z.object({ bot: z.array(z.string().min(1)) }),
   }),
@@ -22,6 +29,11 @@ test("the checked-in Slack manifest is the least-privilege runtime contract", as
     join(import.meta.dir, "..", "config", "slack-manifest.example.json"),
   ).json();
   const manifest = manifestSchema.parse(raw);
+  expect(manifest.features.app_home).toEqual({
+    home_tab_enabled: false,
+    messages_tab_enabled: true,
+    messages_tab_read_only_enabled: false,
+  });
   expect(manifest.oauth_config.scopes.bot).toEqual([
     "app_mentions:read",
     "channels:history",

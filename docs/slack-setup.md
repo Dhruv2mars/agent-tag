@@ -4,7 +4,7 @@ This is the shortest supported path to a live Agent Tag mention. File transfer i
 
 ## 1. Create the app
 
-In Slack's app dashboard, create an app from [`config/slack-manifest.example.json`](../config/slack-manifest.example.json). The manifest enables Socket Mode and interactivity. Its bot token scopes are exactly:
+In Slack's app dashboard, create an app from [`config/slack-manifest.example.json`](../config/slack-manifest.example.json). The manifest enables Socket Mode, interactivity, and a writable App Home Messages tab for DMs. Its bot token scopes are exactly:
 
 - `app_mentions:read`
 - `channels:history`
@@ -63,6 +63,7 @@ Mention the app in an allowed channel. Agent Tag should acknowledge work in the 
 
 ## Known live blockers
 
-- Live Slack ingress and the same-thread acknowledgement have been exercised. A completed provider reply and independent human acceptance run remain open; see [live Slack evidence](evidence/2026-09-28-slack-live.md).
+- A Codex-backed mention and a same-thread follow-up completed with final Slack replies. Independent human acceptance remains open; see [live Slack evidence](evidence/2026-09-28-slack-live.md).
+- The App Home Messages tab was made writable, and one owner-bound Codex DM completed with a final reply. Independent human and cross-identity privacy exercises, plus Assistant Threads, remain open; see [DM evidence](evidence/2026-09-29-dm-live.md).
 - Slack files are not accepted or returned. `files:read` and `files:write` are intentionally absent.
-- Earlier real Codex execution through T3 passed, but the live Slack turn on 2026-09-26 hit an account usage limit. T3 reported Claude as ready and authenticated while earlier Claude turns failed with `provider-api-errors`; Agent Tag does not silently change providers.
+- The first live Slack turn on 2026-09-26 hit a Codex account usage limit. Later Codex turns completed. T3 reports Claude as ready and authenticated, but real Claude turns failed with `provider-api-errors`; Agent Tag does not silently change providers.
