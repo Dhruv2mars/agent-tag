@@ -98,6 +98,14 @@ bun run audit -- /absolute/path/to/agent-tag.json > audit.ndjson
 
 Audit rows contain identity and correlation fields plus bounded transition metadata. They do not contain Slack message bodies. Treat the export as private operational data because its IDs can still be sensitive.
 
+Validate the entire live export without printing IDs or stored content:
+
+```sh
+bun run audit:verify -- /absolute/path/to/agent-tag.json
+```
+
+The verifier reads every page through the production audit parser, requires its count to match the durable store, reports aggregate action counts, and rejects any exact stored Slack message, memory entry, or schedule prompt found in the serialized audit records. Audit writes and reads enforce a closed action set plus non-empty actor, authority, source, target, result, and correlation fields.
+
 Create a consistent backup while the service is stopped or running:
 
 ```sh
