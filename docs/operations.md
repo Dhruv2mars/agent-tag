@@ -114,6 +114,8 @@ bun run restore -- /private/backup/agent-tag.sqlite /new/private/data-directory
 
 Restore validates the source, creates the new directory with mode `0700` when needed, writes `agent-tag.sqlite` with mode `0600`, and refuses to overwrite an existing database. Point a reviewed config at the new directory and run `doctor` before starting it. In-place destructive restore is intentionally unsupported.
 
+Store migrations are append-only and run inside SQLite transactions when Agent Tag opens the database. The automated upgrade matrix constructs every historical schema version, preserves representative version-1 work, opens it through the production migrator, and requires the complete version set plus `PRAGMA quick_check = ok`. Back up before upgrading a release and run `doctor` afterward.
+
 ## Secret scan
 
 Scan the Agent Tag checkout for common Slack, GitHub, AWS, Anthropic, and OpenAI credential shapes:
