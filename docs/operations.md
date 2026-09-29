@@ -1,6 +1,6 @@
 # Operations
 
-Agent Tag is currently a foreground Bun service. A service manager may wrap the documented command, but install, upgrade, backup/restore, and uninstall automation are not complete enough for a GA claim.
+Agent Tag runs in the foreground on macOS or Linux. On macOS, the checked-in manager can install it as a per-user LaunchAgent. Linux service-manager automation is not implemented or tested.
 
 Complete the [Slack setup](slack-setup.md) before running live checks.
 
@@ -29,6 +29,33 @@ Send `SIGINT` or `SIGTERM` to stop it. The service first prevents another worker
 The configured `maxConcurrentTasks` creates that many independent coordinator workers. SQLite still serializes turns within each task and enforces the same global bound. Interaction responses and the Slack outbox have separate workers, so a task waiting for a human does not block another task.
 
 `limits.stalledTurn` controls a T3 turn that stays unsettled. `timeoutSeconds` bounds one polling attempt, `retryDelaySeconds` delays the same stable command before replay, and `maxAttempts` ends the operation with a durable Slack failure after the final deadline. A terminal stall says only that Agent Tag could not confirm completion; the operator must inspect T3 before retrying because the remote outcome may be unknown.
+
+## macOS background service
+
+Install the current checkout and validated config for the logged-in user:
+
+```sh
+bun run service:install -- /absolute/path/to/agent-tag.json
+bun run service:status
+```
+
+The installer runs `doctor` before writing anything, installs `~/Library/LaunchAgents/dev.agent-tag.service.plist` at mode `0600`, precreates `~/Library/Logs/AgentTag` and its logs at `0700`/`0600`, bootstraps the GUI launchd domain, and waits until the process is actually running. A job that is merely registered or repeatedly exiting is not reported as healthy. A failed first install removes its generated plist.
+
+After updating the checkout or config, validate and restart it atomically:
+
+```sh
+bun run service:upgrade -- /absolute/path/to/agent-tag.json
+```
+
+Upgrade waits for the old job to leave launchd before bootstrapping the replacement. If the replacement fails, it restores the prior plist and restarts the old job when it was previously loaded.
+
+Remove only the generated launchd job and plist with:
+
+```sh
+bun run service:uninstall
+```
+
+Uninstall preserves the Agent Tag data directory and service logs. It is therefore reversible with `service:install`. The LaunchAgent needs the user to remain logged in, and the machine must remain awake for local T3 and Socket Mode.
 
 ## Recovery rules
 
@@ -138,4 +165,4 @@ An overdue `run-once` schedule coalesces missed intervals into one run; `skip` r
 
 ## Host constraints
 
-The verified runtime is macOS arm64 with Bun `1.3.13` and T3 Code `0.0.42`. A macOS user service requires the user to remain logged in; an awake host is required for local T3 and Socket Mode availability. Linux service-manager behavior has not yet been exercised, so it remains outside the passing claim.
+The verified runtime is macOS arm64 with Bun `1.3.13` and T3 Code `0.0.42`. The per-user LaunchAgent install, loaded-service upgrade, uninstall, and reinstall have been exercised on macOS. A logged-in user and awake host are still required for local T3 and Socket Mode availability. Linux service-manager behavior has not been exercised, so it remains outside the passing claim.

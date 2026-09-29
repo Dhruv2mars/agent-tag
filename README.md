@@ -31,7 +31,14 @@ Run the foreground service with:
 bun run start -- /absolute/path/to/agent-tag.json
 ```
 
-The service validates every configured provider/model against T3 before connecting to Slack, writes structured JSON lifecycle records to stdout/stderr, and shuts down on `SIGINT` or `SIGTERM`. See [operations](docs/operations.md) for recovery and host constraints.
+On macOS, install the validated config as a per-user LaunchAgent with:
+
+```sh
+bun run service:install -- /absolute/path/to/agent-tag.json
+bun run service:status
+```
+
+The service validates every configured provider/model against T3 before connecting to Slack, writes structured JSON lifecycle records to stdout/stderr, and shuts down on `SIGINT` or `SIGTERM`. See [operations](docs/operations.md) for upgrade, uninstall, recovery, and host constraints.
 
 Provider authentication is not a license grant. Review [provider access and licensing](docs/provider-licensing.md) before making an authenticated provider available to other Slack users.
 
