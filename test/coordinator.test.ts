@@ -37,7 +37,7 @@ const config = agentTagConfigSchema.parse({
   limits: { maxConcurrentTasks: 2 },
 });
 
-function completedSnapshot(threadId: string, text: string): T3ThreadSnapshot {
+function completedSnapshot(threadId: string, text: string, userMessageId?: string): T3ThreadSnapshot {
   return {
     snapshotSequence: 9,
     thread: {
@@ -58,6 +58,15 @@ function completedSnapshot(threadId: string, text: string): T3ThreadSnapshot {
         assistantMessageId: "assistant-1",
       },
       messages: [
+        ...(userMessageId === undefined ? [] : [{
+          id: userMessageId,
+          role: "user" as const,
+          text: "fixture request",
+          turnId: null,
+          streaming: false,
+          createdAt: now,
+          updatedAt: now,
+        }]),
         {
           id: "assistant-1",
           role: "assistant",
@@ -299,13 +308,39 @@ describe("Agent Tag coordinator", () => {
     const commands: T3Command[] = [];
     let finalText = "first-result";
     let threadId = "not-dispatched";
+    let currentMessageId: string | undefined;
+    let previousMessageId: string | undefined;
+    let staleSnapshotsRemaining = 0;
+    let staleReads = 0;
     const t3: T3CoordinatorGateway = {
       dispatch: async (command) => {
         commands.push(command);
-        if (command.type === "thread.turn.start") threadId = command.threadId;
+        if (command.type === "thread.turn.start") {
+          threadId = command.threadId;
+          previousMessageId = currentMessageId;
+          currentMessageId = command.message.messageId;
+        }
         return { sequence: commands.length };
       },
-      fetchThread: async () => completedSnapshot(threadId, finalText),
+      fetchThread: async () => {
+        if (staleSnapshotsRemaining > 0) {
+          staleSnapshotsRemaining -= 1;
+          staleReads += 1;
+          if (staleSnapshotsRemaining === 1) {
+            return completedSnapshot(threadId, "first-result", previousMessageId);
+          }
+          const stale = completedSnapshot(threadId, "first-result", currentMessageId);
+          if (stale.thread.latestTurn === null) throw new Error("fixture turn missing");
+          return {
+            ...stale,
+            thread: {
+              ...stale.thread,
+              latestTurn: { ...stale.thread.latestTurn, requestedAt: "2026-09-20T23:59:59.000Z" },
+            },
+          };
+        }
+        return completedSnapshot(threadId, finalText, currentMessageId);
+      },
     };
     const coordinator = new AgentTagCoordinator({
       config,
@@ -403,8 +438,10 @@ describe("Agent Tag coordinator", () => {
         sourceOrderKey: "1000.000002",
       });
       finalText = "second-result";
+      staleSnapshotsRemaining = 2;
       const second = await coordinator.processNext();
       expect(second.kind).toBe("completed");
+      expect(staleReads).toBe(2);
       expect(commands[2]?.type).toBe("project.create");
       expect(commands[3]).toMatchObject({ type: "thread.turn.start" });
       if (commands[3]?.type !== "thread.turn.start") throw new Error("second turn was not dispatched");

@@ -102,6 +102,13 @@ function t3TurnFailure(snapshot: T3ThreadSnapshot): CoordinatorFailure {
   );
 }
 
+function snapshotHasCurrentTurn(snapshot: T3ThreadSnapshot, messageId: string): boolean {
+  const userMessage = snapshot.thread.messages.find((message) => message.id === messageId && message.role === "user");
+  const latestTurn = snapshot.thread.latestTurn;
+  return userMessage !== undefined && latestTurn !== null &&
+    new Date(latestTurn.requestedAt).getTime() >= new Date(userMessage.createdAt).getTime();
+}
+
 function escapeSlackText(text: string): string {
   return text.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
 }
@@ -361,7 +368,20 @@ export class AgentTagCoordinator {
     const startedAt = this.#now().getTime();
     let renewAt = startedAt + Math.floor(this.#leaseMs / 2);
     while (this.#now().getTime() - startedAt <= this.#maxWaitMs) {
+      if (this.#now().getTime() >= renewAt) {
+        this.#store.renewOperationLease({
+          operationId: operation.operationId,
+          workerId: this.#workerId,
+          now: this.#now().toISOString(),
+          leaseMs: this.#leaseMs,
+        });
+        renewAt = this.#now().getTime() + Math.floor(this.#leaseMs / 2);
+      }
       const snapshot = await this.#t3.fetchThread(task.threadId);
+      if (task.threadStarted && !snapshotHasCurrentTurn(snapshot, operation.messageId)) {
+        await this.#sleep(this.#pollMs);
+        continue;
+      }
       const approvals = pendingT3Approvals(snapshot);
       const userInputs = pendingT3UserInputs(snapshot);
       if (approvals.length > 0 || userInputs.length > 0) {
@@ -440,15 +460,6 @@ export class AgentTagCoordinator {
           now: this.#now().toISOString(),
         });
         return { kind: "completed", operationId: operation.operationId, outboxId };
-      }
-      if (this.#now().getTime() >= renewAt) {
-        this.#store.renewOperationLease({
-          operationId: operation.operationId,
-          workerId: this.#workerId,
-          now: this.#now().toISOString(),
-          leaseMs: this.#leaseMs,
-        });
-        renewAt = this.#now().getTime() + Math.floor(this.#leaseMs / 2);
       }
       await this.#sleep(this.#pollMs);
     }
