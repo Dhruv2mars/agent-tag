@@ -7,7 +7,7 @@ import { AgentTagStore } from "./store/store.ts";
 
 function usage(): never {
   throw new Error(
-    "usage: agent-tag <run|doctor|audit|backup> CONFIG [ARG] | agent-tag restore BACKUP NEW_DATA_DIR | agent-tag schedule-<add|list|cancel> CONFIG TASK ACTOR PROFILE [SPEC_OR_ID]",
+    "usage: agent-tag <run|doctor|status|audit|backup> CONFIG [ARG] | agent-tag restore BACKUP NEW_DATA_DIR | agent-tag schedule-<add|list|cancel> CONFIG TASK ACTOR PROFILE [SPEC_OR_ID]",
   );
 }
 
@@ -38,6 +38,7 @@ if (command === "restore") {
   if (
     command !== "run" &&
     command !== "doctor" &&
+    command !== "status" &&
     command !== "audit" &&
     command !== "backup" &&
     command !== "schedule-add" &&
@@ -47,6 +48,13 @@ if (command === "restore") {
   const config = await loadConfig(resolve(configArgument));
   if (command === "doctor") {
     console.log(JSON.stringify(await diagnoseAgentTag(config), null, 2));
+  } else if (command === "status") {
+    const store = await AgentTagStore.open(resolve(config.dataDir, "agent-tag.sqlite"));
+    try {
+      console.log(JSON.stringify(store.operationalStatus(new Date().toISOString()), null, 2));
+    } finally {
+      store.close();
+    }
   } else if (command === "audit") {
     const store = await AgentTagStore.open(resolve(config.dataDir, "agent-tag.sqlite"));
     try {

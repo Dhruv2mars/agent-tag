@@ -6,6 +6,7 @@
   "scripts": {
     "start": "bun run src/cli.ts run",
     "doctor": "bun run src/cli.ts doctor",
+    "status": "bun run src/cli.ts status",
     "audit": "bun run src/cli.ts audit",
     "backup": "bun run src/cli.ts backup",
     "restore": "bun run src/cli.ts restore",

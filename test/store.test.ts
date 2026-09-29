@@ -45,6 +45,30 @@ async function withStore(
 }
 
 describe("Agent Tag durable store", () => {
+  test("reports ready, deferred, and expired work without provider access", async () => {
+    await withStore(({ store }) => {
+      const receipt = store.ingestSlackEvent(slackEvent());
+      expect(store.operationalStatus(firstAt).operations).toMatchObject({
+        ready: 1,
+        deferred: 0,
+        oldestReadyAt: firstAt,
+      });
+      store.claimNextOperation({ workerId: "worker-a", now: firstAt, leaseMs: 10_000, maxConcurrentTasks: 1 });
+      expect(store.operationalStatus(beforeExpiry).operations).toMatchObject({ activeLease: 1, expiredLease: 0 });
+      expect(store.operationalStatus(afterExpiry).operations).toMatchObject({ activeLease: 0, expiredLease: 1 });
+      store.failOperation({
+        operationId: receipt.operationId,
+        workerId: "worker-a",
+        errorCode: "TransientT3Error",
+        retryable: true,
+        blockedUntil: afterExpiry,
+        now: firstAt,
+      });
+      expect(store.operationalStatus(beforeExpiry).operations).toMatchObject({ ready: 0, deferred: 1 });
+      expect(store.operationalStatus(afterExpiry).operations).toMatchObject({ ready: 1, deferred: 0 });
+    });
+  });
+
   test("shares one T3 project per repository while keeping Slack tasks separate", async () => {
     await withStore(({ store }) => {
       const first = store.ingestSlackEvent(slackEvent());

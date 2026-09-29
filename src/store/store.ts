@@ -251,6 +251,27 @@ export interface ClaimedOperation {
   readonly leaseExpiresAt: string;
 }
 
+export interface OperationalStatus {
+  readonly asOf: string;
+  readonly operations: {
+    readonly ready: number;
+    readonly deferred: number;
+    readonly activeLease: number;
+    readonly expiredLease: number;
+    readonly oldestReadyAt: string | null;
+  };
+  readonly interactions: {
+    readonly awaitingHuman: number;
+    readonly responseQueued: number;
+  };
+  readonly outbox: {
+    readonly pending: number;
+    readonly activeLease: number;
+    readonly expiredLease: number;
+    readonly outcomeUnknown: number;
+  };
+}
+
 export interface SlackOutboxInput {
   readonly taskId: string;
   readonly correlationId: string;
@@ -2741,6 +2762,52 @@ export class AgentTagStore {
       ambientDecisions: count("ambient_decisions"),
       auditRecords: count("audit_log"),
     };
+  }
+
+  operationalStatus(nowInput: string): OperationalStatus {
+    const now = isoDateTime.parse(nowInput);
+    const operations = this.#database.query<{
+      ready: number;
+      deferred: number;
+      activeLease: number;
+      expiredLease: number;
+      oldestReadyAt: string | null;
+    }, [string, string, string, string, string]>(
+      `SELECT
+         COUNT(*) FILTER (WHERE status = 'pending' AND (blocked_until IS NULL OR blocked_until <= ?)) AS ready,
+         COUNT(*) FILTER (WHERE status = 'pending' AND blocked_until > ?) AS deferred,
+         COUNT(*) FILTER (WHERE status = 'inflight' AND lease_expires_at > ?) AS activeLease,
+         COUNT(*) FILTER (WHERE status = 'inflight' AND (lease_expires_at IS NULL OR lease_expires_at <= ?)) AS expiredLease,
+         MIN(CASE WHEN status = 'pending' AND (blocked_until IS NULL OR blocked_until <= ?)
+             THEN created_at END) AS oldestReadyAt
+       FROM operations`,
+    ).get(now, now, now, now, now);
+    const interactions = this.#database.query<{
+      awaitingHuman: number;
+      responseQueued: number;
+    }, []>(
+      `SELECT
+         COUNT(*) FILTER (WHERE state = 'pending') AS awaitingHuman,
+         COUNT(*) FILTER (WHERE state IN ('response-pending', 'inflight')) AS responseQueued
+       FROM interactions`,
+    ).get();
+    const outbox = this.#database.query<{
+      pending: number;
+      activeLease: number;
+      expiredLease: number;
+      outcomeUnknown: number;
+    }, [string, string]>(
+      `SELECT
+         COUNT(*) FILTER (WHERE status = 'pending') AS pending,
+         COUNT(*) FILTER (WHERE status = 'inflight' AND lease_expires_at > ?) AS activeLease,
+         COUNT(*) FILTER (WHERE status = 'inflight' AND (lease_expires_at IS NULL OR lease_expires_at <= ?)) AS expiredLease,
+         COUNT(*) FILTER (WHERE status = 'failed' AND last_error_code = 'delivery-outcome-unknown') AS outcomeUnknown
+       FROM slack_outbox`,
+    ).get(now, now);
+    if (operations === null || interactions === null || outbox === null) {
+      throw new Error("operational status query failed");
+    }
+    return { asOf: now, operations, interactions, outbox };
   }
 
   #findOrCreateTask(event: {
