@@ -23,6 +23,7 @@
     "typecheck": "tsc --noEmit",
     "enroll:t3": "bun run scripts/enroll-t3.ts",
     "verify:t3-pin": "bun run scripts/verify-t3-pin.ts",
+    "verify:clean-install": "bun run scripts/verify-clean-install.ts",
     "check": "bun run typecheck && bun test"
   },
   "dependencies": {
