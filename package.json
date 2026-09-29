@@ -8,6 +8,7 @@
     "doctor": "bun run src/cli.ts doctor",
     "status": "bun run src/cli.ts status",
     "audit": "bun run src/cli.ts audit",
+    "audit:verify": "bun run scripts/verify-audit.ts",
     "backup": "bun run src/cli.ts backup",
     "restore": "bun run src/cli.ts restore",
     "schedule:add": "bun run src/cli.ts schedule-add",

@@ -135,6 +135,55 @@ const auditMetadataSchema = z.record(
   z.string(),
   z.union([z.string(), z.number(), z.boolean(), z.null()]),
 );
+export const AUDIT_ACTIONS = [
+  "ambient.decided",
+  "interaction.approval.requested",
+  "interaction.cancel.requested",
+  "interaction.response.claimed",
+  "interaction.response.completed",
+  "interaction.response.failed",
+  "interaction.response.submitted",
+  "interaction.user-input.requested",
+  "memory.created",
+  "memory.denied",
+  "memory.expired",
+  "memory.forgotten",
+  "memory.updated",
+  "operation.cancelled",
+  "operation.claimed",
+  "operation.completed",
+  "operation.deferred",
+  "operation.failed",
+  "operation.turn-text.resolved",
+  "schedule.cancelled",
+  "schedule.claimed",
+  "schedule.created",
+  "schedule.denied",
+  "schedule.run.settled",
+  "slack.delivery.duplicate",
+  "slack.event.ingested",
+  "slack.outbox.claimed",
+  "slack.outbox.delivered",
+  "slack.outbox.enqueued",
+  "slack.outbox.failed",
+  "slack.outbox.quarantined",
+  "task.cancellation.requested",
+  "task.t3-bound",
+] as const;
+const auditActionSchema = z.enum(AUDIT_ACTIONS);
+export type AuditAction = z.infer<typeof auditActionSchema>;
+const auditWriteSchema = z.object({
+  actorType: nonEmpty,
+  actorId: nonEmpty,
+  authority: nonEmpty,
+  source: nonEmpty,
+  target: nonEmpty,
+  action: auditActionSchema,
+  result: nonEmpty,
+  correlationId: nonEmpty,
+  metadata: auditMetadataSchema,
+  createdAt: isoDateTime,
+});
 const memoryRowSchema = z.object({
   memory_id: nonEmpty,
   workspace_id: nonEmpty,
@@ -319,7 +368,7 @@ export interface AuditRecord {
   readonly authority: string;
   readonly source: string;
   readonly target: string;
-  readonly action: string;
+  readonly action: AuditAction;
   readonly result: string;
   readonly correlationId: string;
   readonly metadata: Readonly<Record<string, string | number | boolean | null>>;
@@ -477,13 +526,14 @@ function writeAudit(
     readonly authority: string;
     readonly source: string;
     readonly target: string;
-    readonly action: string;
+    readonly action: AuditAction;
     readonly result: string;
     readonly correlationId: string;
     readonly metadata: Readonly<Record<string, string | number | boolean | null>>;
     readonly createdAt: string;
   },
 ): void {
+  const record = auditWriteSchema.parse(input);
   database
     .query(
       `INSERT INTO audit_log (
@@ -493,16 +543,16 @@ function writeAudit(
     )
     .run(
       crypto.randomUUID(),
-      input.actorType,
-      input.actorId,
-      input.authority,
-      input.source,
-      input.target,
-      input.action,
-      input.result,
-      input.correlationId,
-      JSON.stringify(input.metadata),
-      input.createdAt,
+      record.actorType,
+      record.actorId,
+      record.authority,
+      record.source,
+      record.target,
+      record.action,
+      record.result,
+      record.correlationId,
+      JSON.stringify(record.metadata),
+      record.createdAt,
     );
 }
 
@@ -613,7 +663,7 @@ export class AgentTagStore {
           authority: row.authority,
           source: row.source,
           target: row.target,
-          action: row.action,
+          action: auditActionSchema.parse(row.action),
           result: row.result,
           correlationId: row.correlation_id,
           metadata: auditMetadataSchema.parse(parseStoredJson(row.metadata_json)),
