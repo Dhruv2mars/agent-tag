@@ -19,6 +19,12 @@ bun test
 bun run typecheck
 ```
 
+Verify the exact committed tree from a fresh archive and frozen dependency install with:
+
+```sh
+bun run verify:clean-install
+```
+
 After copying and editing `config/agent-tag.example.json`, validate the database, T3 session, provider catalog, and Slack bot identity without starting Socket Mode:
 
 ```sh

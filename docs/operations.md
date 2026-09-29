@@ -6,6 +6,16 @@ Complete the [Slack setup](slack-setup.md) before running live checks.
 
 Before enabling a provider for other Slack users, complete the [provider access and licensing review](provider-licensing.md). T3 readiness proves connectivity only; it does not prove that a personal subscription or session may be shared.
 
+## Clean-checkout verification
+
+Run the committed tree through a new frozen dependency install before release:
+
+```sh
+bun run verify:clean-install
+```
+
+The verifier refuses a dirty checkout, exports `HEAD` with `git archive`, installs from `bun.lock` in a fresh private temporary directory, runs typecheck and tests, and verifies the pinned T3 release metadata. It removes the temporary checkout afterward. Passing on one machine is not a substitute for the clean supported-host release run.
+
 ## Start and stop
 
 Run a live dependency check first:
