@@ -22,6 +22,7 @@ The active continuation branch is `feat/t3-slack-spike`, with [draft PR #1](http
 - Live Codex runs have completed from Slack, preserved same-thread context, survived a controlled T3 restart, and completed in an owner-bound DM.
 - Approval, question, cancellation, memory, scheduling, ambient participation, backup/restore, status, audit verification, and secret scanning have executable coverage. One live approval remains intentionally unanswered and must remain a human decision.
 - A macOS per-user LaunchAgent completed install, upgrade, uninstall, and reinstall exercises. Clean GitHub-hosted macOS 15 and Ubuntu 24.04 gates pass.
+- The pinned T3 adapter can upload, download, and delete pending image/file attachments with the existing restricted token. [Transport evidence](evidence/2026-09-30-t3-attachments.md) covers real byte round trips; Slack file ingestion and artifact return remain unimplemented.
 - Provider/model selection is explicit. Real Claude catalog selections currently fail inside pinned T3 with `provider-api-errors`; Codex is the verified live provider.
 
 ## Required work

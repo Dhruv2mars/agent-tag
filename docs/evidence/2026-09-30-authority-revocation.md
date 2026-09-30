@@ -22,7 +22,11 @@ The first attempt exposed a timing defect in the older live test: its replacemen
 
 A real Slack run authenticated the production bridge against the configured workspace using an isolated fixture store. With its route removed, the bridge permanently failed the queued send and recorded one `ExecutionAuthorityDenied` audit row. Slack thread replies contained no rejected marker. Restoring the authorized route sent exactly one new marker to the same existing test thread, confirmed through `conversations.replies`. The reusable `verify:slack-authority` script repeated this result. Neither run started Socket Mode, changed live task state, nor answered a human approval.
 
-The LaunchAgent upgrade succeeded with the changed code. Live status retained one awaiting-human interaction and no queued response. The live 4,484-row audit export passed its count, closed-action, and private-content checks. A configured secret scan covering the checkout, live Agent Tag data, T3 userdata and worktrees scanned 474 files with no findings or skipped symlinks before the verification script was added.
+The LaunchAgent upgrade succeeded with the changed code. Live status retained one awaiting-human interaction and no queued response. The live 4,484-row audit export passed its count, closed-action, and private-content checks. A configured secret scan covering the checkout, live Agent Tag data, T3 userdata and worktrees scanned 474 files with no findings or skipped symlinks before the verification script was added. A subsequent checkout/live-data scan included the script and evidence, scanning 98 files without findings or skipped symlinks.
+
+## CI follow-up
+
+After commit `718603e`, Ubuntu passed, while macOS passed typecheck/tests but failed the remote pin check on GitHub HTTP 403. Commit `0d1a417` supplies the job's GitHub token only to the GitHub API request and refuses redirects. The local gate passed 68 tests; the remote pin check passed. Both platform checks then passed in [CI run 36734182811](https://github.com/Dhruv2mars/agent-tag/actions/runs/36734182811). No digest comparison or acceptance gate was weakened.
 
 ## Limits
 

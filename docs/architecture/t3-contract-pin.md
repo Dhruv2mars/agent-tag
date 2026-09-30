@@ -6,7 +6,7 @@ The adapter may use only these public server boundaries:
 
 - `/oauth/token` to exchange a one-time bootstrap credential for a scoped bearer token;
 - `/api/auth/websocket-ticket` to mint a short-lived WebSocket ticket;
-- authenticated `/ws` Effect RPC for server probe/config, orchestration command dispatch, thread subscription, and attachment URLs where needed.
+- authenticated `/ws` Effect RPC for server probe/config, orchestration command dispatch, thread subscription, and signed attachment upload/download plus pending-attachment deletion.
 
 Requested scopes start with `orchestration:read` and `orchestration:operate`. Terminal, review, access-administration, and relay scopes stay absent until a tested acceptance flow requires one.
 
