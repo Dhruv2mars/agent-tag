@@ -17,6 +17,7 @@ The active continuation branch is `feat/t3-slack-spike`, with [draft PR #1](http
 ## Working baseline
 
 - Slack Socket Mode ingestion, authorization, durable deduplication, T3 dispatch, and Slack replies are implemented.
+- Queued turns, interaction responses, schedules, and Slack replies recheck current loaded task authority before dispatch. [Revocation evidence](evidence/2026-09-30-authority-revocation.md) covers restart fixtures, real Codex continuation, and real Slack delivery. OS isolation and tool-write enforcement remain unimplemented.
 - SQLite owns tasks, operations, leases, interactions, memory, schedules, ambient decisions, audit records, and the Slack outbox.
 - Live Codex runs have completed from Slack, preserved same-thread context, survived a controlled T3 restart, and completed in an owner-bound DM.
 - Approval, question, cancellation, memory, scheduling, ambient participation, backup/restore, status, audit verification, and secret scanning have executable coverage. One live approval remains intentionally unanswered and must remain a human decision.

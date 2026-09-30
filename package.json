@@ -25,7 +25,8 @@
     "enroll:t3": "bun run scripts/enroll-t3.ts",
     "verify:t3-pin": "bun run scripts/verify-t3-pin.ts",
     "verify:clean-install": "bun run scripts/verify-clean-install.ts",
-    "check": "bun run typecheck && bun test"
+    "check": "bun run typecheck && bun test",
+    "verify:slack-authority": "bun run scripts/verify-slack-authority.ts"
   },
   "dependencies": {
     "@slack/bolt": "5.1.0",

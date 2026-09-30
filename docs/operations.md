@@ -155,6 +155,20 @@ Direct messages are off until an operator adds the DM conversation ID to `access
 
 The app manifest includes the `im:history` bot scope and `message.im` subscription. Reinstall the Slack app after changing scopes. Agent Tag accepts unmentioned messages only for the named owner in that exact DM. It does not support group DMs as private single-owner conversations.
 
+## Access changes and live verification
+
+Restart or upgrade the service after changing access configuration. Before each queued T3 turn, interaction response, or schedule, Agent Tag rechecks the stored task against the loaded workspace, user, channel, route, profile, repository, and DM-owner policy. Denied turns and interaction responses fail durably; revoked recurring schedules stop with an audit record. Queued Slack replies also recheck the task route and DM owner before sending. A sanitized failure notice may still reach an authorized shared channel after its requesting user is removed.
+
+These checks do not revoke work already running inside T3, isolate filesystem paths or credentials, or enforce provider tool writes. The OS-isolation and credential-broker acceptance gates remain open.
+
+Verify route revocation and normal delivery against an existing authorized test-channel thread with:
+
+```sh
+bun run verify:slack-authority -- CONFIG CHANNEL THREAD_TS
+```
+
+This command authenticates the real Slack bot, uses a temporary fixture store, rejects a queued message after removing its route, checks its denial audit, and verifies the rejected marker is absent from Slack. It then sends one test marker through the authorized route and verifies exactly one same-thread message. It does not start Socket Mode or change live tasks, schedules, or human approvals. Use a test thread with fewer than 100 replies; the verifier refuses an incomplete reply scan.
+
 ## Schedules
 
 Schedules belong to an existing active Agent Tag task. Create a JSON spec such as:
