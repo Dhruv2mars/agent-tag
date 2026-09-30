@@ -601,6 +601,7 @@ if (!enabled) {
             config: serviceConfig,
             store,
             workerId: `live-after-restart-${crypto.randomUUID()}`,
+            now: () => new Date(Date.now() + 2_000),
             pollMs: 250,
             maxWaitMs: 60_000,
           });
@@ -625,6 +626,26 @@ if (!enabled) {
           });
           expect(outbox?.payload.text.trim()).toBe("durable-fixture-ok");
           expect(outbox?.correlationId).toBe(receipt.operationId);
+
+          const beforeRevocation = await fetchT3ThreadSnapshot({ config, threadId: binding.threadId });
+          const followup = store.ingestSlackEvent({
+            deliveryId: crypto.randomUUID(), eventKey: `C1:${Date.now()}.000002`,
+            workspaceId: "T1", conversationId: "C1", threadTs: "1000.000001",
+            actorUserId: "U1", conversationType: "channel", profileId: "engineering",
+            repositoryRoot: workspaceRoot, text: "Revoked follow-up must never reach T3.",
+            receivedAt: new Date().toISOString(), sourceOrderKey: "1000.000002",
+          });
+          store.close();
+          store = await AgentTagStore.open(storePath);
+          const revokedCoordinator = new AgentTagCoordinator({
+            config: { ...serviceConfig, routes: [] }, store,
+          });
+          expect(await revokedCoordinator.processNext()).toMatchObject({
+            kind: "failed", operationId: followup.operationId, errorCode: "ExecutionAuthorityDenied",
+          });
+          const afterRevocation = await fetchT3ThreadSnapshot({ config, threadId: binding.threadId });
+          expect(afterRevocation.thread.messages).toEqual(beforeRevocation.thread.messages);
+          expect(afterRevocation.thread.latestTurn).toEqual(beforeRevocation.thread.latestTurn);
         } finally {
           if (projectId !== null) {
             await dispatchT3Command({

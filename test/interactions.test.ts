@@ -142,6 +142,7 @@ describe("durable interactions", () => {
         },
       };
       const firstWorker = new InteractionWorker({
+        config,
         store: initialStore,
         t3,
         workerId: "interaction-a",
@@ -153,6 +154,7 @@ describe("durable interactions", () => {
       const reopened = await AgentTagStore.open(path);
       try {
         const secondWorker = new InteractionWorker({
+          config,
           store: reopened,
           t3,
           workerId: "interaction-b",
@@ -218,7 +220,8 @@ describe("durable interactions", () => {
           return { sequence: commands.length };
         },
       };
-      const worker = new InteractionWorker({ store, t3, workerId: "interaction-a", now: () => new Date(now) });
+      const worker = new InteractionWorker({
+        config, store, t3, workerId: "interaction-a", now: () => new Date(now) });
       expect((await worker.processNext()).kind).toBe("resolved");
       expect((await worker.processNext()).kind).toBe("resolved");
       expect(commands).toHaveLength(2);
@@ -241,6 +244,7 @@ describe("durable interactions", () => {
       expect(result.kind).toBe("accepted");
       const commands: T3Command[] = [];
       const worker = new InteractionWorker({
+        config,
         store,
         t3: {
           dispatch: async (command) => {
@@ -283,6 +287,7 @@ describe("durable interactions", () => {
         now,
       });
       const worker = new InteractionWorker({
+        config,
         store,
         t3: {
           dispatch: async () => {

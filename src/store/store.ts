@@ -95,6 +95,8 @@ const taskLookupSchema = z.object({
 const outboxIdentitySchema = z.object({ outbox_id: nonEmpty });
 const taskExecutionSchema = z.object({
   task_id: nonEmpty,
+  workspace_id: nonEmpty,
+  conversation_id: nonEmpty,
   profile_id: nonEmpty,
   repository_root: nonEmpty,
   t3_project_id: nonEmpty,
@@ -269,6 +271,8 @@ export interface ActiveTaskBinding {
 
 export interface TaskExecutionBinding {
   readonly taskId: string;
+  readonly workspaceId: string;
+  readonly conversationId: string;
   readonly profileId: string;
   readonly repositoryRoot: string;
   readonly projectId: string;
@@ -2097,7 +2101,7 @@ export class AgentTagStore {
     const row = taskExecutionSchema.parse(
       this.#database
         .query(
-          `SELECT task_id, profile_id, repository_root, t3_project_id, t3_thread_id,
+          `SELECT task_id, workspace_id, conversation_id, profile_id, repository_root, t3_project_id, t3_thread_id,
                   t3_thread_started_at, conversation_type, owner_user_id, created_at
            FROM tasks WHERE task_id = ? AND state = 'active'`,
         )
@@ -2113,6 +2117,8 @@ export class AgentTagStore {
     );
     return {
       taskId: row.task_id,
+      workspaceId: row.workspace_id,
+      conversationId: row.conversation_id,
       profileId: row.profile_id,
       repositoryRoot: row.repository_root,
       projectId: row.t3_project_id,

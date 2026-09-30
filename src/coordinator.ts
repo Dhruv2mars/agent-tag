@@ -1,4 +1,5 @@
 import type { AgentTagConfig } from "./config.ts";
+import { ExecutionAuthorityDenied, requireExecutionAuthority } from "./policy/execution.ts";
 import { AgentTagMemory } from "./memory.ts";
 import type { AgentTagStore, ClaimedOperation, SlackOutboxPayload } from "./store/store.ts";
 import {
@@ -243,7 +244,12 @@ export class AgentTagCoordinator {
         });
         return { kind: "retry-scheduled", operationId: operation.operationId, errorCode: error.name };
       }
-      if (!(error instanceof CoordinatorFailure) && !(error instanceof T3TurnStalled) && operation.attempt < 5) {
+      if (
+        !(error instanceof CoordinatorFailure) &&
+        !(error instanceof T3TurnStalled) &&
+        !(error instanceof ExecutionAuthorityDenied) &&
+        operation.attempt < 5
+      ) {
         const now = this.#now();
         this.#store.failOperation({
           operationId: operation.operationId,
@@ -259,6 +265,11 @@ export class AgentTagCoordinator {
         ? new CoordinatorFailure(
             error.name,
             `Agent Tag could not confirm completion after ${stalledTurn.maxAttempts} attempts within the configured T3 turn deadline. Ask the operator to inspect T3 before retrying.`,
+          )
+        : error instanceof ExecutionAuthorityDenied
+        ? new CoordinatorFailure(
+            error.name,
+            "Agent Tag stopped this request because the current access configuration no longer authorizes it. Ask the operator to review the task route and access policy.",
           )
         : error instanceof CoordinatorFailure
         ? error
@@ -282,8 +293,11 @@ export class AgentTagCoordinator {
 
   async #run(operation: ClaimedOperation): Promise<CoordinatorOutcome> {
     const task = this.#store.getTaskExecution(operation.taskId);
-    const profile = this.#config.profiles.find((candidate) => candidate.id === task.profileId);
-    if (profile === undefined) throw new Error(`task references missing profile ${task.profileId}`);
+    const profile = requireExecutionAuthority({
+      config: this.#config,
+      task,
+      actorUserId: operation.payload.actorUserId,
+    });
     const modelSelection = {
       instanceId: profile.defaultProviderInstanceId,
       model: profile.defaultModel,

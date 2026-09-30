@@ -1,5 +1,7 @@
 import { z } from "zod";
 
+import type { AgentTagConfig } from "./config.ts";
+import { ExecutionAuthorityDenied, requireExecutionAuthority } from "./policy/execution.ts";
 import type { AgentTagStore } from "./store/store.ts";
 import {
   dispatchT3Command,
@@ -28,6 +30,7 @@ export type InteractionWorkerOutcome =
 
 export class InteractionWorker {
   readonly #store: AgentTagStore;
+  readonly #config: AgentTagConfig;
   readonly #t3: T3InteractionGateway;
   readonly #workerId: string;
   readonly #leaseMs: number;
@@ -35,6 +38,7 @@ export class InteractionWorker {
 
   constructor(input: {
     readonly store: AgentTagStore;
+    readonly config: AgentTagConfig;
     readonly t3Config?: T3ConnectionConfig;
     readonly t3?: T3InteractionGateway;
     readonly workerId?: string;
@@ -42,6 +46,7 @@ export class InteractionWorker {
     readonly now?: () => Date;
   }) {
     this.#store = input.store;
+    this.#config = input.config;
     if (input.t3 !== undefined) {
       this.#t3 = input.t3;
     } else {
@@ -62,6 +67,11 @@ export class InteractionWorker {
     });
     if (response === null) return { kind: "idle" };
     try {
+      requireExecutionAuthority({
+        config: this.#config,
+        task: this.#store.getTaskExecution(response.taskId),
+        actorUserId: response.actorUserId,
+      });
       let command: T3Command;
       if (response.kind === "approval") {
         const parsed = approvalResponseSchema.parse(response.response);
@@ -109,7 +119,7 @@ export class InteractionWorker {
       return { kind: "resolved", interactionId: response.interactionId };
     } catch (error) {
       const code = error instanceof Error && error.name ? error.name : "InteractionDispatchError";
-      const retryable = !(error instanceof z.ZodError);
+      const retryable = !(error instanceof z.ZodError) && !(error instanceof ExecutionAuthorityDenied);
       this.#store.failInteractionResponse({
         interactionId: response.interactionId,
         workerId: this.#workerId,
