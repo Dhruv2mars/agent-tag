@@ -6,6 +6,7 @@ import { readSecretFile } from "../security/secret-file.ts";
 import type { AgentTagStore } from "../store/store.ts";
 import { SLACK_ACTION_IDS, SlackActionRouter } from "./actions.ts";
 import { SlackEventRouter } from "./events.ts";
+import { deliverNextSlackOutbox } from "./outbox.ts";
 import { installUndiciWebSocketCompat } from "./undici-compat.ts";
 
 const authTestSchema = z.object({
@@ -17,11 +18,13 @@ const authTestSchema = z.object({
 export class SlackSocketBridge {
   readonly #app: SlackApp;
   readonly #store: AgentTagStore;
+  readonly #config: AgentTagConfig;
   readonly #workerId = `slack-outbox-${crypto.randomUUID()}`;
 
-  private constructor(app: SlackApp, store: AgentTagStore) {
+  private constructor(app: SlackApp, store: AgentTagStore, config: AgentTagConfig) {
     this.#app = app;
     this.#store = store;
+    this.#config = config;
   }
 
   static async create(input: {
@@ -65,7 +68,7 @@ export class SlackSocketBridge {
         actions.ingest(body);
       });
     }
-    return new SlackSocketBridge(app, input.store);
+    return new SlackSocketBridge(app, input.store, input.config);
   }
 
   async start(): Promise<void> {
@@ -76,37 +79,12 @@ export class SlackSocketBridge {
     await this.#app.stop();
   }
 
-  async deliverNextOutbox(now = new Date().toISOString()): Promise<boolean> {
-    const claimed = this.#store.claimNextOutbox({
+  async deliverNextOutbox(): Promise<boolean> {
+    return deliverNextSlackOutbox({
+      config: this.#config,
+      store: this.#store,
       workerId: this.#workerId,
-      now,
-      leaseMs: 30_000,
+      postMessage: (message) => this.#app.client.chat.postMessage(message),
     });
-    if (claimed === null) return false;
-    try {
-      const response = await this.#app.client.chat.postMessage({
-        channel: claimed.conversationId,
-        thread_ts: claimed.threadTs,
-        text: claimed.payload.text,
-        ...(claimed.payload.blocks === undefined ? {} : { blocks: claimed.payload.blocks }),
-      });
-      const messageTs = z.string().min(1).parse(response.ts);
-      this.#store.markOutboxDelivered({
-        outboxId: claimed.outboxId,
-        workerId: this.#workerId,
-        slackMessageTs: messageTs,
-        now: new Date().toISOString(),
-      });
-      return true;
-    } catch (error) {
-      this.#store.failOutbox({
-        outboxId: claimed.outboxId,
-        workerId: this.#workerId,
-        errorCode: error instanceof Error ? error.name : "SlackDeliveryError",
-        retryable: false,
-        now: new Date().toISOString(),
-      });
-      throw error;
-    }
   }
 }

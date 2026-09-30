@@ -84,7 +84,7 @@ describe("durable scheduler", () => {
       store = await AgentTagStore.open(path);
       schedules = new AgentTagSchedules({ config, store });
 
-      const afterRestart = new ScheduleWorker({
+      const afterRestart = new ScheduleWorker({ config,
         store,
         workerId: "schedule-a",
         now: () => new Date("2026-09-21T00:02:00.000Z"),
@@ -98,7 +98,7 @@ describe("durable scheduler", () => {
         nextRunAt: "2026-09-21T00:03:00.000Z",
       });
 
-      const overlapping = new ScheduleWorker({
+      const overlapping = new ScheduleWorker({ config,
         store,
         workerId: "schedule-b",
         now: () => new Date("2026-09-21T00:03:00.000Z"),
@@ -125,7 +125,7 @@ describe("durable scheduler", () => {
           now: "2026-09-21T00:03:02.000Z",
         }),
       );
-      const reminderWorker = new ScheduleWorker({
+      const reminderWorker = new ScheduleWorker({ config,
         store,
         workerId: "schedule-c",
         now: () => new Date("2026-09-21T00:04:00.000Z"),
@@ -155,7 +155,7 @@ describe("durable scheduler", () => {
           now: "2026-09-21T00:04:02.000Z",
         }),
       );
-      const skipWorker = new ScheduleWorker({
+      const skipWorker = new ScheduleWorker({ config,
         store,
         workerId: "schedule-d",
         now: () => new Date("2026-09-21T00:05:00.000Z"),

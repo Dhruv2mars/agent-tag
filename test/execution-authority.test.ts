@@ -7,6 +7,8 @@ import { z } from "zod";
 import { agentTagConfigSchema, type AgentTagConfig } from "../src/config.ts";
 import { AgentTagCoordinator } from "../src/coordinator.ts";
 import { InteractionWorker } from "../src/interaction-worker.ts";
+import { AgentTagSchedules, ScheduleWorker } from "../src/scheduler.ts";
+import { deliverNextSlackOutbox } from "../src/slack/outbox.ts";
 import { AgentTagStore } from "../src/store/store.ts";
 
 const now = "2026-09-30T00:00:00.000Z";
@@ -61,6 +63,15 @@ for (const revocation of revocations) {
         threadTs: "1000.000001", actorUserId: "U1", sourceActionId: "action-1",
         response: { decision: "accept" }, now,
       }).kind).toBe("accepted");
+      const schedules = new AgentTagSchedules({ config: originalConfig, store });
+      for (const kind of ["reminder", "agent"] as const) {
+        expect(schedules.create({
+          context: { workspaceId: "T1", actorUserId: "U1", profileId: profile.id, taskId: receipt.taskId },
+          spec: { kind, prompt: "private schedule canary", runAt: now, cadenceSeconds: 60,
+            missedRunPolicy: "run-once", misfireGraceSeconds: 60, overlapPolicy: "skip" },
+          now,
+        }).kind).toBe("accepted");
+      }
       store.close();
       store = await AgentTagStore.open(path);
       const changed = structuredClone(originalConfig);
@@ -77,9 +88,28 @@ for (const revocation of revocations) {
       expect(await worker.processNext()).toMatchObject({ kind: "failed", errorCode: "ExecutionAuthorityDenied" });
       expect(await worker.processNext()).toEqual({ kind: "idle" });
       expect(calls).toBe(0);
+      const scheduleWorker = new ScheduleWorker({ config: currentConfig, store, now: () => new Date(now) });
+      expect((await scheduleWorker.processNext()).kind).toBe("authority-revoked");
+      expect((await scheduleWorker.processNext()).kind).toBe("authority-revoked");
+      expect((await scheduleWorker.processNext()).kind).toBe("idle");
+      expect(store.diagnostics().operations).toBe(1);
+      expect(store.diagnostics().scheduleRuns).toBe(0);
+      expect(store.listSchedules(receipt.taskId).every((schedule) => schedule.state === "cancelled")).toBe(true);
+      let sent = 0;
+      while (await deliverNextSlackOutbox({
+        config: currentConfig, store, workerId: "outbox-worker", now: () => now,
+        postMessage: async (message) => {
+          sent++;
+          expect(message.text).not.toContain("private schedule canary");
+          return { ts: "1000.000010" };
+        },
+      })) {}
+      expect(sent).toBe(revocation.name === "user" ? 2 : 0);
       const audit = store.listAuditRecords({ limit: 100 });
-      expect(audit.filter((row) => JSON.stringify(row.metadata).includes("ExecutionAuthorityDenied"))).toHaveLength(2);
+      expect(audit.filter((row) => (row.action === "operation.failed" || row.action === "interaction.response.failed") && JSON.stringify(row.metadata).includes("ExecutionAuthorityDenied"))).toHaveLength(2);
+      expect(audit.filter((row) => row.action === "schedule.authority-revoked")).toHaveLength(2);
       expect(JSON.stringify(audit)).not.toContain("private request canary");
+      expect(JSON.stringify(audit)).not.toContain("private schedule canary");
     } finally {
       store.close();
       await rm(directory, { recursive: true });

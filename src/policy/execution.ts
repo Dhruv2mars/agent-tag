@@ -8,17 +8,15 @@ export class ExecutionAuthorityDenied extends Error {
   }
 }
 
-export function requireExecutionAuthority(input: {
+export function requireTaskAuthority(input: {
   readonly config: AgentTagConfig;
   readonly task: TaskExecutionBinding;
-  readonly actorUserId: string;
 }): AgentTagConfig["profiles"][number] {
-  const { config, task, actorUserId } = input;
+  const { config, task } = input;
   const profile = config.profiles.find((candidate) => candidate.id === task.profileId);
   const route = config.routes.find((candidate) => candidate.conversationId === task.conversationId);
   if (
     task.workspaceId !== config.slack.workspaceId ||
-    !config.access.allowedUserIds.includes(actorUserId) ||
     !config.access.allowedChannelIds.includes(task.conversationId) ||
     profile === undefined ||
     route === undefined ||
@@ -27,9 +25,23 @@ export function requireExecutionAuthority(input: {
     !profile.repositoryRoots.includes(task.repositoryRoot) ||
     (route.repositoryRoot ?? profile.repositoryRoots[0]) !== task.repositoryRoot ||
     (route.conversationType === "dm" &&
-      (route.ownerUserId !== task.ownerUserId || actorUserId !== task.ownerUserId || !profile.memory.privateDm))
+      (route.ownerUserId !== task.ownerUserId || !config.access.allowedUserIds.includes(route.ownerUserId) || !profile.memory.privateDm))
   ) {
     throw new ExecutionAuthorityDenied();
   }
   return profile;
+}
+
+export function requireExecutionAuthority(input: {
+  readonly config: AgentTagConfig;
+  readonly task: TaskExecutionBinding;
+  readonly actorUserId: string;
+}): AgentTagConfig["profiles"][number] {
+  if (
+    !input.config.access.allowedUserIds.includes(input.actorUserId) ||
+    (input.task.conversationType === "dm" && input.actorUserId !== input.task.ownerUserId)
+  ) {
+    throw new ExecutionAuthorityDenied();
+  }
+  return requireTaskAuthority(input);
 }

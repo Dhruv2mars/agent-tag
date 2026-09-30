@@ -158,6 +158,7 @@ export const AUDIT_ACTIONS = [
   "operation.failed",
   "operation.turn-text.resolved",
   "schedule.cancelled",
+  "schedule.authority-revoked",
   "schedule.claimed",
   "schedule.created",
   "schedule.denied",
@@ -1164,6 +1165,23 @@ export class AgentTagStore {
       return true;
     });
     return cancel.immediate();
+  }
+
+  revokeClaimedSchedule(input: { readonly scheduleId: string; readonly workerId: string; readonly now: string }): void {
+    const now = isoDateTime.parse(input.now);
+    const revoke = this.#database.transaction(() => {
+      const result = this.#database.query(
+        `UPDATE schedules SET state = 'cancelled', lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+         WHERE schedule_id = ? AND state = 'active' AND lease_owner = ? AND lease_expires_at > ?`,
+      ).run(now, requiredId(input.scheduleId, "scheduleId"), requiredId(input.workerId, "workerId"), now);
+      if (result.changes !== 1) throw new Error("schedule lease is missing, expired, or cancelled");
+      writeAudit(this.#database, {
+        actorType: "worker", actorId: input.workerId, authority: "schedule-dispatch",
+        source: input.scheduleId, target: input.scheduleId, action: "schedule.authority-revoked",
+        result: "cancelled", correlationId: input.scheduleId, metadata: {}, createdAt: now,
+      });
+    });
+    revoke.immediate();
   }
 
   claimDueSchedule(input: {

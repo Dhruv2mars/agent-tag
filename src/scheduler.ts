@@ -1,5 +1,6 @@
 import { z } from "zod";
 
+import { ExecutionAuthorityDenied, requireExecutionAuthority } from "./policy/execution.ts";
 import type { AgentTagConfig } from "./config.ts";
 import type { AgentTagStore, ClaimedSchedule, ScheduleSummary } from "./store/store.ts";
 
@@ -136,7 +137,7 @@ export class AgentTagSchedules {
 export type ScheduleWorkerOutcome =
   | { readonly kind: "idle" }
   | {
-      readonly kind: "dispatched" | "missed-skipped" | "overlap-skipped";
+      readonly kind: "dispatched" | "missed-skipped" | "overlap-skipped" | "authority-revoked";
       readonly scheduleId: string;
       readonly dueAt: string;
     };
@@ -157,18 +158,21 @@ function slackOrderKey(date: Date): string {
 }
 
 export class ScheduleWorker {
+  readonly #config: AgentTagConfig;
   readonly #store: AgentTagStore;
   readonly #workerId: string;
   readonly #leaseMs: number;
   readonly #now: () => Date;
 
   constructor(input: {
+    readonly config: AgentTagConfig;
     readonly store: AgentTagStore;
     readonly workerId?: string;
     readonly leaseMs?: number;
     readonly now?: () => Date;
   }) {
     this.#store = input.store;
+    this.#config = input.config;
     this.#workerId = input.workerId ?? `schedule-worker-${crypto.randomUUID()}`;
     this.#leaseMs = input.leaseMs ?? 30_000;
     this.#now = input.now ?? (() => new Date());
@@ -182,6 +186,15 @@ export class ScheduleWorker {
       leaseMs: this.#leaseMs,
     });
     if (schedule === null) return { kind: "idle" };
+    try {
+      requireExecutionAuthority({
+        config: this.#config, task: this.#store.getTaskExecution(schedule.taskId), actorUserId: schedule.actorUserId,
+      });
+    } catch (error) {
+      if (!(error instanceof ExecutionAuthorityDenied)) throw error;
+      this.#store.revokeClaimedSchedule({ scheduleId: schedule.scheduleId, workerId: this.#workerId, now: current.toISOString() });
+      return { kind: "authority-revoked", scheduleId: schedule.scheduleId, dueAt: schedule.dueAt };
+    }
     const next = nextRunAt(schedule, current);
     const misfired =
       current.getTime() >

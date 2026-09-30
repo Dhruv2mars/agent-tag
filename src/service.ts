@@ -211,7 +211,7 @@ export async function createAgentTagService(input: {
       bridge,
       coordinators,
       interactionWorkers: [new InteractionWorker({ store, config: input.config, t3Config: input.config.t3 })],
-      scheduleWorkers: [new ScheduleWorker({ store })],
+      scheduleWorkers: [new ScheduleWorker({ config: input.config, store })],
       maintenanceWorkers: [
         {
           processNext: async () => {
