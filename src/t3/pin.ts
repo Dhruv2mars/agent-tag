@@ -1,5 +1,7 @@
 import { z } from "zod";
 
+import type { SecretString } from "../security/secret-file.ts";
+
 const pinSchema = z.object({
   version: z.string().min(1),
   tag: z.string().min(1),
@@ -73,19 +75,24 @@ export function compareRemotePin(input: {
   return failures;
 }
 
-async function fetchJson(url: string): Promise<unknown> {
+async function fetchJson(url: string, githubToken?: SecretString): Promise<unknown> {
   const response = await fetch(url, {
-    headers: { accept: "application/json", "user-agent": "agent-tag-pin-check" },
+    headers: {
+      accept: "application/json",
+      "user-agent": "agent-tag-pin-check",
+      ...(githubToken === undefined ? {} : { authorization: `Bearer ${githubToken.exposeToBoundary()}` }),
+    },
+    redirect: "error",
   });
   if (!response.ok) throw new Error(`${url} returned HTTP ${response.status}`);
   const body: unknown = await response.json();
   return body;
 }
 
-export async function verifyRemotePin(pin: T3Pin): Promise<void> {
+export async function verifyRemotePin(pin: T3Pin, githubToken?: SecretString): Promise<void> {
   const repository = new URL(pin.sourceUrl).pathname.replace(/^\//, "");
   const [githubRelease, npmManifest] = await Promise.all([
-    fetchJson(`https://api.github.com/repos/${repository}/releases/tags/${pin.tag}`),
+    fetchJson(`https://api.github.com/repos/${repository}/releases/tags/${pin.tag}`, githubToken),
     fetchJson(`https://registry.npmjs.org/${pin.npm.package}/${pin.version}`),
   ]);
   const failures = compareRemotePin({ pin, githubRelease, npmManifest });

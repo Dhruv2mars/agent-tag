@@ -34,4 +34,6 @@ jobs:
       - name: Run typecheck and tests
         run: bun run check
       - name: Verify the T3 release pin
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: bun run verify:t3-pin

@@ -1,7 +1,8 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { resolve } from "node:path";
 
-import { compareRemotePin, parseT3Pin } from "../src/t3/pin.ts";
+import { SecretString } from "../src/security/secret-file.ts";
+import { compareRemotePin, parseT3Pin, verifyRemotePin } from "../src/t3/pin.ts";
 
 const pinPath = resolve(import.meta.dir, "..", "t3.lock.json");
 const pin = parseT3Pin(await Bun.file(pinPath).json());
@@ -24,6 +25,20 @@ function matchingManifest(): unknown {
 }
 
 describe("T3 release pin", () => {
+  test("uses the CI credential only for GitHub and refuses redirects", async () => {
+    const requests: { origin: string; authorization: string | null; redirect: RequestRedirect | undefined }[] = [];
+    const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(Object.assign(async (...[url, init]: Parameters<typeof fetch>) => {
+      const origin = new URL(String(url)).origin;
+      requests.push({ origin, authorization: new Headers(init?.headers).get("authorization"), redirect: init?.redirect });
+      return Response.json(origin === "https://api.github.com" ? matchingRelease() : matchingManifest());
+    }, { preconnect: fetch.preconnect }));
+    try {
+      await verifyRemotePin(pin, new SecretString("ci-test-canary"));
+      expect(requests).toContainEqual({ origin: "https://api.github.com", authorization: "Bearer ci-test-canary", redirect: "error" });
+      expect(requests).toContainEqual({ origin: "https://registry.npmjs.org", authorization: null, redirect: "error" });
+    } finally { fetchSpy.mockRestore(); }
+  });
+
   test("accepts matching release metadata", () => {
     expect(
       compareRemotePin({
