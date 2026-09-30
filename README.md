@@ -4,6 +4,8 @@ Agent Tag is an open-source Slack coworker that delegates work to agents running
 
 This repository is under active development. It is not yet generally available. See [the acceptance matrix](docs/ga-acceptance.md) for the evidence required before that claim changes.
 
+For a concise continuation guide, current verified behavior, and the next required work, read [project status](docs/project-status.md).
+
 ## Development
 
 Requirements:
