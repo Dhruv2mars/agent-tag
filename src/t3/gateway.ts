@@ -22,6 +22,24 @@ const modelSelection = z.object({ instanceId: id, model: id });
 const runtimeMode = z.enum(["approval-required", "auto-accept-edits", "auto", "full-access"]);
 const interactionMode = z.enum(["default", "plan"]);
 
+const attachmentBase = z.object({
+  id,
+  name: z.string().trim().min(1).max(255),
+  mimeType: z.string().trim().min(1).max(100),
+});
+export const t3AttachmentSchema = z.discriminatedUnion("type", [
+  attachmentBase.extend({
+    type: z.literal("image"),
+    mimeType: z.enum(["image/gif", "image/jpeg", "image/png", "image/webp"]),
+    sizeBytes: z.number().int().positive().max(10 * 1024 * 1024),
+  }),
+  attachmentBase.extend({
+    type: z.literal("file"),
+    sizeBytes: z.number().int().positive().max(50 * 1024 * 1024),
+  }),
+]);
+export type T3Attachment = z.infer<typeof t3AttachmentSchema>;
+
 const projectCreateCommand = z.object({
   type: z.literal("project.create"),
   commandId: id,
@@ -48,7 +66,7 @@ const turnStartCommand = z.object({
     messageId: id,
     role: z.literal("user"),
     text: z.string(),
-    attachments: z.array(z.unknown()).max(8),
+    attachments: z.array(t3AttachmentSchema).max(8),
   }),
   modelSelection: modelSelection.optional(),
   titleSeed: id.optional(),
@@ -385,7 +403,18 @@ const subscribeThreadRpc = Rpc.make("orchestration.subscribeThread", {
   error: Schema.Unknown,
   stream: true,
 });
-const rpcGroup = RpcGroup.make(probeRpc, configRpc, dispatchRpc, subscribeThreadRpc);
+const attachmentUploadRpc = Rpc.make("attachments.createUploadUrl", {
+  payload: Schema.Unknown, success: Schema.Unknown, error: Schema.Unknown,
+});
+const attachmentDeleteRpc = Rpc.make("attachments.delete", {
+  payload: Schema.Unknown, error: Schema.Unknown,
+});
+const assetUrlRpc = Rpc.make("assets.createUrl", {
+  payload: Schema.Unknown, success: Schema.Unknown, error: Schema.Unknown,
+});
+const rpcGroup = RpcGroup.make(
+  probeRpc, configRpc, dispatchRpc, subscribeThreadRpc, attachmentUploadRpc, attachmentDeleteRpc, assetUrlRpc,
+);
 
 export interface T3ConnectionConfig {
   readonly baseUrl: string;
@@ -487,6 +516,106 @@ export async function watchT3Thread(input: {
       ),
     );
     yield* Effect.raceFirst(consume, abortEffect(input.signal));
+  }).pipe(Effect.provide(protocolLayer(url)), Effect.scoped);
+  await Effect.runPromise(program);
+}
+
+class T3AssetTransferError extends Error {
+  constructor() {
+    super("T3 asset transfer failed");
+    this.name = "T3AssetTransferError";
+  }
+}
+
+function assetTransferUrl(relativeUrl: string, config: T3ConnectionConfig, prefix: string): URL {
+  const url = new URL(relativeUrl, config.baseUrl);
+  if (
+    !relativeUrl.startsWith(`${prefix}/`) ||
+    url.origin !== new URL(config.baseUrl).origin ||
+    !url.pathname.startsWith(`${prefix}/`)
+  ) throw new T3AssetTransferError();
+  return url;
+}
+
+export async function uploadT3Attachment(input: {
+  readonly config: T3ConnectionConfig;
+  readonly type: T3Attachment["type"];
+  readonly name: string;
+  readonly mimeType: string;
+  readonly data: Blob;
+}): Promise<T3Attachment> {
+  const attachment = t3AttachmentSchema.parse({
+    type: input.type, id: "pending", name: input.name, mimeType: input.mimeType, sizeBytes: input.data.size,
+  });
+  const url = await socketUrl(input.config);
+  const program = Effect.gen(function* () {
+    const client = yield* RpcClient.make(rpcGroup);
+    return z.object({ attachmentId: id, relativeUrl: id }).parse(yield* client["attachments.createUploadUrl"]({
+      type: attachment.type, name: attachment.name, mimeType: attachment.mimeType, sizeBytes: attachment.sizeBytes,
+    }));
+  }).pipe(Effect.provide(protocolLayer(url)), Effect.scoped);
+  const upload = await Effect.runPromise(program);
+  try {
+    const response = await fetch(assetTransferUrl(upload.relativeUrl, input.config, "/api/attachments/upload"), {
+      method: "POST", body: input.data, redirect: "error", signal: AbortSignal.timeout(30_000),
+      headers: { "content-type": attachment.mimeType },
+    });
+    if (!response.ok) throw new T3AssetTransferError();
+    return { ...attachment, id: upload.attachmentId };
+  } catch {
+    await deletePendingT3Attachment({ config: input.config, attachmentId: upload.attachmentId }).catch(() => undefined);
+    // Signed URLs contain bearer authority and must never appear in error output.
+    throw new T3AssetTransferError();
+  }
+}
+
+export async function downloadT3Attachment(input: {
+  readonly config: T3ConnectionConfig;
+  readonly attachment: T3Attachment;
+}): Promise<Uint8Array> {
+  const attachment = t3AttachmentSchema.parse(input.attachment);
+  const url = await socketUrl(input.config);
+  const program = Effect.gen(function* () {
+    const client = yield* RpcClient.make(rpcGroup);
+    return z.object({ relativeUrl: id }).parse(yield* client["assets.createUrl"]({
+      resource: { _tag: "attachment", attachmentId: attachment.id, fileName: attachment.name, mimeType: attachment.mimeType },
+    }));
+  }).pipe(Effect.provide(protocolLayer(url)), Effect.scoped);
+  const asset = await Effect.runPromise(program);
+  try {
+    const response = await fetch(assetTransferUrl(asset.relativeUrl, input.config, "/api/assets"), {
+      redirect: "error", signal: AbortSignal.timeout(30_000),
+    });
+    if (!response.ok || response.body === null) throw new T3AssetTransferError();
+    const reader = response.body.getReader();
+    const chunks: Uint8Array[] = [];
+    let length = 0;
+    try {
+      while (true) {
+        const chunk = await reader.read();
+        if (chunk.done) break;
+        length += chunk.value.byteLength;
+        if (length > attachment.sizeBytes) throw new T3AssetTransferError();
+        chunks.push(chunk.value);
+      }
+    } finally { await reader.cancel(); }
+    if (length !== attachment.sizeBytes) throw new T3AssetTransferError();
+    const bytes = new Uint8Array(length);
+    let offset = 0;
+    for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+    return bytes;
+  } catch { throw new T3AssetTransferError(); }
+}
+
+export async function deletePendingT3Attachment(input: {
+  readonly config: T3ConnectionConfig;
+  readonly attachmentId: string;
+}): Promise<void> {
+  const attachmentId = id.parse(input.attachmentId);
+  const url = await socketUrl(input.config);
+  const program = Effect.gen(function* () {
+    const client = yield* RpcClient.make(rpcGroup);
+    yield* client["attachments.delete"]({ attachmentId });
   }).pipe(Effect.provide(protocolLayer(url)), Effect.scoped);
   await Effect.runPromise(program);
 }

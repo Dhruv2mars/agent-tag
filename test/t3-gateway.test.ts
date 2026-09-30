@@ -4,6 +4,7 @@ import {
   pendingT3Approvals,
   pendingT3UserInputs,
   t3CommandSchema,
+  t3AttachmentSchema,
   type T3ThreadSnapshot,
 } from "../src/t3/gateway.ts";
 
@@ -34,6 +35,18 @@ describe("T3 gateway command boundary", () => {
         createdAt: "2026-09-21T00:00:00.000Z",
       }),
     ).toThrow("Too big");
+  });
+
+  test("rejects unsupported images and oversized or malformed file metadata", () => {
+    const attachment = { type: "file" as const, id: "attachment-1", name: "report.txt", mimeType: "text/plain", sizeBytes: 10 };
+    expect(t3AttachmentSchema.parse(attachment)).toEqual(attachment);
+    for (const invalid of [
+      { ...attachment, sizeBytes: 0 },
+      { ...attachment, sizeBytes: 50 * 1024 * 1024 + 1 },
+      { ...attachment, type: "image", mimeType: "image/svg+xml" },
+      { ...attachment, type: "image", mimeType: "image/png", sizeBytes: 10 * 1024 * 1024 + 1 },
+      { ...attachment, id: "" },
+    ]) expect(t3AttachmentSchema.safeParse(invalid).success).toBe(false);
   });
 
   test("reduces resolved approvals out of a thread snapshot", () => {

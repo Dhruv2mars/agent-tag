@@ -11,6 +11,9 @@ import { ProviderSelectionError, validateConfiguredProviders } from "../src/poli
 import { AgentTagStore } from "../src/store/store.ts";
 import {
   dispatchT3Command,
+  uploadT3Attachment,
+  downloadT3Attachment,
+  deletePendingT3Attachment,
   fetchT3ThreadSnapshot,
   inspectT3,
   pendingT3Approvals,
@@ -135,6 +138,21 @@ if (!enabled) {
         expect(error.profileId).toBe("claude-profile");
       }
     });
+
+    test("round trips pending image and file attachments with restricted scopes", async () => {
+      const fixtures = [
+        { type: "file", name: "fixture.txt", mimeType: "text/plain", bytes: new TextEncoder().encode("attachment-fixture-ok") },
+        { type: "image", name: "fixture.png", mimeType: "image/png", bytes: Uint8Array.from(atob("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+j2Z0AAAAASUVORK5CYII="), (char) => char.charCodeAt(0)) },
+      ] as const;
+      for (const fixture of fixtures) {
+        const attachment = await uploadT3Attachment({ config, ...fixture, data: new Blob([fixture.bytes]) });
+        try {
+          expect(attachment).toMatchObject({ type: fixture.type, name: fixture.name, sizeBytes: fixture.bytes.length });
+          expect(await downloadT3Attachment({ config, attachment })).toEqual(fixture.bytes);
+        } finally { await deletePendingT3Attachment({ config, attachmentId: attachment.id }); }
+        await expect(downloadT3Attachment({ config, attachment })).rejects.toThrow();
+      }
+    }, 30_000);
 
     test("returns the same receipt sequence for a replayed command id", async () => {
       const workspaceRoot = await mkdtemp(join(tmpdir(), "agent-tag-t3-project-"));
