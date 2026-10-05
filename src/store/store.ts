@@ -1605,10 +1605,17 @@ export class AgentTagStore {
                    AND (earlier.source_order_key < o.source_order_key OR
                      (earlier.source_order_key = o.source_order_key AND earlier.operation_id < o.operation_id))
                )
+               AND NOT EXISTS (
+                 SELECT 1 FROM operations active
+                 WHERE active.task_id = o.task_id
+                   AND active.operation_id <> o.operation_id
+                   AND active.status = 'inflight'
+                   AND active.lease_expires_at > ?
+               )
              ORDER BY o.source_order_key, o.operation_id
              LIMIT 1`,
           )
-          .get(now, now),
+          .get(now, now, now),
       );
       if (identity === null) return null;
       const updated = this.#database

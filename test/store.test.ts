@@ -351,6 +351,56 @@ describe("Agent Tag durable store", () => {
     }
   });
 
+  test("never leases a delayed earlier message while the same task holds an active lease", async () => {
+    await withStore(({ store }) => {
+      const later = store.ingestSlackEvent(
+        slackEvent({ deliveryId: "delivery-later", eventKey: "C1:1000.0005", sourceOrderKey: "1000.0005" }),
+      );
+      const running = store.claimNextOperation({
+        workerId: "worker-a",
+        now: firstAt,
+        leaseMs: 10_000,
+        maxConcurrentTasks: 2,
+      });
+      expect(running?.operationId).toBe(later.operationId);
+      if (running === null) throw new Error("later operation was not claimable");
+
+      const delayed = store.ingestSlackEvent(
+        slackEvent({
+          deliveryId: "delivery-delayed",
+          eventKey: "C1:1000.0002",
+          text: "Delayed earlier message",
+          sourceOrderKey: "1000.0002",
+          receivedAt: beforeExpiry,
+        }),
+      );
+      expect(delayed.taskId).toBe(later.taskId);
+      expect(
+        store.claimNextOperation({
+          workerId: "worker-b",
+          now: beforeExpiry,
+          leaseMs: 10_000,
+          maxConcurrentTasks: 2,
+        }),
+      ).toBeNull();
+
+      store.completeOperation({
+        operationId: running.operationId,
+        workerId: "worker-a",
+        resultSequence: 1,
+        now: beforeExpiry,
+      });
+      expect(
+        store.claimNextOperation({
+          workerId: "worker-b",
+          now: beforeExpiry,
+          leaseMs: 10_000,
+          maxConcurrentTasks: 2,
+        })?.operationId,
+      ).toBe(delayed.operationId);
+    });
+  });
+
   test("enforces the global active-task bound", async () => {
     await withStore(({ store }) => {
       store.ingestSlackEvent(slackEvent());
