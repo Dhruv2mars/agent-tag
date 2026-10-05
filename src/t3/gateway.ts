@@ -465,6 +465,7 @@ export async function dispatchT3Command(input: {
 export async function fetchT3ThreadSnapshot(input: {
   readonly config: T3ConnectionConfig;
   readonly threadId: string;
+  readonly signal?: AbortSignal;
 }): Promise<T3ThreadSnapshot> {
   const threadId = id.parse(input.threadId);
   const token = await readSecretFile(input.config.tokenFile);
@@ -473,6 +474,7 @@ export async function fetchT3ThreadSnapshot(input: {
   const url = new URL(`/api/orchestration/threads/${encodeURIComponent(threadId)}`, input.config.baseUrl);
   const response = await fetch(url, {
     headers: { authorization: `Bearer ${token.exposeToBoundary()}` },
+    ...(input.signal === undefined ? {} : { signal: input.signal }),
   });
   if (!response.ok) throw new Error(`T3 thread snapshot endpoint returned HTTP ${response.status}`);
   const raw: unknown = await response.json();

@@ -14,7 +14,8 @@ interface ServiceWorkerOutcome {
 }
 
 export interface ServiceWorker {
-  readonly processNext: () => Promise<ServiceWorkerOutcome>;
+  /** The signal aborts when the service stops; long-running work should release durable leases promptly. */
+  readonly processNext: (signal: AbortSignal) => Promise<ServiceWorkerOutcome>;
 }
 
 export interface ServiceSlackBridge {
@@ -156,7 +157,7 @@ export class AgentTagService {
   async #runWorkerLoop(name: string, worker: ServiceWorker, signal: AbortSignal): Promise<void> {
     while (!signal.aborted) {
       try {
-        const outcome = await worker.processNext();
+        const outcome = await worker.processNext(signal);
         if (outcome.kind !== "idle") {
           this.#log({ level: "info", event: "worker.outcome", worker: name, outcome: outcome.kind });
         }

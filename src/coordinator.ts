@@ -17,7 +17,7 @@ import {
 
 export interface T3CoordinatorGateway {
   readonly dispatch: (command: T3Command) => Promise<T3DispatchResult>;
-  readonly fetchThread: (threadId: string) => Promise<T3ThreadSnapshot>;
+  readonly fetchThread: (threadId: string, signal?: AbortSignal) => Promise<T3ThreadSnapshot>;
 }
 
 export type CoordinatorOutcome =
@@ -32,6 +32,7 @@ export type CoordinatorOutcome =
       readonly questionCount: number;
     }
   | { readonly kind: "retry-scheduled"; readonly operationId: string; readonly errorCode: string }
+  | { readonly kind: "released"; readonly operationId: string }
   | { readonly kind: "failed"; readonly operationId: string; readonly outboxId: string; readonly errorCode: string };
 
 export interface CoordinatorOptions {
@@ -71,7 +72,8 @@ function turnTextWithMemory(
 function defaultT3Gateway(config: T3ConnectionConfig): T3CoordinatorGateway {
   return {
     dispatch: (command) => dispatchT3Command({ config, command }),
-    fetchThread: (threadId) => fetchT3ThreadSnapshot({ config, threadId }),
+    fetchThread: (threadId, signal) =>
+      fetchT3ThreadSnapshot({ config, threadId, ...(signal === undefined ? {} : { signal }) }),
   };
 }
 
@@ -87,6 +89,36 @@ class CoordinatorFailure extends Error {
     this.name = code;
     this.userMessage = userMessage;
   }
+}
+
+class CoordinatorAborted extends Error {
+  constructor() {
+    super("coordinator processing was aborted");
+    this.name = "CoordinatorAborted";
+  }
+}
+
+/** Settles with the promise, or rejects as soon as the signal aborts. */
+function abortable<T>(promise: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+  if (signal === undefined) return promise;
+  if (signal.aborted) {
+    promise.catch(() => {});
+    return Promise.reject(new CoordinatorAborted());
+  }
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(new CoordinatorAborted());
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
+  });
 }
 
 class T3TurnStalled extends Error {
@@ -219,7 +251,12 @@ export class AgentTagCoordinator {
     this.#sleep = options.sleep ?? ((milliseconds) => Bun.sleep(milliseconds));
   }
 
-  async processNext(): Promise<CoordinatorOutcome> {
+  /**
+   * Claims and drives one operation. When `signal` aborts (service shutdown), in-flight T3 calls and
+   * polling stop promptly and the lease is released so the operation resumes after restart.
+   */
+  async processNext(signal?: AbortSignal): Promise<CoordinatorOutcome> {
+    if (signal?.aborted) return { kind: "idle" };
     const operation = this.#store.claimNextOperation({
       workerId: this.#workerId,
       now: this.#now().toISOString(),
@@ -229,8 +266,16 @@ export class AgentTagCoordinator {
     if (operation === null) return { kind: "idle" };
 
     try {
-      return await this.#run(operation);
+      return await this.#run(operation, signal);
     } catch (error) {
+      if (signal?.aborted) {
+        this.#store.releaseOperation({
+          operationId: operation.operationId,
+          workerId: this.#workerId,
+          now: this.#now().toISOString(),
+        });
+        return { kind: "released", operationId: operation.operationId };
+      }
       const stalledTurn = this.#config.limits.stalledTurn;
       if (error instanceof T3TurnStalled && operation.attempt < stalledTurn.maxAttempts) {
         const now = this.#now();
@@ -291,7 +336,7 @@ export class AgentTagCoordinator {
     }
   }
 
-  async #run(operation: ClaimedOperation): Promise<CoordinatorOutcome> {
+  async #run(operation: ClaimedOperation, signal: AbortSignal | undefined): Promise<CoordinatorOutcome> {
     const task = this.#store.getTaskExecution(operation.taskId);
     const profile = requireExecutionAuthority({
       config: this.#config,
@@ -318,7 +363,7 @@ export class AgentTagCoordinator {
       proposedText: turnTextWithMemory(operation.payload.text, memories),
       now: this.#now().toISOString(),
     });
-    await this.#t3.dispatch({
+    await abortable(this.#t3.dispatch({
       type: "project.create",
       commandId: `${task.projectOwnerTaskId}:project.create`,
       projectId: task.projectId,
@@ -326,9 +371,9 @@ export class AgentTagCoordinator {
       workspaceRoot: task.repositoryRoot,
       defaultModelSelection: modelSelection,
       createdAt: task.projectCreatedAt,
-    });
+    }), signal);
 
-    const turn = await this.#t3.dispatch({
+    const turn = await abortable(this.#t3.dispatch({
       type: "thread.turn.start",
       commandId: operation.commandId,
       threadId: task.threadId,
@@ -365,7 +410,7 @@ export class AgentTagCoordinator {
             },
           }),
       createdAt: this.#now().toISOString(),
-    });
+    }), signal);
     this.#store.markT3ThreadStarted({ taskId: task.taskId, now: this.#now().toISOString() });
     this.#store.enqueueOutbox({
       taskId: operation.taskId,
@@ -407,6 +452,7 @@ export class AgentTagCoordinator {
     const startedAt = this.#now().getTime();
     let renewAt = startedAt + Math.floor(this.#leaseMs / 2);
     while (this.#now().getTime() - startedAt <= this.#maxWaitMs) {
+      if (signal?.aborted) throw new CoordinatorAborted();
       if (this.#now().getTime() >= renewAt) {
         this.#store.renewOperationLease({
           operationId: operation.operationId,
@@ -416,9 +462,9 @@ export class AgentTagCoordinator {
         });
         renewAt = this.#now().getTime() + Math.floor(this.#leaseMs / 2);
       }
-      const snapshot = await this.#t3.fetchThread(task.threadId);
+      const snapshot = await abortable(this.#t3.fetchThread(task.threadId, signal), signal);
       if (task.threadStarted && !snapshotHasCurrentTurn(snapshot, operation.messageId)) {
-        await this.#sleep(this.#pollMs);
+        await abortable(this.#sleep(this.#pollMs), signal);
         continue;
       }
       const approvals = pendingT3Approvals(snapshot);
@@ -500,7 +546,7 @@ export class AgentTagCoordinator {
         });
         return { kind: "completed", operationId: operation.operationId, outboxId };
       }
-      await this.#sleep(this.#pollMs);
+      await abortable(this.#sleep(this.#pollMs), signal);
     }
     throw new T3TurnStalled();
   }

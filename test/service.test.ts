@@ -3,6 +3,8 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { agentTagConfigSchema } from "../src/config.ts";
+import { AgentTagCoordinator } from "../src/coordinator.ts";
 import {
   AgentTagService,
   type ServiceLogRecord,
@@ -19,11 +21,14 @@ async function eventually(assertion: () => boolean): Promise<void> {
   throw new Error("condition did not become true");
 }
 
-async function withStore(run: (store: AgentTagStore) => Promise<void>): Promise<void> {
+async function withStore(
+  run: (store: AgentTagStore, path: string) => Promise<void>,
+): Promise<void> {
   const directory = await mkdtemp(join(tmpdir(), "agent-tag-service-"));
-  const store = await AgentTagStore.open(join(directory, "agent-tag.sqlite"));
+  const path = join(directory, "agent-tag.sqlite");
+  const store = await AgentTagStore.open(path);
   try {
-    await run(store);
+    await run(store, path);
   } finally {
     if (!directory.startsWith(`${tmpdir()}/agent-tag-service-`)) {
       throw new Error(`refusing to remove unexpected fixture path ${directory}`);
@@ -143,6 +148,104 @@ describe("Agent Tag service", () => {
       expect(logs).toContainEqual(
         expect.objectContaining({ event: "worker.failed", worker: "coordinator-1", errorCode: "Error" }),
       );
+    });
+  });
+
+  test("stop releases a coordinator lease promptly while a T3 turn is still unsettled", async () => {
+    await withStore(async (store, path) => {
+      const config = agentTagConfigSchema.parse({
+        version: 1,
+        dataDir: "/var/lib/agent-tag",
+        t3: { baseUrl: "http://127.0.0.1:37841", tokenFile: "/var/lib/agent-tag/t3-token" },
+        slack: {
+          workspaceId: "T1",
+          appTokenFile: "/var/lib/agent-tag/slack-app-token",
+          botTokenFile: "/var/lib/agent-tag/slack-bot-token",
+        },
+        access: { allowedUserIds: ["U1"], allowedChannelIds: ["C1"] },
+        profiles: [
+          {
+            id: "engineering",
+            repositoryRoots: ["/srv/repos/example"],
+            baseBranch: "main",
+            defaultProviderInstanceId: "codex",
+            defaultModel: "gpt-5.6-sol",
+            runtimeMode: "approval-required",
+            isolation: { mode: "trusted-same-user", acknowledgedSharedMachineAccess: true },
+            externalWrites: { mode: "deny" },
+            memory: { shared: true, privateDm: false, retentionDays: 180 },
+          },
+        ],
+        routes: [{ conversationId: "C1", profileId: "engineering" }],
+        limits: { maxConcurrentTasks: 1, stalledTurn: { timeoutSeconds: 3_600, retryDelaySeconds: 10, maxAttempts: 2 } },
+      });
+      const receipt = store.ingestSlackEvent({
+        deliveryId: "delivery-1",
+        eventKey: "C1:1000.000001",
+        workspaceId: "T1",
+        conversationId: "C1",
+        threadTs: "1000.000001",
+        actorUserId: "U1",
+        conversationType: "channel",
+        profileId: "engineering",
+        repositoryRoot: "/srv/repos/example",
+        text: "request",
+        receivedAt: new Date().toISOString(),
+        sourceOrderKey: "1000.000001",
+      });
+      let polls = 0;
+      const coordinator = new AgentTagCoordinator({
+        config,
+        store,
+        workerId: "coordinator-a",
+        pollMs: 60_000,
+        t3: {
+          dispatch: async () => ({ sequence: 1 }),
+          // The turn never settles: each poll hangs until the caller gives up.
+          fetchThread: (_threadId, signal) => {
+            polls += 1;
+            return new Promise((_resolve, reject) => {
+              signal?.addEventListener("abort", () => reject(new Error("fetch aborted")), { once: true });
+            });
+          },
+        },
+      });
+      const service = new AgentTagService({
+        store,
+        bridge: { start: async () => {}, stop: async () => {}, deliverNextOutbox: async () => false },
+        coordinators: [coordinator],
+        interactionWorkers: [{ processNext: async () => ({ kind: "idle" }) }],
+        idleMs: 1,
+        logger: () => {},
+      });
+      await service.start();
+      await eventually(() => polls >= 1);
+
+      const startedStop = Date.now();
+      const stopped = await Promise.race([
+        service.stop().then(() => "stopped" as const),
+        Bun.sleep(2_000).then(() => "timed-out" as const),
+      ]);
+      expect(stopped).toBe("stopped");
+      expect(Date.now() - startedStop).toBeLessThan(2_000);
+
+      const reopened = await AgentTagStore.open(path);
+      try {
+        const resumed = reopened.claimNextOperation({
+          workerId: "coordinator-b",
+          now: new Date().toISOString(),
+          leaseMs: 10_000,
+          maxConcurrentTasks: 1,
+        });
+        expect(resumed).toMatchObject({
+          operationId: receipt.operationId,
+          commandId: receipt.commandId,
+          attempt: 1,
+        });
+        expect(reopened.operationalStatus(new Date().toISOString()).operations.stalledFailed).toBe(0);
+      } finally {
+        reopened.close();
+      }
     });
   });
 });

@@ -156,6 +156,7 @@ export const AUDIT_ACTIONS = [
   "operation.completed",
   "operation.deferred",
   "operation.failed",
+  "operation.released",
   "operation.turn-text.resolved",
   "schedule.cancelled",
   "schedule.authority-revoked",
@@ -1918,6 +1919,42 @@ export class AgentTagStore {
       });
     });
     defer.immediate();
+  }
+
+  /**
+   * Returns an in-progress operation to the queue without counting the attempt, e.g. on service
+   * shutdown. The stable command and message ids let the next owner resume the same T3 turn.
+   */
+  releaseOperation(input: {
+    readonly operationId: string;
+    readonly workerId: string;
+    readonly now: string;
+  }): boolean {
+    const now = isoDateTime.parse(input.now);
+    const release = this.#database.transaction(() => {
+      const result = this.#database
+        .query(
+          `UPDATE operations SET status = 'pending', attempts = MAX(attempts - 1, 0), blocked_until = NULL,
+             lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+           WHERE operation_id = ? AND status = 'inflight' AND lease_owner = ? AND lease_expires_at > ?`,
+        )
+        .run(now, requiredId(input.operationId, "operationId"), requiredId(input.workerId, "workerId"), now);
+      if (result.changes !== 1) return false;
+      writeAudit(this.#database, {
+        actorType: "worker",
+        actorId: input.workerId,
+        authority: "operation-dispatch",
+        source: input.operationId,
+        target: input.operationId,
+        action: "operation.released",
+        result: "pending",
+        correlationId: input.operationId,
+        metadata: { reason: "shutdown" },
+        createdAt: now,
+      });
+      return true;
+    });
+    return release.immediate();
   }
 
   failOperation(input: {

@@ -699,4 +699,65 @@ describe("Agent Tag coordinator", () => {
       await rm(directory, { recursive: true });
     }
   });
+
+  test("releases the lease without failing when shutdown aborts an unsettled poll", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "agent-tag-coordinator-abort-"));
+    const store = await AgentTagStore.open(join(directory, "agent-tag.sqlite"));
+    let threadId = "not-dispatched";
+    let messageId = "not-dispatched";
+    const controller = new AbortController();
+    const coordinator = new AgentTagCoordinator({
+      config,
+      store,
+      t3: {
+        dispatch: async (command) => {
+          if (command.type === "thread.turn.start") {
+            threadId = command.threadId;
+            messageId = command.message.messageId;
+          }
+          return { sequence: 1 };
+        },
+        fetchThread: async () => runningSnapshot(threadId, messageId),
+      },
+      workerId: "worker-a",
+      now: () => new Date(now),
+      // A poll interval that never elapses on its own; only the abort can end it.
+      sleep: () => {
+        queueMicrotask(() => controller.abort());
+        return new Promise(() => {});
+      },
+    });
+    try {
+      const receipt = store.ingestSlackEvent({
+        deliveryId: "delivery-1",
+        eventKey: "C1:1000.000001",
+        workspaceId: "T1",
+        conversationId: "C1",
+        threadTs: "1000.000001",
+        actorUserId: "U1",
+        conversationType: "channel",
+        profileId: "engineering",
+        repositoryRoot: "/srv/repos/example",
+        text: "request",
+        receivedAt: now,
+        sourceOrderKey: "1000.000001",
+      });
+      expect(await coordinator.processNext(controller.signal)).toEqual({
+        kind: "released",
+        operationId: receipt.operationId,
+      });
+      expect(await coordinator.processNext(controller.signal)).toEqual({ kind: "idle" });
+      // Only the progress reply was queued; no failure reply.
+      expect(store.diagnostics().outbox).toBe(1);
+      expect(
+        store.claimNextOperation({ workerId: "worker-b", now, leaseMs: 10_000, maxConcurrentTasks: 1 }),
+      ).toMatchObject({ operationId: receipt.operationId, commandId: receipt.commandId, attempt: 1 });
+    } finally {
+      store.close();
+      if (!directory.startsWith(`${tmpdir()}/agent-tag-coordinator-abort-`)) {
+        throw new Error(`refusing to remove unexpected fixture path ${directory}`);
+      }
+      await rm(directory, { recursive: true });
+    }
+  });
 });
