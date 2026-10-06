@@ -609,3 +609,17 @@ describe("links at line start", () => {
     expect(chunks[0]?.startsWith("<https://e.com|")).toBe(true);
   });
 });
+
+describe("inline code across splits", () => {
+  test("an oversized inline code span is closed and reopened per message", () => {
+    const text = markdownToMrkdwn(`\`${"x".repeat(4_000)} **literal**\``);
+    const chunks = splitForSlack(text, 3_000);
+    expect(chunks.length).toBeGreaterThan(1);
+    for (const chunk of chunks) {
+      const body = chunk.replace(/\n\(\d+\/\d+\)$/, "");
+      expect((body.match(/`/g) ?? []).length % 2).toBe(0);
+      expect(body.length).toBeLessThanOrEqual(3_000);
+    }
+    expect(chunks.join("")).toContain("**literal**");
+  });
+});

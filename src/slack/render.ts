@@ -277,6 +277,17 @@ function hardWrap(line: string, max: number): string[] {
  * reopens it. Multi-chunk replies get a trailing "(i/n)" marker. Every chunk is
  * at most `limit` UTF-16 units.
  */
+/** Close and reopen an inline code span that a wrap cut through, so each piece renders verbatim. */
+function balanceInlineCode(pieces: readonly string[]): string[] {
+  let open = false;
+  return pieces.map((piece) => {
+    const text = open ? `\`${piece}` : piece;
+    const odd = (text.match(/`/g) ?? []).length % 2 === 1;
+    open = odd;
+    return odd ? `${text}\`` : text;
+  });
+}
+
 export function splitForSlack(text: string, limit = SLACK_MESSAGE_TEXT_LIMIT): string[] {
   if (text.length <= limit) return [text];
   const markerReserve = "\n(9999/9999)".length;
@@ -284,7 +295,14 @@ export function splitForSlack(text: string, limit = SLACK_MESSAGE_TEXT_LIMIT): s
   const budget = limit - markerReserve - fenceReserve;
   if (budget < 16) throw new Error("splitForSlack limit is too small");
 
-  const lines = text.split("\n").flatMap((line) => hardWrap(line, budget));
+  let wrapInFence = false;
+  const lines = text.split("\n").flatMap((line) => {
+    if (isFenceToggle(line)) {
+      wrapInFence = !wrapInFence;
+      return [line];
+    }
+    return wrapInFence ? hardWrap(line, budget) : balanceInlineCode(hardWrap(line, budget - 2));
+  });
   const chunks: string[] = [];
   let current: string[] = [];
   let currentLength = 0;
