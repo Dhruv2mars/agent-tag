@@ -241,7 +241,7 @@ export type T3ThreadSnapshot = z.infer<typeof threadSnapshotSchema>;
 
 const approvalRequestPayloadSchema = z.object({
   requestId: id,
-  requestKind: z.enum(["command", "file-read", "file-change", "mcp-elicitation"]).optional(),
+  requestKind: z.enum(["command", "file-read", "file-change", "mcp-elicitation", "permission"]).optional(),
   requestType: id.optional(),
   detail: z.string().optional(),
   appName: z.string().optional(),
@@ -258,7 +258,7 @@ const approvalRequestPayloadSchema = z.object({
 
 export interface T3PendingApproval {
   readonly requestId: string;
-  readonly requestKind: "command" | "file-read" | "file-change" | "mcp-elicitation";
+  readonly requestKind: "command" | "file-read" | "file-change" | "mcp-elicitation" | "permission";
   readonly detail?: string;
   readonly appName?: string;
   readonly options: ReadonlyArray<{
@@ -304,6 +304,8 @@ function legacyRequestKind(requestType: string | undefined): T3PendingApproval["
       return "file-change";
     case "mcp_elicitation_approval":
       return "mcp-elicitation";
+    case "permission_approval":
+      return "permission";
     default:
       return "command";
   }
