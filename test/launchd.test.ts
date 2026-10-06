@@ -1,6 +1,17 @@
-import { expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
-import { type LaunchAgentDefinition, parseLaunchAgentPaths, renderLaunchAgent } from "../src/launchd.ts";
+import type { CommandResult } from "../src/command.ts";
+import {
+  AGENT_TAG_LAUNCHD_LABEL,
+  type LaunchAgentDefinition,
+  type LaunchdHost,
+  parseLaunchAgentPaths,
+  renderLaunchAgent,
+  restartLaunchAgent,
+} from "../src/launchd.ts";
 import { unitStateFor } from "../src/service-unit.ts";
 
 test("renders a private macOS LaunchAgent with absolute executable arguments", () => {
@@ -73,4 +84,88 @@ test("reads paths back from an installed plist and tells a different checkout fr
     unitStateFor({ unitPath: "/p.plist", existing: drifted, rendered: installed, installed: parseLaunchAgentPaths(drifted), expected: live }),
   ).toMatchObject({ current: false, sameConfig: true, sameCheckout: true, sameBun: true });
   expect(parseLaunchAgentPaths("<plist></plist>")).toEqual({});
+});
+
+/** A scripted launchctl for a fake uid: models a job that is registered (loaded) or not, and running or not. */
+class FakeLaunchctl {
+  readonly commands: string[] = [];
+  loaded = false;
+  running = false;
+  failBootstrap = false;
+
+  readonly run = async (command: readonly string[]): Promise<CommandResult> => {
+    this.commands.push(command.slice(1).join(" "));
+    const ok = (stdout = ""): CommandResult => ({ exitCode: 0, stdout, stderr: "" });
+    const notFound: CommandResult = { exitCode: 113, stdout: "", stderr: "Could not find service in domain for user gui: 4242" };
+    const verb = command[1];
+    if (verb === "print") {
+      return this.loaded ? ok(`${target} = {\n\tstate = ${this.running ? "running" : "not running"}\n}`) : notFound;
+    }
+    if (verb === "kickstart") {
+      if (!this.loaded) return notFound;
+      this.running = true;
+      return ok();
+    }
+    if (verb === "bootstrap") {
+      if (this.failBootstrap) return { exitCode: 5, stdout: "", stderr: "Bootstrap failed: 5: Input/output error" };
+      this.loaded = true;
+      this.running = true; // RunAtLoad
+      return ok();
+    }
+    if (verb === "bootout") {
+      this.loaded = false;
+      this.running = false;
+      return ok();
+    }
+    throw new Error(`unexpected launchctl ${command.join(" ")}`);
+  };
+}
+
+const target = `gui/4242/${AGENT_TAG_LAUNCHD_LABEL}`;
+
+describe("LaunchAgent restart", () => {
+  let directory: string;
+  let fake: FakeLaunchctl;
+  let host: LaunchdHost;
+
+  beforeEach(async () => {
+    directory = await mkdtemp(join(tmpdir(), "agent-tag-launchd-"));
+    fake = new FakeLaunchctl();
+    host = { run: fake.run, sleep: async () => {}, uid: 4242, plistPath: join(directory, `${AGENT_TAG_LAUNCHD_LABEL}.plist`) };
+  });
+
+  afterEach(async () => {
+    await rm(directory, { recursive: true, force: true });
+  });
+
+  test("bootstraps the existing plist when the job was booted out, then starts it", async () => {
+    await writeFile(host.plistPath, "<plist/>", { mode: 0o600 });
+    const status = await restartLaunchAgent(host);
+    expect(status).toMatchObject({ installed: true, loaded: true, running: true, plistPath: host.plistPath });
+    expect(fake.commands.slice(0, 3)).toEqual([
+      `print ${target}`,
+      `bootstrap gui/4242 ${host.plistPath}`,
+      `kickstart ${target}`,
+    ]);
+    expect(fake.commands).not.toContain(`kickstart -k ${target}`);
+  });
+
+  test("kickstarts a loaded job without bootstrapping it again", async () => {
+    await writeFile(host.plistPath, "<plist/>", { mode: 0o600 });
+    fake.loaded = true;
+    const status = await restartLaunchAgent(host);
+    expect(status).toMatchObject({ loaded: true, running: true });
+    expect(fake.commands.slice(0, 2)).toEqual([`print ${target}`, `kickstart -k ${target}`]);
+    expect(fake.commands.some((command) => command.startsWith("bootstrap"))).toBe(false);
+  });
+
+  test("reports a failed bootstrap and refuses to restart without a plist", async () => {
+    await expect(restartLaunchAgent(host)).rejects.toThrow("not installed");
+    expect(fake.commands).toEqual([]);
+
+    await writeFile(host.plistPath, "<plist/>", { mode: 0o600 });
+    fake.failBootstrap = true;
+    await expect(restartLaunchAgent(host)).rejects.toThrow("LaunchAgent bootstrap failed with exit code 5");
+    expect(fake.commands.some((command) => command.startsWith("kickstart"))).toBe(false);
+  });
 });
