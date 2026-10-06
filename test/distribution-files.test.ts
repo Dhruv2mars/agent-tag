@@ -83,6 +83,40 @@ test("the release workflow builds, smoke-tests, and publishes every target", asy
   }
 });
 
+interface WorkflowStep {
+  readonly run?: string;
+  readonly if?: string;
+}
+interface WorkflowJob {
+  readonly needs?: string | readonly string[];
+  readonly if?: string;
+  readonly permissions?: Readonly<Record<string, string>>;
+  readonly steps: readonly WorkflowStep[];
+}
+
+test("the GHCR push waits for every release gate and the published GitHub Release", async () => {
+  const workflow = Bun.YAML.parse(
+    await Bun.file(join(repository, ".github", "workflows", "release.yml")).text(),
+  ) as { readonly jobs: Readonly<Record<string, WorkflowJob>> };
+  const needs = (name: string): readonly string[] => {
+    const value = workflow.jobs[name]?.needs ?? [];
+    return typeof value === "string" ? [value] : value;
+  };
+  const pushers = Object.entries(workflow.jobs)
+    .filter(([, job]) => job.steps.some((step) => step.run?.includes("docker push") === true))
+    .map(([name]) => name);
+  expect(pushers).toEqual(["image"]);
+  expect(needs("image")).toEqual(expect.arrayContaining(["docker", "publish"]));
+  expect(needs("publish")).toEqual(expect.arrayContaining(["build", "smoke", "docker"]));
+  expect(workflow.jobs.build?.steps.some((step) => step.run === "bun run check")).toBe(true);
+  expect(workflow.jobs.image?.if).toBe("needs.version.outputs.publish == 'true'");
+  expect(workflow.jobs.image?.permissions?.packages).toBe("write");
+  // Only the push job may write packages; the PR-reachable verify job stays read-only.
+  for (const [name, job] of Object.entries(workflow.jobs)) {
+    if (name !== "image") expect(job.permissions?.packages).toBeUndefined();
+  }
+});
+
 test("install.sh is valid POSIX sh", async () => {
   const result = await run(["/bin/sh", "-n", join(repository, "install.sh")], repository);
   expect(result.exitCode).toBe(0);

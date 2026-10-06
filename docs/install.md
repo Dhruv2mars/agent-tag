@@ -95,8 +95,9 @@ See the [README](../README.md#development). Follow [operations](operations.md) f
 3. `.github/workflows/release.yml` then runs these jobs:
    - cross-compiles the four binaries with `scripts/build-release.ts`. The macOS binaries are built on macOS so they carry Bun's ad-hoc signature.
    - runs a smoke test of each binary on a native runner (`macos-15`, `macos-15-intel`, `ubuntu-24.04`, `ubuntu-24.04-arm`). The test runs `--help`, `version --json`, and `install.sh` against a local `file://` mirror.
-   - builds the Docker image, checks it, and pushes it.
-   - writes `SHA256SUMS` and publishes the GitHub Release. A hyphenated version is published as a prerelease.
+   - builds the Docker image and checks it.
+   - writes `SHA256SUMS` and publishes the GitHub Release once the typecheck, tests, smoke tests, and image checks have passed. A hyphenated version is published as a prerelease.
+   - pushes the verified image to GHCR only after the GitHub Release exists, so a failed gate never moves `:<version>` or `:latest`.
 
 Pull requests that touch the build inputs run the same build, smoke, and Docker jobs as a dry run. They never publish.
 

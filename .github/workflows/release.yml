@@ -141,13 +141,12 @@ jobs:
           "$RUNNER_TEMP/bin/agent-tag" version
 
   docker:
+    # Builds and checks the image only. Nothing is pushed here: the push lives in the
+    # `image` job, which waits for the GitHub Release (and therefore every gate) to succeed.
     name: Docker image
     needs: version
     runs-on: ubuntu-24.04
     timeout-minutes: 20
-    permissions:
-      contents: read
-      packages: write
     steps:
       - name: Check out source
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -159,21 +158,17 @@ jobs:
           docker run --rm agent-tag:ci --help
           docker run --rm agent-tag:ci version --json | grep -q '"installKind":"container"'
           test "$(docker run --rm --entrypoint id agent-tag:ci -u)" != "0"
-      - name: Push to GHCR
+      - name: Save verified image
         if: needs.version.outputs.publish == 'true'
-        env:
-          VERSION: ${{ needs.version.outputs.version }}
-          GH_TOKEN: ${{ github.token }}
-          ACTOR: ${{ github.actor }}
-        run: |
-          image="ghcr.io/$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
-          echo "$GH_TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
-          docker tag agent-tag:ci "$image:$VERSION"
-          docker push "$image:$VERSION"
-          case "$VERSION" in
-            *-*) ;;
-            *) docker tag agent-tag:ci "$image:latest" && docker push "$image:latest" ;;
-          esac
+        run: docker save agent-tag:ci | gzip > agent-tag-image.tar.gz
+      - name: Upload verified image
+        if: needs.version.outputs.publish == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: docker-image
+          path: agent-tag-image.tar.gz
+          if-no-files-found: error
+          retention-days: 1
 
   publish:
     name: Publish GitHub Release
@@ -216,3 +211,36 @@ jobs:
           # shellcheck disable=SC2086 # empty or a single flag
           gh release create "$TAG" dist/agent-tag-* dist/SHA256SUMS \
             --verify-tag --title "agent-tag $VERSION" --generate-notes $prerelease
+
+  image:
+    # Pushes the exact image the `docker` job verified, and only after `publish` created the
+    # GitHub Release, so a tag whose checks, smoke tests, or release step failed never moves
+    # `:<version>` or `:latest`.
+    name: Push image to GHCR
+    needs: [version, docker, publish]
+    if: needs.version.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Download verified image
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: docker-image
+      - name: Push to GHCR
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          gunzip -c agent-tag-image.tar.gz | docker load
+          image="ghcr.io/$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
+          echo "$GH_TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+          docker tag agent-tag:ci "$image:$VERSION"
+          docker push "$image:$VERSION"
+          case "$VERSION" in
+            *-*) ;;
+            *) docker tag agent-tag:ci "$image:latest" && docker push "$image:latest" ;;
+          esac
