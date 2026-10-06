@@ -8,411 +8,87 @@ import { z } from "zod";
 
 import { scheduleRecurrenceSchema, type ScheduleRecurrence } from "../routines/cron.ts";
 import { STORE_MIGRATIONS } from "./migrations.ts";
+import { requiredId, parseStoredJson } from "./context.ts";
+import { leaseExpiry } from "./lease.ts";
+import {
+  type AuditAction,
+  ambientDecisionSchema,
+  auditActionSchema,
+  auditMetadataSchema,
+  auditRowSchema,
+  auditWriteSchema,
+  canonicalEventSchema,
+  deliveryLookupSchema,
+  interactionIdentitySchema,
+  interactionRowSchema,
+  isoDateTime,
+  memoryContent,
+  memoryRowSchema,
+  nonEmpty,
+  operationIdentitySchema,
+  operationPayloadSchema,
+  operationRowSchema,
+  outboxIdentitySchema,
+  outboxPayloadSchema,
+  outboxRowSchema,
+  partialUserInputSchema,
+  recurrenceJson,
+  resolvedOperationTextSchema,
+  schedulePrompt,
+  scheduleRowSchema,
+  scheduleTargetSchema,
+  taskExecutionSchema,
+  taskLookupSchema,
+  userInputPromptSchema,
+} from "./schema.ts";
+import type {
+  ActiveTaskBinding,
+  AmbientDecision,
+  AuditCursor,
+  AuditRecord,
+  ClaimedInteractionResponse,
+  ClaimedOperation,
+  ClaimedOutboxMessage,
+  ClaimedSchedule,
+  IngestReceipt,
+  MemoryRecord,
+  OperationalStatus,
+  ScheduleSummary,
+  SlackEventInput,
+  SlackOutboxInput,
+  SlackOutboxPayload,
+  StoreFaultPoint,
+  StoreOpenOptions,
+  TaskExecutionBinding,
+  UserInputAnswerResult,
+  UserInputQuestionPrompt,
+  UserInputSelection,
+} from "./types.ts";
 
-const nonEmpty = z.string().min(1);
-const isoDateTime = z.iso.datetime();
-const operationPayloadSchema = z.object({
-  text: z.string(),
-  actorUserId: nonEmpty,
-  conversationId: nonEmpty,
-  threadTs: nonEmpty,
-  profileId: nonEmpty,
-  repositoryRoot: nonEmpty,
-});
-const plainTextObjectSchema = z.object({ type: z.literal("plain_text"), text: z.string(), emoji: z.boolean().optional() });
-const mrkdwnObjectSchema = z.object({ type: z.literal("mrkdwn"), text: z.string() });
-const buttonElementSchema = z.object({
-  type: z.literal("button"),
-  text: plainTextObjectSchema,
-  action_id: nonEmpty,
-  value: nonEmpty,
-  style: z.enum(["primary", "danger"]).optional(),
-  confirm: z
-    .object({
-      title: plainTextObjectSchema,
-      text: z.union([plainTextObjectSchema, mrkdwnObjectSchema]),
-      confirm: plainTextObjectSchema,
-      deny: plainTextObjectSchema,
-      style: z.enum(["primary", "danger"]).optional(),
-    })
-    .optional(),
-});
-const slackBlockSchema = z.discriminatedUnion("type", [
-  z.object({ type: z.literal("section"), text: z.union([plainTextObjectSchema, mrkdwnObjectSchema]) }),
-  z.object({ type: z.literal("actions"), block_id: nonEmpty.optional(), elements: z.array(buttonElementSchema).min(1) }),
-  z.object({ type: z.literal("context"), elements: z.array(z.union([plainTextObjectSchema, mrkdwnObjectSchema])).min(1) }),
-]);
-const outboxPayloadSchema = z.object({
-  text: z.string(),
-  blocks: z.array(slackBlockSchema).optional(),
-});
-
-const operationRowSchema = z.object({
-  operation_id: nonEmpty,
-  task_id: nonEmpty,
-  command_id: nonEmpty,
-  message_id: nonEmpty,
-  payload_json: nonEmpty,
-  attempts: z.number().int().nonnegative(),
-  lease_expires_at: isoDateTime,
-});
-
-const outboxRowSchema = z.object({
-  outbox_id: nonEmpty,
-  task_id: nonEmpty,
-  correlation_id: nonEmpty,
-  conversation_id: nonEmpty,
-  thread_ts: nonEmpty,
-  client_message_id: nonEmpty,
-  payload_json: nonEmpty,
-  attempts: z.number().int().nonnegative(),
-  lease_expires_at: isoDateTime,
-});
-
-const deliveryLookupSchema = z.object({
-  canonical_operation_id: nonEmpty,
-});
-
-const canonicalEventSchema = z.object({
-  operation_id: nonEmpty,
-});
-
-const operationIdentitySchema = z.object({
-  operation_id: nonEmpty,
-  task_id: nonEmpty,
-  command_id: nonEmpty,
-  message_id: nonEmpty,
-});
-
-const taskLookupSchema = z.object({
-  task_id: nonEmpty,
-  profile_id: nonEmpty,
-  repository_root: nonEmpty,
-  t3_project_id: nonEmpty.nullable(),
-  t3_thread_id: nonEmpty.nullable(),
-  conversation_type: z.enum(["channel", "dm"]),
-  owner_user_id: nonEmpty.nullable(),
-});
-const outboxIdentitySchema = z.object({ outbox_id: nonEmpty });
-const taskExecutionSchema = z.object({
-  task_id: nonEmpty,
-  workspace_id: nonEmpty,
-  conversation_id: nonEmpty,
-  profile_id: nonEmpty,
-  repository_root: nonEmpty,
-  t3_project_id: nonEmpty,
-  t3_thread_id: nonEmpty,
-  t3_thread_started_at: isoDateTime.nullable(),
-  conversation_type: z.enum(["channel", "dm"]),
-  owner_user_id: nonEmpty.nullable(),
-  created_at: isoDateTime,
-});
-const interactionIdentitySchema = z.object({ interaction_id: nonEmpty });
-const interactionRowSchema = z.object({
-  interaction_id: nonEmpty,
-  task_id: nonEmpty,
-  operation_id: nonEmpty,
-  thread_id: nonEmpty,
-  request_id: nonEmpty,
-  kind: z.enum(["approval", "user-input", "cancel"]),
-  response_command_id: nonEmpty,
-  response_json: nonEmpty,
-  response_actor_id: nonEmpty,
-  attempts: z.number().int().nonnegative(),
-  lease_expires_at: isoDateTime,
-});
-const userInputQuestionPromptSchema = z.object({
-  id: nonEmpty,
-  header: z.string(),
-  question: z.string(),
-  options: z.array(z.object({ label: z.string(), description: z.string().optional() })),
-  multiSelect: z.boolean(),
-  allowCustomAnswer: z.boolean().optional(),
-});
-const userInputPromptSchema = z.object({ questions: z.array(userInputQuestionPromptSchema).min(1) });
-const userInputAnswerSchema = z.union([z.string().min(1), z.array(z.string()).min(1)]);
-const partialUserInputSchema = z.object({
-  answers: z.record(
-    z.string(),
-    z.object({
-      answer: userInputAnswerSchema,
-      actorUserId: nonEmpty,
-      sourceActionId: nonEmpty,
-      answeredAt: isoDateTime,
-    }),
-  ),
-  sourceActionIds: z.array(nonEmpty),
-});
-const auditRowSchema = z.object({
-  audit_id: nonEmpty,
-  actor_type: nonEmpty,
-  actor_id: nonEmpty,
-  authority: nonEmpty,
-  source: nonEmpty,
-  target: nonEmpty,
-  action: nonEmpty,
-  result: nonEmpty,
-  correlation_id: nonEmpty,
-  metadata_json: z.string(),
-  created_at: isoDateTime,
-});
-const auditMetadataSchema = z.record(
-  z.string(),
-  z.union([z.string(), z.number(), z.boolean(), z.null()]),
-);
-export const AUDIT_ACTIONS = [
-  "ambient.decided",
-  "interaction.approval.requested",
-  "interaction.cancel.requested",
-  "interaction.response.claimed",
-  "interaction.response.completed",
-  "interaction.response.failed",
-  "interaction.response.submitted",
-  "interaction.user-input.answer-recorded",
-  "interaction.user-input.requested",
-  "memory.created",
-  "memory.denied",
-  "memory.expired",
-  "memory.forgotten",
-  "memory.updated",
-  "operation.cancelled",
-  "operation.claimed",
-  "operation.completed",
-  "operation.deferred",
-  "operation.failed",
-  "operation.released",
-  "operation.turn-text.resolved",
-  "schedule.cancelled",
-  "schedule.authority-revoked",
-  "schedule.claimed",
-  "schedule.created",
-  "schedule.denied",
-  "schedule.run.settled",
-  "slack.delivery.duplicate",
-  "slack.event.ingested",
-  "slack.outbox.claimed",
-  "slack.outbox.delivered",
-  "slack.outbox.enqueued",
-  "slack.outbox.failed",
-  "slack.outbox.quarantined",
-  "task.cancellation.requested",
-  "task.t3-bound",
-] as const;
-const auditActionSchema = z.enum(AUDIT_ACTIONS);
-export type AuditAction = z.infer<typeof auditActionSchema>;
-const auditWriteSchema = z.object({
-  actorType: nonEmpty,
-  actorId: nonEmpty,
-  authority: nonEmpty,
-  source: nonEmpty,
-  target: nonEmpty,
-  action: auditActionSchema,
-  result: nonEmpty,
-  correlationId: nonEmpty,
-  metadata: auditMetadataSchema,
-  createdAt: isoDateTime,
-});
-const memoryRowSchema = z.object({
-  memory_id: nonEmpty,
-  workspace_id: nonEmpty,
-  scope: z.enum(["shared", "profile", "task", "private"]),
-  profile_id: nonEmpty.nullable(),
-  task_id: nonEmpty.nullable(),
-  owner_user_id: nonEmpty.nullable(),
-  content: z.string().min(1).max(2_000),
-  source_type: nonEmpty,
-  source_id: nonEmpty,
-  version: z.number().int().positive(),
-  expires_at: isoDateTime,
-  created_by: nonEmpty,
-  created_at: isoDateTime,
-  updated_at: isoDateTime,
-});
-const memoryContent = z.string().trim().min(1).max(2_000);
-const resolvedOperationTextSchema = z.object({ resolved_text: z.string().nullable() });
-const schedulePrompt = z.string().trim().min(1).max(4_000);
-const recurrenceJson = z
-  .string()
-  .nullable()
-  .transform((raw, context): ScheduleRecurrence | null => {
-    if (raw === null) return null;
-    let value: unknown;
-    try {
-      value = JSON.parse(raw);
-    } catch {
-      context.addIssue({ code: "custom", message: "recurrence_json is not valid JSON" });
-      return z.NEVER;
-    }
-    const parsed = scheduleRecurrenceSchema.safeParse(value);
-    if (!parsed.success) {
-      context.addIssue({ code: "custom", message: "recurrence_json is invalid" });
-      return z.NEVER;
-    }
-    return parsed.data;
-  });
-const scheduleRowSchema = z.object({
-  schedule_id: nonEmpty,
-  task_id: nonEmpty,
-  workspace_id: nonEmpty,
-  conversation_id: nonEmpty,
-  thread_ts: nonEmpty,
-  actor_user_id: nonEmpty,
-  profile_id: nonEmpty,
-  repository_root: nonEmpty,
-  kind: z.enum(["agent", "reminder"]),
-  prompt: schedulePrompt,
-  cadence_seconds: z.number().int().min(60).nullable(),
-  recurrence_json: recurrenceJson,
-  missed_run_policy: z.enum(["run-once", "skip"]),
-  misfire_grace_seconds: z.number().int().nonnegative(),
-  overlap_policy: z.enum(["skip", "queue"]),
-  next_run_at: isoDateTime,
-  attempts: z.number().int().nonnegative(),
-  lease_expires_at: isoDateTime,
-});
-const scheduleTargetSchema = z.object({
-  workspace_id: nonEmpty,
-  conversation_id: nonEmpty,
-  thread_ts: nonEmpty,
-  profile_id: nonEmpty,
-  repository_root: nonEmpty,
-});
-const ambientDecisionSchema = z.object({
-  disposition: z.enum(["triggered", "quiet"]),
-  reason: nonEmpty,
-});
-
-export type StoreFaultPoint =
-  | "ingest.after-operation"
-  | "operation-claim.after-update"
-  | "outbox-enqueue.after-insert"
-  | "outbox-claim.after-update";
-
-export interface StoreOpenOptions {
-  readonly faultInjector?: (point: StoreFaultPoint) => void;
-}
-
-export interface SlackEventInput {
-  readonly deliveryId: string;
-  readonly eventKey: string;
-  readonly workspaceId: string;
-  readonly conversationId: string;
-  readonly threadTs: string;
-  readonly actorUserId: string;
-  readonly conversationType: "channel" | "dm";
-  readonly profileId: string;
-  readonly repositoryRoot: string;
-  readonly text: string;
-  readonly receivedAt: string;
-  readonly sourceOrderKey?: string;
-}
-
-export interface ActiveTaskBinding {
-  readonly taskId: string;
-  readonly profileId: string;
-  readonly repositoryRoot: string;
-  readonly conversationType: "channel" | "dm";
-  readonly ownerUserId: string | null;
-}
-
-export interface TaskExecutionBinding {
-  readonly taskId: string;
-  readonly workspaceId: string;
-  readonly conversationId: string;
-  readonly profileId: string;
-  readonly repositoryRoot: string;
-  readonly projectId: string;
-  readonly projectOwnerTaskId: string;
-  readonly projectCreatedAt: string;
-  readonly threadId: string;
-  readonly threadStarted: boolean;
-  readonly conversationType: "channel" | "dm";
-  readonly ownerUserId: string | null;
-  readonly createdAt: string;
-}
-
-export interface IngestReceipt {
-  readonly kind: "accepted" | "duplicate";
-  readonly deliveryId: string;
-  readonly operationId: string;
-  readonly taskId: string;
-  readonly commandId: string;
-  readonly messageId: string;
-}
-
-export interface ClaimedOperation {
-  readonly operationId: string;
-  readonly taskId: string;
-  readonly commandId: string;
-  readonly messageId: string;
-  readonly payload: z.infer<typeof operationPayloadSchema>;
-  readonly attempt: number;
-  readonly leaseExpiresAt: string;
-}
-
-export interface OperationalStatus {
-  readonly asOf: string;
-  readonly operations: {
-    readonly ready: number;
-    readonly deferred: number;
-    readonly activeLease: number;
-    readonly expiredLease: number;
-    readonly stalledRetry: number;
-    readonly stalledFailed: number;
-    readonly oldestReadyAt: string | null;
-  };
-  readonly interactions: {
-    readonly awaitingHuman: number;
-    readonly responseQueued: number;
-  };
-  readonly outbox: {
-    readonly pending: number;
-    readonly activeLease: number;
-    readonly expiredLease: number;
-    readonly outcomeUnknown: number;
-  };
-}
-
-export interface SlackOutboxInput {
-  readonly taskId: string;
-  readonly correlationId: string;
-  readonly conversationId: string;
-  readonly threadTs: string;
-  readonly clientMessageId: string;
-  readonly payload: z.infer<typeof outboxPayloadSchema>;
-  readonly createdAt: string;
-}
-
-export type SlackOutboxPayload = z.infer<typeof outboxPayloadSchema>;
-
-export interface ClaimedInteractionResponse {
-  readonly interactionId: string;
-  readonly taskId: string;
-  readonly operationId: string;
-  readonly threadId: string;
-  readonly requestId: string;
-  readonly kind: "approval" | "user-input" | "cancel";
-  readonly commandId: string;
-  readonly actorUserId: string;
-  readonly response: unknown;
-  readonly attempt: number;
-  readonly leaseExpiresAt: string;
-}
-
-export type UserInputQuestionPrompt = z.infer<typeof userInputQuestionPromptSchema>;
-
-/** A person's choice for one question: option indexes or labels from the prompt, and/or free text. */
-export interface UserInputSelection {
-  readonly optionIndexes?: ReadonlyArray<number>;
-  readonly optionLabels?: ReadonlyArray<string>;
-  readonly text?: string;
-}
-
-export type UserInputAnswerResult =
-  | { readonly kind: "accepted" | "duplicate"; readonly commandId: string }
-  | { readonly kind: "partial"; readonly commandId: string; readonly answered: number; readonly total: number }
-  | { readonly kind: "invalid" }
-  | { readonly kind: "denied" };
+export { AUDIT_ACTIONS, type AuditAction } from "./schema.ts";
+export type {
+  ActiveTaskBinding,
+  AmbientDecision,
+  AuditCursor,
+  AuditRecord,
+  ClaimedInteractionResponse,
+  ClaimedOperation,
+  ClaimedOutboxMessage,
+  ClaimedSchedule,
+  IngestReceipt,
+  MemoryRecord,
+  OperationalStatus,
+  ScheduleSummary,
+  SlackEventInput,
+  SlackOutboxInput,
+  SlackOutboxPayload,
+  StoreFaultPoint,
+  StoreOpenOptions,
+  TaskExecutionBinding,
+  UserInputAnswerResult,
+  UserInputQuestionPrompt,
+  UserInputSelection,
+} from "./types.ts";
 
 /** Applies T3's answer rules: custom text wins when allowed; multi-select yields a list; otherwise one label. */
 function resolveUserInputAnswer(
@@ -442,109 +118,6 @@ function resolveUserInputAnswer(
 
 function escapeSlackText(text: string): string {
   return text.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
-}
-
-export interface ClaimedOutboxMessage {
-  readonly outboxId: string;
-  readonly taskId: string;
-  readonly correlationId: string;
-  readonly conversationId: string;
-  readonly threadTs: string;
-  readonly clientMessageId: string;
-  readonly payload: SlackOutboxPayload;
-  readonly attempt: number;
-  readonly leaseExpiresAt: string;
-}
-
-export interface AuditRecord {
-  readonly auditId: string;
-  readonly actorType: string;
-  readonly actorId: string;
-  readonly authority: string;
-  readonly source: string;
-  readonly target: string;
-  readonly action: AuditAction;
-  readonly result: string;
-  readonly correlationId: string;
-  readonly metadata: Readonly<Record<string, string | number | boolean | null>>;
-  readonly createdAt: string;
-}
-
-export interface AuditCursor {
-  readonly createdAt: string;
-  readonly auditId: string;
-}
-
-export interface MemoryRecord {
-  readonly memoryId: string;
-  readonly workspaceId: string;
-  readonly scope: "shared" | "profile" | "task" | "private";
-  readonly profileId: string | null;
-  readonly taskId: string | null;
-  readonly ownerUserId: string | null;
-  readonly content: string;
-  readonly sourceType: string;
-  readonly sourceId: string;
-  readonly version: number;
-  readonly expiresAt: string;
-  readonly createdBy: string;
-  readonly createdAt: string;
-  readonly updatedAt: string;
-}
-
-export interface ClaimedSchedule {
-  readonly scheduleId: string;
-  readonly taskId: string;
-  readonly workspaceId: string;
-  readonly conversationId: string;
-  readonly threadTs: string;
-  readonly actorUserId: string;
-  readonly profileId: string;
-  readonly repositoryRoot: string;
-  readonly kind: "agent" | "reminder";
-  readonly prompt: string;
-  readonly cadenceSeconds: number | null;
-  readonly recurrence: ScheduleRecurrence | null;
-  readonly missedRunPolicy: "run-once" | "skip";
-  readonly misfireGraceSeconds: number;
-  readonly overlapPolicy: "skip" | "queue";
-  readonly dueAt: string;
-  readonly attempt: number;
-  readonly leaseExpiresAt: string;
-}
-
-export interface ScheduleSummary {
-  readonly scheduleId: string;
-  readonly taskId: string;
-  readonly kind: "agent" | "reminder";
-  readonly prompt: string;
-  readonly state: "active" | "cancelled" | "completed";
-  readonly nextRunAt: string;
-  readonly cadenceSeconds: number | null;
-  readonly recurrence: ScheduleRecurrence | null;
-  readonly missedRunPolicy: "run-once" | "skip";
-  readonly overlapPolicy: "skip" | "queue";
-}
-
-export type AmbientDecision =
-  | { readonly kind: "triggered" }
-  | { readonly kind: "quiet"; readonly reason: "unchanged" | "cooldown" | "hourly-limit" };
-
-function requiredId(value: string, name: string): string {
-  const parsed = nonEmpty.safeParse(value);
-  if (!parsed.success) throw new Error(`${name} must not be empty`);
-  return parsed.data;
-}
-
-function leaseExpiry(now: string, leaseMs: number): string {
-  const parsedNow = isoDateTime.parse(now);
-  if (!Number.isSafeInteger(leaseMs) || leaseMs <= 0) throw new Error("leaseMs must be positive");
-  return new Date(new Date(parsedNow).getTime() + leaseMs).toISOString();
-}
-
-function parseStoredJson(text: string): unknown {
-  const parsed: unknown = JSON.parse(text);
-  return parsed;
 }
 
 function projectMemoryRow(raw: unknown): MemoryRecord {
@@ -2411,7 +1984,6 @@ export class AgentTagStore {
     });
     return record.immediate();
   }
-
 
   submitInteractionResponse(input: {
     readonly interactionId: string;
