@@ -264,4 +264,10 @@ export const STORE_MIGRATIONS: readonly StoreMigration[] = [
       ALTER TABLE interactions ADD COLUMN partial_response_json TEXT;
     `,
   },
+  {
+    version: 11,
+    sql: `
+      ALTER TABLE schedules ADD COLUMN recurrence_json TEXT;
+    `,
+  },
 ];

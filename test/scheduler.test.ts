@@ -233,4 +233,75 @@ describe("durable scheduler", () => {
       await rm(directory, { recursive: true });
     }
   });
+
+  test("persists calendar recurrences and computes DST-correct next runs", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "agent-tag-scheduler-"));
+    const path = join(directory, "agent-tag.sqlite");
+    let store = await AgentTagStore.open(path);
+    try {
+      const receipt = store.ingestSlackEvent({
+        deliveryId: "delivery-r1",
+        eventKey: "C1:2000.000001",
+        workspaceId: "T1",
+        conversationId: "C1",
+        threadTs: "2000.000001",
+        actorUserId: "U1",
+        conversationType: "channel",
+        profileId: "engineering",
+        repositoryRoot: "/srv/repos/example",
+        text: "routine task",
+        receivedAt: "2026-10-30T12:00:00.000Z",
+      });
+      const context: ScheduleContext = {
+        workspaceId: "T1",
+        actorUserId: "U1",
+        profileId: "engineering",
+        taskId: receipt.taskId,
+      };
+      const recurrence = { kind: "cron", expression: "0 9 * * *", timeZone: "America/New_York" } as const;
+      const base = {
+        kind: "reminder",
+        prompt: "daily standup",
+        runAt: "2026-10-31T13:00:00.000Z",
+        missedRunPolicy: "skip",
+        misfireGraceSeconds: 300,
+        overlapPolicy: "skip",
+      } as const;
+      expect(
+        new AgentTagSchedules({ config, store }).create({
+          context,
+          spec: { ...base, recurrence, cadenceSeconds: 86_400 },
+          now: "2026-10-30T12:00:00.000Z",
+        }),
+      ).toEqual({ kind: "denied", reason: "invalid-schedule" });
+      const created = acceptedSchedule(
+        new AgentTagSchedules({ config, store }).create({
+          context,
+          spec: { ...base, recurrence },
+          now: "2026-10-30T12:00:00.000Z",
+        }),
+      );
+      expect(created).toMatchObject({ recurrence, cadenceSeconds: null });
+      store.close();
+      store = await AgentTagStore.open(path);
+      const schedules = new AgentTagSchedules({ config, store });
+      expect(schedules.list(context)[0]).toMatchObject({ recurrence, nextRunAt: "2026-10-31T13:00:00.000Z" });
+
+      // 09:00 EDT on Oct 31 -> 09:00 EST on Nov 1 (23 hours later, across fall-back).
+      const worker = new ScheduleWorker({ config, store, workerId: "routine-a", now: () => new Date("2026-10-31T13:00:00.000Z") });
+      expect(await worker.processNext()).toMatchObject({ kind: "dispatched", scheduleId: created.scheduleId });
+      expect(schedules.list(context)[0]).toMatchObject({ state: "active", nextRunAt: "2026-11-01T14:00:00.000Z" });
+
+      // A late worker skips the stale run and jumps to the next future 09:00 local.
+      const late = new ScheduleWorker({ config, store, workerId: "routine-b", now: () => new Date("2026-11-03T15:00:00.000Z") });
+      expect(await late.processNext()).toMatchObject({ kind: "missed-skipped", dueAt: "2026-11-01T14:00:00.000Z" });
+      expect(schedules.list(context)[0]).toMatchObject({ state: "active", nextRunAt: "2026-11-04T14:00:00.000Z" });
+    } finally {
+      store.close();
+      if (!directory.startsWith(`${tmpdir()}/agent-tag-scheduler-`)) {
+        throw new Error(`refusing to remove unexpected fixture path ${directory}`);
+      }
+      await rm(directory, { recursive: true });
+    }
+  });
 });

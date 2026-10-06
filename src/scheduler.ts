@@ -2,6 +2,7 @@ import { z } from "zod";
 
 import { ExecutionAuthorityDenied, requireExecutionAuthority } from "./policy/execution.ts";
 import type { AgentTagConfig } from "./config.ts";
+import { nextRecurrenceRun, scheduleRecurrenceSchema } from "./routines/cron.ts";
 import type { AgentTagStore, ClaimedSchedule, ScheduleSummary } from "./store/store.ts";
 
 export interface ScheduleContext {
@@ -11,15 +12,21 @@ export interface ScheduleContext {
   readonly taskId: string;
 }
 
-const scheduleSpecSchema = z.object({
-  kind: z.enum(["agent", "reminder"]),
-  prompt: z.string().trim().min(1).max(4_000),
-  runAt: z.iso.datetime(),
-  cadenceSeconds: z.number().int().min(60).max(31_536_000).optional(),
-  missedRunPolicy: z.enum(["run-once", "skip"]),
-  misfireGraceSeconds: z.number().int().min(0).max(86_400),
-  overlapPolicy: z.enum(["skip", "queue"]),
-});
+export const scheduleSpecSchema = z
+  .object({
+    kind: z.enum(["agent", "reminder"]),
+    prompt: z.string().trim().min(1).max(4_000),
+    runAt: z.iso.datetime(),
+    cadenceSeconds: z.number().int().min(60).max(31_536_000).optional(),
+    /** Calendar recurrence evaluated in a time zone (DST-aware); exclusive with cadenceSeconds. */
+    recurrence: scheduleRecurrenceSchema.optional(),
+    missedRunPolicy: z.enum(["run-once", "skip"]),
+    misfireGraceSeconds: z.number().int().min(0).max(86_400),
+    overlapPolicy: z.enum(["skip", "queue"]),
+  })
+  .refine((spec) => spec.cadenceSeconds === undefined || spec.recurrence === undefined, {
+    message: "cadenceSeconds and recurrence are mutually exclusive",
+  });
 
 export type ScheduleSpec = z.infer<typeof scheduleSpecSchema>;
 
@@ -61,6 +68,7 @@ export class AgentTagSchedules {
         ...(parsed.data.cadenceSeconds === undefined
           ? {}
           : { cadenceSeconds: parsed.data.cadenceSeconds }),
+        ...(parsed.data.recurrence === undefined ? {} : { recurrence: parsed.data.recurrence }),
         missedRunPolicy: parsed.data.missedRunPolicy,
         misfireGraceSeconds: parsed.data.misfireGraceSeconds,
         overlapPolicy: parsed.data.overlapPolicy,
@@ -143,8 +151,12 @@ export type ScheduleWorkerOutcome =
     };
 
 function nextRunAt(schedule: ClaimedSchedule, now: Date): string | undefined {
-  if (schedule.cadenceSeconds === null) return undefined;
   const dueMs = new Date(schedule.dueAt).getTime();
+  if (schedule.recurrence !== null) {
+    const next = nextRecurrenceRun(schedule.recurrence, new Date(Math.max(dueMs, now.getTime())));
+    return next === null ? undefined : next.toISOString();
+  }
+  if (schedule.cadenceSeconds === null) return undefined;
   const intervalMs = schedule.cadenceSeconds * 1_000;
   const elapsed = Math.max(0, now.getTime() - dueMs);
   const intervals = Math.floor(elapsed / intervalMs) + 1;

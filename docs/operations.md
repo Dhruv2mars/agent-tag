@@ -189,6 +189,15 @@ Schedules belong to an existing active Agent Tag task. Create a JSON spec such a
 }
 ```
 
+`cadenceSeconds` repeats at a fixed interval. For wall-clock schedules that must
+stay put across DST changes, use `recurrence` instead (mutually exclusive with
+`cadenceSeconds`): a standard 5-field cron expression evaluated in an IANA time
+zone, for example
+`"recurrence": { "kind": "cron", "expression": "0 9 * * 1-5", "timeZone": "America/New_York" }`.
+`runAt` is the first run; later runs follow the cron expression. Natural-language
+phrases ("every weekday at 9am", "in 2 hours") are converted to this format by
+`src/routines/parse.ts`.
+
 Then use the task, actor, and profile IDs from the private audit export:
 
 ```sh
