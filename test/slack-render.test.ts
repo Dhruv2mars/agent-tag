@@ -595,3 +595,17 @@ describe("multi-backtick inline code", () => {
     expect(chunks.some((chunk) => chunk.startsWith("```\n"))).toBe(false);
   });
 });
+
+describe("links at line start", () => {
+  test("a fitting link at the start of a long line is never split at a space", () => {
+    const text = markdownToMrkdwn(`[${"a ".repeat(1200)}](https://e.com)${"z".repeat(2000)}`);
+    const chunks = splitForSlack(text, 3_000);
+    for (const chunk of chunks) {
+      const opens = (chunk.match(/</g) ?? []).length;
+      const closes = (chunk.match(/>/g) ?? []).length;
+      expect(opens).toBe(closes);
+    }
+    expect(chunks[0]).toContain("|");
+    expect(chunks[0]?.startsWith("<https://e.com|")).toBe(true);
+  });
+});

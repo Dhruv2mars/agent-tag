@@ -219,7 +219,14 @@ function safeCutLength(text: string, max: number): number {
   const amp = head.lastIndexOf("&");
   if (amp !== -1 && amp >= cut - 6 && !head.slice(amp).includes(";")) cut = amp;
   const open = head.lastIndexOf("<", cut);
-  if (open !== -1 && !text.slice(open, cut).includes(">") && open > 0) cut = open;
+  if (open !== -1 && !text.slice(open, cut).includes(">")) {
+    if (open > 0) cut = open;
+    else {
+      // A link at offset zero that fits the budget is kept whole; oversized links were unlinked upstream.
+      const close = text.indexOf(">", open);
+      if (close !== -1 && close + 1 <= max) cut = close + 1;
+    }
+  }
   return cut > 0 ? cut : Math.min(max, text.length);
 }
 
@@ -239,6 +246,11 @@ function unlinkOversized(text: string, max: number): string {
   });
 }
 
+function insideLink(text: string, cut: number): boolean {
+  const open = text.lastIndexOf("<", cut - 1);
+  return open !== -1 && !text.slice(open, cut).includes(">");
+}
+
 /** Break a single over-long line into pieces no longer than `max`, preferring whitespace. */
 function hardWrap(line: string, max: number): string[] {
   const pieces: string[] = [];
@@ -247,7 +259,7 @@ function hardWrap(line: string, max: number): string[] {
     let cut = safeCutLength(rest, max);
     // Prefer the last space, but only one whose cut is itself outside any link or entity.
     for (let space = rest.lastIndexOf(" ", cut - 1); space > max / 2; space = rest.lastIndexOf(" ", space - 1)) {
-      if (safeCutLength(rest, space + 1) === space + 1) {
+      if (safeCutLength(rest, space + 1) === space + 1 && !insideLink(rest, space + 1)) {
         cut = space + 1;
         break;
       }
