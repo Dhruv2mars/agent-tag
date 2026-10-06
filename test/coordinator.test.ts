@@ -265,7 +265,7 @@ describe("Agent Tag coordinator", () => {
         now: outboxNow,
       });
       const failure = store.claimNextOutbox({ workerId: "slack-a", now: outboxNow, leaseMs: 10_000 });
-      expect(failure?.payload.text).toContain("configured T3 turn deadline");
+      expect(failure?.payload.text).toContain("no progress for 2 seconds on each of 2 attempts");
     } finally {
       store.close();
       if (!directory.startsWith(`${tmpdir()}/agent-tag-coordinator-stall-`)) {

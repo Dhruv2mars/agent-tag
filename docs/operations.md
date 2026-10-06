@@ -46,7 +46,18 @@ Send `SIGINT` or `SIGTERM` to stop it. The service first prevents another worker
 
 The configured `maxConcurrentTasks` creates that many independent coordinator workers. SQLite still serializes turns within each task and enforces the same global bound. Interaction responses and the Slack outbox have separate workers, so a task waiting for a human does not block another task.
 
-`limits.stalledTurn` controls a T3 turn that stays unsettled. `timeoutSeconds` bounds one polling attempt, `retryDelaySeconds` delays the same stable command before replay, and `maxAttempts` ends the operation with a durable Slack failure after the final deadline. A terminal stall says only that Agent Tag could not confirm completion; the operator must inspect T3 before retrying because the remote outcome may be unknown.
+`limits.stalledTurn` controls a T3 turn that stops making progress. Progress means any change in the T3 thread snapshot: its sequence, the number or newest timestamp of activities and messages, streamed message text, or turn and session state. A turn that keeps progressing is polled until it settles, however long it runs, and its final reply is posted normally.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `timeoutSeconds` | `300` | A turn is stalled after this many seconds with no T3 progress. |
+| `retryDelaySeconds` | `30` | Delay before a stalled turn is claimed again and its stable command replayed. |
+| `maxAttempts` | `5` | Stall windows allowed before the operation fails with a durable Slack notice. |
+| `maxTurnSeconds` | `21600` (6 h) | Backstop on a turn's active polling time, summed across restarts and retries and excluding time spent waiting for a human. Must be at least `timeoutSeconds`. |
+
+A terminal stall says only that Agent Tag could not confirm completion; the operator must inspect T3 before retrying because the remote outcome may be unknown. A turn that reaches `maxTurnSeconds` fails with `T3TurnCeiling`, posts a notice, and queues a durable `thread.turn.interrupt` for T3.
+
+`limits.interactionExpirySeconds` (default `86400`, 24 h; minimum `60`, maximum 30 days) bounds how long an approval or question waits for a human. While it waits, the operation is deferred until the earliest unanswered request expires, and a Slack response wakes it immediately. If every request T3 still shows as pending already has a response in Agent Tag (queued or delivered), the turn keeps polling instead of deferring, so a response that lands while T3 catches up is never lost. When the wait expires, Agent Tag closes the requests (late button clicks are ignored), posts a notice, fails the operation with `InteractionExpired`, and queues a durable `thread.turn.interrupt`. The next queued message in the thread starts once that interrupt has been delivered to T3, or has failed terminally.
 
 ## macOS background service
 
@@ -98,7 +109,7 @@ Run `status` even when T3 is down:
 bun run status -- /absolute/path/to/agent-tag.json
 ```
 
-`status` opens the local store. It does not contact T3 or Slack. It reports counts, not task IDs or message text. `ready` operations can run now; `deferred` operations have a future retry or interaction time. `activeLease` means a worker owns the work, while `expiredLease` means the next worker can recover it. `stalledRetry` counts turns waiting for another configured attempt, and `stalledFailed` counts turns that exhausted the policy. `awaitingHuman` counts unanswered approvals and questions. `outcomeUnknown` counts Slack sends that need manual reconciliation. Check `oldestReadyAt` when ready work is not moving. Run `doctor` after restoring T3 and Slack access.
+`status` opens the local store. It does not contact T3 or Slack. It reports counts, not task IDs or message text. `ready` operations can run now; `deferred` operations have a future retry or interaction time. `activeLease` means a worker owns the work, while `expiredLease` means the next worker can recover it. `stalledRetry` counts turns waiting for another configured attempt, and `stalledFailed` counts turns that exhausted the policy. Expired waits and ceiling failures appear in the audit export as `operation.failed` with `InteractionExpired` or `T3TurnCeiling`, and expired requests as `interaction.expired`. `awaitingHuman` counts unanswered approvals and questions. `outcomeUnknown` counts Slack sends that need manual reconciliation. Check `oldestReadyAt` when ready work is not moving. Run `doctor` after restoring T3 and Slack access.
 
 This status covers only events already stored by Agent Tag. [Slack's Events API](https://docs.slack.dev/apis/events-api/) is best effort, and [Socket Mode requires an acknowledgement](https://docs.slack.dev/apis/events-api/using-socket-mode/). A sleeping or disconnected host may miss events that never enter the local store; `status` cannot detect those gaps. After an outage, compare the affected Slack threads with the Agent Tag audit log before claiming recovery.
 

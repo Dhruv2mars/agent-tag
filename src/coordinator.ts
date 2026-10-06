@@ -33,6 +33,7 @@ export type CoordinatorOutcome =
       readonly approvalCount: number;
       readonly questionCount: number;
     }
+  | { readonly kind: "expired"; readonly operationId: string; readonly outboxId: string }
   | { readonly kind: "retry-scheduled"; readonly operationId: string; readonly errorCode: string }
   | { readonly kind: "released"; readonly operationId: string }
   | { readonly kind: "failed"; readonly operationId: string; readonly outboxId: string; readonly errorCode: string };
@@ -45,7 +46,10 @@ export interface CoordinatorOptions {
   readonly workerId?: string;
   readonly leaseMs?: number;
   readonly pollMs?: number;
-  readonly maxWaitMs?: number;
+  /** No-progress window before a turn counts as stalled. Defaults to `stalledTurn.timeoutSeconds`. */
+  readonly stallMs?: number;
+  /** Absolute ceiling on a turn's active polling time. Defaults to `stalledTurn.maxTurnSeconds`. */
+  readonly maxTurnMs?: number;
   readonly now?: () => Date;
   readonly sleep?: (milliseconds: number) => Promise<void>;
 }
@@ -126,9 +130,44 @@ function abortable<T>(promise: Promise<T>, signal: AbortSignal | undefined): Pro
 
 class T3TurnStalled extends Error {
   constructor() {
-    super("T3 turn exceeded the configured settlement deadline");
+    super("T3 reported no progress for the configured stall window");
     this.name = "T3TurnStalled";
   }
+}
+
+/**
+ * Everything in a snapshot that changes while a turn works: the read-model sequence, activity and
+ * message counts, the newest activity/message timestamp, streamed text length, and turn/session
+ * state. A turn whose marker stops changing for the stall window is stalled.
+ */
+export function t3ProgressMarker(snapshot: T3ThreadSnapshot): string {
+  const thread = snapshot.thread;
+  let latestMs = 0;
+  let textLength = 0;
+  for (const activity of thread.activities) latestMs = Math.max(latestMs, Date.parse(activity.createdAt));
+  for (const message of thread.messages) {
+    latestMs = Math.max(latestMs, Date.parse(message.updatedAt));
+    textLength += message.text.length;
+  }
+  return JSON.stringify([
+    snapshot.snapshotSequence,
+    thread.activities.length,
+    thread.messages.length,
+    latestMs,
+    textLength,
+    thread.latestTurn?.turnId ?? null,
+    thread.latestTurn?.state ?? null,
+    thread.session?.status ?? null,
+    thread.session?.updatedAt ?? null,
+  ]);
+}
+
+/** Renders a configured duration for Slack, e.g. 86400 -> "24 hours". */
+export function describeDuration(seconds: number): string {
+  const unit = (value: number, name: string) => `${value} ${name}${value === 1 ? "" : "s"}`;
+  if (seconds % 3_600 === 0) return unit(seconds / 3_600, "hour");
+  if (seconds % 60 === 0) return unit(seconds / 60, "minute");
+  return unit(seconds, "second");
 }
 
 /**
@@ -327,7 +366,8 @@ export class AgentTagCoordinator {
   readonly #workerId: string;
   readonly #leaseMs: number;
   readonly #pollMs: number;
-  readonly #maxWaitMs: number;
+  readonly #stallMs: number;
+  readonly #maxTurnMs: number;
   readonly #now: () => Date;
   readonly #sleep: (milliseconds: number) => Promise<void>;
 
@@ -339,7 +379,8 @@ export class AgentTagCoordinator {
     this.#workerId = options.workerId ?? `t3-worker-${crypto.randomUUID()}`;
     this.#leaseMs = options.leaseMs ?? 30_000;
     this.#pollMs = options.pollMs ?? 500;
-    this.#maxWaitMs = options.maxWaitMs ?? options.config.limits.stalledTurn.timeoutSeconds * 1_000;
+    this.#stallMs = options.stallMs ?? options.config.limits.stalledTurn.timeoutSeconds * 1_000;
+    this.#maxTurnMs = options.maxTurnMs ?? options.config.limits.stalledTurn.maxTurnSeconds * 1_000;
     this.#now = options.now ?? (() => new Date());
     this.#sleep = options.sleep ?? ((milliseconds) => Bun.sleep(milliseconds));
   }
@@ -402,7 +443,7 @@ export class AgentTagCoordinator {
       const failure = error instanceof T3TurnStalled
         ? new CoordinatorFailure(
             error.name,
-            `Agent Tag could not confirm completion after ${stalledTurn.maxAttempts} attempts within the configured T3 turn deadline. Ask the operator to inspect T3 before retrying.`,
+            `Agent Tag could not confirm completion: T3 reported no progress for ${describeDuration(stalledTurn.timeoutSeconds)} on each of ${stalledTurn.maxAttempts} attempts. Ask the operator to inspect T3 before retrying.`,
           )
         : error instanceof ExecutionAuthorityDenied
         ? new CoordinatorFailure(
@@ -544,9 +585,15 @@ export class AgentTagCoordinator {
       createdAt: this.#now().toISOString(),
     });
 
-    const startedAt = this.#now().getTime();
-    let renewAt = startedAt + Math.floor(this.#leaseMs / 2);
-    while (this.#now().getTime() - startedAt <= this.#maxWaitMs) {
+    // Stall means "no T3 progress for the stall window", not "not finished yet": a long turn that
+    // keeps advancing is polled until it settles, bounded only by the active-time ceiling, which is
+    // summed across claims (restarts, retries, human waits are excluded) and persisted on renewal.
+    const loopStartedAt = this.#now().getTime();
+    const turnActiveMs = () => operation.turnActiveMs + (this.#now().getTime() - loopStartedAt);
+    let progressMarker: string | null = null;
+    let progressAt = loopStartedAt;
+    let renewAt = loopStartedAt + Math.floor(this.#leaseMs / 2);
+    while (true) {
       if (signal?.aborted) throw new CoordinatorAborted();
       if (this.#now().getTime() >= renewAt) {
         this.#store.renewOperationLease({
@@ -554,12 +601,35 @@ export class AgentTagCoordinator {
           workerId: this.#workerId,
           now: this.#now().toISOString(),
           leaseMs: this.#leaseMs,
+          turnActiveMs: turnActiveMs(),
         });
         renewAt = this.#now().getTime() + Math.floor(this.#leaseMs / 2);
       }
+      if (turnActiveMs() > this.#maxTurnMs) {
+        const outboxId = this.#store.abandonOperation({
+          operationId: operation.operationId,
+          taskId: operation.taskId,
+          workerId: this.#workerId,
+          threadId: task.threadId,
+          actorUserId: operation.payload.actorUserId,
+          conversationId: operation.payload.conversationId,
+          threadTs: operation.payload.threadTs,
+          errorCode: "T3TurnCeiling",
+          text: `Agent Tag stopped this request because the T3 turn ran longer than the configured limit of ${describeDuration(Math.round(this.#maxTurnMs / 1_000))}. Agent Tag has asked T3 to interrupt it; ask the operator to inspect T3 before retrying.`,
+          reason: "turn-ceiling",
+          turnActiveMs: turnActiveMs(),
+          now: this.#now().toISOString(),
+        });
+        return { kind: "failed", operationId: operation.operationId, outboxId, errorCode: "T3TurnCeiling" };
+      }
       const snapshot = await abortable(this.#t3.fetchThread(task.threadId, signal), signal);
+      const marker = t3ProgressMarker(snapshot);
+      if (marker !== progressMarker) {
+        progressMarker = marker;
+        progressAt = this.#now().getTime();
+      }
       if (task.threadStarted && !snapshotHasCurrentTurn(snapshot, operation.messageId)) {
-        await abortable(this.#sleep(this.#pollMs), signal);
+        await this.#pollAgain(progressAt, signal);
         continue;
       }
       const approvals = pendingT3Approvals(snapshot);
@@ -594,19 +664,39 @@ export class AgentTagCoordinator {
             now: interactionNow.toISOString(),
           });
         }
-        this.#store.deferOperation({
+        // Re-read the store before deferring, atomically with the defer: if every request already
+        // has a response (queued or delivered, T3 just has not caught up), keep polling. Otherwise
+        // wait until the earliest request expires; a Slack response clears the block to wake us.
+        const expirySeconds = this.#config.limits.interactionExpirySeconds;
+        const wait = this.#store.awaitOperationInteractions({
           operationId: operation.operationId,
+          taskId: operation.taskId,
           workerId: this.#workerId,
-          blockedUntil: new Date(interactionNow.getTime() + 86_400_000).toISOString(),
+          threadId: task.threadId,
+          actorUserId: operation.payload.actorUserId,
+          conversationId: operation.payload.conversationId,
+          threadTs: operation.payload.threadTs,
+          requests: [
+            ...approvals.map((approval) => ({ requestId: approval.requestId, kind: "approval" as const })),
+            ...userInputs.map((userInput) => ({ requestId: userInput.requestId, kind: "user-input" as const })),
+          ],
+          expirySeconds,
+          expiredText: `Agent Tag cancelled this request because an approval or question went unanswered for ${describeDuration(expirySeconds)}. Agent Tag has asked T3 to stop the turn; send a new message to try again.`,
+          turnActiveMs: turnActiveMs(),
           now: interactionNow.toISOString(),
         });
-        return {
-          kind: "waiting-interaction",
-          operationId: operation.operationId,
-          threadId: task.threadId,
-          approvalCount: approvals.length,
-          questionCount: userInputs.length,
-        };
+        if (wait.kind === "expired") {
+          return { kind: "expired", operationId: operation.operationId, outboxId: wait.outboxId };
+        }
+        if (wait.kind === "deferred") {
+          return {
+            kind: "waiting-interaction",
+            operationId: operation.operationId,
+            threadId: task.threadId,
+            approvalCount: approvals.length,
+            questionCount: userInputs.length,
+          };
+        }
       }
       const latestTurn = snapshot.thread.latestTurn;
       if (latestTurn?.state === "error") throw t3TurnFailure(snapshot);
@@ -641,8 +731,13 @@ export class AgentTagCoordinator {
         });
         return { kind: "completed", operationId: operation.operationId, outboxId };
       }
-      await abortable(this.#sleep(this.#pollMs), signal);
+      await this.#pollAgain(progressAt, signal);
     }
-    throw new T3TurnStalled();
+  }
+
+  /** Sleeps one poll interval, unless T3 has shown no progress for the whole stall window. */
+  async #pollAgain(progressAt: number, signal: AbortSignal | undefined): Promise<void> {
+    if (this.#now().getTime() - progressAt > this.#stallMs) throw new T3TurnStalled();
+    await abortable(this.#sleep(this.#pollMs), signal);
   }
 }
