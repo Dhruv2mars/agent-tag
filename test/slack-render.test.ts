@@ -581,3 +581,17 @@ describe("markdownToMrkdwn code preservation", () => {
     expect(markdownToMrkdwn("[file](https://example.com/`file`)")).toBe("<https://example.com/`file`|file>");
   });
 });
+
+describe("multi-backtick inline code", () => {
+  test("protects complete double-backtick spans from emphasis conversion", () => {
+    expect(markdownToMrkdwn("see ``a ` **x** ` b`` now")).toBe("see `a ` **x** ` b` now");
+  });
+
+  test("a line with inline triple-backtick code is not a fence when splitting", () => {
+    const reply = `\`\`\`npm i\`\`\` then run it\n${"word ".repeat(900)}`;
+    const chunks = splitForSlack(markdownToMrkdwn(reply), 1_000);
+    expect(chunks.join("\n")).toContain("npm i");
+    expect(chunks.join("\n")).toContain("then run it");
+    expect(chunks.some((chunk) => chunk.startsWith("```\n"))).toBe(false);
+  });
+});

@@ -116,7 +116,11 @@ function convertInline(line: string): string {
     return `${PLACEHOLDER_OPEN}${tokens.length - 1}${PLACEHOLDER_CLOSE}`;
   };
   const protectedLine = line
-    .replace(/`([^`\n]+)`/g, (_match, code: string) => hold(`\`${escapeEntities(code)}\``, code))
+    .replace(/(?<!`)(`+)(?!`)([^\n]+?)(?<!`)\1(?!`)/g, (_match, _ticks: string, content: string) => {
+      // CommonMark: a span may use N backticks to contain shorter runs; one padding space is stripped.
+      const code = /^ .* $/.test(content) && content.trim() !== "" ? content.slice(1, -1) : content;
+      return hold(`\`${escapeEntities(code)}\``, code);
+    })
     .replace(/!?\[([^\]\n]*)\]\(\s*<?((?:[^()\s>]|\([^()\s>]*\))+)>?(?:\s+"[^"\n]*")?\s*\)/g, (_match, label: string, url: string) => {
       // Slack link labels cannot carry formatting: inline code becomes plain label text.
       const restore = (text: string): string => text.replace(placeholder, (_token, index: string) => `\`${plain[Number(index)] ?? ""}\``);
@@ -200,7 +204,8 @@ export function markdownToMrkdwn(markdown: string): string {
 }
 
 function isFenceToggle(line: string): boolean {
-  return line.trimStart().startsWith("```");
+  // A fence line is ``` plus an optional info string; info strings cannot contain backticks.
+  return /^\s*```[^`]*$/.test(line);
 }
 
 /** Number of UTF-16 units to keep so a cut never splits a surrogate pair, entity, or `<...>` link. */
