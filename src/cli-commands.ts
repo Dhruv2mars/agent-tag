@@ -1,6 +1,10 @@
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 
+// Imported, not read from disk, so compiled release binaries embed them.
+import configTemplate from "../config/agent-tag.example.json" with { type: "json" };
+import slackManifest from "../config/slack-manifest.example.json" with { type: "json" };
+
 import { parseArguments } from "./cli-args.ts";
 import { runCommand } from "./command.ts";
 import { defaultDoctorDependencies, formatDoctorReport, runDoctor } from "./doctor.ts";
@@ -14,8 +18,6 @@ import {
   mintRestrictedT3Token,
 } from "./t3/auth.ts";
 import { inspectT3 } from "./t3/gateway.ts";
-
-const repositoryRoot = resolve(import.meta.dir, "..");
 
 /** CONFIG positional, else $AGENT_TAG_CONFIG, else the onboarding default `~/.agent-tag/agent-tag.json`. */
 export function resolveConfigPath(
@@ -163,8 +165,8 @@ export async function runOnboardCommand(argv: readonly string[]): Promise<number
       },
       listT3Providers: (t3) => inspectT3(t3, AbortSignal.timeout(15_000)),
       installService: manager === undefined ? undefined : (configPath) => manager.install(configPath),
-      template: await Bun.file(join(repositoryRoot, "config", "agent-tag.example.json")).json(),
-      manifest: await Bun.file(join(repositoryRoot, "config", "slack-manifest.example.json")).json(),
+      template: configTemplate,
+      manifest: slackManifest,
     });
   } finally {
     prompter.close();

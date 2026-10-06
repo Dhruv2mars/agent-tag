@@ -63,10 +63,26 @@ test.skipIf(host === undefined)(
     expect((await readdir(outdir)).sort()).toEqual(["SHA256SUMS", `agent-tag-${host}`]);
 
     // An unknown command is a plain usage error, not a Bun crash with an embedded code frame.
-    const unknown = await run([binary, "onboard"]);
+    const unknown = await run([binary, "onbaord"]);
     expect(unknown.exitCode).toBe(1);
-    expect(unknown.stderr).toStartWith("agent-tag: unknown command: onboard\nusage: agent-tag ");
+    expect(unknown.stderr).toStartWith("agent-tag: unknown command: onbaord\nusage: agent-tag onboard");
     expect(unknown.stderr).not.toContain("cli.ts");
+
+    // doctor and onboard load their bundled JSON (T3 pin, package engines, config template, Slack
+    // manifest) from the binary, not from a source tree that does not exist beside it. HOME points
+    // into the temporary directory so neither command can read or write the operator's real home.
+    const isolated = { HOME: join(outdir, "home") };
+    const doctor = await run([binary, "doctor", join(outdir, "missing.json")], isolated);
+    expect(doctor.exitCode).toBe(1);
+    expect(doctor.stdout).toContain("PASS  bun-version");
+    expect(doctor.stdout).toContain(`config not found at ${join(outdir, "missing.json")}`);
+    expect(`${doctor.stdout}${doctor.stderr}`).not.toContain("$bunfs");
+
+    const onboard = await run([binary, "onboard", "--dir", join(outdir, "home", ".agent-tag")], isolated);
+    expect(onboard.exitCode).toBe(1);
+    expect(onboard.stdout).toContain("Agent Tag onboarding");
+    expect(onboard.stderr).toBe("agent-tag onboard: pass --accept-risk to acknowledge trusted same-user execution in non-interactive mode\n");
+    expect((await readdir(outdir)).sort()).toEqual(["SHA256SUMS", `agent-tag-${host}`]);
   },
   120_000,
 );

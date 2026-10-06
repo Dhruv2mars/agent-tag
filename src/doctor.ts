@@ -4,6 +4,10 @@ import { dirname, join, resolve } from "node:path";
 
 import { z } from "zod";
 
+// Imported, not read from disk, so compiled release binaries embed them.
+import packageJson from "../package.json" with { type: "json" };
+import t3Lock from "../t3.lock.json" with { type: "json" };
+
 import { type AgentTagConfig, agentTagConfigSchema } from "./config.ts";
 import { validateConfiguredProviders } from "./policy/provider.ts";
 import { SecretString } from "./security/secret-file.ts";
@@ -617,9 +621,8 @@ const packageSchema = z.object({
 });
 
 export async function defaultDoctorDependencies(service: ServiceManager | undefined): Promise<DoctorDependencies> {
-  const repositoryRoot = resolve(import.meta.dir, "..");
-  const pin = parseT3Pin(await Bun.file(join(repositoryRoot, "t3.lock.json")).json());
-  const packageInfo = packageSchema.parse(await Bun.file(join(repositoryRoot, "package.json")).json());
+  const pin = parseT3Pin(t3Lock);
+  const packageInfo = packageSchema.parse(packageJson);
   return {
     fetch: (url, init) => fetch(url, init),
     bunVersion: Bun.version,
