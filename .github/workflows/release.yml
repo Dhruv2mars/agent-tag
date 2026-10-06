@@ -1,0 +1,251 @@
+name: Release
+
+# Pushing a tag matching v* publishes a GitHub Release with four standalone binaries plus
+# SHA256SUMS. Pull requests and manual (workflow_dispatch) runs execute the same build and
+# native smoke tests as a dry run and never publish anything, even when dispatched on a tag.
+# Publishing requires both a `push` event and a `refs/tags/v*` ref; the version job computes
+# that once and the publish/image jobs re-check it.
+
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - ".github/workflows/release.yml"
+      - "scripts/build-release.ts"
+      - "src/**"
+      - "install.sh"
+      - "Dockerfile"
+      - ".dockerignore"
+      - "package.json"
+      - "bun.lock"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  version:
+    name: Resolve version
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      publish: ${{ steps.version.outputs.publish }}
+    steps:
+      - id: version
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          REF_NAME: ${{ github.ref_name }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          # A manual run dispatched on a tag builds that tag's version but stays a dry run.
+          case "$REF" in
+            refs/tags/v*) version="${REF_NAME#v}" ;;
+            *) version="0.0.0-dryrun.${RUN_NUMBER}" ;;
+          esac
+          publish=false
+          case "$EVENT_NAME:$REF" in
+            push:refs/tags/v*) publish=true ;;
+          esac
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.targets }}
+    needs: version
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          # macOS binaries are built on macOS so Bun applies the ad-hoc code signature
+          # that Apple silicon requires; Linux binaries cross-compile from one runner.
+          - os: macos-15
+            targets: darwin-arm64 darwin-x64
+          - os: ubuntu-24.04
+            targets: linux-x64 linux-arm64
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Install Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.3.13
+          no-cache: true
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Run typecheck and tests
+        run: bun run check
+      - name: Compile release binaries
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          TARGETS: ${{ matrix.targets }}
+        run: |
+          args=""
+          for target in $TARGETS; do args="$args --target $target"; done
+          # shellcheck disable=SC2086 # intentional word splitting of --target flags
+          bun run scripts/build-release.ts --version "$VERSION" --outdir dist $args
+      - name: Upload binaries
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: binaries-${{ matrix.os }}
+          path: dist/agent-tag-*
+          if-no-files-found: error
+          retention-days: 7
+
+  smoke:
+    name: Smoke ${{ matrix.target }}
+    needs: [version, build]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            target: darwin-arm64
+          - os: macos-15-intel
+            target: darwin-x64
+          - os: ubuntu-24.04
+            target: linux-x64
+          - os: ubuntu-24.04-arm
+            target: linux-arm64
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Download binaries
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: binaries-*
+          merge-multiple: true
+          path: release/download/v${{ needs.version.outputs.version }}
+      - name: Run the binary and install.sh against a local release mirror
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -eu
+          dir="release/download/v$VERSION"
+          chmod 755 "$dir"/agent-tag-*
+          (cd "$dir" && if command -v sha256sum >/dev/null; then sha256sum agent-tag-*; else shasum -a 256 agent-tag-*; fi > SHA256SUMS)
+          "$dir/agent-tag-$TARGET" --help
+          "$dir/agent-tag-$TARGET" version --json | tee version.json
+          grep -q "\"version\":\"$VERSION\"" version.json
+          grep -q "\"target\":\"$TARGET\"" version.json
+          grep -q '"installKind":"binary"' version.json
+          AGENT_TAG_RELEASE_BASE_URL="file://$PWD/release" \
+            AGENT_TAG_VERSION="$VERSION" \
+            AGENT_TAG_INSTALL_DIR="$RUNNER_TEMP/bin" \
+            sh ./install.sh
+          "$RUNNER_TEMP/bin/agent-tag" version
+
+  docker:
+    # Builds and checks the image only. Nothing is pushed here: the push lives in the
+    # `image` job, which waits for the GitHub Release (and therefore every gate) to succeed.
+    name: Docker image
+    needs: version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Build image
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          docker build --build-arg "AGENT_TAG_VERSION=$VERSION" -t agent-tag:ci .
+          docker run --rm agent-tag:ci --help
+          docker run --rm agent-tag:ci version --json | grep -q '"installKind":"container"'
+          test "$(docker run --rm --entrypoint id agent-tag:ci -u)" != "0"
+      - name: Save verified image
+        if: needs.version.outputs.publish == 'true'
+        run: docker save agent-tag:ci | gzip > agent-tag-image.tar.gz
+      - name: Upload verified image
+        if: needs.version.outputs.publish == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: docker-image
+          path: agent-tag-image.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish GitHub Release
+    needs: [version, build, smoke, docker]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && needs.version.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Install Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.3.13
+          no-cache: true
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Download binaries
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: binaries-*
+          merge-multiple: true
+          path: dist
+      - name: Write SHA256SUMS
+        run: |
+          chmod 755 dist/agent-tag-*
+          set -- dist/agent-tag-*
+          test "$#" -eq 4
+          bun run scripts/build-release.ts --sums-only --outdir dist
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          prerelease=""
+          case "$VERSION" in *-*) prerelease="--prerelease" ;; esac
+          # shellcheck disable=SC2086 # empty or a single flag
+          gh release create "$TAG" dist/agent-tag-* dist/SHA256SUMS \
+            --verify-tag --title "agent-tag $VERSION" --generate-notes $prerelease
+
+  image:
+    # Pushes the exact image the `docker` job verified, and only after `publish` created the
+    # GitHub Release, so a tag whose checks, smoke tests, or release step failed never moves
+    # `:<version>` or `:latest`.
+    name: Push image to GHCR
+    needs: [version, docker, publish]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && needs.version.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Download verified image
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: docker-image
+      - name: Push to GHCR
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          gunzip -c agent-tag-image.tar.gz | docker load
+          image="ghcr.io/$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
+          echo "$GH_TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+          docker tag agent-tag:ci "$image:$VERSION"
+          docker push "$image:$VERSION"
+          case "$VERSION" in
+            *-*) ;;
+            *) docker tag agent-tag:ci "$image:latest" && docker push "$image:latest" ;;
+          esac

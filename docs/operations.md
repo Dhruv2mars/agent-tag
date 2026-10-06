@@ -16,6 +16,10 @@ bun run verify:clean-install
 
 The verifier refuses a dirty checkout, exports `HEAD` with `git archive`, installs from `bun.lock` in a fresh private temporary directory, runs typecheck and tests, and verifies the pinned T3 release metadata. It removes the temporary checkout afterward. The same locked install and gate run on clean GitHub-hosted macOS 15 and Ubuntu 24.04 workers in `.github/workflows/ci.yml`.
 
+## Binary installs and updates
+
+Hosts installed with `install.sh` run a standalone binary from `~/.local/bin/agent-tag`. Its subcommands replace the package scripts: `agent-tag run CONFIG` for `bun run start -- CONFIG`, `agent-tag doctor CONFIG` for `bun run doctor -- CONFIG`, and likewise for `status`, `audit`, `backup`, `restore`, and `schedule-add|list|cancel`; `agent-tag help` lists them. `agent-tag update` verifies and atomically replaces the binary; restart the foreground process afterward. The macOS LaunchAgent manager still runs from a source checkout. See [install](install.md).
+
 ## Start and stop
 
 Run a live dependency check first:

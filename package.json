@@ -26,6 +26,7 @@
     "verify:t3-pin": "bun run scripts/verify-t3-pin.ts",
     "verify:clean-install": "bun run scripts/verify-clean-install.ts",
     "check": "bun run typecheck && bun test",
+    "build:release": "bun run scripts/build-release.ts",
     "verify:slack-authority": "bun run scripts/verify-slack-authority.ts"
   },
   "dependencies": {
