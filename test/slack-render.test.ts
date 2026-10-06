@@ -578,7 +578,7 @@ describe("markdownToMrkdwn code preservation", () => {
   });
 
   test("keeps backticks inside link destinations", () => {
-    expect(markdownToMrkdwn("[file](https://example.com/`file`)")).toBe("<https://example.com/`file`|file>");
+    expect(markdownToMrkdwn("[file](https://example.com/`file`)")).toBe("<https://example.com/%60file%60|file>");
   });
 });
 
@@ -621,5 +621,14 @@ describe("inline code across splits", () => {
       expect(body.length).toBeLessThanOrEqual(3_000);
     }
     expect(chunks.join("")).toContain("**literal**");
+  });
+});
+
+describe("links with backticks during splits", () => {
+  test("a backtick in a link does not turn later prose into code", () => {
+    const text = markdownToMrkdwn(`[file](https://example.com/\`file) ${"word ".repeat(900)}`);
+    const chunks = splitForSlack(text, 1_000);
+    expect(chunks.length).toBeGreaterThan(1);
+    expect(chunks.join("")).not.toContain("`");
   });
 });

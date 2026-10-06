@@ -84,7 +84,8 @@ function escapeUrl(url: string): string {
     .replaceAll("&", "&amp;")
     .replaceAll("<", "%3C")
     .replaceAll(">", "%3E")
-    .replaceAll("|", "%7C");
+    .replaceAll("|", "%7C")
+    .replaceAll("`", "%60");
 }
 
 function renderLink(label: string, url: string): string {
@@ -282,7 +283,8 @@ function balanceInlineCode(pieces: readonly string[]): string[] {
   let open = false;
   return pieces.map((piece) => {
     const text = open ? `\`${piece}` : piece;
-    const odd = (text.match(/`/g) ?? []).length % 2 === 1;
+    // Backticks inside generated <url|label> tokens are not code delimiters.
+    const odd = (text.replace(/<[^<>\n]*>/g, "").match(/`/g) ?? []).length % 2 === 1;
     open = odd;
     return odd ? `${text}\`` : text;
   });
