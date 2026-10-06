@@ -1,19 +1,27 @@
 {
-  "version": "0.0.42",
-  "tag": "v0.0.42",
-  "commit": "719a76ca1dbf5490f1aa33ffb9966301e02be9a9",
-  "releasedAt": "2026-09-16T04:59:02Z",
+  "version": "0.0.45",
+  "tag": "v0.0.45",
+  "commit": "6c8fed35dded9ff71c5b46807125457acbb76be6",
+  "releasedAt": "2026-10-02T18:17:31Z",
   "sourceUrl": "https://github.com/pingdotgg/t3code",
-  "releaseUrl": "https://github.com/pingdotgg/t3code/releases/tag/v0.0.42",
-  "effectVersion": "4.0.0-rc.112",
+  "releaseUrl": "https://github.com/pingdotgg/t3code/releases/tag/v0.0.45",
+  "effectVersion": "4.0.0-rc.115",
   "npm": {
     "package": "t3",
-    "integrity": "sha512-B/BiAR9qwG+smhUj7b+R8V6rAsmYMyj0Sz50/KbBMmAy2DhFJdj4PpcAVNWabFHyyEksVtAxYuWjxEa01zg/sw=="
+    "integrity": "sha512-K67qRNKWQHdIyoQ8oCP/cK7lG9y23a1bDNaSsdGkvWJTVRySVd9nvYZS49LW6Ap+RF1nR9QBg/i4s0ovDHi96A=="
   },
   "artifacts": {
     "darwin-arm64": {
-      "name": "t3-0.0.42-darwin-arm64.tar.gz",
-      "sha256": "f15b8c4c47092b3d3a4ae2c24b1e1bb93d24a618edbc8aedfc4455a36b76774a"
+      "name": "t3-0.0.45-darwin-arm64.tar.gz",
+      "sha256": "330a2431619b9b225a3d4f4e555bb165bbf83d57b72d6106e75cd2aabc70c8d6"
+    },
+    "linux-arm64": {
+      "name": "t3-0.0.45-linux-arm64.tar.gz",
+      "sha256": "9133591017e7d477525fda661a46cc9528fd62a0c42268079e435ffb35b95ac9"
+    },
+    "linux-x64": {
+      "name": "t3-0.0.45-linux-x64.tar.gz",
+      "sha256": "10505ae74bc6a43cfab0fde0bf06a0e0d6862f74030591be994a640d48a0d6bd"
     }
   }
 }
