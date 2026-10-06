@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { chmod, mkdir, mkdtemp, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { appendFile, chmod, mkdir, mkdtemp, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -180,5 +180,44 @@ test("secret scan reports a tree that never stops changing as unchecked", async 
     });
     expect(result.skippedEntries.length).toBeGreaterThan(0);
     expect(result.skippedEntries.every((entry) => entry.reason === CHANGED_DURING_SCAN)).toBe(true);
+  });
+});
+
+test("secret scan rereads a log that was appended to after its first read", async () => {
+  await withFixture("agent-tag-secret-append-", async (directory) => {
+    const leak = `xoxb-${"G7".repeat(15)}`;
+    const first = join(directory, "a.log");
+    await writeFile(first, "{}\n");
+    await writeFile(join(directory, "b.log"), "{}\n");
+    let appended = false;
+    const result = await scanForSecrets({
+      roots: [directory],
+      afterFile: async (path) => {
+        // a.log was already read; it grows while b.log is being scanned.
+        if (appended || !path.endsWith("b.log")) return;
+        appended = true;
+        await appendFile(first, `x ${leak} x\n`);
+      },
+    });
+    expect(appended).toBe(true);
+    expect(result.findings).toEqual([{ kind: "known-token-pattern", path: first, patternName: "slack-token" }]);
+    expect(result.skippedEntries).toEqual([]);
+    expect(result.filesScanned).toBe(2);
+    expect(JSON.stringify(result)).not.toContain(leak);
+  });
+});
+
+test("secret scan reports a log that keeps growing past the pass cap as unchecked", async () => {
+  await withFixture("agent-tag-secret-growing-", async (directory) => {
+    const live = join(directory, "a.log");
+    await writeFile(live, "{}\n");
+    await writeFile(join(directory, "b.log"), "{}\n");
+    const result = await scanForSecrets({
+      roots: [directory],
+      afterFile: async () => {
+        await appendFile(live, "{}\n");
+      },
+    });
+    expect(result.skippedEntries).toEqual([{ path: live, reason: CHANGED_DURING_SCAN }]);
   });
 });

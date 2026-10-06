@@ -53,8 +53,9 @@ export interface SecretScanResult {
 export const CHANGED_DURING_SCAN = "changed during the scan";
 
 /**
- * Passes over the tree. The first reads every file; each later pass re-lists the tree and reads only files
- * (by device and inode) not yet read, so content renamed by log rotation mid-scan is still checked.
+ * Passes over the tree. The first reads every file; each later pass re-lists the tree and reads files
+ * (by device and inode) not yet read, or whose size or mtime changed since they were read. Content renamed
+ * by log rotation or appended to a live log mid-scan is still checked.
  */
 const MAX_SCAN_PASSES = 4;
 
@@ -72,12 +73,25 @@ function vanished(code: string): boolean {
   return code === "ENOENT" || code === "ELOOP";
 }
 
+/** Identifies a file across renames: device and inode. */
 function fileKey(metadata: { readonly dev: number; readonly ino: number }): string {
   return `${metadata.dev}:${metadata.ino}`;
 }
 
+/** Size and mtime: a change means the file was appended to or rewritten since it was read. */
+function fileVersion(metadata: { readonly size: number; readonly mtimeMs: number }): string {
+  return `${metadata.size}:${metadata.mtimeMs}`;
+}
+
+/** Device and inode of each file read, mapped to the version it had when it was opened. */
+type ScannedVersions = ReadonlyMap<string, string>;
+
+function alreadyRead(scanned: ScannedVersions, file: { readonly key: string; readonly version: string }): boolean {
+  return scanned.get(file.key) === file.version;
+}
+
 interface Listing {
-  readonly files: ReadonlyArray<{ readonly path: string; readonly key: string }>;
+  readonly files: ReadonlyArray<{ readonly path: string; readonly key: string; readonly version: string }>;
   readonly symlinks: readonly string[];
   readonly unreadable: readonly SkippedScanEntry[];
   readonly vanished: readonly string[];
@@ -88,7 +102,7 @@ async function listFiles(input: {
   readonly excludedPaths: ReadonlySet<string>;
 }): Promise<Listing> {
   const pending = [...input.roots];
-  const files = new Map<string, string>();
+  const files = new Map<string, { readonly key: string; readonly version: string }>();
   const symlinks: string[] = [];
   const unreadable: SkippedScanEntry[] = [];
   const gone: string[] = [];
@@ -103,7 +117,7 @@ async function listFiles(input: {
         continue;
       }
       if (metadata.isFile()) {
-        files.set(path, fileKey(metadata));
+        files.set(path, { key: fileKey(metadata), version: fileVersion(metadata) });
         continue;
       }
       if (!metadata.isDirectory()) continue;
@@ -122,7 +136,7 @@ async function listFiles(input: {
   }
 
   return {
-    files: [...files].sort(([left], [right]) => left.localeCompare(right)).map(([path, key]) => ({ path, key })),
+    files: [...files].sort(([left], [right]) => left.localeCompare(right)).map(([path, file]) => ({ path, ...file })),
     symlinks,
     unreadable,
     vanished: gone,
@@ -130,8 +144,14 @@ async function listFiles(input: {
 }
 
 type FileScan =
-  | { readonly status: "scanned"; readonly key: string; readonly bytesScanned: number; readonly findings: readonly SecretFinding[] }
-  | { readonly status: "already-scanned"; readonly key: string }
+  | {
+      readonly status: "scanned";
+      readonly key: string;
+      readonly version: string;
+      readonly bytesScanned: number;
+      readonly findings: readonly SecretFinding[];
+    }
+  | { readonly status: "already-scanned" }
   | { readonly status: "vanished" }
   | { readonly status: "failed"; readonly reason: string; readonly bytesScanned: number; readonly findings: readonly SecretFinding[] };
 
@@ -139,7 +159,7 @@ async function scanFile(input: {
   readonly path: string;
   readonly canaries: readonly PreparedCanary[];
   readonly overlapBytes: number;
-  readonly scannedKeys: ReadonlySet<string>;
+  readonly scanned: ScannedVersions;
 }): Promise<FileScan> {
   let handle: FileHandle;
   try {
@@ -156,8 +176,9 @@ async function scanFile(input: {
   try {
     const metadata = await handle.stat();
     if (!metadata.isFile()) return { status: "vanished" };
-    const key = fileKey(metadata);
-    if (input.scannedKeys.has(key)) return { status: "already-scanned", key };
+    // The version is taken before reading, so anything appended during or after the read shows up as a change.
+    const file = { key: fileKey(metadata), version: fileVersion(metadata) };
+    if (alreadyRead(input.scanned, file)) return { status: "already-scanned" };
 
     const foundCanaries = new Set<string>();
     const foundPatterns = new Set<string>();
@@ -183,7 +204,7 @@ async function scanFile(input: {
       }
       tail = window.subarray(Math.max(0, window.length - input.overlapBytes));
     }
-    return { status: "scanned", key, bytesScanned, findings };
+    return { status: "scanned", ...file, bytesScanned, findings };
   } catch (error) {
     // Keep whatever was found before the read failed.
     return { status: "failed", reason: errorCode(error), bytesScanned, findings };
@@ -240,7 +261,7 @@ export async function scanForSecrets(input: {
     ...canaries.map((canary) => Math.max(0, canary.bytes.length - 1)),
   );
 
-  const scannedKeys = new Set<string>();
+  const scanned = new Map<string, string>();
   const symlinks = new Set<string>();
   const findings = new Map<string, SecretFinding>();
   let bytesScanned = 0;
@@ -250,26 +271,25 @@ export async function scanForSecrets(input: {
     for (const entry of listing.unreadable) skipped.set(entry.path, entry.reason);
     const changed = [...listing.vanished];
     for (const file of listing.files) {
-      if (scannedKeys.has(file.key) || skipped.has(file.path)) continue;
-      const result = await scanFile({ path: file.path, canaries, overlapBytes, scannedKeys });
+      if (alreadyRead(scanned, file) || skipped.has(file.path)) continue;
+      const result = await scanFile({ path: file.path, canaries, overlapBytes, scanned });
       if (result.status === "scanned" || result.status === "failed") {
         bytesScanned += result.bytesScanned;
         for (const finding of result.findings) findings.set(findingKey(finding), finding);
       }
       if (result.status === "scanned") {
-        scannedKeys.add(result.key);
+        scanned.set(result.key, result.version);
         changed.push(file.path);
-      } else if (result.status === "already-scanned") {
-        scannedKeys.add(file.key);
       } else if (result.status === "vanished") {
         changed.push(file.path);
-      } else {
+      } else if (result.status === "failed") {
         skipped.set(file.path, result.reason);
       }
       await input.afterFile?.(file.path);
     }
-    // The first pass always gets a verification pass: rotation can rename a file without any read error.
-    // A later pass that reads nothing new and sees nothing vanish means the tree held still.
+    // The first pass always gets a verification pass: rotation can rename a file without any read error,
+    // and a live log can grow after it was read. A later pass that reads nothing new or changed and sees
+    // nothing vanish means the tree held still.
     if (pass > 1 && changed.length === 0) break;
     if (pass === MAX_SCAN_PASSES) {
       for (const path of changed) if (!skipped.has(path)) skipped.set(path, CHANGED_DURING_SCAN);
@@ -277,7 +297,7 @@ export async function scanForSecrets(input: {
   }
 
   return {
-    filesScanned: scannedKeys.size,
+    filesScanned: scanned.size,
     bytesScanned,
     symlinksSkipped: symlinks.size,
     skippedEntries: [...skipped]
