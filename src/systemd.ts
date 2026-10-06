@@ -86,10 +86,9 @@ export function renderSystemdUnit(input: SystemdUnitDefinition): string {
 [Unit]
 Description=Agent Tag Slack coworker
 Documentation=https://github.com/Dhruv2mars/agent-tag/blob/main/docs/operations.md
-After=network-online.target
-Wants=network-online.target
-StartLimitIntervalSec=300
-StartLimitBurst=10
+# A --user manager cannot order against system targets such as network-online.target.
+# Never give up restarting: agent-tag run exits while T3 is down, and launchd KeepAlive also retries forever.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -243,8 +242,14 @@ export class SystemdUserService {
     });
   }
 
+  /** Clears a failed state (including a start-limit hit) so the next start is not refused. */
+  async #resetFailed(): Promise<void> {
+    await this.#host.run(systemctl("reset-failed", AGENT_TAG_SYSTEMD_UNIT));
+  }
+
   async #enableAndStart(description: string): Promise<void> {
     await requireSuccess(this.#host.run, systemctl("daemon-reload"), "systemd daemon-reload");
+    await this.#resetFailed();
     await requireSuccess(this.#host.run, systemctl("enable", "--now", AGENT_TAG_SYSTEMD_UNIT), description);
     if (!(await this.#waitUntilRunning())) throw new Error("systemd unit did not reach running state");
   }
@@ -278,12 +283,14 @@ export class SystemdUserService {
     try {
       await requireSuccess(this.#host.run, systemctl("daemon-reload"), "systemd daemon-reload");
       await requireSuccess(this.#host.run, systemctl("enable", AGENT_TAG_SYSTEMD_UNIT), "systemd enable");
-        await requireSuccess(this.#host.run, systemctl("restart", AGENT_TAG_SYSTEMD_UNIT), "systemd restart");
+      await this.#resetFailed();
+      await requireSuccess(this.#host.run, systemctl("restart", AGENT_TAG_SYSTEMD_UNIT), "systemd restart");
       if (!(await this.#waitUntilRunning())) throw new Error("systemd unit did not reach running state");
     } catch (error) {
       await writeUnitFile(this.unitPath, prior);
       await this.#host.run(systemctl("daemon-reload"));
-        if (!wasRunning) {
+      await this.#resetFailed();
+      if (!wasRunning) {
         await this.#host.run(systemctl("stop", AGENT_TAG_SYSTEMD_UNIT));
         throw error;
       }
@@ -301,6 +308,7 @@ export class SystemdUserService {
     if ((await readOptional(this.unitPath)) === undefined) {
       throw new Error("Agent Tag systemd unit is not installed");
     }
+    await this.#resetFailed();
     await requireSuccess(this.#host.run, systemctl("restart", AGENT_TAG_SYSTEMD_UNIT), "systemd restart");
     if (!(await this.#waitUntilRunning())) throw new Error("systemd unit did not reach running state");
     return this.status();

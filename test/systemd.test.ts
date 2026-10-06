@@ -34,7 +34,11 @@ describe("systemd unit rendering", () => {
     expect(unit).toContain("Restart=always\n");
     expect(unit).toContain("UMask=0077\n");
     expect(unit).toContain("WantedBy=default.target\n");
-    expect(unit).toContain("After=network-online.target\n");
+    // A --user manager cannot see network-online.target, and a start limit would stop retries for good.
+    expect(unit).not.toMatch(/^(After|Wants)=network-online\.target$/m);
+    expect(unit).toContain("StartLimitIntervalSec=0\n");
+    expect(unit).not.toContain("StartLimitBurst");
+    expect(unit).toContain("RestartSec=10\n");
   });
 
   test("reads ExecStart and WorkingDirectory back, including escaped characters", () => {
@@ -227,7 +231,21 @@ describe("systemd user service lifecycle", () => {
   test("restart waits for the running state", async () => {
     await service.install("/cfg/a.json");
     fake.active = false;
+    fake.commands.length = 0;
     expect((await service.restart()).running).toBe(true);
-    expect(fake.commands).toContain(`systemctl --user restart ${AGENT_TAG_SYSTEMD_UNIT}`);
+    const reset = fake.commands.indexOf(`systemctl --user reset-failed ${AGENT_TAG_SYSTEMD_UNIT}`);
+    const restart = fake.commands.indexOf(`systemctl --user restart ${AGENT_TAG_SYSTEMD_UNIT}`);
+    expect(reset).toBeGreaterThanOrEqual(0);
+    expect(restart).toBeGreaterThan(reset);
+  });
+
+  test("install and upgrade clear a failed state before starting", async () => {
+    await service.install("/cfg/a.json");
+    const enable = fake.commands.indexOf(`systemctl --user enable --now ${AGENT_TAG_SYSTEMD_UNIT}`);
+    expect(fake.commands.slice(0, enable)).toContain(`systemctl --user reset-failed ${AGENT_TAG_SYSTEMD_UNIT}`);
+    fake.commands.length = 0;
+    await service.upgrade("/cfg/b.json");
+    const restart = fake.commands.indexOf(`systemctl --user restart ${AGENT_TAG_SYSTEMD_UNIT}`);
+    expect(fake.commands.slice(0, restart)).toContain(`systemctl --user reset-failed ${AGENT_TAG_SYSTEMD_UNIT}`);
   });
 });
