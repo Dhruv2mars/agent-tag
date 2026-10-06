@@ -51,14 +51,35 @@ detect_arch() {
   printf '%s' "$arch"
 }
 
+fail_musl() {
+  fail "musl-based Linux (for example Alpine) is not supported by the release binaries; use the Docker image instead"
+}
+
+glibc_loader_present() {
+  for loader in /lib*/ld-linux-*.so.*; do
+    if [ -e "$loader" ]; then return 0; fi
+  done
+  return 1
+}
+
+# Refuses only when the C library actually in use is musl. A musl loader that merely
+# exists on disk (Debian/Ubuntu's `musl` package installs /lib/ld-musl-*) does not make
+# a glibc host musl-based.
 check_libc() {
-  if [ "$1" = "linux" ]; then
-    for loader in /lib/ld-musl-*; do
-      if [ -e "$loader" ]; then
-        fail "musl-based Linux (for example Alpine) is not supported by the release binaries; use the Docker image instead"
-      fi
-    done
+  [ "$1" = "linux" ] || return 0
+  if getconf GNU_LIBC_VERSION >/dev/null 2>&1; then
+    return 0
   fi
+  if command -v ldd >/dev/null 2>&1; then
+    case "$(ldd --version 2>&1 || true)" in
+      *musl*) fail_musl ;;
+      *GLIBC* | *glibc* | *"GNU libc"*) return 0 ;;
+    esac
+  fi
+  # Neither tool answered: fall back to the loaders, and refuse only without a glibc one.
+  for loader in /lib/ld-musl-*; do
+    if [ -e "$loader" ] && ! glibc_loader_present; then fail_musl; fi
+  done
 }
 
 normalize_version() {
@@ -72,14 +93,16 @@ normalize_version() {
   printf 'v%s' "$version"
 }
 
+# download URL OUTPUT [HINT]: HINT is appended to the error when the download fails.
 download() {
   if command -v curl >/dev/null 2>&1; then
-    curl -fsSL --retry 3 --output "$2" "$1" || fail "download failed: $1"
+    if curl -fsSL --retry 3 --output "$2" "$1"; then return 0; fi
   elif command -v wget >/dev/null 2>&1; then
-    wget -q -O "$2" "$1" || fail "download failed: $1"
+    if wget -q -O "$2" "$1"; then return 0; fi
   else
     fail "curl or wget is required"
   fi
+  fail "download failed: $1${3:-}"
 }
 
 sha256_of() {
@@ -108,10 +131,15 @@ main() {
   if [ "$requested" = "latest" ]; then
     release_path="latest/download"
     label="latest release"
+    # GitHub's latest/download skips prereleases, so it 404s until a stable release exists.
+    hint="
+agent-tag: if no stable release is published yet, pin a prerelease from $base_url, for example:
+  curl -fsSL https://raw.githubusercontent.com/$REPOSITORY/main/install.sh | AGENT_TAG_VERSION=0.1.0-rc.1 sh"
   else
     tag=$(normalize_version "$requested")
     release_path="download/$tag"
     label="$tag"
+    hint=""
   fi
 
   tmp_dir=$(mktemp -d 2>/dev/null || mktemp -d -t agent-tag)
@@ -119,8 +147,8 @@ main() {
   trap 'exit 130' INT TERM
 
   say "downloading $asset ($label)"
-  download "$base_url/$release_path/$asset" "$tmp_dir/$asset"
-  download "$base_url/$release_path/SHA256SUMS" "$tmp_dir/SHA256SUMS"
+  download "$base_url/$release_path/$asset" "$tmp_dir/$asset" "$hint"
+  download "$base_url/$release_path/SHA256SUMS" "$tmp_dir/SHA256SUMS" "$hint"
 
   expected=$(awk -v name="$asset" '$2 == name || $2 == "*" name { print $1; exit }' "$tmp_dir/SHA256SUMS")
   [ -n "$expected" ] || fail "SHA256SUMS has no entry for $asset"

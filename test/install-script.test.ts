@@ -36,6 +36,14 @@ async function fakeUname(system: string, machine: string): Promise<void> {
   await chmod(path, 0o755);
 }
 
+/** Shadows a libc probe (`getconf` or `ldd`) with a script that prints and exits as given. */
+async function fakeTool(name: string, output: string, exitCode: number, stream: "stdout" | "stderr" = "stdout"): Promise<void> {
+  const path = join(fakeBin, name);
+  const redirect = stream === "stderr" ? " >&2" : "";
+  await writeFile(path, `#!/bin/sh\nprintf '%s\\n' '${output}'${redirect}\nexit ${exitCode}\n`);
+  await chmod(path, 0o755);
+}
+
 async function runInstaller(
   env: Record<string, string> = {},
   shell = "/bin/sh",
@@ -205,4 +213,72 @@ test("refuses a verified binary that cannot execute on this machine", async () =
   expect(result.exitCode).not.toBe(0);
   expect(result.stderr).toContain("does not run on this machine");
   expect(await readdir(installDir)).toEqual([]);
+});
+
+async function writeLinuxX64Release(): Promise<void> {
+  await writeFakeRelease({
+    root: releases,
+    tag: "v0.3.0",
+    latest: true,
+    assets: { "agent-tag-linux-x64": fakeBinaryScript("0.3.0", "linux-x64") },
+  });
+}
+
+test("installs on a glibc host even when ldd or a musl loader suggests musl is present", async () => {
+  // Debian's `musl` package installs /lib/ld-musl-*, but getconf reports the libc in use.
+  await fakeUname("Linux", "x86_64");
+  await fakeTool("getconf", "glibc 2.36", 0);
+  await fakeTool("ldd", "musl libc (x86_64)", 1, "stderr");
+  await writeLinuxX64Release();
+  const result = await runInstaller();
+  expect(result.stderr).toBe("");
+  expect(result.exitCode).toBe(0);
+  expect(await Bun.file(join(installDir, "agent-tag")).exists()).toBe(true);
+});
+
+test("falls back to ldd when getconf cannot name the libc", async () => {
+  await fakeUname("Linux", "x86_64");
+  await fakeTool("getconf", "getconf: GNU_LIBC_VERSION: unknown variable", 1, "stderr");
+  await fakeTool("ldd", "ldd (Debian GLIBC 2.36-9+deb12u7) 2.36", 0);
+  await writeLinuxX64Release();
+  const result = await runInstaller();
+  expect(result.stderr).toBe("");
+  expect(result.exitCode).toBe(0);
+});
+
+test("refuses a musl host such as Alpine before downloading anything", async () => {
+  await fakeUname("Linux", "x86_64");
+  await fakeTool("getconf", "getconf: GNU_LIBC_VERSION: unknown variable", 1, "stderr");
+  await fakeTool("ldd", "musl libc (x86_64)", 1, "stderr");
+  await writeLinuxX64Release();
+  const result = await runInstaller();
+  expect(result.exitCode).not.toBe(0);
+  expect(result.stderr).toContain("musl-based Linux (for example Alpine) is not supported");
+  expect(result.stderr).toContain("Docker image");
+  expect(result.stdout).not.toContain("downloading");
+  expect(await Bun.file(join(installDir, "agent-tag")).exists()).toBe(false);
+});
+
+test("explains how to pin a prerelease when no stable latest release exists", async () => {
+  await fakeUname("Linux", "x86_64");
+  // Only a prerelease is published, so GitHub's latest/download path has nothing.
+  await writeFakeRelease({
+    root: releases,
+    tag: "v0.1.0-rc.1",
+    assets: { "agent-tag-linux-x64": fakeBinaryScript("0.1.0-rc.1", "linux-x64") },
+  });
+  let result = await runInstaller();
+  expect(result.exitCode).not.toBe(0);
+  expect(result.stderr).toContain("download failed");
+  expect(result.stderr).toContain("if no stable release is published yet, pin a prerelease");
+  expect(result.stderr).toContain("AGENT_TAG_VERSION=");
+
+  result = await runInstaller({ AGENT_TAG_VERSION: "0.1.0-rc.1" });
+  expect(result.exitCode).toBe(0);
+
+  // A pinned version that does not exist gets the plain error, not the prerelease hint.
+  result = await runInstaller({ AGENT_TAG_VERSION: "0.9.0" });
+  expect(result.exitCode).not.toBe(0);
+  expect(result.stderr).toContain("download failed");
+  expect(result.stderr).not.toContain("pin a prerelease");
 });

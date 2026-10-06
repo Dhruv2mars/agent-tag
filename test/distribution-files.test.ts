@@ -117,6 +117,17 @@ test("the GHCR push waits for every release gate and the published GitHub Releas
   }
 });
 
+test("install snippets pin a prerelease while the project is not generally available", async () => {
+  const readme = await Bun.file(join(repository, "README.md")).text();
+  if (!readme.includes("not yet generally available")) return;
+  for (const document of ["README.md", "docs/install.md"]) {
+    const text = await Bun.file(join(repository, document)).text();
+    const snippets = text.split("\n").filter((line) => line.includes("install.sh |"));
+    expect(snippets.length).toBeGreaterThan(0);
+    for (const line of snippets) expect(line).toMatch(/\| AGENT_TAG_VERSION=\d+\.\d+\.\d+-\S+ sh$/);
+  }
+});
+
 test("install.sh is valid POSIX sh", async () => {
   const result = await run(["/bin/sh", "-n", join(repository, "install.sh")], repository);
   expect(result.exitCode).toBe(0);

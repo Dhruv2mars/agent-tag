@@ -11,8 +11,10 @@ Agent Tag ships three ways. Each one still needs a running T3 Code `0.0.42` serv
 ## Prebuilt binary
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Dhruv2mars/agent-tag/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/Dhruv2mars/agent-tag/main/install.sh | AGENT_TAG_VERSION=0.1.0-rc.1 sh
 ```
+
+Until GA, pin a prerelease as above; see [the note on `latest`](#latest-and-prereleases) below.
 
 The installer:
 
@@ -20,7 +22,9 @@ The installer:
 2. downloads `agent-tag-<os>-<arch>` and `SHA256SUMS` from [GitHub Releases](https://github.com/Dhruv2mars/agent-tag/releases);
 3. refuses to install if the checksum is missing or wrong;
 4. runs the binary once, then moves it atomically to `~/.local/bin/agent-tag`;
-5. prints the next step, `agent-tag onboard`. Until the onboarding wizard lands, follow [Slack setup](slack-setup.md) and run `agent-tag doctor CONFIG`.
+5. prints the next step: create the Slack app and config with [Slack setup](slack-setup.md), then run `agent-tag doctor /absolute/path/to/agent-tag.json`.
+
+On Linux it asks the C library in use (`getconf GNU_LIBC_VERSION`, then `ldd --version`) and refuses only a musl host. A glibc host that also has Debian's `musl` package installed is fine.
 
 To review the script before running it, download it first and run it with `sh install.sh`.
 
@@ -30,11 +34,15 @@ To review the script before running it, download it first and run it with `sh in
 | `AGENT_TAG_INSTALL_DIR` | `~/.local/bin` | Where to put the binary. |
 | `AGENT_TAG_RELEASE_BASE_URL` | `https://github.com/Dhruv2mars/agent-tag/releases` | A mirror laid out like GitHub Releases (`download/<tag>/<asset>` and `latest/download/<asset>`). |
 
+### `latest` and prereleases
+
 `latest` resolves to GitHub's latest *stable* release and skips prereleases. Until GA, releases are tagged as prereleases (for example `v0.1.0-rc.1`), so pin one:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/Dhruv2mars/agent-tag/main/install.sh | AGENT_TAG_VERSION=0.1.0-rc.1 sh
 ```
+
+Without a pin, the installer fails with `download failed` and prints the pinned command. `agent-tag update` and `agent-tag update --check` likewise report that no stable release is published yet. Move between prereleases with `agent-tag update --version 0.1.0-rc.2`. Neither the installer nor `update` discovers prereleases on its own.
 
 Not supported: Windows outside WSL2, and musl-based Linux such as Alpine (use the Docker image). x64 binaries use Bun's baseline runtime, so CPUs without AVX2 work too.
 

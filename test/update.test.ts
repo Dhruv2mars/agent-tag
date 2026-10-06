@@ -148,8 +148,27 @@ test("fails when the release lacks this platform or does not exist", async () =>
     "download failed with HTTP 404",
   );
   await expect(runUpdate({ check: true, version: undefined }, dependencies(binaryBuild("0.1.0"), execPath))).rejects.toThrow(
-    "no published agent-tag release found",
+    "no stable agent-tag release is published yet",
   );
+});
+
+test("a prerelease install gets actionable guidance while only prereleases exist", async () => {
+  // Before GA every release is a prerelease, so `releases/latest` redirects to `/releases`.
+  const execPath = await installCurrent("0.1.0-rc.1");
+  await writeFakeRelease({ root: releases, tag: "v0.1.0-rc.2", assets: { [asset]: fakeBinaryScript("0.1.0-rc.2", target) } });
+  const build = binaryBuild("0.1.0-rc.1");
+  for (const check of [true, false]) {
+    const io = context(build, execPath);
+    expect(await runDistributionCommand(check ? ["update", "--check"] : ["update"], io)).toBe(1);
+    const stderr = io.err.join("");
+    expect(stderr).toContain("no stable agent-tag release is published yet");
+    expect(stderr).toContain(`${server.url.origin}/releases`);
+    expect(stderr).toContain("agent-tag update --version");
+  }
+  // The suggested path works.
+  const io = context(build, execPath);
+  expect(await runDistributionCommand(["update", "--version", "0.1.0-rc.2"], io)).toBe(0);
+  expect(io.out.join("")).toContain("Updated agent-tag 0.1.0-rc.1 -> 0.1.0-rc.2");
 });
 
 test("--check reports availability without downloading or writing", async () => {

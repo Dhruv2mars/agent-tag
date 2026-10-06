@@ -104,7 +104,22 @@ export async function resolveLatestTag(dependencies: UpdateDependencies): Promis
   if (response.status < 300 || response.status >= 400 || location === null) {
     throw new Error(`could not resolve the latest release from ${url} (HTTP ${response.status})`);
   }
-  return tagFromLatestRedirect(new URL(location, url).pathname);
+  try {
+    return tagFromLatestRedirect(new URL(location, url).pathname);
+  } catch {
+    throw new Error(noStableReleaseGuidance(dependencies.releaseBaseUrl));
+  }
+}
+
+/**
+ * GitHub's `releases/latest` skips prereleases and redirects to the release list when no
+ * stable release exists, which is the normal state before GA.
+ */
+export function noStableReleaseGuidance(releaseBaseUrl: string): string {
+  return [
+    "no stable agent-tag release is published yet (the latest-release lookup skips prereleases).",
+    `Pick a prerelease from ${releaseBaseUrl} and install it explicitly, for example: agent-tag update --version 0.1.0-rc.1`,
+  ].join("\n");
 }
 
 async function smokeTest(path: string, expectedVersion: string): Promise<void> {

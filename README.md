@@ -11,12 +11,13 @@ For a concise continuation guide, current verified behavior, and the next requir
 Install a prebuilt binary (macOS arm64/x64, Linux x64/arm64) without cloning:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Dhruv2mars/agent-tag/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/Dhruv2mars/agent-tag/main/install.sh | AGENT_TAG_VERSION=0.1.0-rc.1 sh
 agent-tag version
-agent-tag update --check
 ```
 
-The installer verifies the release's `SHA256SUMS` and installs to `~/.local/bin`. Set `AGENT_TAG_VERSION` to pin a release and `AGENT_TAG_INSTALL_DIR` to change the destination. A Docker image is also available. See [install](docs/install.md) for both, plus self-update and how releases are cut.
+Until GA every release is a prerelease, and the installer's default (`latest`) only finds stable releases, so pin one from [the releases page](https://github.com/Dhruv2mars/agent-tag/releases) with `AGENT_TAG_VERSION`. For the same reason, move between prereleases with `agent-tag update --version X` rather than a bare `agent-tag update`. After the first stable release, drop the pin and use `agent-tag update --check`.
+
+The installer verifies the release's `SHA256SUMS` and installs to `~/.local/bin`. Set `AGENT_TAG_INSTALL_DIR` to change the destination. Then create the Slack app and config with [Slack setup](docs/slack-setup.md) and check them with `agent-tag doctor /absolute/path/to/agent-tag.json`. A Docker image is also available. See [install](docs/install.md) for both, plus self-update and how releases are cut.
 
 ## Development
 
