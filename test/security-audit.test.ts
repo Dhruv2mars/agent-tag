@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { chmod, mkdir, mkdtemp, rm, utimes, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, realpath, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -19,7 +19,8 @@ import {
   type PathRole,
   type SecurityFinding,
 } from "../src/security/audit.ts";
-import { runSecurityAudit } from "../src/security/audit-run.ts";
+import { canonicalPath, readAuditInputs, runSecurityAudit } from "../src/security/audit-run.ts";
+import { T3HttpError } from "../src/t3/auth.ts";
 import { parseCliArguments } from "../src/security/cli.ts";
 
 const uid = 501;
@@ -65,6 +66,30 @@ describe("file permission checks", () => {
     ]);
     expect(checkPathPermissions({ path: "/x", role: "log", state: { kind: "missing" } }, uid)).toEqual([]);
     expect(checkPathPermissions({ path: "/x", role: "secret-file", state: { kind: "file", mode: 0o600, uid: 0 } }, undefined)).toEqual([]);
+  });
+
+  test("symbolic links are graded by who can repoint them, and checks apply to the target", () => {
+    const linked = (role: PathRole, replaceableByOthers: boolean, mode = 0o600) =>
+      checkPathPermissions(
+        { path: "/x/link", role, state: { kind: "file", mode, uid, link: { target: "/real/file", replaceableByOthers } } },
+        uid,
+      );
+    expect(ids(linked("secret-file", false))).toEqual(["info:secret-file-symlink"]);
+    expect(ids(linked("secret-file", true))).toEqual(["high:secret-file-symlink"]);
+    expect(ids(linked("log", true))).toEqual(["medium:log-symlink"]);
+    const loose = linked("secret-file", false, 0o644);
+    expect(ids(loose)).toEqual(["info:secret-file-symlink", "high:secret-file-mode"]);
+    expect(loose[1]?.remediation).toBe("chmod 600 /real/file");
+  });
+
+  test("paths the auditing user cannot stat are reported instead of crashing", () => {
+    const unreadable = (role: PathRole) =>
+      checkPathPermissions({ path: "/x", role, state: { kind: "unreadable", code: "EACCES" } }, uid);
+    for (const role of ["config", "secret-file", "secret-directory", "data-directory", "database"] as const) {
+      expect(ids(unreadable(role))).toEqual([`high:${role}-unreadable`]);
+    }
+    expect(ids(unreadable("log"))).toEqual(["low:log-unreadable"]);
+    expect(unreadable("secret-file")[0]?.message).toContain("EACCES");
   });
 
   test("config and logs grade read and write exposure", () => {
@@ -146,6 +171,9 @@ describe("config checks", () => {
     expect(ids(checkT3Session({ now, unavailableReason: "offline", tokenModifiedAt: "2026-09-01T00:00:00.000Z" }))).toEqual([
       "info:t3-session-unchecked",
     ]);
+    const rejected = checkT3Session({ now, rejectedStatus: 401, tokenModifiedAt: "2026-09-01T00:00:00.000Z" });
+    expect(ids(rejected)).toEqual(["high:t3-token-rejected"]);
+    expect(rejected[0]?.message).toContain("HTTP 401");
   });
 
   test("rejects repository roots that expose the home directory or Agent Tag state", () => {
@@ -162,6 +190,22 @@ describe("config checks", () => {
     expect(check("/Users/me/code/app")).toEqual([]);
     expect(check("/Users/meow")).toEqual([]);
     expect(check("/srv/agent-tag")).toEqual(["high:repo-root-contains-private-path", "medium:repo-root-contains-private-path"]);
+    // Canonical forms decide: a root that links to home, and a root above a linked parent such as macOS /tmp.
+    expect(
+      ids(checkRepositoryRoots({ roots: [{ profileId: "p", root: "/srv/link", realRoot: "/Users/me" }], home: "/Users/me", protectedPaths: [] })),
+    ).toEqual(["high:repo-root-home"]);
+    expect(
+      ids(
+        checkRepositoryRoots({
+          roots: [{ profileId: "p", root: "/private/tmp", realRoot: "/private/tmp" }],
+          home: "/Users/me",
+          protectedPaths: [{ label: "data directory", path: "/tmp/sa/data", realPath: "/private/tmp/sa/data", severity: "high" }],
+        }),
+      ),
+    ).toEqual(["high:repo-root-contains-private-path"]);
+    expect(
+      ids(checkRepositoryRoots({ roots: [{ profileId: "p", root: "/srv/repos/app" }], home: "/var/home/me", realHome: "/srv/repos/app/me", protectedPaths: [] })),
+    ).toEqual(["high:repo-root-home"]);
   });
 
   test("flags approval bypass and unenforced isolation", () => {
@@ -200,6 +244,49 @@ describe("config checks", () => {
         }),
       ),
     ).toEqual(["high:secret-at-rest", "high:secret-at-rest", "low:secret-scan-incomplete"]);
+    const remediations = checkSecretScan(
+      {
+        filesScanned: 2,
+        bytesScanned: 10,
+        symlinksSkipped: 0,
+        findings: [
+          { kind: "known-token-pattern", path: "/d/agent-tag.sqlite-wal", patternName: "slack-token" },
+          { kind: "known-token-pattern", path: "/logs/service.stderr.log", patternName: "slack-token" },
+        ],
+      },
+      { databasePaths: ["/d/agent-tag.sqlite", "/d/agent-tag.sqlite-wal"] },
+    ).map((finding) => finding.remediation);
+    expect(remediations[0]).toContain("docs/operations.md#purging-content-from-the-store");
+    expect(remediations[0]).toContain("VACUUM");
+    expect(remediations[1]).toBe("rotate the credential, then delete or rewrite the file");
+  });
+
+  test("reads audit facts leniently from a config that fails validation", () => {
+    const inputs = readAuditInputs({
+      dataDir: "relative/data",
+      t3: { baseUrl: "http://10.0.0.5", tokenFile: "/s/t3" },
+      slack: "broken",
+      access: { allowedUserIds: ["*", 7], allowedChannelIds: "C1" },
+      profiles: [
+        { id: "a", repositoryRoots: ["/", "relative"], runtimeMode: "full-access", isolation: { mode: "trusted-same-user" }, externalWrites: { mode: "deny" } },
+        { repositoryRoots: ["/srv/b"] },
+        "junk",
+      ],
+      retention: { auditDays: -1, messageDays: 30 },
+    });
+    expect(inputs.dataDir).toBeUndefined();
+    expect(inputs.t3BaseUrl).toBe("http://10.0.0.5");
+    expect(inputs.secretFiles).toEqual([{ name: "t3-service-token", path: "/s/t3" }]);
+    expect(inputs.access).toEqual({ allowedUserIds: ["*"], allowedChannelIds: [] });
+    expect(inputs.roots).toEqual([
+      { profileId: "a", root: "/" },
+      { profileId: "(unnamed)", root: "/srv/b" },
+    ]);
+    expect(inputs.profiles).toEqual([
+      { id: "a", runtimeMode: "full-access", isolationMode: "trusted-same-user", externalWritesMode: "deny", ambientEnabled: false },
+    ]);
+    expect(inputs.retention).toEqual({ messageDays: 30 });
+    expect(readAuditInputs([]).secretFiles).toEqual([]);
   });
 
   test("sorts findings and fails only on high severity", () => {
@@ -321,19 +408,77 @@ describe("security audit run", () => {
         now: new Date(now),
         home: "/nonexistent-home",
         inspectSession: async () => {
-          throw new Error("T3 session endpoint returned HTTP 401");
+          throw new T3HttpError("session", 503);
         },
       });
-      expect(unreachable.findings.find((finding) => finding.id === "t3-session-unchecked")?.message).toContain("HTTP 401");
+      expect(unreachable.findings.find((finding) => finding.id === "t3-session-unchecked")?.message).toContain("HTTP 503");
+      expect(ids(unreachable.findings)).toContain("medium:t3-token-old");
     });
   });
 
-  test("reports invalid or unreadable config without continuing", async () => {
+  test("fails when T3 rejects the service token", async () => {
+    await withHost(async ({ configPath }) => {
+      for (const status of [401, 403]) {
+        const report = await runSecurityAudit({
+          configPath,
+          now: new Date(now),
+          home: "/nonexistent-home",
+          inspectSession: async () => {
+            throw new T3HttpError("session", status);
+          },
+        });
+        expect(report.result).toBe("fail");
+        expect(ids(report.findings)).toContain("high:t3-token-rejected");
+        expect(ids(report.findings)).not.toContain("info:t3-session-unchecked");
+      }
+    });
+  });
+
+  test("keeps checking a config that fails validation, without sending the token anywhere", async () => {
     await withHost(async ({ root, configPath, config }) => {
-      await writeFile(configPath, JSON.stringify({ ...config, access: { allowedUserIds: [] } }), { mode: 0o600 });
-      const invalid = await runSecurityAudit({ configPath, now: new Date(now), home: "/h", offline: true });
-      expect(ids(invalid.findings)).toEqual(["high:config-invalid"]);
-      expect(invalid.findings[0]?.message).toContain("access.allowedUserIds");
+      const profiles = config.profiles as Array<Record<string, unknown>>;
+      await writeFile(
+        configPath,
+        JSON.stringify({
+          ...config,
+          t3: { ...(config.t3 as object), baseUrl: "http://10.0.0.5:37841" },
+          access: { allowedUserIds: ["*"], allowedChannelIds: [] },
+          profiles: profiles.map((profile) => ({ ...profile, runtimeMode: "full-access" })),
+        }),
+        { mode: 0o600 },
+      );
+      await chmod(join(root, "secrets", "slack-bot-token"), 0o644);
+      let inspected = false;
+      const report = await runSecurityAudit({
+        configPath,
+        now: new Date(now),
+        home: "/nonexistent-home",
+        logDirectory: join(root, "logs"),
+        logFiles: [],
+        inspectSession: async () => {
+          inspected = true;
+          throw new Error("must not be called");
+        },
+      });
+      expect(inspected).toBe(false);
+      expect(report.result).toBe("fail");
+      expect(ids(report.findings)).toEqual(
+        expect.arrayContaining([
+          "high:config-invalid",
+          "high:t3-url-plaintext-remote",
+          "high:access-users-wildcard",
+          "medium:access-channels-empty",
+          "high:profile-approval-bypass",
+          "high:secret-file-mode",
+          "info:t3-session-unchecked",
+        ]),
+      );
+      expect(report.findings.find((finding) => finding.id === "config-invalid")?.message).toContain("access.allowedUserIds");
+    });
+  });
+
+  test("reports unreadable config without continuing", async () => {
+    await withHost(async ({ root, configPath }) => {
       await writeFile(configPath, "{", { mode: 0o600 });
       expect(ids((await runSecurityAudit({ configPath, now: new Date(now), home: "/h" })).findings)).toEqual([
         "high:config-unreadable",
@@ -342,6 +487,77 @@ describe("security audit run", () => {
         "high:config-missing",
         "high:config-unreadable",
       ]);
+    });
+  });
+
+  test("sees through symlinked repository roots and parent directories", async () => {
+    await withHost(async ({ root, configPath, config }) => {
+      const home = join(root, "home");
+      await mkdir(home);
+      await symlink(home, join(root, "home-link"));
+      await symlink(root, join(root, "root-link"));
+      const profiles = config.profiles as Array<Record<string, unknown>>;
+      const write = async (repositoryRoots: string[], dataDir = config.dataDir) =>
+        writeFile(
+          configPath,
+          JSON.stringify({ ...config, dataDir, profiles: profiles.map((profile) => ({ ...profile, repositoryRoots })) }),
+          { mode: 0o600 },
+        );
+      const audit = async () =>
+        ids((await runSecurityAudit({ configPath, now: new Date(now), home, offline: true, logDirectory: join(root, "logs"), logFiles: [] })).findings);
+
+      await write([join(root, "home-link")]);
+      expect(await audit()).toContain("high:repo-root-home");
+
+      // The data directory is configured through a linked parent; the root names the real directory.
+      await write([await realpath(root)], join(root, "root-link", "data"));
+      expect(await audit()).toEqual(expect.arrayContaining(["high:repo-root-contains-private-path"]));
+
+      await write([join(root, "repo")]);
+      expect(await audit()).not.toContain("high:repo-root-contains-private-path");
+      expect(await canonicalPath(join(root, "root-link", "missing", "x"))).toBe(join(await realpath(root), "missing", "x"));
+    });
+  });
+
+  test("reports a symlinked secret file that other users can repoint", async () => {
+    await withHost(async ({ root, configPath, config }) => {
+      const shared = join(root, "shared");
+      await mkdir(shared);
+      await chmod(shared, 0o777);
+      await symlink(join(root, "secrets", "slack-app-token"), join(shared, "slack-app-token"));
+      const slack = config.slack as Record<string, unknown>;
+      await writeFile(configPath, JSON.stringify({ ...config, slack: { ...slack, appTokenFile: join(shared, "slack-app-token") } }), { mode: 0o600 });
+      const report = await runSecurityAudit({ configPath, now: new Date(now), home: "/nonexistent-home", offline: true, logDirectory: join(root, "logs"), logFiles: [] });
+      expect(ids(report.findings)).toEqual(expect.arrayContaining(["high:secret-file-symlink", "high:secret-directory-mode"]));
+      expect(ids(report.findings)).not.toContain("high:secret-file-mode");
+    });
+  });
+
+  test("an unreadable secrets directory is a finding, not a crash", async () => {
+    if (process.getuid?.() === 0) return; // root bypasses directory permissions
+    await withHost(async ({ root, configPath }) => {
+      await chmod(join(root, "secrets"), 0o000);
+      try {
+        const report = await runSecurityAudit({ configPath, now: new Date(now), home: "/nonexistent-home", offline: true, logDirectory: join(root, "logs"), logFiles: [] });
+        expect(report.result).toBe("fail");
+        expect(ids(report.findings).filter((id) => id === "high:secret-file-unreadable")).toHaveLength(3);
+        expect(ids(report.findings)).not.toContain("high:secret-file-missing");
+      } finally {
+        await chmod(join(root, "secrets"), 0o700);
+      }
+    });
+  });
+
+  test("points a credential found in the store at the purge procedure", async () => {
+    await withHost(async ({ root, configPath }) => {
+      await writeFile(join(root, "data", "agent-tag.sqlite"), `x xoxb-${"A1".repeat(15)} x`, { mode: 0o600 });
+      await writeFile(join(root, "logs", "service.stderr.log"), `x xoxb-${"B2".repeat(15)} x`, { mode: 0o600 });
+      const report = await runSecurityAudit({ configPath, now: new Date(now), home: "/nonexistent-home", offline: true, logDirectory: join(root, "logs"), logFiles: [] });
+      const atRest = report.findings.filter((finding) => finding.id === "secret-at-rest");
+      expect(atRest).toHaveLength(2);
+      const store = atRest.find((finding) => finding.path?.endsWith("agent-tag.sqlite"));
+      expect(store?.remediation).toContain("#purging-content-from-the-store");
+      expect(atRest.find((finding) => finding.path?.endsWith(".log"))?.remediation).not.toContain("VACUUM");
     });
   });
 });

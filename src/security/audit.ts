@@ -61,9 +61,23 @@ export type PathRole =
   | "log"
   | "log-directory";
 
+/** Present when the configured path is a symbolic link; mode, owner, and kind then describe its target. */
+export interface PathLink {
+  readonly target: string;
+  /** Another local user can replace the link because its directory is group or world writable without the sticky bit. */
+  readonly replaceableByOthers: boolean;
+}
+
 export type PathState =
   | { readonly kind: "missing" }
-  | { readonly kind: "file" | "directory" | "other"; readonly mode: number; readonly uid: number };
+  /** The auditing user cannot stat the path (for example EACCES on a parent owned by another account). */
+  | { readonly kind: "unreadable"; readonly code: string }
+  | {
+      readonly kind: "file" | "directory" | "other";
+      readonly mode: number;
+      readonly uid: number;
+      readonly link?: PathLink | undefined;
+    };
 
 export interface PathFact {
   readonly path: string;
@@ -109,8 +123,35 @@ export function checkPathPermissions(
     }
     return [];
   }
-  const findings: SecurityFinding[] = [];
   const sensitive = role !== "log" && role !== "log-directory";
+  if (state.kind === "unreadable") {
+    return [{
+      id: `${role}-unreadable`,
+      severity: sensitive ? "high" : "low",
+      message: `${role} cannot be inspected by the auditing user (${state.code}); its owner and mode were not checked`,
+      path,
+      remediation: "run the audit as the Agent Tag service user (for example with sudo -u)",
+    }];
+  }
+  const findings: SecurityFinding[] = [];
+  if (state.link !== undefined) {
+    findings.push(
+      state.link.replaceableByOthers
+        ? {
+            id: `${role}-symlink`,
+            severity: sensitive ? "high" : "medium",
+            message: `${role} is a symbolic link to ${state.link.target} in a directory other users can write; they can repoint it`,
+            path,
+            remediation: `point the config at ${state.link.target}, or make the link's directory writable only by the service user`,
+          }
+        : {
+            id: `${role}-symlink`,
+            severity: "info",
+            message: `${role} is a symbolic link to ${state.link.target}; checks apply to the target`,
+            path,
+          },
+    );
+  }
   if (state.kind !== (directory ? "directory" : "file")) {
     findings.push({
       id: `${role}-type`,
@@ -129,7 +170,7 @@ export function checkPathPermissions(
     });
   }
   const mode = state.mode & 0o777;
-  const remediation = `chmod ${expected.slice(1)} ${path}`;
+  const remediation = `chmod ${expected.slice(1)} ${state.link?.target ?? path}`;
   if (PRIVATE_ROLES.has(role)) {
     if ((mode & 0o077) !== 0) {
       const shielded = role === "database" && options.parentPrivate === true;
@@ -328,11 +369,21 @@ export function checkT3Session(input: {
   readonly now: string;
   readonly session?: T3SessionFacts | undefined;
   readonly unavailableReason?: string | undefined;
+  /** HTTP status when T3 answered and refused the token (401 or 403). */
+  readonly rejectedStatus?: number | undefined;
   readonly tokenModifiedAt?: string | undefined;
 }): SecurityFinding[] {
   const nowMs = Date.parse(input.now);
   const findings: SecurityFinding[] = [];
   const session = input.session;
+  if (input.rejectedStatus !== undefined) {
+    return [{
+      id: "t3-token-rejected",
+      severity: "high",
+      message: `T3 rejected the service token (HTTP ${input.rejectedStatus}); it is expired, revoked, or not a T3 token`,
+      remediation: "re-enroll with bun run enroll:t3",
+    }];
+  }
   if (session === undefined) {
     findings.push({
       id: "t3-session-unchecked",
@@ -410,18 +461,26 @@ function isWithin(child: string, parent: string): boolean {
   return path === "" || (!path.startsWith(`..${sep}`) && path !== ".." && !isAbsolute(path));
 }
 
+/**
+ * `realRoot`, `realHome`, and `realPath` are the symlink-free forms of each path. When present they
+ * decide containment, so a root that links to the home directory (or sits under a linked parent such
+ * as macOS /tmp) is still caught. Findings report the configured paths.
+ */
 export function checkRepositoryRoots(input: {
-  readonly roots: ReadonlyArray<{ readonly profileId: string; readonly root: string }>;
+  readonly roots: ReadonlyArray<{ readonly profileId: string; readonly root: string; readonly realRoot?: string }>;
   readonly home: string;
+  readonly realHome?: string;
   readonly protectedPaths: ReadonlyArray<{
     readonly label: string;
     readonly path: string;
+    readonly realPath?: string;
     readonly severity: SecuritySeverity;
   }>;
 }): SecurityFinding[] {
   const findings: SecurityFinding[] = [];
-  for (const { profileId, root } of input.roots) {
-    const normalized = resolve(root);
+  const home = input.realHome ?? input.home;
+  for (const { profileId, root, realRoot } of input.roots) {
+    const normalized = resolve(realRoot ?? root);
     if (normalized === "/") {
       findings.push({
         id: "repo-root-filesystem",
@@ -430,7 +489,7 @@ export function checkRepositoryRoots(input: {
         path: root,
         remediation: "list individual repository checkouts",
       });
-    } else if (isWithin(input.home, normalized)) {
+    } else if (isWithin(home, normalized)) {
       findings.push({
         id: "repo-root-home",
         severity: "high",
@@ -440,7 +499,7 @@ export function checkRepositoryRoots(input: {
       });
     }
     for (const target of input.protectedPaths) {
-      if (isWithin(target.path, normalized)) {
+      if (isWithin(target.realPath ?? target.path, normalized)) {
         findings.push({
           id: "repo-root-contains-private-path",
           severity: target.severity,
@@ -538,7 +597,15 @@ export function checkRetention(policy: RetentionPolicy): SecurityFinding[] {
   return [];
 }
 
-export function checkSecretScan(result: SecretScanResult): SecurityFinding[] {
+const STORE_SECRET_REMEDIATION =
+  "rotate the credential first. agent-tag prune only redacts rows older than the retention window and never touches interactions, schedules, or memory, so overwrite the remaining rows, then purge freed pages with VACUUM or backup and restore (docs/operations.md#purging-content-from-the-store)";
+
+/** `databasePaths` are the SQLite store files (main, -wal, -shm), which need a different cleanup than logs. */
+export function checkSecretScan(
+  result: SecretScanResult,
+  options: { readonly databasePaths?: ReadonlyArray<string> } = {},
+): SecurityFinding[] {
+  const databasePaths = new Set((options.databasePaths ?? []).map((path) => resolve(path)));
   const findings: SecurityFinding[] = result.findings.map((finding) => ({
     id: "secret-at-rest",
     severity: "high",
@@ -547,7 +614,9 @@ export function checkSecretScan(result: SecretScanResult): SecurityFinding[] {
         ? `file contains the configured ${finding.canaryName} credential`
         : `file contains a ${finding.patternName} credential`,
     path: finding.path,
-    remediation: "rotate the credential, then prune or delete the file (agent-tag prune for the store)",
+    remediation: databasePaths.has(resolve(finding.path))
+      ? STORE_SECRET_REMEDIATION
+      : "rotate the credential, then delete or rewrite the file",
   }));
   if (result.symlinksSkipped > 0) {
     findings.push({

@@ -1,11 +1,12 @@
-import { lstat } from "node:fs/promises";
+import { lstat, realpath, stat } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 
 import { z } from "zod";
 
 import { agentTagConfigSchema } from "../config.ts";
-import { inspectT3Session } from "../t3/auth.ts";
+import type { RetentionPolicy } from "../store/retention.ts";
+import { inspectT3Session, isT3CredentialRejection } from "../t3/auth.ts";
 import {
   checkAccess,
   checkInlineCredentials,
@@ -18,8 +19,10 @@ import {
   checkT3Transport,
   summarizeFindings,
   type PathFact,
+  type PathLink,
   type PathRole,
   type PathState,
+  type ProfileSecurityFacts,
   type SecurityFinding,
   type SecurityReport,
   type T3SessionFacts,
@@ -33,24 +36,145 @@ export function defaultLogPaths(home: string): { readonly directory: string; rea
   return { directory, files: [join(directory, "service.stdout.log"), join(directory, "service.stderr.log")] };
 }
 
+const DATABASE_SUFFIXES = ["", "-wal", "-shm"] as const;
+
+/** lstat/stat failures that mean "this path cannot be inspected by the auditing user", not "this path is absent". */
+const UNREADABLE_CODES: ReadonlySet<string> = new Set(["EACCES", "EPERM", "ENOTDIR", "ELOOP"]);
+
+function errorCode(error: unknown): string | undefined {
+  return error instanceof Error && "code" in error && typeof error.code === "string" ? error.code : undefined;
+}
+
+/** Group or world writable without the sticky bit: another user can rename or replace entries. */
+function replaceableByOthers(mode: number): boolean {
+  return (mode & 0o022) !== 0 && (mode & 0o1000) === 0;
+}
+
+/**
+ * Describes what the service will actually open. Agent Tag follows symlinks (stat), so mode, owner,
+ * and kind come from the target; the link itself is reported separately.
+ */
 async function pathState(path: string): Promise<PathState & { readonly mtime?: Date }> {
   try {
-    const metadata = await lstat(path);
+    const own = await lstat(path);
+    const link: PathLink | undefined = own.isSymbolicLink()
+      ? {
+          target: await realpath(path),
+          replaceableByOthers: replaceableByOthers((await stat(dirname(path))).mode),
+        }
+      : undefined;
+    const metadata = link === undefined ? own : await stat(path);
     const kind = metadata.isFile() ? "file" : metadata.isDirectory() ? "directory" : "other";
-    return { kind, mode: metadata.mode, uid: metadata.uid, mtime: metadata.mtime };
+    return { kind, mode: metadata.mode, uid: metadata.uid, mtime: metadata.mtime, ...(link === undefined ? {} : { link }) };
   } catch (error) {
-    if (error instanceof Error && "code" in error && error.code === "ENOENT") return { kind: "missing" };
+    const code = errorCode(error);
+    // A dangling symlink is as unusable as a missing path.
+    if (code === "ENOENT") return { kind: "missing" };
+    if (code !== undefined && UNREADABLE_CODES.has(code)) return { kind: "unreadable", code };
     throw error;
   }
 }
 
-async function fact(path: string, role: PathRole): Promise<PathFact> {
+async function fact(path: string, role: PathRole): Promise<PathFact & { readonly state: { readonly mtime?: Date } }> {
   return { path, role, state: await pathState(path) };
 }
 
-const adminExtension = z
-  .object({ access: z.object({ adminUserIds: z.array(z.string()).optional() }).loose() })
-  .loose();
+/**
+ * Resolves every symlink in `path`, including parent components. A missing or unreadable tail is
+ * appended to the canonical form of its nearest resolvable ancestor.
+ */
+export async function canonicalPath(path: string): Promise<string> {
+  const absolute = resolve(path);
+  try {
+    return await realpath(absolute);
+  } catch {
+    const parent = dirname(absolute);
+    if (parent === absolute) return absolute;
+    return join(await canonicalPath(parent), basename(absolute));
+  }
+}
+
+// The audit reads facts from the raw JSON leniently, so a config that fails validation is still
+// checked for the problems the schema exists to prevent (remote T3, wildcards, approval bypass).
+const optionalString = z.string().optional().catch(undefined);
+const optionalAbsolutePath = z.string().refine(isAbsolute).optional().catch(undefined);
+const stringList = z
+  .array(z.unknown())
+  .catch([])
+  .transform((items) => items.filter((item): item is string => typeof item === "string"));
+const optionalDays = z.number().int().positive().optional().catch(undefined);
+
+const auditInputSchema = z.object({
+  dataDir: optionalAbsolutePath,
+  t3: z.object({ baseUrl: optionalString, tokenFile: optionalAbsolutePath }).catch({}),
+  slack: z.object({ appTokenFile: optionalAbsolutePath, botTokenFile: optionalAbsolutePath }).catch({}),
+  access: z
+    .object({
+      allowedUserIds: stringList,
+      allowedChannelIds: stringList,
+      adminUserIds: z.array(z.string()).optional().catch(undefined),
+    })
+    .catch({ allowedUserIds: [], allowedChannelIds: [] }),
+  profiles: z.array(z.unknown()).catch([]),
+  retention: z.object({ auditDays: optionalDays, outboxDays: optionalDays, messageDays: optionalDays }).catch({}),
+});
+
+const profileRootsSchema = z.object({
+  id: z.string().catch("(unnamed)"),
+  repositoryRoots: stringList.transform((roots) => roots.filter((root) => isAbsolute(root))),
+});
+
+const profileFactsSchema = z
+  .object({
+    id: z.string(),
+    runtimeMode: z.string(),
+    isolation: z.object({ mode: z.string() }),
+    externalWrites: z.object({ mode: z.string() }),
+    ambient: z.object({ enabled: z.boolean() }).catch({ enabled: false }),
+  })
+  .transform(
+    (profile): ProfileSecurityFacts => ({
+      id: profile.id,
+      runtimeMode: profile.runtimeMode,
+      isolationMode: profile.isolation.mode,
+      externalWritesMode: profile.externalWrites.mode,
+      ambientEnabled: profile.ambient.enabled,
+    }),
+  );
+
+interface AuditInputs {
+  readonly dataDir: string | undefined;
+  readonly t3BaseUrl: string | undefined;
+  readonly secretFiles: ReadonlyArray<{ readonly name: string; readonly path: string }>;
+  readonly access: { readonly allowedUserIds: string[]; readonly allowedChannelIds: string[]; readonly adminUserIds?: string[] | undefined };
+  readonly roots: ReadonlyArray<{ readonly profileId: string; readonly root: string }>;
+  readonly profiles: ReadonlyArray<ProfileSecurityFacts>;
+  readonly retention: RetentionPolicy;
+}
+
+export function readAuditInputs(raw: unknown): AuditInputs {
+  const input = auditInputSchema.parse(typeof raw === "object" && raw !== null && !Array.isArray(raw) ? raw : {});
+  const secretFiles = [
+    { name: "t3-service-token", path: input.t3.tokenFile },
+    { name: "slack-app-token", path: input.slack.appTokenFile },
+    { name: "slack-bot-token", path: input.slack.botTokenFile },
+  ].flatMap(({ name, path }) => (path === undefined ? [] : [{ name, path }]));
+  return {
+    dataDir: input.dataDir,
+    t3BaseUrl: input.t3.baseUrl,
+    secretFiles,
+    access: input.access,
+    roots: input.profiles.flatMap((profile) => {
+      const parsed = profileRootsSchema.safeParse(profile);
+      return parsed.success ? parsed.data.repositoryRoots.map((root) => ({ profileId: parsed.data.id, root })) : [];
+    }),
+    profiles: input.profiles.flatMap((profile) => {
+      const parsed = profileFactsSchema.safeParse(profile);
+      return parsed.success ? [parsed.data] : [];
+    }),
+    retention: input.retention,
+  };
+}
 
 function errorReason(error: unknown): string {
   return error instanceof Error ? error.message : "unknown error";
@@ -108,24 +232,18 @@ export async function runSecurityAudit(options: SecurityAuditOptions): Promise<S
     findings.push({
       id: "config-invalid",
       severity: "high",
-      message: `config fails validation at ${paths.join(", ")}`,
+      message: `config fails validation at ${paths.join(", ")}; the service will not start, and the checks below use the fields that could be read`,
       path: options.configPath,
     });
-    return finish();
   }
-  const config = parsed.data;
-  const databasePath = join(config.dataDir, "agent-tag.sqlite");
-  const secretFiles = [
-    { name: "t3-service-token", path: config.t3.tokenFile },
-    { name: "slack-app-token", path: config.slack.appTokenFile },
-    { name: "slack-bot-token", path: config.slack.botTokenFile },
-  ];
+  const inputs = readAuditInputs(raw);
+  const databasePath = inputs.dataDir === undefined ? undefined : join(inputs.dataDir, "agent-tag.sqlite");
 
   const facts = await Promise.all([
-    ...secretFiles.map(({ path }) => fact(path, "secret-file")),
-    ...[...new Set(secretFiles.map(({ path }) => dirname(path)))].map((path) => fact(path, "secret-directory")),
-    fact(config.dataDir, "data-directory"),
-    ...["", "-wal", "-shm"].map((suffix) => fact(`${databasePath}${suffix}`, "database")),
+    ...inputs.secretFiles.map(({ path }) => fact(path, "secret-file")),
+    ...[...new Set(inputs.secretFiles.map(({ path }) => dirname(path)))].map((path) => fact(path, "secret-directory")),
+    ...(inputs.dataDir === undefined ? [] : [fact(inputs.dataDir, "data-directory")]),
+    ...(databasePath === undefined ? [] : DATABASE_SUFFIXES.map((suffix) => fact(`${databasePath}${suffix}`, "database"))),
     fact(logDirectory, "log-directory"),
     ...logFiles.map((path) => fact(path, "log")),
   ]);
@@ -137,68 +255,62 @@ export async function runSecurityAudit(options: SecurityAuditOptions): Promise<S
     (ownerUid === undefined || dataDirectory.uid === ownerUid);
   for (const item of facts) findings.push(...checkPathPermissions(item, ownerUid, { parentPrivate }));
 
-  const extension = adminExtension.safeParse(raw);
-  findings.push(
-    ...checkAccess({
-      allowedUserIds: config.access.allowedUserIds,
-      allowedChannelIds: config.access.allowedChannelIds,
-      adminUserIds: extension.success ? extension.data.access.adminUserIds : undefined,
-    }),
-  );
-  findings.push(...checkT3Transport(config.t3.baseUrl));
+  findings.push(...checkAccess(inputs.access));
+  if (inputs.t3BaseUrl !== undefined) findings.push(...checkT3Transport(inputs.t3BaseUrl));
 
-  const tokenState = await pathState(config.t3.tokenFile);
-  const tokenModifiedAt = "mtime" in tokenState && tokenState.mtime !== undefined
-    ? tokenState.mtime.toISOString()
-    : undefined;
+  const tokenFile = inputs.secretFiles.find((item) => item.name === "t3-service-token")?.path;
+  const tokenState = facts.find((item) => item.role === "secret-file" && item.path === tokenFile)?.state;
+  const tokenModifiedAt = tokenState?.mtime?.toISOString();
   if (options.offline === true) {
     findings.push(...checkT3Session({ now: now.toISOString(), unavailableReason: "offline mode", tokenModifiedAt }));
+  } else if (!parsed.success) {
+    // Only a validated config guarantees a loopback T3 URL; never send the token anywhere else.
+    findings.push(
+      ...checkT3Session({ now: now.toISOString(), unavailableReason: "the config is invalid", tokenModifiedAt }),
+    );
   } else {
     try {
       const session = await (options.inspectSession ?? defaultInspectSession)({
-        baseUrl: config.t3.baseUrl,
-        tokenFile: config.t3.tokenFile,
+        baseUrl: parsed.data.t3.baseUrl,
+        tokenFile: parsed.data.t3.tokenFile,
       });
       findings.push(...checkT3Session({ now: now.toISOString(), session }));
     } catch (error) {
       findings.push(
-        ...checkT3Session({ now: now.toISOString(), unavailableReason: errorReason(error), tokenModifiedAt }),
+        ...checkT3Session(
+          isT3CredentialRejection(error)
+            ? { now: now.toISOString(), rejectedStatus: error.status }
+            : { now: now.toISOString(), unavailableReason: errorReason(error), tokenModifiedAt },
+        ),
       );
     }
   }
 
+  // Containment is decided on canonical paths so a symlinked root, home, or parent directory cannot hide it.
+  const protectedPaths = [
+    ...(inputs.dataDir === undefined ? [] : [{ label: "data directory", path: inputs.dataDir, severity: "high" as const }]),
+    ...inputs.secretFiles.map(({ name, path }) => ({ label: `${name} file`, path, severity: "high" as const })),
+    { label: "config file", path: options.configPath, severity: "medium" as const },
+  ];
   findings.push(
     ...checkRepositoryRoots({
-      roots: config.profiles.flatMap((profile) =>
-        profile.repositoryRoots.map((root) => ({ profileId: profile.id, root })),
-      ),
+      roots: await Promise.all(inputs.roots.map(async (entry) => ({ ...entry, realRoot: await canonicalPath(entry.root) }))),
       home,
-      protectedPaths: [
-        { label: "data directory", path: config.dataDir, severity: "high" },
-        ...secretFiles.map(({ name, path }) => ({ label: `${name} file`, path, severity: "high" as const })),
-        { label: "config file", path: options.configPath, severity: "medium" },
-      ],
+      realHome: await canonicalPath(home),
+      protectedPaths: await Promise.all(
+        protectedPaths.map(async (entry) => ({ ...entry, realPath: await canonicalPath(entry.path) })),
+      ),
     }),
   );
-  findings.push(
-    ...checkProfiles(
-      config.profiles.map((profile) => ({
-        id: profile.id,
-        runtimeMode: profile.runtimeMode,
-        isolationMode: profile.isolation.mode,
-        externalWritesMode: profile.externalWrites.mode,
-        ambientEnabled: profile.ambient.enabled,
-      })),
-    ),
-  );
-  findings.push(...checkRetention(config.retention));
+  findings.push(...checkProfiles(inputs.profiles));
+  findings.push(...checkRetention(inputs.retention));
 
   const scanRoots = facts
     .filter((item) => (item.role === "data-directory" || item.role === "log-directory") && item.state.kind === "directory")
     .map((item) => item.path);
   if (scanRoots.length > 0) {
     const canaries: SecretCanary[] = [];
-    for (const secretFile of secretFiles) {
+    for (const secretFile of inputs.secretFiles) {
       try {
         canaries.push({ name: secretFile.name, secret: await readSecretFile(secretFile.path) });
       } catch {
@@ -209,7 +321,13 @@ export async function runSecurityAudit(options: SecurityAuditOptions): Promise<S
       .filter((item) => item.role === "secret-file" && item.state.kind === "file")
       .map((item) => item.path);
     try {
-      findings.push(...checkSecretScan(await scanForSecrets({ roots: scanRoots, canaries, excludedPaths })));
+      // The scanner reports resolved paths, so match the store files under the resolved data directory.
+      const realDataDir = inputs.dataDir === undefined ? undefined : await canonicalPath(inputs.dataDir);
+      const databasePaths =
+        realDataDir === undefined ? [] : DATABASE_SUFFIXES.map((suffix) => join(realDataDir, `agent-tag.sqlite${suffix}`));
+      findings.push(
+        ...checkSecretScan(await scanForSecrets({ roots: scanRoots, canaries, excludedPaths }), { databasePaths }),
+      );
     } catch (error) {
       findings.push({
         id: "secret-scan-failed",

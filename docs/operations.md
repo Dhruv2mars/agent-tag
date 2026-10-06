@@ -169,14 +169,18 @@ The audit reads the config, the files it references, the data directory, and the
 | Check | Severity |
 | --- | --- |
 | Secret files or their directory are missing, not owned by the service user, or grant group/world access (expected `0600`/`0700`) | high |
+| A checked path is a symbolic link in a directory other users can write (they can repoint it) / any other symbolic link (owner and mode are then checked on the target) | high (medium for logs) / info |
+| The auditing user cannot inspect a config, secret, data, or database path (for example `EACCES`); run the audit as the service user | high (low for logs) |
 | Data directory or database grants group/world access | high (low for SQLite `-wal`/`-shm` files inside a private data directory) |
 | Config is group/world writable / world readable / group readable | high / medium / low |
 | Service logs are world / group accessible | medium / low |
 | A credential pattern, or a `*token`/`*secret`/`*password` field with a value, appears inline in the config | high |
-| Config does not parse or validate (later checks are skipped) | high |
+| Config is not readable JSON (later checks are skipped) | high |
+| Config fails validation. The service refuses to start; the audit still runs every check below on the fields it can read, but does not query T3 | high |
 | Allowlist contains a wildcard / is empty | high / medium |
 | Allowed user and conversation counts, admin users | info |
 | T3 URL is non-loopback without TLS / non-loopback with TLS | high / medium |
+| T3 refuses the token (HTTP 401 or 403: expired, revoked, or not a T3 token) | high |
 | T3 token expired or expires within 3 days / within 7 days | high / medium |
 | T3 token has scopes beyond `orchestration:read` and `orchestration:operate` | high |
 | T3 session unreachable (or `--offline`) and the token file is older than 30 days | medium |
@@ -186,9 +190,11 @@ The audit reads the config, the files it references, the data directory, and the
 | Profile declares `os-account` or `container` isolation, which is not enforced | medium |
 | `externalWrites` is advisory | low |
 | No retention configured / partly configured | low / info |
-| Secret scan of the data and log directories finds a configured token or a known credential pattern (this includes the SQLite store) | high |
+| Secret scan of the data and log directories finds a configured token or a known credential pattern. For the SQLite store the fix links to [purging content](#purging-content-from-the-store) | high |
 
-The T3 check calls `/api/auth/session` on the configured loopback URL with a 5-second timeout. Use `--offline` to skip it.
+Repository-root containment is decided after resolving every symbolic link in each root, the home directory, and each protected path, including parent directories, so a root that links to the home directory (or a data directory under macOS `/tmp`, which links to `/private/tmp`) is still caught.
+
+The T3 check calls `/api/auth/session` on the configured loopback URL with a 5-second timeout. Use `--offline` to skip it. Runtime approval settings are only checked in the profile: Agent Tag sends the profile's `runtimeMode` with every turn it starts, so the defaults of the T3 provider instance never apply to its turns.
 
 ## Data retention
 
