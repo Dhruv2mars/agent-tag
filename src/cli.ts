@@ -1,13 +1,14 @@
 import { resolve } from "node:path";
 
 import { loadConfig } from "./config.ts";
+import { isDistributionCommand, processDistributionContext, runDistributionCommand } from "./distribution.ts";
 import { createAgentTagService, diagnoseAgentTag } from "./service.ts";
 import { AgentTagSchedules } from "./scheduler.ts";
 import { AgentTagStore } from "./store/store.ts";
 
 function usage(): never {
   throw new Error(
-    "usage: agent-tag <run|doctor|status|audit|backup> CONFIG [ARG] | agent-tag restore BACKUP NEW_DATA_DIR | agent-tag schedule-<add|list|cancel> CONFIG TASK ACTOR PROFILE [SPEC_OR_ID]",
+    "usage: agent-tag <run|doctor|status|audit|backup> CONFIG [ARG] | agent-tag restore BACKUP NEW_DATA_DIR | agent-tag schedule-<add|list|cancel> CONFIG TASK ACTOR PROFILE [SPEC_OR_ID] | agent-tag <version|update|help>",
   );
 }
 
@@ -24,6 +25,9 @@ function waitForShutdownSignal(): Promise<void> {
 }
 
 const command = process.argv[2];
+if (isDistributionCommand(command)) {
+  process.exit(await runDistributionCommand(process.argv.slice(2), processDistributionContext()));
+}
 const configArgument = process.argv[3];
 if (configArgument === undefined) usage();
 
