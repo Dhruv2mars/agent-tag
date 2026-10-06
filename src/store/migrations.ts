@@ -286,4 +286,12 @@ export const STORE_MIGRATIONS: readonly StoreMigration[] = [
       );
     `,
   },
+  {
+    // Independent of 13 (another branch): only adds a column, so it applies in any order relative to it.
+    version: 14,
+    sql: `
+      ALTER TABLE operations ADD COLUMN turn_active_ms INTEGER NOT NULL DEFAULT 0
+        CHECK (turn_active_ms >= 0);
+    `,
+  },
 ];

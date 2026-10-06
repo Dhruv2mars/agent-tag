@@ -76,6 +76,8 @@ export interface ClaimedOperation {
   readonly payload: z.infer<typeof operationPayloadSchema>;
   readonly attempt: number;
   readonly leaseExpiresAt: string;
+  /** Milliseconds this turn has already spent being polled, summed over earlier claims. */
+  readonly turnActiveMs: number;
 }
 
 export interface OperationalStatus {

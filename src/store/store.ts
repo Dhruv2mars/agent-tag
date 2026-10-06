@@ -8,6 +8,7 @@
  *   schedules.ts    schedules and runs                     memory.ts       memory entries
  *   ambient.ts      ambient trigger decisions              audit.ts        audit log write/export
  *   diagnostics.ts  counts and operational status          lease.ts        shared lease helpers
+ *   waits.ts        human waits, expiry, abandoned turns
  *   schema.ts       zod schemas                            types.ts        public types (re-exported)
  */
 import type { Database } from "bun:sqlite";
@@ -43,6 +44,7 @@ import * as operations from "./operations.ts";
 import * as interactions from "./interactions.ts";
 import * as userInput from "./user-input.ts";
 import * as outbox from "./outbox.ts";
+import * as waits from "./waits.ts";
 
 export { AUDIT_ACTIONS, type AuditAction } from "./schema.ts";
 export type {
@@ -115,7 +117,14 @@ export type {
   ClaimNextInteractionResponseInput,
   CompleteInteractionResponseInput,
   FailInteractionResponseInput,
+  QueueTurnInterruptInput,
 } from "./interactions.ts";
+export type {
+  AbandonOperationInput,
+  AwaitOperationInteractionsInput,
+  AwaitOperationInteractionsResult,
+  PendingInteractionRequest,
+} from "./waits.ts";
 export type { GetPendingUserInputQuestionInput, SubmitUserInputAnswerInput } from "./user-input.ts";
 export type {
   EnqueueOutboxResult,
@@ -273,6 +282,19 @@ export class AgentTagStore {
 
   failOperationWithOutbox(input: operations.FailOperationWithOutboxInput): string {
     return operations.failOperationWithOutbox(this.#database, input);
+  }
+
+  /**
+   * Decides, atomically with any concurrent Slack response, whether a turn blocked on approvals or
+   * questions keeps polling (all answered), defers until the earliest expiry, or expires.
+   */
+  awaitOperationInteractions(input: waits.AwaitOperationInteractionsInput): waits.AwaitOperationInteractionsResult {
+    return waits.awaitOperationInteractions(this.#database, input);
+  }
+
+  /** Fails a leased operation with a Slack notice and queues a durable interrupt of its T3 turn. */
+  abandonOperation(input: waits.AbandonOperationInput): string {
+    return waits.abandonOperation(this.#database, input);
   }
 
   bindT3Task(input: tasks.BindT3TaskInput): void {

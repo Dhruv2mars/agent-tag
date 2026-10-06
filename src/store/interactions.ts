@@ -445,3 +445,67 @@ export function failInteractionResponse(database: Database, input: FailInteracti
   });
   fail.immediate();
 }
+
+export interface QueueTurnInterruptInput {
+  readonly taskId: string;
+  readonly operationId: string;
+  readonly threadId: string;
+  /** The operation's requester; the interaction worker re-checks their authority before sending. */
+  readonly actorUserId: string;
+  readonly reason: "interaction-expired" | "turn-ceiling";
+  readonly now: string;
+}
+
+/**
+ * Queues a durable `thread.turn.interrupt` for an operation Agent Tag is abandoning. The interaction
+ * worker delivers it with the usual retry/lease rules, and the operation claim query holds the next
+ * turn of the task until it is delivered (see `claimNextOperation`). Runs inside the caller's
+ * transaction; idempotent per operation.
+ */
+export function queueTurnInterrupt(database: Database, input: QueueTurnInterruptInput): string {
+  const now = isoDateTime.parse(input.now);
+  const operationId = requiredId(input.operationId, "operationId");
+  const threadId = requiredId(input.threadId, "threadId");
+  const requestId = `interrupt:${operationId}`;
+  const prior = interactionIdentitySchema.nullable().parse(
+    database
+      .query("SELECT interaction_id FROM interactions WHERE thread_id = ? AND request_id = ? AND kind = 'cancel'")
+      .get(threadId, requestId),
+  );
+  if (prior !== null) return prior.interaction_id;
+  const interactionId = crypto.randomUUID();
+  database
+    .query(
+      `INSERT INTO interactions (
+        interaction_id, task_id, operation_id, thread_id, request_id, kind, prompt_json,
+        state, response_command_id, response_json, response_actor_id, source_action_id,
+        created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, 'cancel', ?, 'response-pending', ?, '{}', ?, ?, ?, ?)`,
+    )
+    .run(
+      interactionId,
+      requiredId(input.taskId, "taskId"),
+      operationId,
+      threadId,
+      requestId,
+      JSON.stringify({ reason: input.reason }),
+      crypto.randomUUID(),
+      requiredId(input.actorUserId, "actorUserId"),
+      requestId,
+      now,
+      now,
+    );
+  writeAudit(database, {
+    actorType: "service",
+    actorId: "agent-tag",
+    authority: "turn-policy",
+    source: operationId,
+    target: interactionId,
+    action: "interaction.cancel.requested",
+    result: "response-pending",
+    correlationId: operationId,
+    metadata: { reason: input.reason },
+    createdAt: now,
+  });
+  return interactionId;
+}

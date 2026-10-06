@@ -64,6 +64,16 @@ export function claimNextOperation(
                  AND active.status = 'inflight'
                  AND active.lease_expires_at > ?
              )
+             -- An interrupt queued for an earlier, already settled turn (an expired approval or a
+             -- turn past its ceiling) must reach T3 before the next turn starts, or it could stop it.
+             AND NOT EXISTS (
+               SELECT 1 FROM interactions interrupt
+               WHERE interrupt.task_id = o.task_id
+                 AND interrupt.operation_id <> o.operation_id
+                 AND interrupt.kind = 'cancel'
+                 AND interrupt.state IN ('response-pending', 'inflight')
+                 AND interrupt.request_id LIKE 'interrupt:%'
+             )
            ORDER BY o.source_order_key, o.operation_id
            LIMIT 1`,
         )
@@ -84,7 +94,7 @@ export function claimNextOperation(
       database
         .query(
           `SELECT operation_id, task_id, command_id, message_id, payload_json,
-                  attempts, lease_expires_at
+                  attempts, lease_expires_at, turn_active_ms
            FROM operations WHERE operation_id = ?`,
         )
         .get(identity.operation_id),
@@ -109,6 +119,7 @@ export function claimNextOperation(
       payload: operationPayloadSchema.parse(parseStoredJson(row.payload_json)),
       attempt: row.attempts,
       leaseExpiresAt: row.lease_expires_at,
+      turnActiveMs: row.turn_active_ms,
     };
   });
   return claim.immediate();
@@ -119,19 +130,30 @@ export interface RenewOperationLeaseInput {
   readonly workerId: string;
   readonly now: string;
   readonly leaseMs: number;
+  /** Total active polling time of the turn so far; persisted so the turn ceiling survives restarts. */
+  readonly turnActiveMs?: number;
+}
+
+export function requireTurnActiveMs(value: number | undefined): number | null {
+  if (value === undefined) return null;
+  if (!Number.isSafeInteger(value) || value < 0) throw new Error("turnActiveMs must be a non-negative integer");
+  return value;
 }
 
 export function renewOperationLease(database: Database, input: RenewOperationLeaseInput): string {
   const now = isoDateTime.parse(input.now);
   const expiresAt = leaseExpiry(now, input.leaseMs);
+  const turnActiveMs = requireTurnActiveMs(input.turnActiveMs);
   const result = database
     .query(
-      `UPDATE operations SET lease_expires_at = ?, updated_at = ?
+      `UPDATE operations SET lease_expires_at = ?, updated_at = ?,
+         turn_active_ms = MAX(turn_active_ms, COALESCE(?, 0))
        WHERE operation_id = ? AND status = 'inflight' AND lease_owner = ? AND lease_expires_at > ?`,
     )
     .run(
       expiresAt,
       now,
+      turnActiveMs,
       requiredId(input.operationId, "operationId"),
       requiredId(input.workerId, "workerId"),
       now,
@@ -467,73 +489,84 @@ export interface FailOperationWithOutboxInput {
 }
 
 export function failOperationWithOutbox(database: Database, input: FailOperationWithOutboxInput): string {
-  const now = isoDateTime.parse(input.now);
-  const fail = database.transaction(() => {
-    const operationId = requiredId(input.operationId, "operationId");
-    const taskId = requiredId(input.taskId, "taskId");
-    const result = database
-      .query(
-        `UPDATE operations SET status = 'failed', last_error_code = ?, lease_owner = NULL,
-           lease_expires_at = NULL, updated_at = ?
-         WHERE operation_id = ? AND task_id = ? AND status = 'inflight'
-           AND lease_owner = ? AND lease_expires_at > ?`,
-      )
-      .run(
-        requiredId(input.errorCode, "errorCode"),
-        now,
-        operationId,
-        taskId,
-        requiredId(input.workerId, "workerId"),
-        now,
-      );
-    requireLeaseHeld(result, "operation");
+  const fail = database.transaction(() => settleFailedOperation(database, input));
+  return fail.immediate();
+}
 
-    const clientMessageId = `${operationId}:failed`;
-    const prior = outboxIdentitySchema.nullable().parse(
-      database.query("SELECT outbox_id FROM slack_outbox WHERE client_message_id = ?").get(clientMessageId),
+/**
+ * Terminally fails a leased operation and queues its one Slack failure notice. Runs inside the
+ * caller's transaction so it can be combined with other writes (see waits.ts).
+ */
+export function settleFailedOperation(
+  database: Database,
+  input: FailOperationWithOutboxInput & { readonly turnActiveMs?: number },
+): string {
+  const now = isoDateTime.parse(input.now);
+  const turnActiveMs = requireTurnActiveMs(input.turnActiveMs);
+  const operationId = requiredId(input.operationId, "operationId");
+  const taskId = requiredId(input.taskId, "taskId");
+  const result = database
+    .query(
+      `UPDATE operations SET status = 'failed', last_error_code = ?, lease_owner = NULL,
+         lease_expires_at = NULL, updated_at = ?, turn_active_ms = MAX(turn_active_ms, COALESCE(?, 0))
+       WHERE operation_id = ? AND task_id = ? AND status = 'inflight'
+         AND lease_owner = ? AND lease_expires_at > ?`,
+    )
+    .run(
+      requiredId(input.errorCode, "errorCode"),
+      now,
+      turnActiveMs,
+      operationId,
+      taskId,
+      requiredId(input.workerId, "workerId"),
+      now,
     );
-    const outboxId = prior?.outbox_id ?? crypto.randomUUID();
-    if (prior === null) {
-      insertOutboxMessage(database, {
-        outboxId,
-        taskId,
-        correlationId: operationId,
-        conversationId: requiredId(input.conversationId, "conversationId"),
-        threadTs: requiredId(input.threadTs, "threadTs"),
-        clientMessageId,
-        payload: outboxPayloadSchema.parse({ text: input.text }),
-        createdAt: now,
-      });
-    }
-    writeAudit(database, {
-      actorType: "worker",
-      actorId: input.workerId,
-      authority: "operation-dispatch",
-      source: operationId,
-      target: taskId,
-      action: "operation.failed",
-      result: "failed",
+  requireLeaseHeld(result, "operation");
+
+  const clientMessageId = `${operationId}:failed`;
+  const prior = outboxIdentitySchema.nullable().parse(
+    database.query("SELECT outbox_id FROM slack_outbox WHERE client_message_id = ?").get(clientMessageId),
+  );
+  const outboxId = prior?.outbox_id ?? crypto.randomUUID();
+  if (prior === null) {
+    insertOutboxMessage(database, {
+      outboxId,
+      taskId,
       correlationId: operationId,
-      metadata: { errorCode: input.errorCode, retryable: false },
+      conversationId: requiredId(input.conversationId, "conversationId"),
+      threadTs: requiredId(input.threadTs, "threadTs"),
+      clientMessageId,
+      payload: outboxPayloadSchema.parse({ text: input.text }),
       createdAt: now,
     });
-    if (prior === null) {
-      writeAudit(database, {
-        actorType: "service",
-        actorId: "agent-tag",
-        authority: "slack-write",
-        source: operationId,
-        target: outboxId,
-        action: "slack.outbox.enqueued",
-        result: "pending",
-        correlationId: operationId,
-        metadata: { clientMessageId },
-        createdAt: now,
-      });
-    }
-    return outboxId;
+  }
+  writeAudit(database, {
+    actorType: "worker",
+    actorId: input.workerId,
+    authority: "operation-dispatch",
+    source: operationId,
+    target: taskId,
+    action: "operation.failed",
+    result: "failed",
+    correlationId: operationId,
+    metadata: { errorCode: input.errorCode, retryable: false },
+    createdAt: now,
   });
-  return fail.immediate();
+  if (prior === null) {
+    writeAudit(database, {
+      actorType: "service",
+      actorId: "agent-tag",
+      authority: "slack-write",
+      source: operationId,
+      target: outboxId,
+      action: "slack.outbox.enqueued",
+      result: "pending",
+      correlationId: operationId,
+      metadata: { clientMessageId },
+      createdAt: now,
+    });
+  }
+  return outboxId;
 }
 
 export interface CancelOperationWithOutboxInput {
