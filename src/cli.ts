@@ -8,15 +8,15 @@ import { createAgentTagService } from "./service.ts";
 import { AgentTagSchedules } from "./scheduler.ts";
 import { AgentTagStore } from "./store/store.ts";
 
+// One leading "usage: agent-tag" line, continuation lines aligned under it.
 const USAGE = [
-  "usage:",
-  "  agent-tag onboard [--yes --accept-risk ...]",
-  "  agent-tag doctor [CONFIG] [--fix] [--json]",
-  "  agent-tag service <install|upgrade|uninstall|status|restart|logs> [CONFIG] [--lines N] [--follow]",
-  "  agent-tag <run|status|audit|backup> CONFIG [ARG]",
-  "  agent-tag restore BACKUP NEW_DATA_DIR",
-  "  agent-tag schedule-<add|list|cancel> CONFIG TASK ACTOR PROFILE [SPEC_OR_ID]",
-  "  agent-tag <version|update|help>",
+  "usage: agent-tag onboard [--yes --accept-risk ...]",
+  "       agent-tag doctor [CONFIG] [--fix] [--json]",
+  "       agent-tag service <install|upgrade|uninstall|status|restart|logs> [CONFIG] [--lines N] [--follow]",
+  "       agent-tag <run|status|audit|backup> CONFIG [ARG]",
+  "       agent-tag restore BACKUP NEW_DATA_DIR",
+  "       agent-tag schedule-<add|list|cancel> CONFIG TASK ACTOR PROFILE [SPEC_OR_ID]",
+  "       agent-tag <version|update|help>",
 ].join("\n");
 
 const KNOWN_COMMANDS = new Set([
@@ -63,7 +63,7 @@ const operatorCommands = new Map<string, (argv: readonly string[]) => Promise<nu
   ["doctor", runDoctorCommand],
   ["service", runServiceCommand],
 ]);
-const operatorCommand = command === undefined ? undefined : operatorCommands.get(command);
+const operatorCommand = operatorCommands.get(command);
 
 if (operatorCommand !== undefined) {
   try {
