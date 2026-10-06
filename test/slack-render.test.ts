@@ -584,7 +584,7 @@ describe("markdownToMrkdwn code preservation", () => {
 
 describe("multi-backtick inline code", () => {
   test("protects complete double-backtick spans from emphasis conversion", () => {
-    expect(markdownToMrkdwn("see ``a ` **x** ` b`` now")).toBe("see `a ` **x** ` b` now");
+    expect(markdownToMrkdwn("see ``a ` **x** ` b`` now")).toBe("see `a \u02cb **x** \u02cb b` now");
   });
 
   test("a line with inline triple-backtick code is not a fence when splitting", () => {

@@ -119,7 +119,8 @@ function convertInline(line: string): string {
     .replace(/(?<!`)(`+)(?!`)([^\n]+?)(?<!`)\1(?!`)/g, (_match, _ticks: string, content: string) => {
       // CommonMark: a span may use N backticks to contain shorter runs; one padding space is stripped.
       const code = /^ .* $/.test(content) && content.trim() !== "" ? content.slice(1, -1) : content;
-      return hold(`\`${escapeEntities(code)}\``, code);
+      // Slack inline code cannot contain backticks; show them as look-alike U+02CB so the span stays verbatim.
+      return hold(`\`${escapeEntities(code.replaceAll("`", "\u02cb"))}\``, code);
     })
     .replace(/!?\[([^\]\n]*)\]\(\s*<?((?:[^()\s>]|\([^()\s>]*\))+)>?(?:\s+"[^"\n]*")?\s*\)/g, (_match, label: string, url: string) => {
       // Slack link labels cannot carry formatting: inline code becomes plain label text.
