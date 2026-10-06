@@ -5,6 +5,7 @@ import { z } from "zod";
 
 import { writeAudit } from "./audit.ts";
 import { requiredId, parseStoredJson } from "./context.ts";
+import { insertOutboxMessage } from "./outbox.ts";
 import {
   isoDateTime,
   nonEmpty,
@@ -177,30 +178,20 @@ export function submitUserInputAnswer(
         )
         .run(JSON.stringify(next), now, row.interaction_id);
       const remaining = unanswered.map((candidate) => candidate.header || candidate.question).join(", ");
-      database
-        .query(
-          `INSERT INTO slack_outbox (
-            outbox_id, task_id, correlation_id, conversation_id, thread_ts,
-            client_message_id, payload_json, status, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
-        )
-        .run(
-          crypto.randomUUID(),
-          row.task_id,
-          row.interaction_id,
-          input.conversationId,
-          input.threadTs,
-          `${row.interaction_id}:answer:${sourceActionId}`,
-          JSON.stringify(
-            outboxPayloadSchema.parse({
-              text: escapeSlackText(
-                `Answer recorded for "${question.header || question.question}" (${answered} of ${total}). Still needed: ${remaining}.`,
-              ),
-            }),
+      insertOutboxMessage(database, {
+        outboxId: crypto.randomUUID(),
+        taskId: row.task_id,
+        correlationId: row.interaction_id,
+        conversationId: input.conversationId,
+        threadTs: input.threadTs,
+        clientMessageId: `${row.interaction_id}:answer:${sourceActionId}`,
+        payload: outboxPayloadSchema.parse({
+          text: escapeSlackText(
+            `Answer recorded for "${question.header || question.question}" (${answered} of ${total}). Still needed: ${remaining}.`,
           ),
-          now,
-          now,
-        );
+        }),
+        createdAt: now,
+      });
       writeAudit(database, {
         actorType: "slack-user",
         actorId: actorUserId,

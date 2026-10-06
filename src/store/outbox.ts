@@ -10,7 +10,44 @@ import {
   outboxPayloadSchema,
   outboxRowSchema,
 } from "./schema.ts";
-import type { ClaimedOutboxMessage, SlackOutboxInput } from "./types.ts";
+import type { ClaimedOutboxMessage, SlackOutboxInput, SlackOutboxPayload } from "./types.ts";
+
+export interface OutboxMessageRow {
+  readonly outboxId: string;
+  readonly taskId: string;
+  readonly correlationId: string;
+  readonly conversationId: string;
+  readonly threadTs: string;
+  readonly clientMessageId: string;
+  readonly payload: SlackOutboxPayload;
+  /** Also written as updated_at. */
+  readonly createdAt: string;
+}
+
+/**
+ * The single writer of new slack_outbox rows: inserts one pending message. Callers validate ids and
+ * parse the payload first, and decide whether to look up an existing client_message_id beforehand.
+ */
+export function insertOutboxMessage(database: Database, row: OutboxMessageRow): void {
+  database
+    .query(
+      `INSERT INTO slack_outbox (
+        outbox_id, task_id, correlation_id, conversation_id, thread_ts,
+        client_message_id, payload_json, status, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
+    )
+    .run(
+      row.outboxId,
+      row.taskId,
+      row.correlationId,
+      row.conversationId,
+      row.threadTs,
+      row.clientMessageId,
+      JSON.stringify(row.payload),
+      row.createdAt,
+      row.createdAt,
+    );
+}
 
 export type EnqueueOutboxResult = { readonly kind: "accepted" | "duplicate"; readonly outboxId: string };
 
@@ -26,24 +63,16 @@ export function enqueueOutbox(context: StoreContext, input: SlackOutboxInput): E
     );
     if (prior !== null) return { kind: "duplicate" as const, outboxId: prior.outbox_id };
     const outboxId = crypto.randomUUID();
-    database
-      .query(
-        `INSERT INTO slack_outbox (
-          outbox_id, task_id, correlation_id, conversation_id, thread_ts,
-          client_message_id, payload_json, status, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
-      )
-      .run(
-        outboxId,
-        requiredId(input.taskId, "taskId"),
-        requiredId(input.correlationId, "correlationId"),
-        requiredId(input.conversationId, "conversationId"),
-        requiredId(input.threadTs, "threadTs"),
-        input.clientMessageId,
-        JSON.stringify(payload),
-        createdAt,
-        createdAt,
-      );
+    insertOutboxMessage(database, {
+      outboxId,
+      taskId: requiredId(input.taskId, "taskId"),
+      correlationId: requiredId(input.correlationId, "correlationId"),
+      conversationId: requiredId(input.conversationId, "conversationId"),
+      threadTs: requiredId(input.threadTs, "threadTs"),
+      clientMessageId: input.clientMessageId,
+      payload,
+      createdAt,
+    });
     faultInjector("outbox-enqueue.after-insert");
     writeAudit(database, {
       actorType: "service",

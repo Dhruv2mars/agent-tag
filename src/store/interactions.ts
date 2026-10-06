@@ -6,6 +6,7 @@ import { z } from "zod";
 import { writeAudit } from "./audit.ts";
 import { requiredId, parseStoredJson } from "./context.ts";
 import { leaseExpiry, requireLeaseHeld } from "./lease.ts";
+import { insertOutboxMessage } from "./outbox.ts";
 import {
   interactionIdentitySchema,
   interactionRowSchema,
@@ -92,24 +93,16 @@ export function recordPendingInteraction(
         now,
         now,
       );
-    database
-      .query(
-        `INSERT INTO slack_outbox (
-          outbox_id, task_id, correlation_id, conversation_id, thread_ts,
-          client_message_id, payload_json, status, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
-      )
-      .run(
-        outboxId,
-        input.taskId,
-        interactionId,
-        requiredId(input.conversationId, "conversationId"),
-        requiredId(input.threadTs, "threadTs"),
-        `${interactionId}:prompt`,
-        JSON.stringify(message),
-        now,
-        now,
-      );
+    insertOutboxMessage(database, {
+      outboxId,
+      taskId: input.taskId,
+      correlationId: interactionId,
+      conversationId: requiredId(input.conversationId, "conversationId"),
+      threadTs: requiredId(input.threadTs, "threadTs"),
+      clientMessageId: `${interactionId}:prompt`,
+      payload: message,
+      createdAt: now,
+    });
     writeAudit(database, {
       actorType: "provider",
       actorId: "t3",

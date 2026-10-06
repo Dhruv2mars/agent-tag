@@ -4,6 +4,7 @@ import type { Database } from "bun:sqlite";
 import { writeAudit } from "./audit.ts";
 import { type StoreContext, requiredId, parseStoredJson } from "./context.ts";
 import { leaseExpiry, requireLeaseHeld } from "./lease.ts";
+import { insertOutboxMessage } from "./outbox.ts";
 import {
   isoDateTime,
   operationIdentitySchema,
@@ -282,24 +283,16 @@ export function completeOperationWithOutbox(
       );
       const outboxId = prior?.outbox_id ?? crypto.randomUUID();
       if (prior === null) {
-        database
-          .query(
-            `INSERT INTO slack_outbox (
-              outbox_id, task_id, correlation_id, conversation_id, thread_ts,
-              client_message_id, payload_json, status, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
-          )
-          .run(
-            outboxId,
-            taskId,
-            operationId,
-            requiredId(input.conversationId, "conversationId"),
-            requiredId(input.threadTs, "threadTs"),
-            clientMessageId,
-            JSON.stringify(outboxPayloadSchema.parse({ text })),
-            createdAt,
-            createdAt,
-          );
+        insertOutboxMessage(database, {
+          outboxId,
+          taskId,
+          correlationId: operationId,
+          conversationId: requiredId(input.conversationId, "conversationId"),
+          threadTs: requiredId(input.threadTs, "threadTs"),
+          clientMessageId,
+          payload: outboxPayloadSchema.parse({ text }),
+          createdAt,
+        });
       }
       return { outboxId, clientMessageId };
     });
@@ -501,24 +494,16 @@ export function failOperationWithOutbox(database: Database, input: FailOperation
     );
     const outboxId = prior?.outbox_id ?? crypto.randomUUID();
     if (prior === null) {
-      database
-        .query(
-          `INSERT INTO slack_outbox (
-            outbox_id, task_id, correlation_id, conversation_id, thread_ts,
-            client_message_id, payload_json, status, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
-        )
-        .run(
-          outboxId,
-          taskId,
-          operationId,
-          requiredId(input.conversationId, "conversationId"),
-          requiredId(input.threadTs, "threadTs"),
-          clientMessageId,
-          JSON.stringify(outboxPayloadSchema.parse({ text: input.text })),
-          now,
-          now,
-        );
+      insertOutboxMessage(database, {
+        outboxId,
+        taskId,
+        correlationId: operationId,
+        conversationId: requiredId(input.conversationId, "conversationId"),
+        threadTs: requiredId(input.threadTs, "threadTs"),
+        clientMessageId,
+        payload: outboxPayloadSchema.parse({ text: input.text }),
+        createdAt: now,
+      });
     }
     writeAudit(database, {
       actorType: "worker",
@@ -582,24 +567,16 @@ export function cancelOperationWithOutbox(database: Database, input: CancelOpera
     requireLeaseHeld(result, "operation");
     const clientMessageId = `${operationId}:cancelled`;
     const outboxId = crypto.randomUUID();
-    database
-      .query(
-        `INSERT INTO slack_outbox (
-          outbox_id, task_id, correlation_id, conversation_id, thread_ts,
-          client_message_id, payload_json, status, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
-      )
-      .run(
-        outboxId,
-        taskId,
-        operationId,
-        requiredId(input.conversationId, "conversationId"),
-        requiredId(input.threadTs, "threadTs"),
-        clientMessageId,
-        JSON.stringify(outboxPayloadSchema.parse({ text: "Cancelled." })),
-        now,
-        now,
-      );
+    insertOutboxMessage(database, {
+      outboxId,
+      taskId,
+      correlationId: operationId,
+      conversationId: requiredId(input.conversationId, "conversationId"),
+      threadTs: requiredId(input.threadTs, "threadTs"),
+      clientMessageId,
+      payload: outboxPayloadSchema.parse({ text: "Cancelled." }),
+      createdAt: now,
+    });
     writeAudit(database, {
       actorType: "worker",
       actorId: input.workerId,
