@@ -264,6 +264,34 @@ describe("agent-tag onboard (non-interactive)", () => {
     expect(harness.output.join("\n")).toContain("bun run enroll:t3");
   });
 
+  test("treats a T3 server doctor would fail as incompatible: no token, no providers, no service", async () => {
+    const protocolTwo: OnboardDependencies = {
+      ...harness.deps,
+      fetch: async (input) => {
+        if (String(input).startsWith("https://slack.com/")) return json({ ok: true, team_id: "T0FIXTURE" });
+        return json({ serverVersion: "0.0.46-nightly", orchestrationProtocolVersion: 2 });
+      },
+      listT3Providers: async () => {
+        throw new Error("providers must not be listed on an incompatible server");
+      },
+    };
+    await expect(runOnboard(flags(harness), protocolTwo)).rejects.toThrow(
+      "cannot enroll a T3 token: T3 0.0.46-nightly speaks orchestration protocol 2; Agent Tag requires 1 (run the T3 version pinned in t3.lock.json)",
+    );
+    expect(harness.commands).toEqual([]);
+
+    const result = await runOnboard(flags(harness, { t3IssueToken: false, force: true }), protocolTwo);
+    expect(result.secrets.t3Token).toBe("missing");
+    expect(harness.commands).toEqual([]);
+    expect(harness.enrolled).toEqual([]);
+    expect(harness.output.join("\n")).toContain("run the T3 version pinned in t3.lock.json, then `bun run enroll:t3`");
+
+    await expect(
+      runOnboard(flags(harness, { t3IssueToken: false, force: true, installService: true }), protocolTwo),
+    ).rejects.toThrow("service not installed: T3 0.0.46-nightly speaks orchestration protocol 2");
+    expect(harness.installs).toEqual([]);
+  });
+
   test("a failed t3 CLI is reported without echoing its output", async () => {
     const failing: OnboardDependencies = {
       ...harness.deps,

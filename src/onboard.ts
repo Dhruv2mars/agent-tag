@@ -5,6 +5,7 @@ import { z } from "zod";
 
 import type { CommandRunner } from "./command.ts";
 import { type AgentTagConfig, agentTagConfigSchema } from "./config.ts";
+import { checkT3Environment } from "./doctor.ts";
 import type { Prompter } from "./prompt.ts";
 import { createSecretFile, readSecretFile, SecretString } from "./security/secret-file.ts";
 import type { ServiceStatusReport } from "./service-manager.ts";
@@ -359,34 +360,17 @@ async function slackWorkspace(context: Context, botToken: SecretString): Promise
   }
 }
 
-const environmentSchema = z.object({
-  serverVersion: z.string().optional(),
-  orchestrationProtocolVersion: z.number().int().optional(),
-});
+type T3Probe =
+  | { readonly usable: true }
+  | { readonly usable: false; readonly reachable: boolean; readonly problem: string };
 
-async function probeT3(context: Context, baseUrl: string): Promise<boolean> {
+/** Probes T3 with doctor's own environment check, so onboarding never proceeds against a server doctor fails. */
+async function probeT3(context: Context, baseUrl: string): Promise<T3Probe> {
   const { deps } = context;
-  try {
-    const response = await deps.fetch(new URL("/.well-known/t3/environment", baseUrl), {
-      signal: AbortSignal.timeout(5_000),
-    });
-    if (response.status === 404) {
-      deps.print(`  T3 is reachable at ${baseUrl} (no environment metadata)`);
-      return true;
-    }
-    if (!response.ok) {
-      deps.print(`  T3 environment endpoint returned HTTP ${response.status}`);
-      return false;
-    }
-    const environment = environmentSchema.parse(await response.json());
-    const protocol = environment.orchestrationProtocolVersion ?? 1;
-    deps.print(`  T3 ${environment.serverVersion ?? "(unknown version)"} reachable, orchestration protocol ${protocol}`);
-    if (protocol !== 1) deps.print("  warning: Agent Tag requires orchestration protocol 1");
-    return true;
-  } catch (error) {
-    deps.print(`  T3 is not reachable at ${baseUrl}: ${errorMessage(error)}`);
-    return false;
-  }
+  const { check, reachable } = await checkT3Environment({ t3: { baseUrl } }, { fetch: deps.fetch });
+  deps.print(`  ${check.summary}`);
+  if (check.status !== "fail") return { usable: true };
+  return { usable: false, reachable, problem: check.hint === undefined ? check.summary : `${check.summary} (${check.hint})` };
 }
 
 async function provisionT3Token(
@@ -571,17 +555,21 @@ export async function runOnboard(options: OnboardOptions, deps: OnboardDependenc
       return new URL(raw.trim()).origin;
     },
   });
-  const t3Reachable = await probeT3(context, t3BaseUrl);
-  if (!t3Reachable && (options.t3AdminTokenFile !== undefined || options.t3IssueToken)) {
-    throw new Error(`cannot enroll a T3 token: T3 is not reachable at ${t3BaseUrl}`);
+  const t3 = await probeT3(context, t3BaseUrl);
+  if (!t3.usable && (options.t3AdminTokenFile !== undefined || options.t3IssueToken)) {
+    throw new Error(`cannot enroll a T3 token: ${t3.problem}`);
   }
-  const t3Token = t3Reachable
+  const t3Token = t3.usable
     ? await provisionT3Token(context, { baseUrl: t3BaseUrl, baseDir: t3BaseDir, path: paths.t3TokenFile })
     : (await exists(paths.t3TokenFile))
       ? "kept"
       : "missing";
-  if (!t3Reachable && t3Token === "missing") {
-    print("  start T3, then mint a token with `bun run enroll:t3` and run `agent-tag doctor`");
+  if (!t3.usable) {
+    print(
+      t3.reachable
+        ? "  skipping T3 token and provider setup: run the T3 version pinned in t3.lock.json, then `bun run enroll:t3` and `agent-tag doctor`"
+        : "  skipping T3 token and provider setup: start T3, then mint a token with `bun run enroll:t3` and run `agent-tag doctor`",
+    );
   }
 
   // 4. Repositories and provider.
@@ -610,7 +598,7 @@ export async function runOnboard(options: OnboardOptions, deps: OnboardDependenc
       return raw.trim();
     },
   });
-  const discovered = t3Token === "missing" ? {} : await providerDefaults(context, { baseUrl: t3BaseUrl, tokenFile: paths.t3TokenFile });
+  const discovered = !t3.usable || t3Token === "missing" ? {} : await providerDefaults(context, { baseUrl: t3BaseUrl, tokenFile: paths.t3TokenFile });
   const providerInstanceId = await resolveValue(context, {
     flag: "provider",
     value: options.providerInstanceId,
@@ -717,8 +705,14 @@ export async function runOnboard(options: OnboardOptions, deps: OnboardDependenc
     print("  no supported service manager on this platform; run `agent-tag run CONFIG` in the foreground");
   } else {
     const install = options.installService ??
-      (options.interactive && (await prompter.confirm("  Install and start the background service now?", t3Token !== "missing")));
-    if (install) {
+      (options.interactive &&
+        (await prompter.confirm("  Install and start the background service now?", t3.usable && t3Token !== "missing")));
+    if (install && !t3.usable) {
+      // The installer's doctor preflight would fail the same check; say so instead of attempting it.
+      print(`  not installing the service: ${t3.problem}`);
+      print(`  once T3 is fixed: \`agent-tag doctor ${paths.configPath}\`, then \`agent-tag service install ${paths.configPath}\``);
+      if (!options.interactive) throw new Error(`service not installed: ${t3.problem}`);
+    } else if (install) {
       try {
         service = await deps.installService(paths.configPath);
         print(`  ${service.manager} service installed${service.running ? " and running" : ""} (${service.unitPath})`);

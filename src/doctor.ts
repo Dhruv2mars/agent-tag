@@ -105,7 +105,7 @@ function modeText(mode: number): string {
 }
 
 async function fetchWithTimeout(
-  dependencies: DoctorDependencies,
+  dependencies: Pick<DoctorDependencies, "fetch">,
   url: string | URL,
   init: RequestInit = {},
 ): Promise<Response> {
@@ -291,9 +291,10 @@ export function checkBunVersion(dependencies: Pick<DoctorDependencies, "bunVersi
   return { id: "bun-version", status: "pass", summary: `Bun ${bunVersion}` };
 }
 
+/** Shared with `agent-tag onboard`, so the wizard and doctor agree on which T3 servers are usable. */
 export async function checkT3Environment(
-  config: AgentTagConfig,
-  dependencies: DoctorDependencies,
+  config: { readonly t3: Pick<AgentTagConfig["t3"], "baseUrl"> },
+  dependencies: Pick<DoctorDependencies, "fetch">,
 ): Promise<{ readonly check: DoctorCheck; readonly reachable: boolean; readonly serverVersion?: string }> {
   const id = "t3-environment";
   const url = new URL("/.well-known/t3/environment", config.t3.baseUrl);
