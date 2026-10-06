@@ -85,6 +85,7 @@ class FakeSystemctl {
   enabled = false;
   failEnable = false;
   failRestart = false;
+  failDisable = false;
   linger = "no";
   preflights = 0;
 
@@ -119,6 +120,7 @@ class FakeSystemctl {
       return ok();
     }
     if (verb === "disable") {
+      if (this.failDisable) return { exitCode: 1, stdout: "", stderr: "Failed to stop unit: Access denied\n" };
       this.enabled = false;
       if (command.includes("--now")) this.active = false;
       return ok();
@@ -226,6 +228,23 @@ describe("systemd user service lifecycle", () => {
     expect(status).toMatchObject({ installed: false, running: false, enabled: false });
     expect(fake.commands).toContain(`systemctl --user disable --now ${AGENT_TAG_SYSTEMD_UNIT}`);
     expect(fake.commands).toContain(`systemctl --user reset-failed ${AGENT_TAG_SYSTEMD_UNIT}`);
+  });
+
+  test("uninstall keeps the unit when disable --now fails, so it can be retried", async () => {
+    await service.install("/cfg/a.json");
+    const unit = await readFile(service.unitPath, "utf8");
+    fake.failDisable = true;
+    fake.commands.length = 0;
+    await expect(service.uninstall()).rejects.toThrow(
+      `systemd disable --now failed with exit code 1: Failed to stop unit: Access denied; kept ${service.unitPath}`,
+    );
+    expect(await readFile(service.unitPath, "utf8")).toBe(unit);
+    expect(fake.commands).not.toContain("systemctl --user daemon-reload");
+    expect(fake.commands).not.toContain(`systemctl --user reset-failed ${AGENT_TAG_SYSTEMD_UNIT}`);
+
+    fake.failDisable = false;
+    expect(await service.uninstall()).toMatchObject({ installed: false, running: false });
+    expect(await Bun.file(service.unitPath).exists()).toBe(false);
   });
 
   test("restart waits for the running state", async () => {

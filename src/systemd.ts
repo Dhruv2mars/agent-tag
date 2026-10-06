@@ -316,7 +316,14 @@ export class SystemdUserService {
 
   async uninstall(): Promise<SystemdServiceStatus> {
     if ((await this.#runtime()).loaded) {
-      await this.#host.run(systemctl("disable", "--now", AGENT_TAG_SYSTEMD_UNIT));
+      // Keep the unit file when systemd could not stop it, so the operator can fix the cause and retry.
+      const disabled = await this.#host.run(systemctl("disable", "--now", AGENT_TAG_SYSTEMD_UNIT));
+      if (disabled.exitCode !== 0) {
+        throw new Error(
+          `systemd disable --now failed with exit code ${disabled.exitCode}: ${disabled.stderr.trim()}; ` +
+            `kept ${this.unitPath} so you can retry \`agent-tag service uninstall\``,
+        );
+      }
     }
     await rm(this.unitPath, { force: true });
     await requireSuccess(this.#host.run, systemctl("daemon-reload"), "systemd daemon-reload");
