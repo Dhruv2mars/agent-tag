@@ -1,3 +1,4 @@
+// Scoped memory entries with versioned edits, forgetting and retention expiry.
 import type { Database } from "bun:sqlite";
 
 import { writeAudit } from "./audit.ts";

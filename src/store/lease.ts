@@ -1,3 +1,4 @@
+// Lease helpers shared by the operation, interaction, outbox and schedule queues.
 import { isoDateTime } from "./schema.ts";
 
 export function leaseExpiry(now: string, leaseMs: number): string {

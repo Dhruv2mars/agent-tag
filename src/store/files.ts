@@ -1,3 +1,4 @@
+// Store file lifecycle: private open + migrations, backup and restore.
 import { Database } from "bun:sqlite";
 import { constants } from "node:fs";
 import { chmod, copyFile, link, mkdir, open, rm, stat } from "node:fs/promises";

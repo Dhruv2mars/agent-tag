@@ -1,3 +1,4 @@
+// Ambient (unmentioned) message trigger decisions with dedupe, cooldown and hourly limit.
 import type { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
 

@@ -1,29 +1,18 @@
+/**
+ * AgentTagStore is the public facade over the SQLite store. Each domain lives in its own module and
+ * owns its SQL and transactions; this class only holds the handle and delegates:
+ *
+ *   files.ts        open + migrations, backup/restore      tasks.ts        Slack ingest, task bindings
+ *   operations.ts   operation leases and outcomes          interactions.ts approvals, cancel, responses
+ *   user-input.ts   multi-question user-input answers      outbox.ts       Slack outbox queue
+ *   schedules.ts    schedules and runs                     memory.ts       memory entries
+ *   ambient.ts      ambient trigger decisions              audit.ts        audit log write/export
+ *   diagnostics.ts  counts and operational status          lease.ts        shared lease helpers
+ *   schema.ts       zod schemas                            types.ts        public types (re-exported)
+ */
 import type { Database } from "bun:sqlite";
 
-import { z } from "zod";
-
-import { writeAudit } from "./audit.ts";
-import { requiredId, parseStoredJson } from "./context.ts";
-import { leaseExpiry } from "./lease.ts";
-import {
-  canonicalEventSchema,
-  deliveryLookupSchema,
-  interactionIdentitySchema,
-  interactionRowSchema,
-  isoDateTime,
-  nonEmpty,
-  operationIdentitySchema,
-  operationPayloadSchema,
-  operationRowSchema,
-  outboxIdentitySchema,
-  outboxPayloadSchema,
-  outboxRowSchema,
-  partialUserInputSchema,
-  resolvedOperationTextSchema,
-  taskExecutionSchema,
-  taskLookupSchema,
-  userInputPromptSchema,
-} from "./schema.ts";
+import type { StoreContext } from "./context.ts";
 import type {
   ActiveTaskBinding,
   AmbientDecision,
@@ -38,13 +27,10 @@ import type {
   ScheduleSummary,
   SlackEventInput,
   SlackOutboxInput,
-  SlackOutboxPayload,
-  StoreFaultPoint,
   StoreOpenOptions,
   TaskExecutionBinding,
   UserInputAnswerResult,
   UserInputQuestionPrompt,
-  UserInputSelection,
 } from "./types.ts";
 import * as files from "./files.ts";
 import * as audit from "./audit.ts";
@@ -52,6 +38,11 @@ import * as memory from "./memory.ts";
 import * as schedules from "./schedules.ts";
 import * as ambient from "./ambient.ts";
 import * as diagnostics from "./diagnostics.ts";
+import * as tasks from "./tasks.ts";
+import * as operations from "./operations.ts";
+import * as interactions from "./interactions.ts";
+import * as userInput from "./user-input.ts";
+import * as outbox from "./outbox.ts";
 
 export { AUDIT_ACTIONS, type AuditAction } from "./schema.ts";
 export type {
@@ -96,44 +87,50 @@ export type {
   RecordScheduleDenialInput,
 } from "./schedules.ts";
 export type { EvaluateAmbientInput } from "./ambient.ts";
-
-/** Applies T3's answer rules: custom text wins when allowed; multi-select yields a list; otherwise one label. */
-function resolveUserInputAnswer(
-  question: UserInputQuestionPrompt,
-  selection: UserInputSelection,
-): string | string[] | null {
-  const text = selection.text?.trim() ?? "";
-  if (text.length > 0) {
-    const customAllowed = question.options.length === 0 || question.allowCustomAnswer !== false;
-    return customAllowed ? text : null;
-  }
-  const labels: string[] = [];
-  for (const index of selection.optionIndexes ?? []) {
-    const option = Number.isSafeInteger(index) ? question.options[index] : undefined;
-    if (option === undefined) return null;
-    labels.push(option.label);
-  }
-  for (const label of selection.optionLabels ?? []) {
-    if (!question.options.some((option) => option.label === label)) return null;
-    labels.push(label);
-  }
-  const unique = [...new Set(labels)];
-  if (unique.length === 0) return null;
-  if (question.multiSelect) return unique;
-  return unique.length === 1 ? (unique[0] ?? null) : null;
-}
-
-function escapeSlackText(text: string): string {
-  return text.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
-}
+export type {
+  TaskBelongsToContextInput,
+  BindT3TaskInput,
+  FindActiveTaskInput,
+  MarkT3ThreadStartedInput,
+} from "./tasks.ts";
+export type {
+  ClaimNextOperationInput,
+  RenewOperationLeaseInput,
+  ResolveOperationTurnTextInput,
+  CompleteOperationInput,
+  CompleteOperationWithOutboxInput,
+  DeferOperationInput,
+  ReleaseOperationInput,
+  FailOperationInput,
+  FailOperationWithOutboxInput,
+  CancelOperationWithOutboxInput,
+} from "./operations.ts";
+export type {
+  RecordPendingInteractionResult,
+  SubmitInteractionResponseResult,
+  RequestTaskCancellationResult,
+  RecordPendingInteractionInput,
+  SubmitInteractionResponseInput,
+  RequestTaskCancellationInput,
+  ClaimNextInteractionResponseInput,
+  CompleteInteractionResponseInput,
+  FailInteractionResponseInput,
+} from "./interactions.ts";
+export type { GetPendingUserInputQuestionInput, SubmitUserInputAnswerInput } from "./user-input.ts";
+export type {
+  EnqueueOutboxResult,
+  ClaimNextOutboxInput,
+  MarkOutboxDeliveredInput,
+  FailOutboxInput,
+} from "./outbox.ts";
 
 export class AgentTagStore {
   readonly #database: Database;
-  readonly #faultInjector: (point: StoreFaultPoint) => void;
+  readonly #context: StoreContext;
 
   private constructor(database: Database, options: StoreOpenOptions) {
     this.#database = database;
-    this.#faultInjector = options.faultInjector ?? (() => {});
+    this.#context = { database, faultInjector: options.faultInjector ?? (() => {}) };
   }
 
   static async open(path: string, options: StoreOpenOptions = {}): Promise<AgentTagStore> {
@@ -180,73 +177,16 @@ export class AgentTagStore {
     return memory.expireMemory(this.#database, nowInput);
   }
 
-  taskBelongsToContext(input: {
-    readonly taskId: string;
-    readonly workspaceId: string;
-    readonly profileId: string;
-    readonly actorUserId: string;
-  }): boolean {
-    const row = this.#database
-      .query<{ count: number }, [string, string, string, string]>(
-        `SELECT COUNT(*) AS count FROM tasks
-         WHERE task_id = ? AND workspace_id = ? AND profile_id = ? AND state = 'active'
-           AND (conversation_type = 'channel' OR owner_user_id = ?)`,
-      )
-      .get(
-        requiredId(input.taskId, "taskId"),
-        requiredId(input.workspaceId, "workspaceId"),
-        requiredId(input.profileId, "profileId"),
-        requiredId(input.actorUserId, "actorUserId"),
-      );
-    if (row === null) throw new Error("failed to check task context");
-    return row.count === 1;
+  taskBelongsToContext(input: tasks.TaskBelongsToContextInput): boolean {
+    return tasks.taskBelongsToContext(this.#database, input);
   }
 
   recordMemoryDenial(input: memory.RecordMemoryDenialInput): void {
     memory.recordMemoryDenial(this.#database, input);
   }
 
-  resolveOperationTurnText(input: {
-    readonly operationId: string;
-    readonly workerId: string;
-    readonly proposedText: string;
-    readonly now: string;
-  }): string {
-    const now = isoDateTime.parse(input.now);
-    const resolve = this.#database.transaction(() => {
-      const operationId = requiredId(input.operationId, "operationId");
-      const prior = resolvedOperationTextSchema.parse(
-        this.#database
-          .query(
-            `SELECT resolved_text FROM operations
-             WHERE operation_id = ? AND status = 'inflight' AND lease_owner = ? AND lease_expires_at > ?`,
-          )
-          .get(operationId, requiredId(input.workerId, "workerId"), now),
-      );
-      if (prior.resolved_text !== null) return prior.resolved_text;
-      const result = this.#database
-        .query(
-          `UPDATE operations SET resolved_text = ?, updated_at = ?
-           WHERE operation_id = ? AND status = 'inflight' AND lease_owner = ?
-             AND lease_expires_at > ? AND resolved_text IS NULL`,
-        )
-        .run(input.proposedText, now, operationId, input.workerId, now);
-      if (result.changes !== 1) throw new Error("operation turn text could not be resolved");
-      writeAudit(this.#database, {
-        actorType: "worker",
-        actorId: input.workerId,
-        authority: "operation-dispatch",
-        source: operationId,
-        target: operationId,
-        action: "operation.turn-text.resolved",
-        result: "immutable",
-        correlationId: operationId,
-        metadata: {},
-        createdAt: now,
-      });
-      return input.proposedText;
-    });
-    return resolve.immediate();
+  resolveOperationTurnText(input: operations.ResolveOperationTurnTextInput): string {
+    return operations.resolveOperationTurnText(this.#database, input);
   }
 
   countActiveSchedules(workspaceId: string): number {
@@ -290,966 +230,82 @@ export class AgentTagStore {
   }
 
   ingestSlackEvent(input: SlackEventInput): IngestReceipt {
-    const event = {
-      deliveryId: requiredId(input.deliveryId, "deliveryId"),
-      eventKey: requiredId(input.eventKey, "eventKey"),
-      workspaceId: requiredId(input.workspaceId, "workspaceId"),
-      conversationId: requiredId(input.conversationId, "conversationId"),
-      threadTs: requiredId(input.threadTs, "threadTs"),
-      actorUserId: requiredId(input.actorUserId, "actorUserId"),
-      conversationType: z.enum(["channel", "dm"]).parse(input.conversationType),
-      profileId: requiredId(input.profileId, "profileId"),
-      repositoryRoot: requiredId(input.repositoryRoot, "repositoryRoot"),
-      text: input.text,
-      receivedAt: isoDateTime.parse(input.receivedAt),
-      sourceOrderKey: requiredId(input.sourceOrderKey ?? input.receivedAt, "sourceOrderKey"),
-    };
-    const ingest = this.#database.transaction((): IngestReceipt => {
-      const priorDelivery = deliveryLookupSchema.nullable().parse(
-        this.#database
-          .query("SELECT canonical_operation_id FROM slack_deliveries WHERE delivery_id = ?")
-          .get(event.deliveryId),
-      );
-      if (priorDelivery !== null) {
-        return this.#receipt("duplicate", event.deliveryId, priorDelivery.canonical_operation_id);
-      }
-
-      const canonical = canonicalEventSchema.nullable().parse(
-        this.#database
-          .query("SELECT operation_id FROM slack_events WHERE workspace_id = ? AND event_key = ?")
-          .get(event.workspaceId, event.eventKey),
-      );
-      if (canonical !== null) {
-        this.#insertDelivery(event, canonical.operation_id, "duplicate");
-        writeAudit(this.#database, {
-          actorType: "slack-user",
-          actorId: event.actorUserId,
-          authority: event.profileId,
-          source: event.deliveryId,
-          target: canonical.operation_id,
-          action: "slack.delivery.duplicate",
-          result: "ignored",
-          correlationId: canonical.operation_id,
-          metadata: { eventKey: event.eventKey },
-          createdAt: event.receivedAt,
-        });
-        return this.#receipt("duplicate", event.deliveryId, canonical.operation_id);
-      }
-
-      const taskId = this.#findOrCreateTask(event);
-      const operationId = crypto.randomUUID();
-      const commandId = crypto.randomUUID();
-      const messageId = crypto.randomUUID();
-      const payload = operationPayloadSchema.parse({
-        text: event.text,
-        actorUserId: event.actorUserId,
-        conversationId: event.conversationId,
-        threadTs: event.threadTs,
-        profileId: event.profileId,
-        repositoryRoot: event.repositoryRoot,
-      });
-      this.#database
-        .query(
-          `INSERT INTO operations (
-            operation_id, task_id, source_delivery_id, source_event_key, kind, command_id,
-            message_id, payload_json, status, source_order_key, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, 'user-turn', ?, ?, ?, 'pending', ?, ?, ?)`,
-        )
-        .run(
-          operationId,
-          taskId,
-          event.deliveryId,
-          event.eventKey,
-          commandId,
-          messageId,
-          JSON.stringify(payload),
-          event.sourceOrderKey,
-          event.receivedAt,
-          event.receivedAt,
-        );
-      this.#faultInjector("ingest.after-operation");
-      this.#database
-        .query(
-          `INSERT INTO slack_events (
-            workspace_id, event_key, canonical_delivery_id, operation_id, conversation_id,
-            thread_ts, actor_user_id, text, received_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        )
-        .run(
-          event.workspaceId,
-          event.eventKey,
-          event.deliveryId,
-          operationId,
-          event.conversationId,
-          event.threadTs,
-          event.actorUserId,
-          event.text,
-          event.receivedAt,
-        );
-      this.#insertDelivery(event, operationId, "accepted");
-      writeAudit(this.#database, {
-        actorType: "slack-user",
-        actorId: event.actorUserId,
-        authority: event.profileId,
-        source: event.deliveryId,
-        target: taskId,
-        action: "slack.event.ingested",
-        result: "accepted",
-        correlationId: operationId,
-        metadata: { eventKey: event.eventKey, operationKind: "user-turn" },
-        createdAt: event.receivedAt,
-      });
-      return { kind: "accepted", deliveryId: event.deliveryId, operationId, taskId, commandId, messageId };
-    });
-    return ingest.immediate();
+    return tasks.ingestSlackEvent(this.#context, input);
   }
 
-  claimNextOperation(input: {
-    readonly workerId: string;
-    readonly now: string;
-    readonly leaseMs: number;
-    readonly maxConcurrentTasks: number;
-  }): ClaimedOperation | null {
-    const workerId = requiredId(input.workerId, "workerId");
-    const now = isoDateTime.parse(input.now);
-    if (!Number.isSafeInteger(input.maxConcurrentTasks) || input.maxConcurrentTasks <= 0) {
-      throw new Error("maxConcurrentTasks must be positive");
-    }
-    const expiresAt = leaseExpiry(now, input.leaseMs);
-    const claim = this.#database.transaction((): ClaimedOperation | null => {
-      const active = this.#database
-        .query<{ count: number }, [string]>(
-          "SELECT COUNT(DISTINCT task_id) AS count FROM operations WHERE status = 'inflight' AND lease_expires_at > ?",
-        )
-        .get(now)?.count;
-      if (active === undefined) throw new Error("failed to count active operation leases");
-      if (active >= input.maxConcurrentTasks) return null;
-
-      const identity = operationIdentitySchema.nullable().parse(
-        this.#database
-          .query(
-            `SELECT o.operation_id, o.task_id, o.command_id, o.message_id
-             FROM operations o
-             WHERE ((o.status = 'pending' AND (o.blocked_until IS NULL OR o.blocked_until <= ?))
-                OR (o.status = 'inflight' AND o.lease_expires_at <= ?))
-               AND NOT EXISTS (
-                 SELECT 1 FROM operations earlier
-                 WHERE earlier.task_id = o.task_id
-                   AND earlier.status IN ('pending', 'inflight')
-                   AND (earlier.source_order_key < o.source_order_key OR
-                     (earlier.source_order_key = o.source_order_key AND earlier.operation_id < o.operation_id))
-               )
-               AND NOT EXISTS (
-                 SELECT 1 FROM operations active
-                 WHERE active.task_id = o.task_id
-                   AND active.operation_id <> o.operation_id
-                   AND active.status = 'inflight'
-                   AND active.lease_expires_at > ?
-               )
-             ORDER BY o.source_order_key, o.operation_id
-             LIMIT 1`,
-          )
-          .get(now, now, now),
-      );
-      if (identity === null) return null;
-      const updated = this.#database
-        .query(
-          `UPDATE operations
-           SET status = 'inflight', attempts = attempts + 1, lease_owner = ?, lease_expires_at = ?, updated_at = ?
-           WHERE operation_id = ? AND ((status = 'pending' AND (blocked_until IS NULL OR blocked_until <= ?))
-             OR (status = 'inflight' AND lease_expires_at <= ?))`,
-        )
-        .run(workerId, expiresAt, now, identity.operation_id, now, now);
-      if (updated.changes !== 1) return null;
-      this.#faultInjector("operation-claim.after-update");
-      const row = operationRowSchema.parse(
-        this.#database
-          .query(
-            `SELECT operation_id, task_id, command_id, message_id, payload_json,
-                    attempts, lease_expires_at
-             FROM operations WHERE operation_id = ?`,
-          )
-          .get(identity.operation_id),
-      );
-      writeAudit(this.#database, {
-        actorType: "worker",
-        actorId: workerId,
-        authority: "operation-dispatch",
-        source: row.operation_id,
-        target: row.task_id,
-        action: "operation.claimed",
-        result: "inflight",
-        correlationId: row.operation_id,
-        metadata: { attempt: row.attempts },
-        createdAt: now,
-      });
-      return {
-        operationId: row.operation_id,
-        taskId: row.task_id,
-        commandId: row.command_id,
-        messageId: row.message_id,
-        payload: operationPayloadSchema.parse(parseStoredJson(row.payload_json)),
-        attempt: row.attempts,
-        leaseExpiresAt: row.lease_expires_at,
-      };
-    });
-    return claim.immediate();
+  claimNextOperation(input: operations.ClaimNextOperationInput): ClaimedOperation | null {
+    return operations.claimNextOperation(this.#context, input);
   }
 
-  completeOperation(input: {
-    readonly operationId: string;
-    readonly workerId: string;
-    readonly resultSequence: number;
-    readonly now: string;
-  }): void {
-    const now = isoDateTime.parse(input.now);
-    if (!Number.isSafeInteger(input.resultSequence) || input.resultSequence < 0) {
-      throw new Error("resultSequence must be a non-negative integer");
-    }
-    const complete = this.#database.transaction(() => {
-      const result = this.#database
-        .query(
-          `UPDATE operations SET status = 'succeeded', result_sequence = ?, lease_owner = NULL,
-             lease_expires_at = NULL, updated_at = ?
-           WHERE operation_id = ? AND status = 'inflight' AND lease_owner = ? AND lease_expires_at > ?`,
-        )
-        .run(
-          input.resultSequence,
-          now,
-          requiredId(input.operationId, "operationId"),
-          requiredId(input.workerId, "workerId"),
-          now,
-        );
-      if (result.changes !== 1) throw new Error("operation lease is missing, expired, or owned by another worker");
-      writeAudit(this.#database, {
-        actorType: "worker",
-        actorId: input.workerId,
-        authority: "operation-dispatch",
-        source: input.operationId,
-        target: input.operationId,
-        action: "operation.completed",
-        result: "succeeded",
-        correlationId: input.operationId,
-        metadata: { resultSequence: input.resultSequence },
-        createdAt: now,
-      });
-    });
-    complete.immediate();
+  completeOperation(input: operations.CompleteOperationInput): void {
+    operations.completeOperation(this.#database, input);
   }
 
-  completeOperationWithOutbox(input: {
-    readonly operationId: string;
-    readonly taskId: string;
-    readonly workerId: string;
-    readonly resultSequence: number;
-    readonly conversationId: string;
-    readonly threadTs: string;
-    /** One reply, or ordered Slack-sized chunks of one reply (see splitForSlack). */
-    readonly text: string | readonly string[];
-    readonly now: string;
-  }): string {
-    const now = isoDateTime.parse(input.now);
-    if (!Number.isSafeInteger(input.resultSequence) || input.resultSequence < 0) {
-      throw new Error("resultSequence must be a non-negative integer");
-    }
-    const complete = this.#database.transaction(() => {
-      const operationId = requiredId(input.operationId, "operationId");
-      const taskId = requiredId(input.taskId, "taskId");
-      const result = this.#database
-        .query(
-          `UPDATE operations SET status = 'succeeded', result_sequence = ?, lease_owner = NULL,
-             lease_expires_at = NULL, updated_at = ?
-           WHERE operation_id = ? AND task_id = ? AND status = 'inflight'
-             AND lease_owner = ? AND lease_expires_at > ?`,
-        )
-        .run(
-          input.resultSequence,
-          now,
-          operationId,
-          taskId,
-          requiredId(input.workerId, "workerId"),
-          now,
-        );
-      if (result.changes !== 1) throw new Error("operation lease is missing, expired, or owned by another worker");
-
-      // A single reply keeps the historical `:final` id; chunked replies get stable
-      // `:final-1..n` ids. Chunks are spaced 1ms apart so the outbox claim order
-      // (created_at first) delivers them in sequence.
-      const texts = typeof input.text === "string" ? [input.text] : [...input.text];
-      if (texts.length === 0) throw new Error("final reply must have at least one chunk");
-      const outboxIds = texts.map((text, index) => {
-        const clientMessageId = texts.length === 1 ? `${operationId}:final` : `${operationId}:final-${index + 1}`;
-        const createdAt = new Date(new Date(now).getTime() + index).toISOString();
-        const prior = outboxIdentitySchema.nullable().parse(
-          this.#database
-            .query("SELECT outbox_id FROM slack_outbox WHERE client_message_id = ?")
-            .get(clientMessageId),
-        );
-        const outboxId = prior?.outbox_id ?? crypto.randomUUID();
-        if (prior === null) {
-          this.#database
-            .query(
-              `INSERT INTO slack_outbox (
-                outbox_id, task_id, correlation_id, conversation_id, thread_ts,
-                client_message_id, payload_json, status, created_at, updated_at
-              ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
-            )
-            .run(
-              outboxId,
-              taskId,
-              operationId,
-              requiredId(input.conversationId, "conversationId"),
-              requiredId(input.threadTs, "threadTs"),
-              clientMessageId,
-              JSON.stringify(outboxPayloadSchema.parse({ text })),
-              createdAt,
-              createdAt,
-            );
-        }
-        return { outboxId, clientMessageId };
-      });
-      const first = outboxIds[0];
-      if (first === undefined) throw new Error("final reply must have at least one chunk");
-      const outboxId = first.outboxId;
-      writeAudit(this.#database, {
-        actorType: "worker",
-        actorId: input.workerId,
-        authority: "operation-dispatch",
-        source: operationId,
-        target: taskId,
-        action: "operation.completed",
-        result: "succeeded",
-        correlationId: operationId,
-        metadata: { resultSequence: input.resultSequence },
-        createdAt: now,
-      });
-      writeAudit(this.#database, {
-        actorType: "service",
-        actorId: "agent-tag",
-        authority: "slack-write",
-        source: operationId,
-        target: outboxId,
-        action: "slack.outbox.enqueued",
-        result: "pending",
-        correlationId: operationId,
-        metadata: { clientMessageId: first.clientMessageId, chunks: outboxIds.length },
-        createdAt: now,
-      });
-      return outboxId;
-    });
-    return complete.immediate();
+  completeOperationWithOutbox(input: operations.CompleteOperationWithOutboxInput): string {
+    return operations.completeOperationWithOutbox(this.#database, input);
   }
 
-  cancelOperationWithOutbox(input: {
-    readonly operationId: string;
-    readonly taskId: string;
-    readonly workerId: string;
-    readonly conversationId: string;
-    readonly threadTs: string;
-    readonly now: string;
-  }): string {
-    const now = isoDateTime.parse(input.now);
-    const cancel = this.#database.transaction(() => {
-      const operationId = requiredId(input.operationId, "operationId");
-      const taskId = requiredId(input.taskId, "taskId");
-      const result = this.#database
-        .query(
-          `UPDATE operations SET status = 'failed', last_error_code = 'user-cancelled',
-             lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
-           WHERE operation_id = ? AND task_id = ? AND status = 'inflight'
-             AND lease_owner = ? AND lease_expires_at > ?`,
-        )
-        .run(
-          now,
-          operationId,
-          taskId,
-          requiredId(input.workerId, "workerId"),
-          now,
-        );
-      if (result.changes !== 1) throw new Error("operation lease is missing, expired, or owned by another worker");
-      const clientMessageId = `${operationId}:cancelled`;
-      const outboxId = crypto.randomUUID();
-      this.#database
-        .query(
-          `INSERT INTO slack_outbox (
-            outbox_id, task_id, correlation_id, conversation_id, thread_ts,
-            client_message_id, payload_json, status, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
-        )
-        .run(
-          outboxId,
-          taskId,
-          operationId,
-          requiredId(input.conversationId, "conversationId"),
-          requiredId(input.threadTs, "threadTs"),
-          clientMessageId,
-          JSON.stringify(outboxPayloadSchema.parse({ text: "Cancelled." })),
-          now,
-          now,
-        );
-      writeAudit(this.#database, {
-        actorType: "worker",
-        actorId: input.workerId,
-        authority: "operation-dispatch",
-        source: operationId,
-        target: taskId,
-        action: "operation.cancelled",
-        result: "failed",
-        correlationId: operationId,
-        metadata: { errorCode: "user-cancelled" },
-        createdAt: now,
-      });
-      return outboxId;
-    });
-    return cancel.immediate();
+  cancelOperationWithOutbox(input: operations.CancelOperationWithOutboxInput): string {
+    return operations.cancelOperationWithOutbox(this.#database, input);
   }
 
-  renewOperationLease(input: {
-    readonly operationId: string;
-    readonly workerId: string;
-    readonly now: string;
-    readonly leaseMs: number;
-  }): string {
-    const now = isoDateTime.parse(input.now);
-    const expiresAt = leaseExpiry(now, input.leaseMs);
-    const result = this.#database
-      .query(
-        `UPDATE operations SET lease_expires_at = ?, updated_at = ?
-         WHERE operation_id = ? AND status = 'inflight' AND lease_owner = ? AND lease_expires_at > ?`,
-      )
-      .run(
-        expiresAt,
-        now,
-        requiredId(input.operationId, "operationId"),
-        requiredId(input.workerId, "workerId"),
-        now,
-      );
-    if (result.changes !== 1) throw new Error("operation lease is missing, expired, or owned by another worker");
-    return expiresAt;
+  renewOperationLease(input: operations.RenewOperationLeaseInput): string {
+    return operations.renewOperationLease(this.#database, input);
   }
 
-  deferOperation(input: {
-    readonly operationId: string;
-    readonly workerId: string;
-    readonly blockedUntil: string;
-    readonly now: string;
-  }): void {
-    const now = isoDateTime.parse(input.now);
-    const blockedUntil = isoDateTime.parse(input.blockedUntil);
-    const defer = this.#database.transaction(() => {
-      const result = this.#database
-        .query(
-          `UPDATE operations SET status = 'pending', blocked_until = ?, lease_owner = NULL,
-             lease_expires_at = NULL, updated_at = ?
-           WHERE operation_id = ? AND status = 'inflight' AND lease_owner = ? AND lease_expires_at > ?`,
-        )
-        .run(
-          blockedUntil,
-          now,
-          requiredId(input.operationId, "operationId"),
-          requiredId(input.workerId, "workerId"),
-          now,
-        );
-      if (result.changes !== 1) throw new Error("operation lease is missing, expired, or owned by another worker");
-      writeAudit(this.#database, {
-        actorType: "worker",
-        actorId: input.workerId,
-        authority: "operation-dispatch",
-        source: input.operationId,
-        target: input.operationId,
-        action: "operation.deferred",
-        result: "pending-interaction",
-        correlationId: input.operationId,
-        metadata: { blockedUntil },
-        createdAt: now,
-      });
-    });
-    defer.immediate();
+  deferOperation(input: operations.DeferOperationInput): void {
+    operations.deferOperation(this.#database, input);
   }
 
   /**
    * Returns an in-progress operation to the queue without counting the attempt, e.g. on service
    * shutdown. The stable command and message ids let the next owner resume the same T3 turn.
    */
-  releaseOperation(input: {
-    readonly operationId: string;
-    readonly workerId: string;
-    readonly now: string;
-  }): boolean {
-    const now = isoDateTime.parse(input.now);
-    const release = this.#database.transaction(() => {
-      const result = this.#database
-        .query(
-          `UPDATE operations SET status = 'pending', attempts = MAX(attempts - 1, 0), blocked_until = NULL,
-             lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
-           WHERE operation_id = ? AND status = 'inflight' AND lease_owner = ? AND lease_expires_at > ?`,
-        )
-        .run(now, requiredId(input.operationId, "operationId"), requiredId(input.workerId, "workerId"), now);
-      if (result.changes !== 1) return false;
-      writeAudit(this.#database, {
-        actorType: "worker",
-        actorId: input.workerId,
-        authority: "operation-dispatch",
-        source: input.operationId,
-        target: input.operationId,
-        action: "operation.released",
-        result: "pending",
-        correlationId: input.operationId,
-        metadata: { reason: "shutdown" },
-        createdAt: now,
-      });
-      return true;
-    });
-    return release.immediate();
+  releaseOperation(input: operations.ReleaseOperationInput): boolean {
+    return operations.releaseOperation(this.#database, input);
   }
 
-  failOperation(input: {
-    readonly operationId: string;
-    readonly workerId: string;
-    readonly errorCode: string;
-    readonly retryable: boolean;
-    readonly blockedUntil?: string;
-    readonly now: string;
-  }): void {
-    const now = isoDateTime.parse(input.now);
-    const status = input.retryable ? "pending" : "failed";
-    const blockedUntil = input.retryable && input.blockedUntil !== undefined
-      ? isoDateTime.parse(input.blockedUntil)
-      : null;
-    const fail = this.#database.transaction(() => {
-      const result = this.#database
-        .query(
-          `UPDATE operations SET status = ?, last_error_code = ?, blocked_until = ?, lease_owner = NULL,
-             lease_expires_at = NULL, updated_at = ?
-           WHERE operation_id = ? AND status = 'inflight' AND lease_owner = ? AND lease_expires_at > ?`,
-        )
-        .run(
-          status,
-          requiredId(input.errorCode, "errorCode"),
-          blockedUntil,
-          now,
-          requiredId(input.operationId, "operationId"),
-          requiredId(input.workerId, "workerId"),
-          now,
-        );
-      if (result.changes !== 1) throw new Error("operation lease is missing, expired, or owned by another worker");
-      writeAudit(this.#database, {
-        actorType: "worker",
-        actorId: input.workerId,
-        authority: "operation-dispatch",
-        source: input.operationId,
-        target: input.operationId,
-        action: "operation.failed",
-        result: status,
-        correlationId: input.operationId,
-        metadata: { errorCode: input.errorCode, retryable: input.retryable, blockedUntil },
-        createdAt: now,
-      });
-    });
-    fail.immediate();
+  failOperation(input: operations.FailOperationInput): void {
+    operations.failOperation(this.#database, input);
   }
 
-  failOperationWithOutbox(input: {
-    readonly operationId: string;
-    readonly taskId: string;
-    readonly workerId: string;
-    readonly errorCode: string;
-    readonly conversationId: string;
-    readonly threadTs: string;
-    readonly text: string;
-    readonly now: string;
-  }): string {
-    const now = isoDateTime.parse(input.now);
-    const fail = this.#database.transaction(() => {
-      const operationId = requiredId(input.operationId, "operationId");
-      const taskId = requiredId(input.taskId, "taskId");
-      const result = this.#database
-        .query(
-          `UPDATE operations SET status = 'failed', last_error_code = ?, lease_owner = NULL,
-             lease_expires_at = NULL, updated_at = ?
-           WHERE operation_id = ? AND task_id = ? AND status = 'inflight'
-             AND lease_owner = ? AND lease_expires_at > ?`,
-        )
-        .run(
-          requiredId(input.errorCode, "errorCode"),
-          now,
-          operationId,
-          taskId,
-          requiredId(input.workerId, "workerId"),
-          now,
-        );
-      if (result.changes !== 1) throw new Error("operation lease is missing, expired, or owned by another worker");
-
-      const clientMessageId = `${operationId}:failed`;
-      const prior = outboxIdentitySchema.nullable().parse(
-        this.#database.query("SELECT outbox_id FROM slack_outbox WHERE client_message_id = ?").get(clientMessageId),
-      );
-      const outboxId = prior?.outbox_id ?? crypto.randomUUID();
-      if (prior === null) {
-        this.#database
-          .query(
-            `INSERT INTO slack_outbox (
-              outbox_id, task_id, correlation_id, conversation_id, thread_ts,
-              client_message_id, payload_json, status, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
-          )
-          .run(
-            outboxId,
-            taskId,
-            operationId,
-            requiredId(input.conversationId, "conversationId"),
-            requiredId(input.threadTs, "threadTs"),
-            clientMessageId,
-            JSON.stringify(outboxPayloadSchema.parse({ text: input.text })),
-            now,
-            now,
-          );
-      }
-      writeAudit(this.#database, {
-        actorType: "worker",
-        actorId: input.workerId,
-        authority: "operation-dispatch",
-        source: operationId,
-        target: taskId,
-        action: "operation.failed",
-        result: "failed",
-        correlationId: operationId,
-        metadata: { errorCode: input.errorCode, retryable: false },
-        createdAt: now,
-      });
-      if (prior === null) {
-        writeAudit(this.#database, {
-          actorType: "service",
-          actorId: "agent-tag",
-          authority: "slack-write",
-          source: operationId,
-          target: outboxId,
-          action: "slack.outbox.enqueued",
-          result: "pending",
-          correlationId: operationId,
-          metadata: { clientMessageId },
-          createdAt: now,
-        });
-      }
-      return outboxId;
-    });
-    return fail.immediate();
+  failOperationWithOutbox(input: operations.FailOperationWithOutboxInput): string {
+    return operations.failOperationWithOutbox(this.#database, input);
   }
 
-  bindT3Task(input: {
-    readonly taskId: string;
-    readonly projectId: string;
-    readonly threadId: string;
-    readonly now: string;
-  }): void {
-    const now = isoDateTime.parse(input.now);
-    const bind = this.#database.transaction(() => {
-      const result = this.#database
-        .query(
-          "UPDATE tasks SET t3_project_id = ?, t3_thread_id = ?, updated_at = ? WHERE task_id = ? AND state = 'active'",
-        )
-        .run(
-          requiredId(input.projectId, "projectId"),
-          requiredId(input.threadId, "threadId"),
-          now,
-          requiredId(input.taskId, "taskId"),
-        );
-      if (result.changes !== 1) throw new Error("active task not found");
-      writeAudit(this.#database, {
-        actorType: "service",
-        actorId: "agent-tag",
-        authority: "t3-orchestration",
-        source: input.taskId,
-        target: input.threadId,
-        action: "task.t3-bound",
-        result: "active",
-        correlationId: input.taskId,
-        metadata: { projectId: input.projectId },
-        createdAt: now,
-      });
-    });
-    bind.immediate();
+  bindT3Task(input: tasks.BindT3TaskInput): void {
+    tasks.bindT3Task(this.#database, input);
   }
 
-  findActiveTask(input: {
-    readonly workspaceId: string;
-    readonly conversationId: string;
-    readonly threadTs: string;
-  }): ActiveTaskBinding | null {
-    const schema = z.object({
-      task_id: nonEmpty,
-      profile_id: nonEmpty,
-      repository_root: nonEmpty,
-      conversation_type: z.enum(["channel", "dm"]),
-      owner_user_id: nonEmpty.nullable(),
-    });
-    const row = schema.nullable().parse(
-      this.#database
-        .query(
-          `SELECT task_id, profile_id, repository_root, conversation_type, owner_user_id FROM tasks
-           WHERE workspace_id = ? AND conversation_id = ? AND thread_ts = ? AND state = 'active'`,
-        )
-        .get(
-          requiredId(input.workspaceId, "workspaceId"),
-          requiredId(input.conversationId, "conversationId"),
-          requiredId(input.threadTs, "threadTs"),
-        ),
-    );
-    if (row === null) return null;
-    return {
-      taskId: row.task_id,
-      profileId: row.profile_id,
-      repositoryRoot: row.repository_root,
-      conversationType: row.conversation_type,
-      ownerUserId: row.owner_user_id,
-    };
+  findActiveTask(input: tasks.FindActiveTaskInput): ActiveTaskBinding | null {
+    return tasks.findActiveTask(this.#database, input);
   }
 
   getTaskExecution(taskIdInput: string): TaskExecutionBinding {
-    const row = taskExecutionSchema.parse(
-      this.#database
-        .query(
-          `SELECT task_id, workspace_id, conversation_id, profile_id, repository_root, t3_project_id, t3_thread_id,
-                  t3_thread_started_at, conversation_type, owner_user_id, created_at
-           FROM tasks WHERE task_id = ? AND state = 'active'`,
-        )
-        .get(requiredId(taskIdInput, "taskId")),
-    );
-    const projectOwner = z.object({ task_id: nonEmpty, created_at: isoDateTime }).parse(
-      this.#database
-        .query(
-          `SELECT task_id, created_at FROM tasks WHERE t3_project_id = ?
-           ORDER BY rowid LIMIT 1`,
-        )
-        .get(row.t3_project_id),
-    );
-    return {
-      taskId: row.task_id,
-      workspaceId: row.workspace_id,
-      conversationId: row.conversation_id,
-      profileId: row.profile_id,
-      repositoryRoot: row.repository_root,
-      projectId: row.t3_project_id,
-      projectOwnerTaskId: projectOwner.task_id,
-      projectCreatedAt: projectOwner.created_at,
-      threadId: row.t3_thread_id,
-      threadStarted: row.t3_thread_started_at !== null,
-      conversationType: row.conversation_type,
-      ownerUserId: row.owner_user_id,
-      createdAt: row.created_at,
-    };
+    return tasks.getTaskExecution(this.#database, taskIdInput);
   }
 
-  markT3ThreadStarted(input: { readonly taskId: string; readonly now: string }): void {
-    const now = isoDateTime.parse(input.now);
-    const result = this.#database
-      .query(
-        `UPDATE tasks SET t3_thread_started_at = COALESCE(t3_thread_started_at, ?), updated_at = ?
-         WHERE task_id = ? AND state = 'active'`,
-      )
-      .run(now, now, requiredId(input.taskId, "taskId"));
-    if (result.changes !== 1) throw new Error("active task not found");
+  markT3ThreadStarted(input: tasks.MarkT3ThreadStartedInput): void {
+    tasks.markT3ThreadStarted(this.#database, input);
   }
 
-  recordPendingInteraction(input: {
-    readonly taskId: string;
-    readonly operationId: string;
-    readonly threadId: string;
-    readonly requestId: string;
-    readonly kind: "approval" | "user-input";
-    readonly prompt: unknown;
-    readonly conversationId: string;
-    readonly threadTs: string;
-    readonly message: (interactionId: string) => SlackOutboxPayload;
-    readonly now: string;
-  }): { readonly kind: "accepted" | "duplicate"; readonly interactionId: string; readonly outboxId: string } {
-    const now = isoDateTime.parse(input.now);
-    const record = this.#database.transaction(() => {
-      const prior = interactionIdentitySchema.nullable().parse(
-        this.#database
-          .query(
-            "SELECT interaction_id FROM interactions WHERE thread_id = ? AND request_id = ? AND kind = ?",
-          )
-          .get(
-            requiredId(input.threadId, "threadId"),
-            requiredId(input.requestId, "requestId"),
-            input.kind,
-          ),
-      );
-      if (prior !== null) {
-        const outbox = outboxIdentitySchema.parse(
-          this.#database
-            .query("SELECT outbox_id FROM slack_outbox WHERE client_message_id = ?")
-            .get(`${prior.interaction_id}:prompt`),
-        );
-        return { kind: "duplicate" as const, interactionId: prior.interaction_id, outboxId: outbox.outbox_id };
-      }
-
-      const interactionId = crypto.randomUUID();
-      const responseCommandId = crypto.randomUUID();
-      const outboxId = crypto.randomUUID();
-      const message = outboxPayloadSchema.parse(input.message(interactionId));
-      this.#database
-        .query(
-          `INSERT INTO interactions (
-            interaction_id, task_id, operation_id, thread_id, request_id, kind, prompt_json,
-            state, response_command_id, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)`,
-        )
-        .run(
-          interactionId,
-          requiredId(input.taskId, "taskId"),
-          requiredId(input.operationId, "operationId"),
-          input.threadId,
-          input.requestId,
-          input.kind,
-          JSON.stringify(input.prompt),
-          responseCommandId,
-          now,
-          now,
-        );
-      this.#database
-        .query(
-          `INSERT INTO slack_outbox (
-            outbox_id, task_id, correlation_id, conversation_id, thread_ts,
-            client_message_id, payload_json, status, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
-        )
-        .run(
-          outboxId,
-          input.taskId,
-          interactionId,
-          requiredId(input.conversationId, "conversationId"),
-          requiredId(input.threadTs, "threadTs"),
-          `${interactionId}:prompt`,
-          JSON.stringify(message),
-          now,
-          now,
-        );
-      writeAudit(this.#database, {
-        actorType: "provider",
-        actorId: "t3",
-        authority: "interaction-request",
-        source: input.requestId,
-        target: interactionId,
-        action: `interaction.${input.kind}.requested`,
-        result: "pending",
-        correlationId: input.operationId,
-        metadata: {},
-        createdAt: now,
-      });
-      return { kind: "accepted" as const, interactionId, outboxId };
-    });
-    return record.immediate();
+  recordPendingInteraction(
+    input: interactions.RecordPendingInteractionInput,
+  ): interactions.RecordPendingInteractionResult {
+    return interactions.recordPendingInteraction(this.#database, input);
   }
 
-  submitInteractionResponse(input: {
-    readonly interactionId: string;
-    readonly workspaceId: string;
-    readonly conversationId: string;
-    readonly threadTs: string;
-    readonly actorUserId: string;
-    readonly sourceActionId: string;
-    readonly response: unknown;
-    readonly now: string;
-  }):
-    | { readonly kind: "accepted" | "duplicate"; readonly commandId: string }
-    | { readonly kind: "denied" } {
-    const now = isoDateTime.parse(input.now);
-    const submit = this.#database.transaction(() => {
-      const rowSchema = z.object({
-        interaction_id: nonEmpty,
-        response_command_id: nonEmpty,
-        source_action_id: nonEmpty.nullable(),
-        state: z.enum(["pending", "response-pending", "inflight", "resolved", "failed"]),
-      });
-      const row = rowSchema.nullable().parse(
-        this.#database
-          .query(
-            `SELECT i.interaction_id, i.response_command_id, i.source_action_id, i.state
-             FROM interactions i JOIN tasks t ON t.task_id = i.task_id
-             WHERE i.interaction_id = ? AND t.workspace_id = ? AND t.conversation_id = ?
-               AND t.thread_ts = ? AND t.state = 'active'
-               AND (t.conversation_type = 'channel' OR t.owner_user_id = ?)`,
-          )
-          .get(
-            requiredId(input.interactionId, "interactionId"),
-            requiredId(input.workspaceId, "workspaceId"),
-            requiredId(input.conversationId, "conversationId"),
-            requiredId(input.threadTs, "threadTs"),
-            requiredId(input.actorUserId, "actorUserId"),
-          ),
-      );
-      if (row === null) return { kind: "denied" as const };
-      if (row.source_action_id === input.sourceActionId || row.state !== "pending") {
-        return { kind: "duplicate" as const, commandId: row.response_command_id };
-      }
-      const updated = this.#database
-        .query(
-          `UPDATE interactions SET state = 'response-pending', response_json = ?,
-             response_actor_id = ?, source_action_id = ?, updated_at = ?
-           WHERE interaction_id = ? AND state = 'pending'`,
-        )
-        .run(
-          JSON.stringify(input.response),
-          requiredId(input.actorUserId, "actorUserId"),
-          requiredId(input.sourceActionId, "sourceActionId"),
-          now,
-          row.interaction_id,
-        );
-      if (updated.changes !== 1) {
-        return { kind: "duplicate" as const, commandId: row.response_command_id };
-      }
-      this.#database
-        .query("UPDATE operations SET blocked_until = NULL, updated_at = ? WHERE operation_id = (SELECT operation_id FROM interactions WHERE interaction_id = ?)")
-        .run(now, row.interaction_id);
-      writeAudit(this.#database, {
-        actorType: "slack-user",
-        actorId: input.actorUserId,
-        authority: "interaction-response",
-        source: input.sourceActionId,
-        target: row.interaction_id,
-        action: "interaction.response.submitted",
-        result: "response-pending",
-        correlationId: row.interaction_id,
-        metadata: {},
-        createdAt: now,
-      });
-      return { kind: "accepted" as const, commandId: row.response_command_id };
-    });
-    return submit.immediate();
+  submitInteractionResponse(
+    input: interactions.SubmitInteractionResponseInput,
+  ): interactions.SubmitInteractionResponseResult {
+    return interactions.submitInteractionResponse(this.#database, input);
   }
 
   /** Returns one question of a still-pending user-input request when the actor may answer it. */
-  getPendingUserInputQuestion(input: {
-    readonly interactionId: string;
-    readonly questionId: string;
-    readonly workspaceId: string;
-    readonly conversationId: string;
-    readonly threadTs: string;
-    readonly actorUserId: string;
-  }): UserInputQuestionPrompt | null {
-    const row = z.object({ prompt_json: nonEmpty }).nullable().parse(
-      this.#database
-        .query(
-          `SELECT i.prompt_json
-           FROM interactions i JOIN tasks t ON t.task_id = i.task_id
-           WHERE i.interaction_id = ? AND i.kind = 'user-input' AND i.state = 'pending'
-             AND t.workspace_id = ? AND t.conversation_id = ? AND t.thread_ts = ? AND t.state = 'active'
-             AND (t.conversation_type = 'channel' OR t.owner_user_id = ?)`,
-        )
-        .get(
-          requiredId(input.interactionId, "interactionId"),
-          requiredId(input.workspaceId, "workspaceId"),
-          requiredId(input.conversationId, "conversationId"),
-          requiredId(input.threadTs, "threadTs"),
-          requiredId(input.actorUserId, "actorUserId"),
-        ),
-    );
-    if (row === null) return null;
-    const prompt = userInputPromptSchema.safeParse(parseStoredJson(row.prompt_json));
-    if (!prompt.success) return null;
-    return prompt.data.questions.find((question) => question.id === input.questionId) ?? null;
+  getPendingUserInputQuestion(
+    input: userInput.GetPendingUserInputQuestionInput,
+  ): UserInputQuestionPrompt | null {
+    return userInput.getPendingUserInputQuestion(this.#database, input);
   }
 
   /**
@@ -1257,629 +313,48 @@ export class AgentTagStore {
    * response is queued for T3 only once every question has an answer; until then each answer is kept
    * in `partial_response_json` and acknowledged in the Slack thread.
    */
-  submitUserInputAnswer(input: {
-    readonly interactionId: string;
-    readonly questionId: string;
-    readonly selection: UserInputSelection;
-    readonly workspaceId: string;
-    readonly conversationId: string;
-    readonly threadTs: string;
-    readonly actorUserId: string;
-    readonly sourceActionId: string;
-    readonly now: string;
-  }): UserInputAnswerResult {
-    const now = isoDateTime.parse(input.now);
-    const actorUserId = requiredId(input.actorUserId, "actorUserId");
-    const sourceActionId = requiredId(input.sourceActionId, "sourceActionId");
-    const submit = this.#database.transaction((): UserInputAnswerResult => {
-      const row = z
-        .object({
-          interaction_id: nonEmpty,
-          task_id: nonEmpty,
-          response_command_id: nonEmpty,
-          source_action_id: nonEmpty.nullable(),
-          state: z.enum(["pending", "response-pending", "inflight", "resolved", "failed"]),
-          prompt_json: nonEmpty,
-          partial_response_json: z.string().nullable(),
-        })
-        .nullable()
-        .parse(
-          this.#database
-            .query(
-              `SELECT i.interaction_id, i.task_id, i.response_command_id, i.source_action_id, i.state,
-                      i.prompt_json, i.partial_response_json
-               FROM interactions i JOIN tasks t ON t.task_id = i.task_id
-               WHERE i.interaction_id = ? AND i.kind = 'user-input'
-                 AND t.workspace_id = ? AND t.conversation_id = ? AND t.thread_ts = ? AND t.state = 'active'
-                 AND (t.conversation_type = 'channel' OR t.owner_user_id = ?)`,
-            )
-            .get(
-              requiredId(input.interactionId, "interactionId"),
-              requiredId(input.workspaceId, "workspaceId"),
-              requiredId(input.conversationId, "conversationId"),
-              requiredId(input.threadTs, "threadTs"),
-              actorUserId,
-            ),
-        );
-      if (row === null) return { kind: "denied" };
-      const partial = partialUserInputSchema.parse(
-        row.partial_response_json === null
-          ? { answers: {}, sourceActionIds: [] }
-          : parseStoredJson(row.partial_response_json),
-      );
-      if (
-        row.state !== "pending" ||
-        row.source_action_id === sourceActionId ||
-        partial.sourceActionIds.includes(sourceActionId)
-      ) {
-        return { kind: "duplicate", commandId: row.response_command_id };
-      }
-      const prompt = userInputPromptSchema.parse(parseStoredJson(row.prompt_json));
-      const question = prompt.questions.find((candidate) => candidate.id === input.questionId);
-      if (question === undefined) return { kind: "invalid" };
-      const answer = resolveUserInputAnswer(question, input.selection);
-      if (answer === null) return { kind: "invalid" };
-
-      const next = {
-        answers: {
-          ...partial.answers,
-          [question.id]: { answer, actorUserId, sourceActionId, answeredAt: now },
-        },
-        sourceActionIds: [...partial.sourceActionIds, sourceActionId],
-      };
-      const unanswered = prompt.questions.filter((candidate) => next.answers[candidate.id] === undefined);
-      const total = prompt.questions.length;
-      const answered = total - unanswered.length;
-
-      if (unanswered.length > 0) {
-        this.#database
-          .query(
-            `UPDATE interactions SET partial_response_json = ?, updated_at = ?
-             WHERE interaction_id = ? AND state = 'pending'`,
-          )
-          .run(JSON.stringify(next), now, row.interaction_id);
-        const remaining = unanswered.map((candidate) => candidate.header || candidate.question).join(", ");
-        this.#database
-          .query(
-            `INSERT INTO slack_outbox (
-              outbox_id, task_id, correlation_id, conversation_id, thread_ts,
-              client_message_id, payload_json, status, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
-          )
-          .run(
-            crypto.randomUUID(),
-            row.task_id,
-            row.interaction_id,
-            input.conversationId,
-            input.threadTs,
-            `${row.interaction_id}:answer:${sourceActionId}`,
-            JSON.stringify(
-              outboxPayloadSchema.parse({
-                text: escapeSlackText(
-                  `Answer recorded for "${question.header || question.question}" (${answered} of ${total}). Still needed: ${remaining}.`,
-                ),
-              }),
-            ),
-            now,
-            now,
-          );
-        writeAudit(this.#database, {
-          actorType: "slack-user",
-          actorId: actorUserId,
-          authority: "interaction-response",
-          source: sourceActionId,
-          target: row.interaction_id,
-          action: "interaction.user-input.answer-recorded",
-          result: "pending",
-          correlationId: row.interaction_id,
-          metadata: { questionId: question.id, answered, total },
-          createdAt: now,
-        });
-        return { kind: "partial", commandId: row.response_command_id, answered, total };
-      }
-
-      const answers = Object.fromEntries(
-        prompt.questions.map((candidate) => [candidate.id, next.answers[candidate.id]?.answer]),
-      );
-      const contributors = [...new Set(Object.values(next.answers).map((entry) => entry.actorUserId))];
-      const updated = this.#database
-        .query(
-          `UPDATE interactions SET state = 'response-pending', response_json = ?, partial_response_json = ?,
-             response_actor_id = ?, source_action_id = ?, updated_at = ?
-           WHERE interaction_id = ? AND state = 'pending'`,
-        )
-        .run(
-          JSON.stringify({ kind: "answer", answers, contributors }),
-          JSON.stringify(next),
-          actorUserId,
-          sourceActionId,
-          now,
-          row.interaction_id,
-        );
-      if (updated.changes !== 1) return { kind: "duplicate", commandId: row.response_command_id };
-      this.#database
-        .query("UPDATE operations SET blocked_until = NULL, updated_at = ? WHERE operation_id = (SELECT operation_id FROM interactions WHERE interaction_id = ?)")
-        .run(now, row.interaction_id);
-      writeAudit(this.#database, {
-        actorType: "slack-user",
-        actorId: actorUserId,
-        authority: "interaction-response",
-        source: sourceActionId,
-        target: row.interaction_id,
-        action: "interaction.response.submitted",
-        result: "response-pending",
-        correlationId: row.interaction_id,
-        metadata: { questionCount: total },
-        createdAt: now,
-      });
-      return { kind: "accepted", commandId: row.response_command_id };
-    });
-    return submit.immediate();
+  submitUserInputAnswer(input: userInput.SubmitUserInputAnswerInput): UserInputAnswerResult {
+    return userInput.submitUserInputAnswer(this.#database, input);
   }
 
-  requestTaskCancellation(input: {
-    readonly taskId: string;
-    readonly workspaceId: string;
-    readonly conversationId: string;
-    readonly threadTs: string;
-    readonly actorUserId: string;
-    readonly sourceActionId: string;
-    readonly now: string;
-  }):
-    | { readonly kind: "accepted" | "duplicate"; readonly interactionId: string; readonly commandId: string }
-    | { readonly kind: "denied" } {
-    const now = isoDateTime.parse(input.now);
-    const request = this.#database.transaction(() => {
-      const targetSchema = z.object({ operation_id: nonEmpty, thread_id: nonEmpty });
-      const target = targetSchema.nullable().parse(
-        this.#database
-          .query(
-            `SELECT o.operation_id, t.t3_thread_id AS thread_id
-             FROM tasks t JOIN operations o ON o.task_id = t.task_id
-             WHERE t.task_id = ? AND t.workspace_id = ? AND t.conversation_id = ? AND t.thread_ts = ?
-               AND (t.conversation_type = 'channel' OR t.owner_user_id = ?)
-               AND t.state = 'active' AND o.status IN ('pending', 'inflight')
-             ORDER BY CASE o.status WHEN 'inflight' THEN 0 ELSE 1 END, o.source_order_key, o.operation_id
-             LIMIT 1`,
-          )
-          .get(
-            requiredId(input.taskId, "taskId"),
-            requiredId(input.workspaceId, "workspaceId"),
-            requiredId(input.conversationId, "conversationId"),
-            requiredId(input.threadTs, "threadTs"),
-            requiredId(input.actorUserId, "actorUserId"),
-          ),
-      );
-      if (target === null) return { kind: "denied" as const };
-      const requestId = `cancel:${target.operation_id}`;
-      const prior = interactionIdentitySchema.nullable().parse(
-        this.#database
-          .query("SELECT interaction_id FROM interactions WHERE thread_id = ? AND request_id = ? AND kind = 'cancel'")
-          .get(target.thread_id, requestId),
-      );
-      if (prior !== null) {
-        const command = z.object({ response_command_id: nonEmpty }).parse(
-          this.#database
-            .query("SELECT response_command_id FROM interactions WHERE interaction_id = ?")
-            .get(prior.interaction_id),
-        );
-        return { kind: "duplicate" as const, interactionId: prior.interaction_id, commandId: command.response_command_id };
-      }
-      const interactionId = crypto.randomUUID();
-      const commandId = crypto.randomUUID();
-      this.#database
-        .query(
-          `INSERT INTO interactions (
-            interaction_id, task_id, operation_id, thread_id, request_id, kind, prompt_json,
-            state, response_command_id, response_json, response_actor_id, source_action_id,
-            created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, 'cancel', '{}', 'response-pending', ?, '{}', ?, ?, ?, ?)`,
-        )
-        .run(
-          interactionId,
-          input.taskId,
-          target.operation_id,
-          target.thread_id,
-          requestId,
-          commandId,
-          requiredId(input.actorUserId, "actorUserId"),
-          requiredId(input.sourceActionId, "sourceActionId"),
-          now,
-          now,
-        );
-      writeAudit(this.#database, {
-        actorType: "slack-user",
-        actorId: input.actorUserId,
-        authority: "task-cancel",
-        source: input.sourceActionId,
-        target: target.operation_id,
-        action: "task.cancellation.requested",
-        result: "response-pending",
-        correlationId: target.operation_id,
-        metadata: {},
-        createdAt: now,
-      });
-      return { kind: "accepted" as const, interactionId, commandId };
-    });
-    return request.immediate();
+  requestTaskCancellation(
+    input: interactions.RequestTaskCancellationInput,
+  ): interactions.RequestTaskCancellationResult {
+    return interactions.requestTaskCancellation(this.#database, input);
   }
 
-  claimNextInteractionResponse(input: {
-    readonly workerId: string;
-    readonly now: string;
-    readonly leaseMs: number;
-  }): ClaimedInteractionResponse | null {
-    const workerId = requiredId(input.workerId, "workerId");
-    const now = isoDateTime.parse(input.now);
-    const expiresAt = leaseExpiry(now, input.leaseMs);
-    const claim = this.#database.transaction((): ClaimedInteractionResponse | null => {
-      const candidate = interactionIdentitySchema.nullable().parse(
-        this.#database
-          .query(
-            `SELECT interaction_id FROM interactions
-             WHERE state = 'response-pending' OR (state = 'inflight' AND lease_expires_at <= ?)
-             ORDER BY created_at, interaction_id LIMIT 1`,
-          )
-          .get(now),
-      );
-      if (candidate === null) return null;
-      const updated = this.#database
-        .query(
-          `UPDATE interactions SET state = 'inflight', attempts = attempts + 1,
-             lease_owner = ?, lease_expires_at = ?, updated_at = ?
-           WHERE interaction_id = ? AND (state = 'response-pending' OR (state = 'inflight' AND lease_expires_at <= ?))`,
-        )
-        .run(workerId, expiresAt, now, candidate.interaction_id, now);
-      if (updated.changes !== 1) return null;
-      const row = interactionRowSchema.parse(
-        this.#database
-          .query(
-            `SELECT interaction_id, task_id, operation_id, thread_id, request_id, kind,
-                    response_command_id, response_json, response_actor_id, attempts, lease_expires_at
-             FROM interactions WHERE interaction_id = ?`,
-          )
-          .get(candidate.interaction_id),
-      );
-      writeAudit(this.#database, {
-        actorType: "worker",
-        actorId: workerId,
-        authority: "interaction-response",
-        source: row.interaction_id,
-        target: row.thread_id,
-        action: "interaction.response.claimed",
-        result: "inflight",
-        correlationId: row.operation_id,
-        metadata: { attempt: row.attempts },
-        createdAt: now,
-      });
-      return {
-        interactionId: row.interaction_id,
-        taskId: row.task_id,
-        operationId: row.operation_id,
-        threadId: row.thread_id,
-        requestId: row.request_id,
-        kind: row.kind,
-        commandId: row.response_command_id,
-        actorUserId: row.response_actor_id,
-        response: parseStoredJson(row.response_json),
-        attempt: row.attempts,
-        leaseExpiresAt: row.lease_expires_at,
-      };
-    });
-    return claim.immediate();
+  claimNextInteractionResponse(
+    input: interactions.ClaimNextInteractionResponseInput,
+  ): ClaimedInteractionResponse | null {
+    return interactions.claimNextInteractionResponse(this.#database, input);
   }
 
-  completeInteractionResponse(input: {
-    readonly interactionId: string;
-    readonly workerId: string;
-    readonly now: string;
-  }): void {
-    const now = isoDateTime.parse(input.now);
-    const complete = this.#database.transaction(() => {
-      const result = this.#database
-        .query(
-          `UPDATE interactions SET state = 'resolved', lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
-           WHERE interaction_id = ? AND state = 'inflight' AND lease_owner = ? AND lease_expires_at > ?`,
-        )
-        .run(
-          now,
-          requiredId(input.interactionId, "interactionId"),
-          requiredId(input.workerId, "workerId"),
-          now,
-        );
-      if (result.changes !== 1) throw new Error("interaction lease is missing, expired, or owned by another worker");
-      this.#database
-        .query("UPDATE operations SET blocked_until = NULL, updated_at = ? WHERE operation_id = (SELECT operation_id FROM interactions WHERE interaction_id = ?)")
-        .run(now, input.interactionId);
-      writeAudit(this.#database, {
-        actorType: "worker",
-        actorId: input.workerId,
-        authority: "interaction-response",
-        source: input.interactionId,
-        target: input.interactionId,
-        action: "interaction.response.completed",
-        result: "resolved",
-        correlationId: input.interactionId,
-        metadata: {},
-        createdAt: now,
-      });
-    });
-    complete.immediate();
+  completeInteractionResponse(input: interactions.CompleteInteractionResponseInput): void {
+    interactions.completeInteractionResponse(this.#database, input);
   }
 
-  failInteractionResponse(input: {
-    readonly interactionId: string;
-    readonly workerId: string;
-    readonly errorCode: string;
-    readonly retryable: boolean;
-    readonly now: string;
-  }): void {
-    const now = isoDateTime.parse(input.now);
-    const state = input.retryable ? "response-pending" : "failed";
-    const fail = this.#database.transaction(() => {
-      const result = this.#database
-        .query(
-          `UPDATE interactions SET state = ?, last_error_code = ?, lease_owner = NULL,
-             lease_expires_at = NULL, updated_at = ?
-           WHERE interaction_id = ? AND state = 'inflight' AND lease_owner = ? AND lease_expires_at > ?`,
-        )
-        .run(
-          state,
-          requiredId(input.errorCode, "errorCode"),
-          now,
-          requiredId(input.interactionId, "interactionId"),
-          requiredId(input.workerId, "workerId"),
-          now,
-        );
-      if (result.changes !== 1) throw new Error("interaction lease is missing, expired, or owned by another worker");
-      writeAudit(this.#database, {
-        actorType: "worker",
-        actorId: input.workerId,
-        authority: "interaction-response",
-        source: input.interactionId,
-        target: input.interactionId,
-        action: "interaction.response.failed",
-        result: state,
-        correlationId: input.interactionId,
-        metadata: { errorCode: input.errorCode, retryable: input.retryable },
-        createdAt: now,
-      });
-    });
-    fail.immediate();
+  failInteractionResponse(input: interactions.FailInteractionResponseInput): void {
+    interactions.failInteractionResponse(this.#database, input);
   }
 
-  enqueueOutbox(input: SlackOutboxInput): { readonly kind: "accepted" | "duplicate"; readonly outboxId: string } {
-    const payload = outboxPayloadSchema.parse(input.payload);
-    const createdAt = isoDateTime.parse(input.createdAt);
-    const enqueue = this.#database.transaction(() => {
-      const prior = outboxIdentitySchema.nullable().parse(
-        this.#database
-          .query("SELECT outbox_id FROM slack_outbox WHERE client_message_id = ?")
-          .get(requiredId(input.clientMessageId, "clientMessageId")),
-      );
-      if (prior !== null) return { kind: "duplicate" as const, outboxId: prior.outbox_id };
-      const outboxId = crypto.randomUUID();
-      this.#database
-        .query(
-          `INSERT INTO slack_outbox (
-            outbox_id, task_id, correlation_id, conversation_id, thread_ts,
-            client_message_id, payload_json, status, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
-        )
-        .run(
-          outboxId,
-          requiredId(input.taskId, "taskId"),
-          requiredId(input.correlationId, "correlationId"),
-          requiredId(input.conversationId, "conversationId"),
-          requiredId(input.threadTs, "threadTs"),
-          input.clientMessageId,
-          JSON.stringify(payload),
-          createdAt,
-          createdAt,
-        );
-      this.#faultInjector("outbox-enqueue.after-insert");
-      writeAudit(this.#database, {
-        actorType: "service",
-        actorId: "agent-tag",
-        authority: "slack-write",
-        source: input.correlationId,
-        target: outboxId,
-        action: "slack.outbox.enqueued",
-        result: "pending",
-        correlationId: input.correlationId,
-        metadata: { clientMessageId: input.clientMessageId },
-        createdAt,
-      });
-      return { kind: "accepted" as const, outboxId };
-    });
-    return enqueue.immediate();
+  enqueueOutbox(input: SlackOutboxInput): outbox.EnqueueOutboxResult {
+    return outbox.enqueueOutbox(this.#context, input);
   }
 
-  claimNextOutbox(input: {
-    readonly workerId: string;
-    readonly now: string;
-    readonly leaseMs: number;
-  }): ClaimedOutboxMessage | null {
-    const workerId = requiredId(input.workerId, "workerId");
-    const now = isoDateTime.parse(input.now);
-    const expiresAt = leaseExpiry(now, input.leaseMs);
-    const claim = this.#database.transaction((): ClaimedOutboxMessage | null => {
-      const candidate = outboxIdentitySchema.nullable().parse(
-        this.#database
-          .query(
-            `SELECT outbox_id FROM slack_outbox
-             WHERE status = 'pending'
-             ORDER BY created_at, correlation_id,
-               CASE WHEN client_message_id LIKE '%:started' THEN 0 ELSE 1 END,
-               outbox_id
-             LIMIT 1`,
-          )
-          .get(),
-      );
-      if (candidate === null) return null;
-      const updated = this.#database
-        .query(
-          `UPDATE slack_outbox SET status = 'inflight', attempts = attempts + 1,
-             lease_owner = ?, lease_expires_at = ?, updated_at = ?
-           WHERE outbox_id = ? AND (status = 'pending' OR (status = 'inflight' AND lease_expires_at <= ?))`,
-        )
-        .run(workerId, expiresAt, now, candidate.outbox_id, now);
-      if (updated.changes !== 1) return null;
-      this.#faultInjector("outbox-claim.after-update");
-      const row = outboxRowSchema.parse(
-        this.#database
-          .query(
-            `SELECT outbox_id, task_id, correlation_id, conversation_id, thread_ts,
-                    client_message_id, payload_json, attempts, lease_expires_at
-             FROM slack_outbox WHERE outbox_id = ?`,
-          )
-          .get(candidate.outbox_id),
-      );
-      writeAudit(this.#database, {
-        actorType: "worker",
-        actorId: workerId,
-        authority: "slack-write",
-        source: row.outbox_id,
-        target: row.conversation_id,
-        action: "slack.outbox.claimed",
-        result: "inflight",
-        correlationId: row.correlation_id,
-        metadata: { attempt: row.attempts },
-        createdAt: now,
-      });
-      return {
-        outboxId: row.outbox_id,
-        taskId: row.task_id,
-        correlationId: row.correlation_id,
-        conversationId: row.conversation_id,
-        threadTs: row.thread_ts,
-        clientMessageId: row.client_message_id,
-        payload: outboxPayloadSchema.parse(parseStoredJson(row.payload_json)),
-        attempt: row.attempts,
-        leaseExpiresAt: row.lease_expires_at,
-      };
-    });
-    return claim.immediate();
+  claimNextOutbox(input: outbox.ClaimNextOutboxInput): ClaimedOutboxMessage | null {
+    return outbox.claimNextOutbox(this.#context, input);
   }
 
-  markOutboxDelivered(input: {
-    readonly outboxId: string;
-    readonly workerId: string;
-    readonly slackMessageTs: string;
-    readonly now: string;
-  }): void {
-    const now = isoDateTime.parse(input.now);
-    const deliver = this.#database.transaction(() => {
-      const result = this.#database
-        .query(
-          `UPDATE slack_outbox SET status = 'delivered', slack_message_ts = ?, lease_owner = NULL,
-             lease_expires_at = NULL, updated_at = ?
-           WHERE outbox_id = ? AND status = 'inflight' AND lease_owner = ? AND lease_expires_at > ?`,
-        )
-        .run(
-          requiredId(input.slackMessageTs, "slackMessageTs"),
-          now,
-          requiredId(input.outboxId, "outboxId"),
-          requiredId(input.workerId, "workerId"),
-          now,
-        );
-      if (result.changes !== 1) {
-        throw new Error("outbox lease is missing, expired, or owned by another worker");
-      }
-      writeAudit(this.#database, {
-        actorType: "worker",
-        actorId: input.workerId,
-        authority: "slack-write",
-        source: input.outboxId,
-        target: input.slackMessageTs,
-        action: "slack.outbox.delivered",
-        result: "delivered",
-        correlationId: input.outboxId,
-        metadata: {},
-        createdAt: now,
-      });
-    });
-    deliver.immediate();
+  markOutboxDelivered(input: outbox.MarkOutboxDeliveredInput): void {
+    outbox.markOutboxDelivered(this.#database, input);
   }
 
-  failOutbox(input: {
-    readonly outboxId: string;
-    readonly workerId: string;
-    readonly errorCode: string;
-    readonly retryable: boolean;
-    readonly now: string;
-  }): void {
-    const now = isoDateTime.parse(input.now);
-    const status = input.retryable ? "pending" : "failed";
-    const fail = this.#database.transaction(() => {
-      const result = this.#database
-        .query(
-          `UPDATE slack_outbox SET status = ?, last_error_code = ?, lease_owner = NULL,
-             lease_expires_at = NULL, updated_at = ?
-           WHERE outbox_id = ? AND status = 'inflight' AND lease_owner = ? AND lease_expires_at > ?`,
-        )
-        .run(
-          status,
-          requiredId(input.errorCode, "errorCode"),
-          now,
-          requiredId(input.outboxId, "outboxId"),
-          requiredId(input.workerId, "workerId"),
-          now,
-        );
-      if (result.changes !== 1) {
-        throw new Error("outbox lease is missing, expired, or owned by another worker");
-      }
-      writeAudit(this.#database, {
-        actorType: "worker",
-        actorId: input.workerId,
-        authority: "slack-write",
-        source: input.outboxId,
-        target: input.outboxId,
-        action: "slack.outbox.failed",
-        result: status,
-        correlationId: input.outboxId,
-        metadata: { errorCode: input.errorCode, retryable: input.retryable },
-        createdAt: now,
-      });
-    });
-    fail.immediate();
+  failOutbox(input: outbox.FailOutboxInput): void {
+    outbox.failOutbox(this.#database, input);
   }
 
   quarantineExpiredOutbox(nowInput: string): number {
-    const now = isoDateTime.parse(nowInput);
-    const quarantine = this.#database.transaction(() => {
-      const expired = this.#database
-        .query<{ outbox_id: string; correlation_id: string }, [string]>(
-          `SELECT outbox_id, correlation_id FROM slack_outbox
-           WHERE status = 'inflight' AND lease_expires_at <= ?`,
-        )
-        .all(now);
-      for (const row of expired) {
-        const outboxId = requiredId(row.outbox_id, "outboxId");
-        const correlationId = requiredId(row.correlation_id, "correlationId");
-        this.#database
-          .query(
-            `UPDATE slack_outbox SET status = 'failed', last_error_code = 'delivery-outcome-unknown',
-               lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
-             WHERE outbox_id = ? AND status = 'inflight'`,
-          )
-          .run(now, outboxId);
-        writeAudit(this.#database, {
-          actorType: "service",
-          actorId: "agent-tag",
-          authority: "slack-write",
-          source: outboxId,
-          target: outboxId,
-          action: "slack.outbox.quarantined",
-          result: "delivery-outcome-unknown",
-          correlationId,
-          metadata: {},
-          createdAt: now,
-        });
-      }
-      return expired.length;
-    });
-    return quarantine.immediate();
+    return outbox.quarantineExpiredOutbox(this.#database, nowInput);
   }
 
   diagnostics(): diagnostics.StoreDiagnostics {
@@ -1888,131 +363,5 @@ export class AgentTagStore {
 
   operationalStatus(nowInput: string): OperationalStatus {
     return diagnostics.operationalStatus(this.#database, nowInput);
-  }
-
-  #findOrCreateTask(event: {
-    readonly workspaceId: string;
-    readonly conversationId: string;
-    readonly threadTs: string;
-    readonly actorUserId: string;
-    readonly conversationType: "channel" | "dm";
-    readonly profileId: string;
-    readonly repositoryRoot: string;
-    readonly receivedAt: string;
-  }): string {
-    const existing = taskLookupSchema.nullable().parse(
-      this.#database
-        .query(
-          `SELECT task_id, profile_id, repository_root, t3_project_id, t3_thread_id,
-                  conversation_type, owner_user_id FROM tasks
-           WHERE workspace_id = ? AND conversation_id = ? AND thread_ts = ?`,
-        )
-        .get(event.workspaceId, event.conversationId, event.threadTs),
-    );
-    if (existing !== null) {
-      const expectedOwner = event.conversationType === "dm" ? event.actorUserId : null;
-      if (
-        existing.profile_id !== event.profileId ||
-        existing.repository_root !== event.repositoryRoot ||
-        existing.conversation_type !== event.conversationType ||
-        existing.owner_user_id !== expectedOwner
-      ) {
-        throw new Error("task conversation identity does not match the incoming event");
-      }
-      if (existing.t3_project_id === null || existing.t3_thread_id === null) {
-        this.#database
-          .query(
-            `UPDATE tasks SET t3_project_id = COALESCE(t3_project_id, ?),
-               t3_thread_id = COALESCE(t3_thread_id, ?), updated_at = ? WHERE task_id = ?`,
-          )
-          .run(
-            this.#projectIdForRoot(event.repositoryRoot),
-            `agent-tag-thread-${crypto.randomUUID()}`,
-            event.receivedAt,
-            existing.task_id,
-          );
-      }
-      return existing.task_id;
-    }
-    const taskId = crypto.randomUUID();
-    const projectId = this.#projectIdForRoot(event.repositoryRoot);
-    const threadId = `agent-tag-thread-${crypto.randomUUID()}`;
-    this.#database
-      .query(
-        `INSERT INTO tasks (
-          task_id, workspace_id, conversation_id, thread_ts, profile_id, repository_root,
-          t3_project_id, t3_thread_id, conversation_type, owner_user_id, state, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)`,
-      )
-      .run(
-        taskId,
-        event.workspaceId,
-        event.conversationId,
-        event.threadTs,
-        event.profileId,
-        event.repositoryRoot,
-        projectId,
-        threadId,
-        event.conversationType,
-        event.conversationType === "dm" ? event.actorUserId : null,
-        event.receivedAt,
-        event.receivedAt,
-      );
-    return taskId;
-  }
-
-  #projectIdForRoot(repositoryRoot: string): string {
-    const existing = z.object({ t3_project_id: nonEmpty }).nullable().parse(
-      this.#database
-        .query(
-          `SELECT t3_project_id FROM tasks
-           WHERE repository_root = ? AND t3_project_id IS NOT NULL
-           ORDER BY rowid LIMIT 1`,
-        )
-        .get(repositoryRoot),
-    );
-    return existing?.t3_project_id ?? `agent-tag-project-${crypto.randomUUID()}`;
-  }
-
-  #insertDelivery(
-    event: {
-      readonly deliveryId: string;
-      readonly workspaceId: string;
-      readonly eventKey: string;
-      readonly receivedAt: string;
-    },
-    operationId: string,
-    disposition: "accepted" | "duplicate",
-  ): void {
-    this.#database
-      .query(
-        `INSERT INTO slack_deliveries (
-          delivery_id, workspace_id, event_key, canonical_operation_id, disposition, received_at
-        ) VALUES (?, ?, ?, ?, ?, ?)`,
-      )
-      .run(
-        event.deliveryId,
-        event.workspaceId,
-        event.eventKey,
-        operationId,
-        disposition,
-        event.receivedAt,
-      );
-  }
-
-  #receipt(kind: IngestReceipt["kind"], deliveryId: string, operationId: string): IngestReceipt {
-    const identity = operationIdentitySchema.parse(
-      this.#database
-        .query("SELECT operation_id, task_id, command_id, message_id FROM operations WHERE operation_id = ?")
-        .get(operationId),
-    );
-    return {
-      kind,
-      deliveryId,
-      operationId: identity.operation_id,
-      taskId: identity.task_id,
-      commandId: identity.command_id,
-      messageId: identity.message_id,
-    };
   }
 }

@@ -1,3 +1,4 @@
+// Append-only audit log: the single writer used by every module, and paged export.
 import type { Database } from "bun:sqlite";
 
 import { requiredId, parseStoredJson } from "./context.ts";
@@ -54,7 +55,10 @@ export interface ListAuditRecordsInput {
   readonly limit?: number;
 }
 
-export function listAuditRecords(database: Database, input: ListAuditRecordsInput = {}): ReadonlyArray<AuditRecord> {
+export function listAuditRecords(
+  database: Database,
+  input: ListAuditRecordsInput = {},
+): ReadonlyArray<AuditRecord> {
   const limit = input.limit ?? 1_000;
   if (!Number.isSafeInteger(limit) || limit <= 0 || limit > 10_000) {
     throw new Error("audit export limit must be between 1 and 10000");

@@ -1,3 +1,4 @@
+// Schedules: creation, listing, cancellation, claiming due runs and settling them.
 import type { Database } from "bun:sqlite";
 
 import { z } from "zod";

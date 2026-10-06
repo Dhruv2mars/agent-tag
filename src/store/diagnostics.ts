@@ -1,3 +1,4 @@
+// Read-only table counts and operational status for doctor/status.
 import type { Database } from "bun:sqlite";
 
 import { isoDateTime } from "./schema.ts";

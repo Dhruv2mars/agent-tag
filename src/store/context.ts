@@ -1,3 +1,4 @@
+// Shared helpers for store modules.
 import type { Database } from "bun:sqlite";
 
 import { nonEmpty } from "./schema.ts";
