@@ -134,6 +134,8 @@ interface FakeWorld {
   slackApp: unknown;
   server: T3ServerInfo;
   readonly seenAuthorization: string[];
+  /** Every authenticated T3 call (session inspection, provider/model listing); each one carries the token. */
+  readonly t3TokenRequests: string[];
 }
 
 function json(value: unknown, status = 200): Response {
@@ -160,11 +162,15 @@ function dependencies(world: FakeWorld, service: ServiceManager | undefined): Do
     pin,
     bunRequirement: { minimum: "1.2.0", pinned: "1.3.13" },
     inspectSession: async ({ token }) => {
+      world.t3TokenRequests.push("session");
       expect(token.exposeToBoundary()).toBe(T3_TOKEN);
       if (world.session instanceof Error) throw world.session;
       return world.session;
     },
-    inspectT3: async () => world.server,
+    inspectT3: async () => {
+      world.t3TokenRequests.push("providers");
+      return world.server;
+    },
     storeDiagnostics: async () => ({ tasks: 2, operations: 3 }),
     service,
   };
@@ -183,6 +189,7 @@ function healthyWorld(): FakeWorld {
     slackApp: { ok: true, url: "wss://example.invalid" },
     server: readyServer,
     seenAuthorization: [],
+    t3TokenRequests: [],
   };
 }
 
@@ -301,6 +308,35 @@ describe("agent-tag doctor", () => {
 
     world.environment = new Response("not found", { status: 404 });
     expect(check(await run(), "t3-environment").status).toBe("warn");
+  });
+
+  test("never sends the T3 token to a server that fails the environment check", async () => {
+    for (const environment of [
+      json({ serverVersion: "0.1.0", orchestrationProtocolVersion: 2 }),
+      json({ orchestrationProtocolVersion: "one" }),
+      new Response("<html>not json</html>", { status: 200 }),
+    ]) {
+      world = healthyWorld();
+      world.environment = environment;
+      const report = await run();
+      expect(check(report, "t3-environment").status).toBe("fail");
+      for (const id of ["t3-session", "t3-providers"]) {
+        expect(check(report, id).status).toBe("skip");
+        expect(check(report, id).summary).toContain("environment check failed");
+      }
+      expect(world.t3TokenRequests).toEqual([]);
+      expect(world.seenAuthorization.some((value) => value.includes(T3_TOKEN))).toBe(false);
+      expect(report.ok).toBe(false);
+    }
+
+    // An older server without the endpoint warns and implies protocol 1, so the authenticated checks still run.
+    world = healthyWorld();
+    world.environment = new Response("not found", { status: 404 });
+    const legacy = await run();
+    expect(check(legacy, "t3-environment").status).toBe("warn");
+    expect(check(legacy, "t3-session").status).toBe("pass");
+    expect(check(legacy, "t3-providers").status).toBe("pass");
+    expect(world.t3TokenRequests).toEqual(["session", "providers"]);
   });
 
   test("warns when T3 differs from t3.lock.json", async () => {

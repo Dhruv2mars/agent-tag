@@ -557,8 +557,14 @@ export async function runDoctor(input: {
   checks.push(environment.check);
   checks.push(checkT3Version(environment.serverVersion, dependencies.pin));
   const t3Token = secrets.get("secret:t3-token");
+  // Authenticated checks send the T3 token, so they run only against a server whose environment check
+  // passed (or warned that it predates the endpoint, which implies protocol 1). A server speaking another
+  // protocol or publishing an unrecognized descriptor is reachable but must never receive the token.
   if (!environment.reachable) {
     checks.push(skipped("t3-session", "T3 is not reachable"), skipped("t3-providers", "T3 is not reachable"));
+  } else if (environment.check.status === "fail") {
+    const reason = "T3 environment check failed; the token is not sent to an incompatible server";
+    checks.push(skipped("t3-session", reason), skipped("t3-providers", reason));
   } else if (t3Token === undefined) {
     checks.push(skipped("t3-session", "T3 token is not usable"), skipped("t3-providers", "T3 token is not usable"));
   } else {
