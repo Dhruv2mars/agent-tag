@@ -240,6 +240,7 @@ describe("config checks", () => {
           filesScanned: 2,
           bytesScanned: 10,
           symlinksSkipped: 1,
+          skippedEntries: [],
           findings: [
             { kind: "exact-secret", path: "/d/a", canaryName: "slack-bot-token" },
             { kind: "known-token-pattern", path: "/d/b", patternName: "github-token" },
@@ -252,6 +253,7 @@ describe("config checks", () => {
         filesScanned: 2,
         bytesScanned: 10,
         symlinksSkipped: 0,
+        skippedEntries: [],
         findings: [
           { kind: "known-token-pattern", path: "/d/agent-tag.sqlite-wal", patternName: "slack-token" },
           { kind: "known-token-pattern", path: "/logs/service.stderr.log", patternName: "slack-token" },
@@ -262,6 +264,34 @@ describe("config checks", () => {
     expect(remediations[0]).toContain("docs/operations.md#purging-content-from-the-store");
     expect(remediations[0]).toContain("VACUUM");
     expect(remediations[1]).toBe("rotate the credential, then delete or rewrite the file");
+  });
+
+  test("an entry the secret scan could not read is high severity, listed by path, and capped", () => {
+    const unreadable = checkSecretScan({
+      filesScanned: 1,
+      bytesScanned: 10,
+      symlinksSkipped: 0,
+      skippedEntries: [
+        { path: "/d/locked.bin", reason: "EACCES" },
+        { path: "/logs/agent-tag.log", reason: "changed during the scan" },
+      ],
+      findings: [{ kind: "known-token-pattern", path: "/d/a", patternName: "slack-token" }],
+    });
+    expect(ids(unreadable)).toEqual(["high:secret-at-rest", "high:secret-scan-unreadable", "high:secret-scan-unreadable"]);
+    expect(unreadable.slice(1).map((finding) => finding.path)).toEqual(["/d/locked.bin", "/logs/agent-tag.log"]);
+    expect(unreadable[1]?.message).toContain("EACCES");
+    expect(summarizeFindings(unreadable.slice(1), now).result).toBe("fail");
+
+    const many = checkSecretScan({
+      filesScanned: 0,
+      bytesScanned: 0,
+      symlinksSkipped: 0,
+      skippedEntries: Array.from({ length: 25 }, (_, index) => ({ path: `/d/f${index}`, reason: "EACCES" })),
+      findings: [],
+    });
+    expect(many).toHaveLength(21);
+    expect(many.filter((finding) => finding.path !== undefined)).toHaveLength(20);
+    expect(many.at(-1)?.message).toContain("5 more path(s)");
   });
 
   test("reads audit facts leniently from a config that fails validation", () => {
@@ -568,6 +598,40 @@ describe("security audit run", () => {
       const store = atRest.find((finding) => finding.path?.endsWith("agent-tag.sqlite"));
       expect(store?.remediation).toContain("#purging-content-from-the-store");
       expect(atRest.find((finding) => finding.path?.endsWith(".log"))?.remediation).not.toContain("VACUUM");
+    });
+  });
+
+  test("an unreadable file in the data directory does not hide a leak elsewhere or let the audit pass", async () => {
+    if (process.getuid?.() === 0) return; // root bypasses file permissions
+    await withHost(async ({ root, configPath }) => {
+      const locked = join(root, "data", "locked.bin");
+      const lockedDirectory = join(root, "logs", "archive");
+      await writeFile(locked, "x\n", { mode: 0o600 });
+      await mkdir(lockedDirectory, { mode: 0o700 });
+      await chmod(locked, 0o000);
+      await chmod(lockedDirectory, 0o000);
+      const options = { configPath, now: new Date(now), home: "/nonexistent-home", offline: true, logDirectory: join(root, "logs"), logFiles: [] };
+      try {
+        const clean = await runSecurityAudit(options);
+        expect(clean.result).toBe("fail");
+        expect(ids(clean.findings)).not.toContain("high:secret-scan-failed");
+        expect(clean.findings.filter((finding) => finding.id === "secret-scan-unreadable").map((finding) => finding.path)).toEqual([
+          join(await realpath(root), "data", "locked.bin"),
+          join(await realpath(root), "logs", "archive"),
+        ]);
+
+        const leak = `xoxb-${"F6".repeat(15)}`;
+        await writeFile(join(root, "logs", "service.stdout.log"), `x ${leak} x\n`, { mode: 0o600 });
+        const leaky = await runSecurityAudit(options);
+        expect(leaky.findings.find((finding) => finding.id === "secret-at-rest")?.path).toBe(
+          await realpath(join(root, "logs", "service.stdout.log")),
+        );
+        expect(ids(leaky.findings).filter((id) => id === "high:secret-scan-unreadable")).toHaveLength(2);
+        expect(JSON.stringify(leaky)).not.toContain(leak);
+      } finally {
+        await chmod(lockedDirectory, 0o700);
+        await chmod(locked, 0o600);
+      }
     });
   });
 

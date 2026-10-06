@@ -634,5 +634,29 @@ export function checkSecretScan(
       message: `secret scan skipped ${result.symlinksSkipped} symbolic link(s)`,
     });
   }
+  // An entry the scan could not read may hold a credential, so the audit cannot pass with one.
+  const listed = result.skippedEntries.slice(0, MAX_LISTED_UNSCANNED_ENTRIES);
+  for (const entry of listed) {
+    findings.push({
+      id: "secret-scan-unreadable",
+      severity: "high",
+      message: `secret scan could not check this path (${entry.reason}), so a credential in it would go unreported`,
+      path: entry.path,
+      remediation: UNSCANNED_REMEDIATION,
+    });
+  }
+  const unlisted = result.skippedEntries.length - listed.length;
+  if (unlisted > 0) {
+    findings.push({
+      id: "secret-scan-unreadable",
+      severity: "high",
+      message: `secret scan could not check ${unlisted} more path(s) beyond those listed`,
+      remediation: UNSCANNED_REMEDIATION,
+    });
+  }
   return findings;
 }
+
+const MAX_LISTED_UNSCANNED_ENTRIES = 20;
+const UNSCANNED_REMEDIATION =
+  "run the audit as the service user and make the path readable by it; if logs were rotating, re-run the audit";

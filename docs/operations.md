@@ -152,7 +152,7 @@ Add `--config` to load the three configured service credentials as exact canarie
 bun run scan:secrets -- --config /absolute/path/to/agent-tag.json /absolute/path/to/agent-tag
 ```
 
-The JSON report names only the file, credential class, and configured canary label. It never returns matched values. The command skips `.git` and `node_modules`. A finding or skipped symbolic link sets a nonzero exit code, so a release check cannot silently claim a partial clean scan. Keep source secret files outside scanned roots when practical; if they are inside, the configured scan excludes those exact files and scans their siblings.
+The JSON report names only the file, credential class, and configured canary label. It never returns matched values. The command skips `.git` and `node_modules`. A file or directory that cannot be read (for example `EACCES`) does not stop the scan: findings from every readable file are still reported, and the unreadable paths are listed under `skippedEntries` with an error code. A finding, skipped symbolic link, or skipped entry sets a nonzero exit code, so a release check cannot silently claim a partial clean scan. The scan re-lists the tree after reading it and reads any file it has not seen yet, so a log rotated mid-scan is still checked; a tree that keeps changing is reported as `changed during the scan`. Keep source secret files outside scanned roots when practical; if they are inside, the configured scan excludes those exact files and scans their siblings.
 
 ## Security audit
 
@@ -193,6 +193,7 @@ The audit reads the config, the files it references, the data directory, and the
 | `externalWrites` is advisory | low |
 | No retention configured / partly configured | low / info |
 | Secret scan of the data and log directories finds a configured token or a known credential pattern. For the SQLite store the fix links to [purging content](#purging-content-from-the-store) | high |
+| Secret scan could not read a file or directory, or the scan could not run at all. Findings from readable files are still reported; each unchecked path is listed (up to 20) | high |
 
 Repository-root containment is decided after resolving every symbolic link in each root, the home directory, and each protected path, including parent directories, so a root that links to the home directory (or a data directory under macOS `/tmp`, which links to `/private/tmp`) is still caught.
 

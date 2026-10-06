@@ -342,10 +342,11 @@ export async function runSecurityAudit(options: SecurityAuditOptions): Promise<S
         ...checkSecretScan(await scanForSecrets({ roots: scanRoots, canaries, excludedPaths }), { databasePaths }),
       );
     } catch (error) {
+      // Per-entry failures are reported by the scan itself; this is a scan that could not run at all.
       findings.push({
         id: "secret-scan-failed",
-        severity: "medium",
-        message: `secret scan of the data and log directories failed: ${errorReason(error)}`,
+        severity: "high",
+        message: `secret scan of the data and log directories failed, so leaked credentials would go unreported: ${errorReason(error)}`,
       });
     }
   }
