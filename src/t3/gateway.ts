@@ -15,6 +15,7 @@ import {
   inspectT3Session,
   issueT3WebSocketUrl,
 } from "./auth.ts";
+import { assertSupportedT3Protocol } from "./protocol.ts";
 
 const id = z.string().trim().min(1);
 const isoDateTime = z.iso.datetime();
@@ -451,7 +452,15 @@ function protocolLayer(url: string) {
   );
 }
 
-export async function inspectT3(config: T3ConnectionConfig, signal?: AbortSignal): Promise<T3ServerInfo> {
+/**
+ * Startup and doctor probe. Gates on the unauthenticated environment descriptor first so an
+ * incompatible T3 fails closed with a clear protocol message before any token is presented.
+ */
+export async function inspectT3(
+  config: T3ConnectionConfig,
+  signal?: AbortSignal,
+): Promise<T3ServerInfo & { readonly orchestrationProtocol: number }> {
+  const orchestrationProtocol = await assertSupportedT3Protocol({ baseUrl: config.baseUrl, ...signalOption(signal) });
   const url = await socketUrl(config, signal);
   const program = Effect.gen(function* () {
     const client = yield* RpcClient.make(rpcGroup);
@@ -459,7 +468,7 @@ export async function inspectT3(config: T3ConnectionConfig, signal?: AbortSignal
     const raw = yield* client["server.getConfig"]({});
     return serverConfigSchema.parse(raw);
   }).pipe(Effect.provide(protocolLayer(url)), Effect.scoped);
-  return runRpc(program, signal);
+  return { ...(await runRpc(program, signal)), orchestrationProtocol };
 }
 
 /**
