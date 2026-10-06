@@ -6,6 +6,18 @@ This repository is under active development. It is not yet generally available. 
 
 For a concise continuation guide, current verified behavior, and the next required work, read [project status](docs/project-status.md).
 
+## Install
+
+Install a prebuilt binary (macOS arm64/x64, Linux x64/arm64) without cloning:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Dhruv2mars/agent-tag/main/install.sh | sh
+agent-tag version
+agent-tag update --check
+```
+
+The installer verifies the release's `SHA256SUMS` and installs to `~/.local/bin`. Set `AGENT_TAG_VERSION` to pin a release and `AGENT_TAG_INSTALL_DIR` to change the destination. A Docker image is also available. See [install](docs/install.md) for both, plus self-update and how releases are cut.
+
 ## Development
 
 Requirements:
