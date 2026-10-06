@@ -46,7 +46,15 @@ if (isDistributionCommand(command)) {
   process.exit(await runDistributionCommand(process.argv.slice(2), processDistributionContext()));
 }
 if (command === "security" || command === "prune") {
-  process.exit(await runSecurityCli(process.argv.slice(2)));
+  let exitCode: number;
+  try {
+    exitCode = await runSecurityCli(process.argv.slice(2));
+  } catch (error) {
+    // Argument mistakes print usage like other commands; anything else keeps its stack trace.
+    if (!(error instanceof Error && error.message.includes(SECURITY_CLI_USAGE))) throw error;
+    usage(error.message.slice(0, error.message.indexOf("usage:")).replace(/[;:\s]+$/, "") || `invalid ${command} arguments`);
+  }
+  process.exit(exitCode);
 }
 if (command === undefined || !CONFIG_COMMANDS.has(command)) usage(`unknown command: ${String(command)}`);
 const configArgument = process.argv[3];

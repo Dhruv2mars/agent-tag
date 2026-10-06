@@ -19,6 +19,9 @@ Usage:
   agent-tag schedule-add CONFIG TASK ACTOR PROFILE SPEC_FILE
   agent-tag schedule-list CONFIG TASK ACTOR PROFILE
   agent-tag schedule-cancel CONFIG TASK ACTOR PROFILE SCHEDULE_ID
+  agent-tag security audit CONFIG [--json] [--offline] [--log-dir DIR]
+                                       Check permissions, config, T3 token, and leaked credentials
+  agent-tag prune CONFIG [--dry-run]   Delete data older than the retention windows
   agent-tag version [--json]           Print the version, platform, and install kind
   agent-tag update [--check] [--version X]
                                        Download, verify, and replace this release binary
