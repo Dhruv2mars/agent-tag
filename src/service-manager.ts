@@ -1,0 +1,104 @@
+import {
+  installLaunchAgent,
+  launchAgentLogsCommand,
+  launchAgentStatus,
+  launchAgentUnitState,
+  type LaunchAgentStatus,
+  restartLaunchAgent,
+  uninstallLaunchAgent,
+  upgradeLaunchAgent,
+} from "./launchd.ts";
+import { createSystemdUserService, type SystemdUserService } from "./systemd.ts";
+
+export type ServiceManagerKind = "launchd" | "systemd";
+
+export interface ServiceStatusReport {
+  readonly manager: ServiceManagerKind;
+  readonly unitPath: string;
+  readonly installed: boolean;
+  readonly loaded: boolean;
+  readonly running: boolean;
+  readonly hints: readonly string[];
+}
+
+export interface ServiceUnitState {
+  readonly unitPath: string;
+  readonly installed: boolean;
+  /** The installed unit is byte-identical to what this checkout would generate now. */
+  readonly current: boolean;
+  /** The installed unit runs the same config path. */
+  readonly sameConfig: boolean;
+}
+
+export interface ServiceManager {
+  readonly kind: ServiceManagerKind;
+  readonly status: () => Promise<ServiceStatusReport>;
+  readonly install: (configPath: string) => Promise<ServiceStatusReport>;
+  readonly upgrade: (configPath: string) => Promise<ServiceStatusReport>;
+  readonly uninstall: () => Promise<ServiceStatusReport>;
+  readonly restart: () => Promise<ServiceStatusReport>;
+  readonly unitState: (configPath: string) => Promise<ServiceUnitState>;
+  readonly logsCommand: (input: { readonly lines: number; readonly follow: boolean }) => string[];
+}
+
+export const SERVICE_ACTIONS = ["install", "upgrade", "uninstall", "status", "restart", "logs"] as const;
+export type ServiceAction = (typeof SERVICE_ACTIONS)[number];
+
+export function isServiceAction(value: string | undefined): value is ServiceAction {
+  return SERVICE_ACTIONS.some((action) => action === value);
+}
+
+const LAUNCHD_HINT = "the LaunchAgent runs only while this user is logged in and the Mac is awake";
+
+function fromLaunchAgent(status: LaunchAgentStatus): ServiceStatusReport & { readonly label: string; readonly plistPath: string } {
+  return {
+    manager: "launchd",
+    label: status.label,
+    plistPath: status.plistPath,
+    unitPath: status.plistPath,
+    installed: status.installed,
+    loaded: status.loaded,
+    running: status.running,
+    hints: [LAUNCHD_HINT],
+  };
+}
+
+export function launchdServiceManager(): ServiceManager {
+  return {
+    kind: "launchd",
+    status: async () => fromLaunchAgent(await launchAgentStatus()),
+    install: async (configPath) => fromLaunchAgent(await installLaunchAgent(configPath)),
+    upgrade: async (configPath) => fromLaunchAgent(await upgradeLaunchAgent(configPath)),
+    uninstall: async () => fromLaunchAgent(await uninstallLaunchAgent()),
+    restart: async () => fromLaunchAgent(await restartLaunchAgent()),
+    unitState: launchAgentUnitState,
+    logsCommand: launchAgentLogsCommand,
+  };
+}
+
+export function systemdServiceManager(service: SystemdUserService): ServiceManager {
+  return {
+    kind: "systemd",
+    status: () => service.status(),
+    install: (configPath) => service.install(configPath),
+    upgrade: (configPath) => service.upgrade(configPath),
+    uninstall: () => service.uninstall(),
+    restart: () => service.restart(),
+    unitState: (configPath) => service.unitState(configPath),
+    logsCommand: (input) => service.logsCommand(input),
+  };
+}
+
+export function serviceManagerKindFor(platform: NodeJS.Platform): ServiceManagerKind | undefined {
+  if (platform === "darwin") return "launchd";
+  if (platform === "linux") return "systemd";
+  return undefined;
+}
+
+/** Returns the per-user service manager for this host, or undefined on unsupported platforms. */
+export function serviceManagerFor(platform: NodeJS.Platform = process.platform): ServiceManager | undefined {
+  const kind = serviceManagerKindFor(platform);
+  if (kind === "launchd") return launchdServiceManager();
+  if (kind === "systemd") return systemdServiceManager(createSystemdUserService());
+  return undefined;
+}

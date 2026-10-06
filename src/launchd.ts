@@ -173,6 +173,14 @@ function plistPath(): string {
   return join(homedir(), "Library", "LaunchAgents", `${AGENT_TAG_LAUNCHD_LABEL}.plist`);
 }
 
+export function launchAgentPlistPath(): string {
+  return plistPath();
+}
+
+export async function launchAgentDefinition(configPathInput: string): Promise<LaunchAgentDefinition> {
+  return definition(configPathInput);
+}
+
 async function definition(configPathInput: string): Promise<LaunchAgentDefinition> {
   const configPath = resolve(configPathInput);
   await loadConfig(configPath);
@@ -286,4 +294,43 @@ export async function uninstallLaunchAgent(): Promise<LaunchAgentStatus> {
   }
   await rm(path, { force: true });
   return launchAgentStatus();
+}
+
+export async function restartLaunchAgent(): Promise<LaunchAgentStatus> {
+  const uid = requireMacOS();
+  if (!(await pathExists(plistPath()))) throw new Error("Agent Tag LaunchAgent is not installed");
+  await requireCommand(["/bin/launchctl", "kickstart", "-k", launchctlTarget(uid)], "LaunchAgent restart");
+  if (!(await waitUntilRunning(uid))) throw new Error("LaunchAgent did not reach running state");
+  return launchAgentStatus();
+}
+
+/** Compares the installed plist with the one this checkout would generate for `configPath`. */
+export async function launchAgentUnitState(configPath: string): Promise<{
+  readonly unitPath: string;
+  readonly installed: boolean;
+  readonly current: boolean;
+  readonly sameConfig: boolean;
+}> {
+  const path = plistPath();
+  if (!(await pathExists(path))) return { unitPath: path, installed: false, current: false, sameConfig: false };
+  const existing = await readFile(path, "utf8");
+  const input = await definition(configPath);
+  return {
+    unitPath: path,
+    installed: true,
+    current: existing === renderLaunchAgent(input),
+    sameConfig: existing.includes(xmlString(input.configPath)),
+  };
+}
+
+export function launchAgentLogsCommand(input: { readonly lines: number; readonly follow: boolean }): string[] {
+  const logDirectory = join(homedir(), "Library", "Logs", "AgentTag");
+  return [
+    "/usr/bin/tail",
+    "-n",
+    String(input.lines),
+    ...(input.follow ? ["-F"] : []),
+    join(logDirectory, "service.stdout.log"),
+    join(logDirectory, "service.stderr.log"),
+  ];
 }
