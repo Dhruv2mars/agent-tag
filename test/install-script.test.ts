@@ -86,7 +86,10 @@ test("installs the latest verified release into ~/.local/bin by default", async 
   expect(result.stdout).toContain("verified sha256");
   expect(result.stdout).toContain("agent-tag 0.3.0 (linux-x64, binary)");
   expect(result.stdout).toContain("is not on your PATH");
-  expect(result.stdout).toContain("next step: agent-tag onboard");
+  expect(result.stdout).toContain("docs/slack-setup.md");
+  expect(result.stdout).toContain("agent-tag doctor /absolute/path/to/agent-tag.json");
+  // The hint must name only commands this build ships.
+  expect(result.stdout).not.toContain("onboard");
   expect((await readdir(installDir)).sort()).toEqual(["agent-tag"]);
 });
 

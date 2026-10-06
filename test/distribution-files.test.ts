@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 import packageJson from "../package.json" with { type: "json" };
+import { HELP_TEXT } from "../src/distribution.ts";
 import { RELEASE_TARGETS } from "../src/release.ts";
 
 const repository = resolve(import.meta.dir, "..");
@@ -126,6 +127,13 @@ test("install snippets pin a prerelease while the project is not generally avail
     expect(snippets.length).toBeGreaterThan(0);
     for (const line of snippets) expect(line).toMatch(/\| AGENT_TAG_VERSION=\d+\.\d+\.\d+-\S+ sh$/);
   }
+});
+
+test("install.sh only suggests commands the CLI ships", async () => {
+  const script = await Bun.file(join(repository, "install.sh")).text();
+  const suggested = [...script.matchAll(/^\s*say ".*?\bagent-tag ([a-z][a-z-]*)/gm)].map((match) => match[1]);
+  expect(suggested.length).toBeGreaterThan(0);
+  for (const command of suggested) expect(HELP_TEXT).toContain(`agent-tag ${command} `);
 });
 
 test("install.sh is valid POSIX sh", async () => {

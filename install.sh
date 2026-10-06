@@ -177,7 +177,8 @@ agent-tag: if no stable release is published yet, pin a prerelease from $base_ur
       printf '\n  export PATH="%s:$PATH"\n\n' "$install_dir"
       ;;
   esac
-  say "next step: agent-tag onboard"
+  say "next step: create the Slack app and config (https://github.com/$REPOSITORY/blob/main/docs/slack-setup.md),"
+  say "then check them with: agent-tag doctor /absolute/path/to/agent-tag.json"
 }
 
 main "$@"

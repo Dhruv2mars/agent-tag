@@ -61,6 +61,12 @@ test.skipIf(host === undefined)(
     expect(update.stderr).toStartWith("agent-tag: downloading agent-tag 0.0.2");
     expect(update.stderr.trim().split("\n").at(-1)).toStartWith("agent-tag: ");
     expect((await readdir(outdir)).sort()).toEqual(["SHA256SUMS", `agent-tag-${host}`]);
+
+    // An unknown command is a plain usage error, not a Bun crash with an embedded code frame.
+    const unknown = await run([binary, "onboard"]);
+    expect(unknown.exitCode).toBe(1);
+    expect(unknown.stderr).toStartWith("agent-tag: unknown command: onboard\nusage: agent-tag ");
+    expect(unknown.stderr).not.toContain("cli.ts");
   },
   120_000,
 );

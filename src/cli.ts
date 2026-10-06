@@ -6,10 +6,25 @@ import { createAgentTagService, diagnoseAgentTag } from "./service.ts";
 import { AgentTagSchedules } from "./scheduler.ts";
 import { AgentTagStore } from "./store/store.ts";
 
-function usage(): never {
-  throw new Error(
-    "usage: agent-tag <run|doctor|status|audit|backup> CONFIG [ARG] | agent-tag restore BACKUP NEW_DATA_DIR | agent-tag schedule-<add|list|cancel> CONFIG TASK ACTOR PROFILE [SPEC_OR_ID] | agent-tag <version|update|help>",
-  );
+const USAGE =
+  "usage: agent-tag <run|doctor|status|audit|backup> CONFIG [ARG] | agent-tag restore BACKUP NEW_DATA_DIR | agent-tag schedule-<add|list|cancel> CONFIG TASK ACTOR PROFILE [SPEC_OR_ID] | agent-tag <version|update|help>";
+
+const CONFIG_COMMANDS = new Set([
+  "run",
+  "doctor",
+  "status",
+  "audit",
+  "backup",
+  "restore",
+  "schedule-add",
+  "schedule-list",
+  "schedule-cancel",
+]);
+
+/** Prints a usage error without a stack trace and exits, like runDistributionCommand. */
+function usage(problem?: string): never {
+  process.stderr.write(`${problem === undefined ? "" : `agent-tag: ${problem}\n`}${USAGE}\nRun \`agent-tag help\` for details.\n`);
+  process.exit(1);
 }
 
 function waitForShutdownSignal(): Promise<void> {
@@ -28,8 +43,9 @@ const command = process.argv[2];
 if (isDistributionCommand(command)) {
   process.exit(await runDistributionCommand(process.argv.slice(2), processDistributionContext()));
 }
+if (command === undefined || !CONFIG_COMMANDS.has(command)) usage(`unknown command: ${String(command)}`);
 const configArgument = process.argv[3];
-if (configArgument === undefined) usage();
+if (configArgument === undefined) usage(`${command} requires an argument`);
 
 if (command === "restore") {
   const destinationDirectory = process.argv[4];
