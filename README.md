@@ -40,30 +40,48 @@ Verify the exact committed tree from a fresh archive and frozen dependency insta
 bun run verify:clean-install
 ```
 
-After copying and editing `config/agent-tag.example.json`, validate the database, T3 session, provider catalog, and Slack bot identity without starting Socket Mode:
+## Quickstart
+
+With T3 Code running, the onboarding wizard writes `~/.agent-tag/agent-tag.json`, creates the data directory, prints a create-from-manifest link for the Slack app, stores the Slack tokens in mode-`0600` files, mints a restricted T3 token, and offers to install the background service:
 
 ```sh
-bun run doctor -- /absolute/path/to/agent-tag.json
+bun run onboard
 ```
 
-Run the foreground service with:
+Every prompt also has a flag, so CI and scripted installs can run without a TTY (see [operations](docs/operations.md#onboarding)):
+
+```sh
+AGENT_TAG_SLACK_APP_TOKEN=... AGENT_TAG_SLACK_BOT_TOKEN=... \
+bun run onboard -- --yes --accept-risk --repo /srv/repo --users U0123 --channels C0123 --t3-issue-token --install-service
+```
+
+Check the install. `--fix` repairs safe problems: file modes, a missing data directory, and a stale or stopped service unit.
+
+```sh
+bun run doctor            # or: bun run doctor -- /absolute/path/to/agent-tag.json --fix
+```
+
+Manage the per-user background service. It uses a LaunchAgent on macOS and a `systemd --user` unit on Linux:
+
+```sh
+bun run service:install -- /absolute/path/to/agent-tag.json
+bun run service:status
+bun run service:logs -- --follow
+```
+
+To run it in the foreground instead:
 
 ```sh
 bun run start -- /absolute/path/to/agent-tag.json
 ```
 
-On macOS, install the validated config as a per-user LaunchAgent with:
-
-```sh
-bun run service:install -- /absolute/path/to/agent-tag.json
-bun run service:status
-```
+`bun link` puts the `agent-tag` command on your `PATH`, so `agent-tag onboard|doctor|service ...` work the same way.
 
 The service validates every configured provider/model against T3 before connecting to Slack, writes structured JSON lifecycle records to stdout/stderr, and shuts down on `SIGINT` or `SIGTERM`. See [operations](docs/operations.md) for upgrade, uninstall, recovery, and host constraints.
 
 Provider authentication is not a license grant. Review [provider access and licensing](docs/provider-licensing.md) before making an authenticated provider available to other Slack users.
 
-For the exact Slack manifest, scopes, token files, route fields, and first live mention, follow [Slack setup](docs/slack-setup.md). The checked-in manifest deliberately omits file scopes because Slack file transfer remains outside the implemented path.
+For the exact Slack manifest, scopes, token files, route fields, and first live mention without the wizard, follow [Slack setup](docs/slack-setup.md). The checked-in manifest deliberately omits file scopes because Slack file transfer remains outside the implemented path.
 
 With the pinned T3 server running and an exact-scope service token configured:
 
