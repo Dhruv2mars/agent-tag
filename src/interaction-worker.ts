@@ -14,7 +14,11 @@ const approvalResponseSchema = z.object({
   decision: z.enum(["accept", "acceptForSession", "acceptAlways", "decline", "cancel"]),
 });
 const userInputResponseSchema = z.discriminatedUnion("kind", [
-  z.object({ kind: z.literal("answer"), answers: z.record(z.string(), z.unknown()) }),
+  z.object({
+    kind: z.literal("answer"),
+    answers: z.record(z.string(), z.unknown()),
+    contributors: z.array(z.string().min(1)).optional(),
+  }),
   z.object({ kind: z.literal("dismiss") }),
 ]);
 
@@ -85,6 +89,13 @@ export class InteractionWorker {
         };
       } else if (response.kind === "user-input") {
         const parsed = userInputResponseSchema.parse(response.response);
+        // Every person who answered part of a multi-question request must still be authorized.
+        if (parsed.kind === "answer") {
+          const task = this.#store.getTaskExecution(response.taskId);
+          for (const contributor of parsed.contributors ?? []) {
+            requireExecutionAuthority({ config: this.#config, task, actorUserId: contributor });
+          }
+        }
         command =
           parsed.kind === "dismiss"
             ? {

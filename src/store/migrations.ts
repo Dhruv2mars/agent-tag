@@ -258,4 +258,10 @@ export const STORE_MIGRATIONS: readonly StoreMigration[] = [
       ALTER TABLE tasks ADD COLUMN owner_user_id TEXT;
     `,
   },
+  {
+    version: 10,
+    sql: `
+      ALTER TABLE interactions ADD COLUMN partial_response_json TEXT;
+    `,
+  },
 ];

@@ -189,27 +189,78 @@ function approvalMessage(interactionId: string, approval: T3PendingApproval): Sl
   };
 }
 
-function questionMessage(interactionId: string, request: T3PendingUserInput): SlackOutboxPayload {
-  const first = request.questions[0];
-  if (first === undefined) throw new Error("T3 user-input request has no questions");
+function truncateText(text: string, max: number): string {
+  return text.length <= max ? text : `${text.slice(0, max - 1)}…`;
+}
+
+/**
+ * Renders every question of a T3 user-input request. Single-select options are buttons; multi-select
+ * and free-text answers open a modal. Answers are collected per question and sent to T3 once complete.
+ */
+export function questionMessage(interactionId: string, request: T3PendingUserInput): SlackOutboxPayload {
+  if (request.questions.length === 0) throw new Error("T3 user-input request has no questions");
   type SlackBlock = NonNullable<SlackOutboxPayload["blocks"]>[number];
   type SlackActionsBlock = Extract<SlackBlock, { readonly type: "actions" }>;
-  const elements: SlackActionsBlock["elements"] = first.options.slice(0, 5).map((option) => ({
-    type: "button",
-    text: { type: "plain_text", text: option.label },
-    action_id: "agent-tag.user-input.answer",
-    value: JSON.stringify({ interactionId, questionId: first.id, answer: option.label }),
-  }));
-  const blocks: NonNullable<SlackOutboxPayload["blocks"]> = [
-    {
+  const total = request.questions.length;
+  const blocks: SlackBlock[] = [];
+  if (total > 1) {
+    blocks.push({
       type: "section",
-      text: { type: "mrkdwn", text: `*${escapeSlackText(first.header)}*\n${escapeSlackText(first.question)}` },
-    },
-  ];
-  if (elements.length > 0) blocks.push({ type: "actions", elements });
+      text: {
+        type: "mrkdwn",
+        text: `*The agent has ${total} questions.* Answer each one; the replies are sent together once all are answered.`,
+      },
+    });
+  }
+  request.questions.forEach((question, index) => {
+    const customAllowed = question.options.length === 0 || question.allowCustomAnswer !== false;
+    const optionLines =
+      question.multiSelect || question.options.some((option) => option.description !== undefined)
+        ? question.options.map((option) =>
+            `• ${escapeSlackText(option.label)}${option.description === undefined ? "" : ` — ${escapeSlackText(option.description)}`}`,
+          )
+        : [];
+    const prefix = total > 1 ? `${index + 1}/${total} · ` : "";
+    blocks.push({
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text: truncateText(
+          [`*${prefix}${escapeSlackText(question.header)}*`, escapeSlackText(question.question), ...optionLines].join("\n"),
+          3_000,
+        ),
+      },
+    });
+    const elements: SlackActionsBlock["elements"] = question.multiSelect
+      ? []
+      : question.options.slice(0, 24).map((option, optionIndex) => ({
+          type: "button" as const,
+          text: { type: "plain_text" as const, text: truncateText(option.label, 75) },
+          action_id: "agent-tag.user-input.answer",
+          value: JSON.stringify({ interactionId, questionId: question.id, optionIndex }),
+        }));
+    const needsModal = (question.multiSelect && question.options.length > 0) || customAllowed;
+    if (needsModal) {
+      elements.push({
+        type: "button",
+        text: {
+          type: "plain_text",
+          text: question.multiSelect && question.options.length > 0
+            ? "Choose options"
+            : question.options.length > 0 ? "Other answer" : "Type answer",
+        },
+        action_id: "agent-tag.user-input.open",
+        value: JSON.stringify({ interactionId, questionId: question.id }),
+      });
+    }
+    if (elements.length > 0) {
+      blocks.push({ type: "actions", block_id: `agent-tag:${interactionId}:q${index}`, elements });
+    }
+  });
   if (request.dismissible) {
     blocks.push({
       type: "actions",
+      block_id: `agent-tag:${interactionId}:dismiss`,
       elements: [
         {
           type: "button",
@@ -220,8 +271,11 @@ function questionMessage(interactionId: string, request: T3PendingUserInput): Sl
       ],
     });
   }
+  const first = request.questions[0];
   return {
-    text: `Question from the agent: ${first.question}`,
+    text: total === 1 && first !== undefined
+      ? `Question from the agent: ${first.question}`
+      : `The agent has ${total} questions: ${request.questions.map((question) => question.question).join(" / ")}`,
     blocks,
   };
 }

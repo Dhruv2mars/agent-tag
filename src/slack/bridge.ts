@@ -4,7 +4,7 @@ import { z } from "zod";
 import type { AgentTagConfig } from "../config.ts";
 import { readSecretFile } from "../security/secret-file.ts";
 import type { AgentTagStore } from "../store/store.ts";
-import { SLACK_ACTION_IDS, SlackActionRouter } from "./actions.ts";
+import { SLACK_ACTION_IDS, SlackActionRouter, USER_INPUT_MODAL_CALLBACK_ID } from "./actions.ts";
 import { SlackEventRouter } from "./events.ts";
 import { deliverNextSlackOutbox } from "./outbox.ts";
 import { installUndiciWebSocketCompat } from "./undici-compat.ts";
@@ -63,11 +63,23 @@ export class SlackSocketBridge {
       router.ingest(body);
     });
     for (const actionId of SLACK_ACTION_IDS) {
-      app.action(actionId, async ({ ack, body }) => {
+      app.action(actionId, async ({ ack, body, client }) => {
         await ack();
-        actions.ingest(body);
+        const result = actions.ingest(body);
+        // Free-text and multi-select answers are collected in a modal; trigger ids expire in 3 seconds.
+        if (result.kind === "open-modal") {
+          await client.views.open({ trigger_id: result.triggerId, view: result.view });
+        }
       });
     }
+    app.view(USER_INPUT_MODAL_CALLBACK_ID, async ({ ack, body }) => {
+      const result = actions.ingestViewSubmission(body);
+      if (result.kind === "invalid-input") {
+        await ack({ response_action: "errors", errors: { ...result.errors } });
+      } else {
+        await ack();
+      }
+    });
     return new SlackSocketBridge(app, input.store, input.config);
   }
 
