@@ -3,7 +3,7 @@ import type { Database } from "bun:sqlite";
 
 import { writeAudit } from "./audit.ts";
 import { type StoreContext, requiredId, parseStoredJson } from "./context.ts";
-import { leaseExpiry } from "./lease.ts";
+import { leaseExpiry, requireLeaseHeld } from "./lease.ts";
 import {
   isoDateTime,
   outboxIdentitySchema,
@@ -158,9 +158,7 @@ export function markOutboxDelivered(database: Database, input: MarkOutboxDeliver
         requiredId(input.workerId, "workerId"),
         now,
       );
-    if (result.changes !== 1) {
-      throw new Error("outbox lease is missing, expired, or owned by another worker");
-    }
+    requireLeaseHeld(result, "outbox");
     writeAudit(database, {
       actorType: "worker",
       actorId: input.workerId,
@@ -203,9 +201,7 @@ export function failOutbox(database: Database, input: FailOutboxInput): void {
         requiredId(input.workerId, "workerId"),
         now,
       );
-    if (result.changes !== 1) {
-      throw new Error("outbox lease is missing, expired, or owned by another worker");
-    }
+    requireLeaseHeld(result, "outbox");
     writeAudit(database, {
       actorType: "worker",
       actorId: input.workerId,

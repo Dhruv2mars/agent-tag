@@ -6,7 +6,7 @@ import { z } from "zod";
 import { scheduleRecurrenceSchema, type ScheduleRecurrence } from "../routines/cron.ts";
 import { writeAudit } from "./audit.ts";
 import { requiredId } from "./context.ts";
-import { leaseExpiry } from "./lease.ts";
+import { leaseExpiry, requireLeaseHeld } from "./lease.ts";
 import {
   isoDateTime,
   nonEmpty,
@@ -222,7 +222,7 @@ export function revokeClaimedSchedule(database: Database, input: RevokeClaimedSc
       `UPDATE schedules SET state = 'cancelled', lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
        WHERE schedule_id = ? AND state = 'active' AND lease_owner = ? AND lease_expires_at > ?`,
     ).run(now, requiredId(input.scheduleId, "scheduleId"), requiredId(input.workerId, "workerId"), now);
-    if (result.changes !== 1) throw new Error("schedule lease is missing, expired, or cancelled");
+    requireLeaseHeld(result, "schedule");
     writeAudit(database, {
       actorType: "worker", actorId: input.workerId, authority: "schedule-dispatch",
       source: input.scheduleId, target: input.scheduleId, action: "schedule.authority-revoked",
@@ -362,7 +362,7 @@ export function settleScheduleRun(database: Database, input: SettleScheduleRunIn
         requiredId(input.workerId, "workerId"),
         now,
       );
-    if (result.changes !== 1) throw new Error("schedule lease is missing, expired, or cancelled");
+    requireLeaseHeld(result, "schedule");
     writeAudit(database, {
       actorType: "worker",
       actorId: input.workerId,

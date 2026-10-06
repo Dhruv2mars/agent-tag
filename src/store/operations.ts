@@ -3,7 +3,7 @@ import type { Database } from "bun:sqlite";
 
 import { writeAudit } from "./audit.ts";
 import { type StoreContext, requiredId, parseStoredJson } from "./context.ts";
-import { leaseExpiry } from "./lease.ts";
+import { leaseExpiry, requireLeaseHeld } from "./lease.ts";
 import {
   isoDateTime,
   operationIdentitySchema,
@@ -135,7 +135,7 @@ export function renewOperationLease(database: Database, input: RenewOperationLea
       requiredId(input.workerId, "workerId"),
       now,
     );
-  if (result.changes !== 1) throw new Error("operation lease is missing, expired, or owned by another worker");
+  requireLeaseHeld(result, "operation");
   return expiresAt;
 }
 
@@ -210,7 +210,7 @@ export function completeOperation(database: Database, input: CompleteOperationIn
         requiredId(input.workerId, "workerId"),
         now,
       );
-    if (result.changes !== 1) throw new Error("operation lease is missing, expired, or owned by another worker");
+    requireLeaseHeld(result, "operation");
     writeAudit(database, {
       actorType: "worker",
       actorId: input.workerId,
@@ -265,7 +265,7 @@ export function completeOperationWithOutbox(
         requiredId(input.workerId, "workerId"),
         now,
       );
-    if (result.changes !== 1) throw new Error("operation lease is missing, expired, or owned by another worker");
+    requireLeaseHeld(result, "operation");
 
     // A single reply keeps the historical `:final` id; chunked replies get stable
     // `:final-1..n` ids. Chunks are spaced 1ms apart so the outbox claim order
@@ -359,7 +359,7 @@ export function deferOperation(database: Database, input: DeferOperationInput): 
         requiredId(input.workerId, "workerId"),
         now,
       );
-    if (result.changes !== 1) throw new Error("operation lease is missing, expired, or owned by another worker");
+    requireLeaseHeld(result, "operation");
     writeAudit(database, {
       actorType: "worker",
       actorId: input.workerId,
@@ -445,7 +445,7 @@ export function failOperation(database: Database, input: FailOperationInput): vo
         requiredId(input.workerId, "workerId"),
         now,
       );
-    if (result.changes !== 1) throw new Error("operation lease is missing, expired, or owned by another worker");
+    requireLeaseHeld(result, "operation");
     writeAudit(database, {
       actorType: "worker",
       actorId: input.workerId,
@@ -493,7 +493,7 @@ export function failOperationWithOutbox(database: Database, input: FailOperation
         requiredId(input.workerId, "workerId"),
         now,
       );
-    if (result.changes !== 1) throw new Error("operation lease is missing, expired, or owned by another worker");
+    requireLeaseHeld(result, "operation");
 
     const clientMessageId = `${operationId}:failed`;
     const prior = outboxIdentitySchema.nullable().parse(
@@ -579,7 +579,7 @@ export function cancelOperationWithOutbox(database: Database, input: CancelOpera
         requiredId(input.workerId, "workerId"),
         now,
       );
-    if (result.changes !== 1) throw new Error("operation lease is missing, expired, or owned by another worker");
+    requireLeaseHeld(result, "operation");
     const clientMessageId = `${operationId}:cancelled`;
     const outboxId = crypto.randomUUID();
     database

@@ -5,7 +5,7 @@ import { z } from "zod";
 
 import { writeAudit } from "./audit.ts";
 import { requiredId, parseStoredJson } from "./context.ts";
-import { leaseExpiry } from "./lease.ts";
+import { leaseExpiry, requireLeaseHeld } from "./lease.ts";
 import {
   interactionIdentitySchema,
   interactionRowSchema,
@@ -390,7 +390,7 @@ export function completeInteractionResponse(
         requiredId(input.workerId, "workerId"),
         now,
       );
-    if (result.changes !== 1) throw new Error("interaction lease is missing, expired, or owned by another worker");
+    requireLeaseHeld(result, "interaction");
     database
       .query("UPDATE operations SET blocked_until = NULL, updated_at = ? WHERE operation_id = (SELECT operation_id FROM interactions WHERE interaction_id = ?)")
       .run(now, input.interactionId);
@@ -436,7 +436,7 @@ export function failInteractionResponse(database: Database, input: FailInteracti
         requiredId(input.workerId, "workerId"),
         now,
       );
-    if (result.changes !== 1) throw new Error("interaction lease is missing, expired, or owned by another worker");
+    requireLeaseHeld(result, "interaction");
     writeAudit(database, {
       actorType: "worker",
       actorId: input.workerId,
