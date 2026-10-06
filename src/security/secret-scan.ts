@@ -8,7 +8,7 @@ const SCAN_CHUNK_BYTES = 64 * 1_024;
 const PATTERN_OVERLAP_BYTES = 256;
 const EXCLUDED_DIRECTORY_NAMES = new Set([".git", "node_modules"]);
 
-const knownCredentialPatterns = [
+export const KNOWN_CREDENTIAL_PATTERNS = [
   { name: "slack-token", expression: /\bxox[baprs]-[A-Za-z0-9-]{20,}\b/ },
   { name: "slack-app-token", expression: /\bxapp-[A-Za-z0-9-]{20,}\b/ },
   { name: "github-token", expression: /\bgh[pousr]_[A-Za-z0-9]{20,}\b/ },
@@ -101,7 +101,7 @@ async function scanFile(input: {
       }
     }
     const text = window.toString("utf8");
-    for (const pattern of knownCredentialPatterns) {
+    for (const pattern of KNOWN_CREDENTIAL_PATTERNS) {
       if (!foundPatterns.has(pattern.name) && pattern.expression.test(text)) {
         foundPatterns.add(pattern.name);
         findings.push({ kind: "known-token-pattern", path: input.path, patternName: pattern.name });
