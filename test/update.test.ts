@@ -4,7 +4,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { runDistributionCommand, type DistributionContext } from "../src/distribution.ts";
-import { parseUpdateArguments, releaseBaseUrlFromEnv, runUpdate, type UpdateDependencies } from "../src/update.ts";
+import {
+  isProcessAlive,
+  parseUpdateArguments,
+  releaseBaseUrlFromEnv,
+  runUpdate,
+  temporaryUpdateName,
+  type UpdateDependencies,
+} from "../src/update.ts";
 import type { BuildInfo } from "../src/version.ts";
 import { fakeBinaryScript, writeFakeRelease } from "./fixtures/fake-release.ts";
 
@@ -136,6 +143,31 @@ test("refuses a downloaded binary that reports the wrong version", async () => {
   );
   expect(await Bun.file(execPath).text()).toBe(fakeBinaryScript("0.1.0", target));
   expect(await readdir(binDir)).toEqual(["agent-tag"]);
+});
+
+test("an overlapping update keeps another live updater's staged file and clears only dead ones", async () => {
+  // Stand-in for a second `agent-tag update` that is mid-download/smoke-test.
+  const concurrent = Bun.spawn(["sleep", "30"], { stdin: "ignore", stdout: "ignore", stderr: "ignore" });
+  const exited = Bun.spawn(["true"], { stdin: "ignore", stdout: "ignore", stderr: "ignore" });
+  await exited.exited;
+  try {
+    expect(isProcessAlive(concurrent.pid)).toBe(true);
+    expect(isProcessAlive(exited.pid)).toBe(false);
+    const execPath = await installCurrent("0.1.0");
+    const live = temporaryUpdateName(concurrent.pid, "aaaaaaaaaaaa");
+    const dead = temporaryUpdateName(exited.pid, "bbbbbbbbbbbb");
+    const legacy = ".agent-tag-update-unknown";
+    for (const name of [live, dead, legacy]) await writeFile(join(binDir, name), "staged");
+    await writeFakeRelease({ root: releases, tag: "v0.2.0", assets: { [asset]: fakeBinaryScript("0.2.0", target) } });
+    const result = await runUpdate({ check: false, version: "0.2.0" }, dependencies(binaryBuild("0.1.0"), execPath));
+    expect(result.status).toBe("updated");
+    expect(await Bun.file(execPath).text()).toBe(fakeBinaryScript("0.2.0", target));
+    expect((await readdir(binDir)).sort()).toEqual([live, "agent-tag"].sort());
+    expect(await Bun.file(join(binDir, live)).text()).toBe("staged");
+  } finally {
+    concurrent.kill();
+    await concurrent.exited;
+  }
 });
 
 test("fails when the release lacks this platform or does not exist", async () => {

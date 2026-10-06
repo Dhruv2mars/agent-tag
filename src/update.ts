@@ -153,10 +153,36 @@ async function writeExecutable(path: string, bytes: Uint8Array): Promise<void> {
   await chmod(path, 0o755);
 }
 
-/** Removes temporary files that a crashed update left beside the binary. */
-export async function removeStaleUpdateFiles(directory: string): Promise<void> {
+/** Reports whether a process with this pid exists (EPERM means it exists under another user). */
+export function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error instanceof Error && "code" in error && error.code === "EPERM";
+  }
+}
+
+/** Builds the staging filename beside the binary; it embeds the owner pid for stale detection. */
+export function temporaryUpdateName(pid: number, nonce: string): string {
+  return `${TEMPORARY_PREFIX}${pid}-${nonce}`;
+}
+
+/**
+ * Removes temporary files that a crashed update left beside the binary. Each staging file
+ * names its owner pid, so a file whose owner is still running belongs to a concurrent
+ * update and is left alone; only files from dead (or unidentifiable) owners are removed.
+ */
+export async function removeStaleUpdateFiles(
+  directory: string,
+  isAlive: (pid: number) => boolean = isProcessAlive,
+): Promise<void> {
   for (const entry of await readdir(directory)) {
-    if (entry.startsWith(TEMPORARY_PREFIX)) await rm(join(directory, entry), { force: true });
+    if (!entry.startsWith(TEMPORARY_PREFIX)) continue;
+    const owner = /^(\d+)-/.exec(entry.slice(TEMPORARY_PREFIX.length))?.[1];
+    const pid = owner === undefined ? Number.NaN : Number(owner);
+    if (Number.isSafeInteger(pid) && pid > 0 && isAlive(pid)) continue;
+    await rm(join(directory, entry), { force: true });
   }
 }
 
@@ -195,7 +221,7 @@ export async function runUpdate(options: UpdateOptions, dependencies: UpdateDepe
   if (actual !== expected) throw new Error(`checksum mismatch for ${asset}: expected ${expected}, got ${actual}`);
 
   await removeStaleUpdateFiles(directory);
-  const temporary = join(directory, `${TEMPORARY_PREFIX}${process.pid}-${randomBytes(6).toString("hex")}`);
+  const temporary = join(directory, temporaryUpdateName(process.pid, randomBytes(6).toString("hex")));
   try {
     try {
       await writeExecutable(temporary, bytes);
