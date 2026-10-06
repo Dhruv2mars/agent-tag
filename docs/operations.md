@@ -174,6 +174,7 @@ The audit reads the config, the files it references, the data directory, and the
 | The auditing user cannot inspect a config, secret, data, or database path (for example `EACCES`); run the audit as the service user | high (low for logs) |
 | Data directory or database grants group/world access | high (low for SQLite `-wal`/`-shm` files inside a private data directory) |
 | Config is group/world writable / world readable / group readable | high / medium / low |
+| The config, secret directory, data directory, or log directory (or a symlink's target) is in a directory that is group/world writable without the sticky bit, or owned by another non-root user, so it can be replaced regardless of its own mode | high (medium for the log directory) |
 | Service logs are world / group accessible | medium / low |
 | Log directory not found, so logs were not checked (pass `--log-dir`) | low |
 | A credential pattern, or a `*token`/`*secret`/`*password` field with a value, appears inline in the config | high |

@@ -20,6 +20,7 @@ import {
   summarizeFindings,
   type PathFact,
   type PathLink,
+  type PathParent,
   type PathRole,
   type PathState,
   type ProfileSecurityFacts,
@@ -62,6 +63,16 @@ function replaceableByOthers(mode: number): boolean {
   return (mode & 0o022) !== 0 && (mode & 0o1000) === 0;
 }
 
+/** Mode and owner of the directory holding a path; whoever can write it can replace the path. */
+async function parentState(path: string): Promise<PathParent | undefined> {
+  try {
+    const metadata = await stat(path);
+    return { path, mode: metadata.mode, uid: metadata.uid };
+  } catch {
+    return undefined; // An unreadable parent already makes the path itself unreadable or is reported on its own.
+  }
+}
+
 /**
  * Describes what the service will actually open. Agent Tag follows symlinks (stat), so mode, owner,
  * and kind come from the target; the link itself is reported separately.
@@ -77,7 +88,15 @@ async function pathState(path: string): Promise<PathState & { readonly mtime?: D
       : undefined;
     const metadata = link === undefined ? own : await stat(path);
     const kind = metadata.isFile() ? "file" : metadata.isDirectory() ? "directory" : "other";
-    return { kind, mode: metadata.mode, uid: metadata.uid, mtime: metadata.mtime, ...(link === undefined ? {} : { link }) };
+    const parent = await parentState(dirname(link?.target ?? path));
+    return {
+      kind,
+      mode: metadata.mode,
+      uid: metadata.uid,
+      mtime: metadata.mtime,
+      ...(link === undefined ? {} : { link }),
+      ...(parent === undefined ? {} : { parent }),
+    };
   } catch (error) {
     const code = errorCode(error);
     // A dangling symlink is as unusable as a missing path.

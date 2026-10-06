@@ -85,6 +85,43 @@ describe("file permission checks", () => {
     expect(loose[1]?.remediation).toBe("chmod 600 /real/file");
   });
 
+  test("a path in a directory other users can write is replaceable even when its own mode is private", () => {
+    const inParent = (role: PathRole, parentMode: number, options: { parentUid?: number; link?: boolean } = {}) =>
+      checkPathPermissions(
+        {
+          path: "/shared/item",
+          role,
+          state: {
+            kind: role.endsWith("directory") ? "directory" : "file",
+            mode: role.endsWith("directory") ? 0o700 : 0o600,
+            uid,
+            parent: { path: "/shared", mode: 0o040000 | parentMode, uid: options.parentUid ?? uid },
+            ...(options.link === true ? { link: { target: "/shared/item", replaceableByOthers: false } } : {}),
+          },
+        },
+        uid,
+      );
+    const config = inParent("config", 0o777);
+    expect(ids(config)).toEqual(["high:config-parent-replaceable"]);
+    expect(config[0]?.message).toContain("world writable without the sticky bit");
+    expect(config[0]?.message).toContain("change the allowlist");
+    expect(ids(inParent("config", 0o775))).toEqual(["high:config-parent-replaceable"]);
+    expect(ids(inParent("config", 0o755, { parentUid: 777 }))).toEqual(["high:config-parent-replaceable"]);
+    expect(inParent("config", 0o1777)).toEqual([]);
+    expect(inParent("config", 0o755, { parentUid: 0 })).toEqual([]);
+    expect(inParent("config", 0o700)).toEqual([]);
+    expect(ids(inParent("data-directory", 0o777))).toEqual(["high:data-directory-parent-replaceable"]);
+    expect(ids(inParent("secret-directory", 0o777))).toEqual(["high:secret-directory-parent-replaceable"]);
+    expect(ids(inParent("log-directory", 0o777))).toEqual(["medium:log-directory-parent-replaceable"]);
+    // These parents are audited as the secret, data, and log directories, unless a symlink points elsewhere.
+    expect(inParent("secret-file", 0o777)).toEqual([]);
+    expect(inParent("database", 0o777)).toEqual([]);
+    expect(ids(inParent("secret-file", 0o777, { link: true }))).toEqual([
+      "info:secret-file-symlink",
+      "high:secret-file-parent-replaceable",
+    ]);
+  });
+
   test("paths the auditing user cannot stat are reported instead of crashing", () => {
     const unreadable = (role: PathRole) =>
       checkPathPermissions({ path: "/x", role, state: { kind: "unreadable", code: "EACCES" } }, uid);
@@ -631,6 +668,30 @@ describe("security audit run", () => {
       } finally {
         await chmod(lockedDirectory, 0o700);
         await chmod(locked, 0o600);
+      }
+    });
+  });
+
+  test("a private config in a directory other users can write fails the audit", async () => {
+    await withHost(async ({ root, configPath }) => {
+      const options = { configPath, now: new Date(now), home: "/nonexistent-home", offline: true, logDirectory: join(root, "logs"), logFiles: [] };
+      expect((await runSecurityAudit(options)).findings.filter((finding) => finding.id.endsWith("-parent-replaceable"))).toEqual([]);
+      try {
+        await chmod(root, 0o777);
+        const shared = await runSecurityAudit(options);
+        expect(shared.result).toBe("fail");
+        expect(ids(shared.findings).filter((id) => id.endsWith("-parent-replaceable")).sort()).toEqual([
+          "high:config-parent-replaceable",
+          "high:data-directory-parent-replaceable",
+          "high:secret-directory-parent-replaceable",
+          "medium:log-directory-parent-replaceable",
+        ]);
+        // Bun's chmod drops the sticky bit (Bun 1.3), so set it with the system tool.
+        expect(Bun.spawnSync(["chmod", "1777", root]).exitCode).toBe(0);
+        const sticky = await runSecurityAudit(options);
+        expect(ids(sticky.findings).filter((id) => id.endsWith("-parent-replaceable"))).toEqual([]);
+      } finally {
+        await chmod(root, 0o700);
       }
     });
   });

@@ -68,6 +68,13 @@ export interface PathLink {
   readonly replaceableByOthers: boolean;
 }
 
+/** The directory holding the file or directory the service actually opens (the link target's, for a symlink). */
+export interface PathParent {
+  readonly path: string;
+  readonly mode: number;
+  readonly uid: number;
+}
+
 export type PathState =
   | { readonly kind: "missing" }
   /** The auditing user cannot stat the path (for example EACCES on a parent owned by another account). */
@@ -77,6 +84,7 @@ export type PathState =
       readonly mode: number;
       readonly uid: number;
       readonly link?: PathLink | undefined;
+      readonly parent?: PathParent | undefined;
     };
 
 export interface PathFact {
@@ -92,6 +100,27 @@ const PRIVATE_ROLES: ReadonlySet<PathRole> = new Set([
   "data-directory",
   "database",
 ]);
+
+/**
+ * Roles whose parent directory is audited as its own path (secret directory, data directory, log
+ * directory), so a replaceable parent is already reported there unless the path is a symlink elsewhere.
+ */
+const PARENT_AUDITED_ROLES: ReadonlySet<PathRole> = new Set(["secret-file", "database", "log"]);
+
+/**
+ * Why another local user could rename or replace entries in `parent`, or undefined if they cannot.
+ * Root-owned directories are trusted; the owner of a directory can replace its entries even with the sticky bit.
+ */
+export function parentReplaceability(parent: PathParent, ownerUid: number | undefined): string | undefined {
+  const mode = parent.mode & 0o7777;
+  if ((mode & 0o022) !== 0 && (mode & 0o1000) === 0) {
+    return `has mode ${formatMode(mode)} (${(mode & 0o002) !== 0 ? "world" : "group"} writable without the sticky bit)`;
+  }
+  if (ownerUid !== undefined && parent.uid !== ownerUid && parent.uid !== 0) {
+    return `is owned by uid ${parent.uid}, not the Agent Tag user (uid ${ownerUid})`;
+  }
+  return undefined;
+}
 
 export function formatMode(mode: number): string {
   return (mode & 0o777).toString(8).padStart(4, "0");
@@ -160,6 +189,19 @@ export function checkPathPermissions(
             path,
           },
     );
+  }
+  const parentReason =
+    state.parent === undefined || (state.link === undefined && PARENT_AUDITED_ROLES.has(role))
+      ? undefined
+      : parentReplaceability(state.parent, ownerUid);
+  if (state.parent !== undefined && parentReason !== undefined) {
+    findings.push({
+      id: `${role}-parent-replaceable`,
+      severity: sensitive ? "high" : "medium",
+      message: `${role} is in ${state.parent.path}, which ${parentReason}; another local user can replace the ${role}${role === "config" ? " and change the allowlist" : ""}`,
+      path,
+      remediation: `make ${state.parent.path} writable only by the service user (chmod go-w), or move the ${role} into a directory only the service user can write`,
+    });
   }
   if (state.kind !== (directory ? "directory" : "file")) {
     findings.push({
