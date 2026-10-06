@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -23,6 +23,24 @@ import {
 } from "../src/t3/gateway.ts";
 
 const enabled = Bun.env.RUN_T3_INTEGRATION === "1";
+
+/**
+ * Removes a fixture directory after the caller's prefix guard. After `project.delete`, T3 0.0.45
+ * keeps pruning worktree metadata inside the fixture's `.git` asynchronously, so a single recursive
+ * remove can race it and fail with ENOENT while leaving `.git` behind. Retry until the tree is gone.
+ */
+async function removeFixtureDirectory(directory: string): Promise<void> {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      await rm(directory, { recursive: true, force: true });
+    } catch (error) {
+      if (attempt >= 50) throw error;
+    }
+    if (!(await stat(directory).then(() => true, () => false))) return;
+    if (attempt >= 50) throw new Error(`fixture directory still present after cleanup: ${directory}`);
+    await Bun.sleep(100);
+  }
+}
 
 async function runGit(cwd: string, ...args: readonly string[]): Promise<void> {
   const process = Bun.spawn(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
@@ -53,9 +71,12 @@ if (!enabled) {
       let lastSnapshot = await fetchT3ThreadSnapshot({ config, threadId });
       while (!predicate(lastSnapshot) && Date.now() < deadline) {
         if (lastSnapshot.thread.latestTurn?.state === "error") {
-          const diagnostic = lastSnapshot.thread.session?.lastError?.includes("repeated API errors")
+          const lastError = lastSnapshot.thread.session?.lastError ?? "";
+          const diagnostic = lastError.includes("repeated API errors")
             ? "provider-api-errors"
-            : "provider-error";
+            : lastError.toLowerCase().includes("usage limit")
+              ? "provider-usage-limit"
+              : "provider-error";
           throw new Error(`T3 provider turn entered the error state (${diagnostic})`);
         }
         await Bun.sleep(250);
@@ -187,7 +208,7 @@ if (!enabled) {
         if (!workspaceRoot.startsWith(`${tmpdir()}/agent-tag-t3-project-`)) {
           throw new Error(`refusing to remove unexpected fixture path ${workspaceRoot}`);
         }
-        await rm(workspaceRoot, { recursive: true });
+        await removeFixtureDirectory(workspaceRoot);
       }
     });
 
@@ -303,7 +324,7 @@ if (!enabled) {
           if (!workspaceRoot.startsWith(`${tmpdir()}/agent-tag-t3-turn-`)) {
             throw new Error(`refusing to remove unexpected fixture path ${workspaceRoot}`);
           }
-          await rm(workspaceRoot, { recursive: true });
+          await removeFixtureDirectory(workspaceRoot);
         }
       },
       150_000,
@@ -401,7 +422,7 @@ if (!enabled) {
           if (!workspaceRoot.startsWith(`${tmpdir()}/agent-tag-t3-claude-`)) {
             throw new Error(`refusing to remove unexpected fixture path ${workspaceRoot}`);
           }
-          await rm(workspaceRoot, { recursive: true });
+          await removeFixtureDirectory(workspaceRoot);
         }
       },
       150_000,
@@ -523,7 +544,7 @@ if (!enabled) {
           if (!workspaceRoot.startsWith(`${tmpdir()}/agent-tag-t3-approval-`)) {
             throw new Error(`refusing to remove unexpected fixture path ${workspaceRoot}`);
           }
-          await rm(workspaceRoot, { recursive: true });
+          await removeFixtureDirectory(workspaceRoot);
         }
       },
       90_000,
@@ -681,7 +702,7 @@ if (!enabled) {
             if (!directory.startsWith(`${tmpdir()}/agent-tag-t3-coordinator-`)) {
               throw new Error(`refusing to remove unexpected fixture path ${directory}`);
             }
-            await rm(directory, { recursive: true });
+            await removeFixtureDirectory(directory);
           }
         }
       },
@@ -822,7 +843,7 @@ if (!enabled) {
           if (!workspaceRoot.startsWith(`${tmpdir()}/agent-tag-t3-control-`)) {
             throw new Error(`refusing to remove unexpected fixture path ${workspaceRoot}`);
           }
-          await rm(workspaceRoot, { recursive: true });
+          await removeFixtureDirectory(workspaceRoot);
         }
       },
       120_000,

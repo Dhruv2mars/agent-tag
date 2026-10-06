@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { agentTagConfigSchema } from "../src/config.ts";
-import { AgentTagCoordinator, type T3CoordinatorGateway } from "../src/coordinator.ts";
+import { AgentTagCoordinator, classifyT3TurnFailure, type T3CoordinatorGateway } from "../src/coordinator.ts";
 import { AgentTagMemory } from "../src/memory.ts";
 import { AgentTagStore } from "../src/store/store.ts";
 import type { T3Command, T3ThreadSnapshot } from "../src/t3/gateway.ts";
@@ -759,5 +759,24 @@ describe("Agent Tag coordinator", () => {
       }
       await rm(directory, { recursive: true });
     }
+  });
+
+  test("classifies provider authentication failures distinctly without leaking provider text", () => {
+    const orgPolicy =
+      'API Error: 403 {"type":"error","error":{"type":"permission_error","message":"OAuth authentication is currently not allowed for this organization.","details":{"error_code":"oauth_not_allowed_for_organization"}}}';
+    expect(classifyT3TurnFailure(orgPolicy).code).toBe("T3ProviderAuthPolicy");
+    expect(classifyT3TurnFailure("OAuth authentication is currently not allowed for this organization.").code)
+      .toBe("T3ProviderAuthPolicy");
+    expect(classifyT3TurnFailure(orgPolicy).userMessage).not.toContain("oauth_not_allowed_for_organization");
+    expect(
+      classifyT3TurnFailure(
+        "Claude could not authenticate. For subscription login, run `claude auth login` on this environment's machine, then start a new thread.",
+      ).code,
+    ).toBe("T3ProviderAuth");
+    expect(classifyT3TurnFailure("Claude usage limit reached. Send the message again once the limit resets.").code)
+      .toBe("T3ProviderLimit");
+    // The generic Claude api_error text does not say why; it stays a generic turn error.
+    expect(classifyT3TurnFailure("Claude gave up after repeated API errors.").code).toBe("T3TurnError");
+    expect(classifyT3TurnFailure(null).code).toBe("T3TurnError");
   });
 });

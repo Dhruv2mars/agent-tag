@@ -246,6 +246,7 @@ export async function diagnoseAgentTag(config: AgentTagConfig): Promise<{
   readonly store: ReturnType<AgentTagStore["diagnostics"]>;
   readonly t3: {
     readonly reachable: true;
+    readonly orchestrationProtocol: number;
     readonly providers: ReadonlyArray<{
       readonly instanceId: string;
       readonly status: string;
@@ -265,6 +266,7 @@ export async function diagnoseAgentTag(config: AgentTagConfig): Promise<{
       store: store.diagnostics(),
       t3: {
         reachable: true,
+        orchestrationProtocol: t3.orchestrationProtocol,
         providers: t3.providers.map((provider) => ({
           instanceId: provider.instanceId,
           status: provider.status,

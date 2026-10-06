@@ -1,6 +1,7 @@
 import { z } from "zod";
 
 import { SecretString } from "../security/secret-file.ts";
+import { SUPPORTED_T3_ORCHESTRATION_PROTOCOL } from "./protocol.ts";
 
 export const REQUIRED_T3_SCOPES: readonly ["orchestration:read", "orchestration:operate"] = [
   "orchestration:read",
@@ -140,6 +141,8 @@ export async function issueT3WebSocketUrl(input: {
   url.searchParams.set("clientDeviceType", "desktop");
   url.searchParams.set("clientOs", process.platform === "darwin" ? "macOS" : "Linux");
   url.searchParams.set("connectionMethod", "direct");
+  // Ignored by protocol-1 servers; lets a future protocol-2 server negotiate down instead of guessing.
+  url.searchParams.set("orchestrationProtocol", String(SUPPORTED_T3_ORCHESTRATION_PROTOCOL));
   return url.toString();
 }
 

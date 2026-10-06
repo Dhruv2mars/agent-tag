@@ -95,6 +95,45 @@ describe("T3 gateway command boundary", () => {
     expect(pendingT3Approvals(snapshot)).toEqual([]);
   });
 
+  test("surfaces pending permission approvals instead of skipping them", () => {
+    const requestedAt = "2026-10-06T00:00:00.000Z";
+    const activity = (id: string, payload: unknown) => ({
+      id,
+      tone: "approval" as const,
+      kind: "approval.requested",
+      summary: "Approval requested",
+      payload,
+      turnId: "turn-1",
+      createdAt: requestedAt,
+    });
+    const snapshot: T3ThreadSnapshot = {
+      snapshotSequence: 4,
+      thread: {
+        id: "thread-1",
+        projectId: "project-1",
+        title: "Fixture",
+        modelSelection: { instanceId: "codex", model: "gpt-5.6-sol" },
+        runtimeMode: "approval-required",
+        interactionMode: "default",
+        branch: "main",
+        worktreePath: "/tmp/fixture",
+        latestTurn: null,
+        messages: [],
+        activities: [
+          // T3 0.0.45 projects Codex `item/permissions/requestApproval` as requestKind "permission".
+          activity("activity-1", { requestId: "request-1", requestKind: "permission", detail: "network access" }),
+          // Older payloads carry only the provider request type.
+          activity("activity-2", { requestId: "request-2", requestType: "permission_approval" }),
+        ],
+        session: null,
+      },
+    };
+    expect(pendingT3Approvals(snapshot)).toEqual([
+      { requestId: "request-1", requestKind: "permission", detail: "network access", options: [] },
+      { requestId: "request-2", requestKind: "permission", options: [] },
+    ]);
+  });
+
   test("projects pending user questions and removes resolved requests", () => {
     const requestedAt = "2026-09-20T00:00:00.000Z";
     const snapshot: T3ThreadSnapshot = {

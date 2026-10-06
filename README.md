@@ -11,7 +11,7 @@ For a concise continuation guide, current verified behavior, and the next requir
 Requirements:
 
 - Bun
-- T3 Code `0.0.42`
+- T3 Code `0.0.45` (orchestration protocol 1; `0.0.42`–`0.0.45` are accepted)
 - macOS or Linux for background operation
 
 ```sh

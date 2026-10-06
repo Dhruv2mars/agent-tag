@@ -24,7 +24,11 @@ Run a live dependency check first:
 bun run doctor -- /absolute/path/to/agent-tag.json
 ```
 
-The check opens and migrates the SQLite store, authenticates with the restricted T3 service token, decodes the provider catalog, validates every profile's provider and model, and verifies that the Slack bot belongs to the configured workspace. Missing, disabled, unauthenticated, non-ready, and model-mismatch states fail before Socket Mode or task dispatch. Its JSON output contains aggregate row counts and provider states, not tokens or message text.
+The check opens and migrates the SQLite store, reads T3's unauthenticated `/.well-known/t3/environment` descriptor, authenticates with the restricted T3 service token, decodes the provider catalog, validates every profile's provider and model, and verifies that the Slack bot belongs to the configured workspace. Missing, disabled, unauthenticated, non-ready, and model-mismatch states fail before Socket Mode or task dispatch. Its JSON output contains aggregate row counts, the T3 orchestration protocol, and provider states, not tokens or message text.
+
+This build speaks T3 orchestration protocol 1 (T3 `0.0.42`–`0.0.45`). A descriptor without `orchestrationProtocolVersion` is protocol 1. Any other version makes `doctor` and `start` fail closed with `T3 server speaks orchestration protocol N; this Agent Tag build supports protocol 1 (T3 0.0.42–0.0.45)` before the T3 token is presented. Upgrade Agent Tag before pointing it at a newer protocol.
+
+A failed provider turn settles with one sanitized Slack notice and a stable code in audit and status output: `T3ProviderAuthPolicy` when the provider's organization rejects the login method (for Claude, HTTP 403 `oauth_not_allowed_for_organization` on a subscription login), `T3ProviderAuth` when the provider is signed out or its credential is invalid, `T3ProviderLimit` for usage limits, and `T3TurnError` otherwise. T3 sometimes reports only `Claude gave up after repeated API errors.`; that text does not carry the cause, so it stays `T3TurnError` and the operator must inspect the T3 server log.
 
 The configured data directory must be owned by the Agent Tag user and grant no group or world access. Startup rejects a permissive existing directory because SQLite WAL and shared-memory files live beside the main mode-`0600` database.
 
@@ -199,4 +203,4 @@ An overdue `run-once` schedule coalesces missed intervals into one run; `skip` r
 
 ## Host constraints
 
-The verified runtime is macOS arm64 with Bun `1.3.13` and T3 Code `0.0.42`. The per-user LaunchAgent install, loaded-service upgrade, uninstall, and reinstall have been exercised on macOS. A logged-in user and awake host are still required for local T3 and Socket Mode availability. Linux service-manager behavior has not been exercised, so it remains outside the passing claim.
+The verified runtime is macOS arm64 with Bun `1.3.13` and T3 Code `0.0.45` ([live adapter evidence](evidence/2026-10-06-t3-0.0.45.md)). The per-user LaunchAgent install, loaded-service upgrade, uninstall, and reinstall were exercised on macOS against T3 `0.0.42`. A logged-in user and awake host are still required for local T3 and Socket Mode availability. Linux service-manager behavior has not been exercised, so it remains outside the passing claim.
