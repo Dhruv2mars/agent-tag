@@ -8,6 +8,7 @@ import { onboardOptionsFromArguments, resolveConfigPath } from "../src/cli-comma
 import type { CommandResult } from "../src/command.ts";
 import { agentTagConfigSchema } from "../src/config.ts";
 import {
+  defaultT3BaseDir,
   detectT3Runtime,
   type OnboardDependencies,
   type OnboardOptions,
@@ -16,6 +17,7 @@ import {
   SLACK_APP_TOKEN_ENV,
   SLACK_BOT_TOKEN_ENV,
   slackManifestUrl,
+  t3BaseDirMismatch,
 } from "../src/onboard.ts";
 import { nonInteractivePrompter, parseYesNo, type Prompter } from "../src/prompt.ts";
 import { SecretString } from "../src/security/secret-file.ts";
@@ -292,6 +294,43 @@ describe("agent-tag onboard (non-interactive)", () => {
     expect(harness.installs).toEqual([]);
   });
 
+  test("finds the T3 base dir through T3CODE_HOME", async () => {
+    const { t3BaseDir: _flag, ...withoutBaseDir } = flags(harness);
+    const result = await runOnboard(withoutBaseDir, {
+      ...harness.deps,
+      env: { ...harness.deps.env, T3CODE_HOME: harness.t3BaseDir },
+    });
+    expect(result.secrets.t3Token).toBe("created");
+    expect(result.config.t3.baseUrl).toBe("http://127.0.0.1:3774");
+    expect(harness.commands[0]).toContain(`--base-dir ${harness.t3BaseDir} `);
+  });
+
+  test("refuses to issue an admin session from a base dir that belongs to another T3 instance", async () => {
+    const anyT3: OnboardDependencies = {
+      ...harness.deps,
+      fetch: async (input) => {
+        if (String(input).startsWith("https://slack.com/")) return json({ ok: true, team_id: "T0FIXTURE" });
+        return json({ serverVersion: "0.0.42", orchestrationProtocolVersion: 1 });
+      },
+    };
+    const isolated = { t3BaseUrl: "http://127.0.0.1:3999" };
+    await expect(runOnboard(flags(harness, isolated), anyT3)).rejects.toThrow(
+      `cannot issue a T3 admin session: ${harness.t3BaseDir} belongs to the T3 server at http://127.0.0.1:3774, not http://127.0.0.1:3999`,
+    );
+    expect(harness.commands).toEqual([]);
+
+    const result = await runOnboard(flags(harness, { ...isolated, t3IssueToken: false, force: true }), anyT3);
+    expect(result.secrets.t3Token).toBe("missing");
+    expect(harness.commands).toEqual([]);
+    expect(harness.output.join("\n")).toContain("pass --t3-base-dir for the T3 instance at http://127.0.0.1:3999");
+
+    const adminTokenFile = join(harness.directory, "admin-token");
+    await writeFile(adminTokenFile, ADMIN_TOKEN, { mode: 0o600 });
+    const withFile = await runOnboard(flags(harness, { ...isolated, t3IssueToken: false, force: true, t3AdminTokenFile: adminTokenFile }), anyT3);
+    expect(withFile.secrets.t3Token).toBe("created");
+    expect(harness.enrolled).toEqual([ADMIN_TOKEN]);
+  });
+
   test("a failed t3 CLI is reported without echoing its output", async () => {
     const failing: OnboardDependencies = {
       ...harness.deps,
@@ -418,6 +457,20 @@ describe("onboarding helpers", () => {
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
+  });
+
+  test("resolves the T3 base dir like T3 and matches it to the configured URL", () => {
+    expect(defaultT3BaseDir({ T3CODE_HOME: "/srv/t3" }, "/home/u")).toBe("/srv/t3");
+    expect(defaultT3BaseDir({ T3_HOME: "/srv/wrong" }, "/home/u")).toBe("/home/u/.t3");
+    expect(defaultT3BaseDir({ T3CODE_HOME: " " }, "/home/u")).toBe("/home/u/.t3");
+
+    const baseDir = "/srv/t3";
+    expect(t3BaseDirMismatch({ baseUrl: "http://127.0.0.1:3773", baseDir, detected: "http://127.0.0.1:3773" })).toBeUndefined();
+    expect(t3BaseDirMismatch({ baseUrl: "http://localhost:3773", baseDir, detected: "http://127.0.0.1:3773" })).toBeUndefined();
+    expect(t3BaseDirMismatch({ baseUrl: "http://127.0.0.1:3773", baseDir, detected: "http://127.0.0.1:3774" })).toContain(
+      "belongs to the T3 server at http://127.0.0.1:3774",
+    );
+    expect(t3BaseDirMismatch({ baseUrl: "http://127.0.0.1:3773", baseDir, detected: undefined })).toContain("no running T3 server");
   });
 
   test("maps CLI flags to wizard options", () => {

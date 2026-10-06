@@ -163,6 +163,35 @@ export async function detectT3Runtime(baseDir: string): Promise<string | undefin
   return new URL(candidate).origin;
 }
 
+/** T3's own base-dir resolution: `--t3-base-dir`, then `$T3CODE_HOME`, then `~/.t3`. */
+export function defaultT3BaseDir(env: Readonly<Record<string, string | undefined>>, homeDirectory: string): string {
+  const configured = env.T3CODE_HOME?.trim();
+  return configured !== undefined && configured.length > 0 ? configured : join(homeDirectory, ".t3");
+}
+
+function effectivePort(url: URL): string {
+  return url.port.length > 0 ? url.port : url.protocol === "https:" ? "443" : "80";
+}
+
+/**
+ * Explains why `t3 auth session issue --base-dir DIR` may target a different T3 instance than `baseUrl`,
+ * or returns undefined when DIR's running server is the one at `baseUrl`. Both URLs are loopback, so
+ * scheme and port identify the server regardless of `localhost` versus `127.0.0.1`.
+ */
+export function t3BaseDirMismatch(input: {
+  readonly baseUrl: string;
+  readonly baseDir: string;
+  readonly detected: string | undefined;
+}): string | undefined {
+  if (input.detected === undefined) {
+    return `${input.baseDir} has no running T3 server (no userdata/server-runtime.json), so it may not be the instance at ${input.baseUrl}`;
+  }
+  const detected = new URL(input.detected);
+  const configured = new URL(input.baseUrl);
+  if (detected.protocol === configured.protocol && effectivePort(detected) === effectivePort(configured)) return undefined;
+  return `${input.baseDir} belongs to the T3 server at ${input.detected}, not ${input.baseUrl}`;
+}
+
 export interface OnboardAnswers {
   readonly paths: OnboardPaths;
   readonly t3BaseUrl: string;
@@ -375,7 +404,13 @@ async function probeT3(context: Context, baseUrl: string): Promise<T3Probe> {
 
 async function provisionT3Token(
   context: Context,
-  input: { readonly baseUrl: string; readonly baseDir: string; readonly path: string },
+  input: {
+    readonly baseUrl: string;
+    readonly baseDir: string;
+    readonly path: string;
+    /** Set when the base dir may belong to another T3 instance; the CLI must not issue a session then. */
+    readonly baseDirMismatch: string | undefined;
+  },
 ): Promise<SecretOutcome> {
   const { options, deps } = context;
   if (await exists(input.path)) {
@@ -392,6 +427,12 @@ async function provisionT3Token(
   if (options.t3AdminTokenFile !== undefined) {
     explicit = true;
     administrativeToken = await readSecretFile(resolve(deps.cwd, options.t3AdminTokenFile));
+  } else if (input.baseDirMismatch !== undefined) {
+    // A session issued for another instance carries its signing keys and would fail enrollment here.
+    const advice = `pass --t3-base-dir for the T3 instance at ${input.baseUrl}, or --t3-admin-token-file`;
+    if (options.t3IssueToken) throw new Error(`cannot issue a T3 admin session: ${input.baseDirMismatch}; ${advice}`);
+    deps.print(`  not issuing a T3 admin session: ${input.baseDirMismatch}`);
+    deps.print(`  ${advice}`);
   } else {
     const issue = options.t3IssueToken ||
       (options.interactive &&
@@ -538,7 +579,7 @@ export async function runOnboard(options: OnboardOptions, deps: OnboardDependenc
   // 3. T3.
   print("");
   print("Step 3/6: T3 Code");
-  const t3BaseDir = resolve(deps.cwd, options.t3BaseDir ?? deps.env.T3_HOME ?? join(deps.homeDirectory, ".t3"));
+  const t3BaseDir = resolve(deps.cwd, options.t3BaseDir ?? defaultT3BaseDir(deps.env, deps.homeDirectory));
   const detectedT3 = await detectT3Runtime(t3BaseDir);
   if (detectedT3 !== undefined) print(`  detected a running T3 server at ${detectedT3} (${t3BaseDir})`);
   const t3BaseUrl = await resolveValue(context, {
@@ -560,7 +601,12 @@ export async function runOnboard(options: OnboardOptions, deps: OnboardDependenc
     throw new Error(`cannot enroll a T3 token: ${t3.problem}`);
   }
   const t3Token = t3.usable
-    ? await provisionT3Token(context, { baseUrl: t3BaseUrl, baseDir: t3BaseDir, path: paths.t3TokenFile })
+    ? await provisionT3Token(context, {
+      baseUrl: t3BaseUrl,
+      baseDir: t3BaseDir,
+      path: paths.t3TokenFile,
+      baseDirMismatch: t3BaseDirMismatch({ baseUrl: t3BaseUrl, baseDir: t3BaseDir, detected: detectedT3 }),
+    })
     : (await exists(paths.t3TokenFile))
       ? "kept"
       : "missing";
