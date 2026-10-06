@@ -98,6 +98,44 @@ export function fromLocal(local: LocalDateTime, timeZone: string): Date {
   return new Date(candidates[0] ?? wall - before);
 }
 
+export interface OffsetTransition {
+  /** First instant (to the second) at which the new offset applies. */
+  readonly at: Date;
+  /** New offset minus old offset; positive for spring-forward. */
+  readonly deltaMs: number;
+}
+
+const DAY_MS = 86_400_000;
+
+/**
+ * UTC offset changes in (from, to]. Samples once a day and bisects to the
+ * second, so it assumes a zone changes offset at most once per day.
+ */
+export function offsetTransitions(timeZone: string, from: Date, to: Date): OffsetTransition[] {
+  const transitions: OffsetTransition[] = [];
+  const endMs = to.getTime();
+  let previousMs = from.getTime();
+  let previousOffset = offsetAt(previousMs, timeZone);
+  while (previousMs < endMs) {
+    const nextMs = Math.min(previousMs + DAY_MS, endMs);
+    const nextOffset = offsetAt(nextMs, timeZone);
+    if (nextOffset !== previousOffset) {
+      let low = previousMs;
+      let high = nextMs;
+      while (high - low > 1_000) {
+        const middle = Math.floor((low + high) / 2);
+        if (offsetAt(middle, timeZone) === previousOffset) low = middle;
+        else high = middle;
+      }
+      // Offsets resolve per whole second, so the change starts at high's second.
+      transitions.push({ at: new Date(Math.floor(high / 1_000) * 1_000), deltaMs: nextOffset - previousOffset });
+    }
+    previousMs = nextMs;
+    previousOffset = nextOffset;
+  }
+  return transitions;
+}
+
 /** Calendar arithmetic on local dates (no time zone involved). */
 export function addDays(date: LocalDate, days: number): LocalDate {
   const shifted = new Date(Date.UTC(date.year, date.month - 1, date.day + days));

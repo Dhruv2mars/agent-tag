@@ -1,5 +1,5 @@
 import type { ScheduleSpec } from "../scheduler.ts";
-import { nextCronOccurrence, parseCron, type ScheduleRecurrence } from "./cron.ts";
+import { hasMinimumSpacing, nextCronOccurrence, parseCron, type ScheduleRecurrence } from "./cron.ts";
 import {
   addDays,
   daysInMonth,
@@ -527,15 +527,7 @@ function describeInterval(seconds: number): string {
 
 function minimumCronGapOk(expression: string, timeZone: string, now: Date): boolean {
   const parsed = parseCron(expression);
-  if (parsed.kind === "error") return false;
-  let previous = nextCronOccurrence(parsed.cron, timeZone, now);
-  for (let index = 0; index < 24 && previous !== null; index += 1) {
-    const next = nextCronOccurrence(parsed.cron, timeZone, previous);
-    if (next === null) return true;
-    if (next.getTime() - previous.getTime() < MIN_INTERVAL_SECONDS * 1_000) return false;
-    previous = next;
-  }
-  return true;
+  return parsed.kind === "ok" && hasMinimumSpacing(parsed.cron, timeZone, now, MIN_INTERVAL_SECONDS * 1_000);
 }
 
 function isValidDate(date: LocalDate): boolean {
@@ -791,18 +783,23 @@ function stealsFromTask(taskWords: ReadonlyArray<string>, timing: string): boole
   return /^on\b/i.test(timing) && ON_PARTICLE_WORDS.has(last);
 }
 
-/**
- * Longest leading phrase, else longest trailing phrase, whose parse result is
- * accepted. Prefers the timing at the start ("<timing> <task>"). A trailing
- * phrase is skipped if taking it would leave the task dangling.
- */
-function findTiming(words: ReadonlyArray<string>, accept: (result: TimingResult) => boolean): TimingSplit | undefined {
-  const limit = Math.min(words.length, MAX_TIMING_WORDS);
-  for (let size = limit; size >= 1; size -= 1) {
+type Accept = (result: TimingResult) => boolean;
+
+/** Longest leading phrase whose parse result is accepted ("<timing> <task>"). */
+function findLeadingTiming(words: ReadonlyArray<string>, accept: Accept): TimingSplit | undefined {
+  for (let size = Math.min(words.length, MAX_TIMING_WORDS); size >= 1; size -= 1) {
     const candidate = words.slice(0, size).join(" ");
     const result = parseTiming(candidate);
     if (accept(result)) return { timing: candidate, taskWords: words.slice(size), leading: true, result };
   }
+  return undefined;
+}
+
+/**
+ * Longest trailing phrase whose parse result is accepted ("<task> <timing>").
+ * A phrase is skipped if taking it would leave the task dangling.
+ */
+function findTrailingTiming(words: ReadonlyArray<string>, accept: Accept): TimingSplit | undefined {
   for (let start = Math.max(1, words.length - MAX_TIMING_WORDS); start < words.length; start += 1) {
     const candidate = words.slice(start).join(" ");
     const taskWords = words.slice(0, start);
@@ -811,6 +808,56 @@ function findTiming(words: ReadonlyArray<string>, accept: (result: TimingResult)
     if (accept(result)) return { timing: candidate, taskWords, leading: false, result };
   }
   return undefined;
+}
+
+const isOk: Accept = (result) => result.kind === "ok";
+const isInvalid: Accept = (result) => result.kind === "invalid";
+
+/**
+ * Leading timing wins over trailing timing. Within each position a valid
+ * phrase beats a recognized-but-invalid one, so a leading "every 2 minutes"
+ * reports "too frequent" instead of falling back to a trailing "at 5pm".
+ */
+function findTiming(words: ReadonlyArray<string>): TimingSplit | undefined {
+  return (
+    findLeadingTiming(words, isOk) ??
+    findLeadingTiming(words, isInvalid) ??
+    findTrailingTiming(words, isOk) ??
+    findTrailingTiming(words, isInvalid)
+  );
+}
+
+/** Looks like a clock time (has am/pm or a colon) whether or not it is valid. */
+const CLOCK_SHAPED = /^\d{1,2}(?::\d{1,2})?(?:am|pm)$|^\d{1,2}:\d{1,2}$/;
+
+/** The clause if `tokens` holds a clock-shaped but invalid time ("at 13pm", "25:00"). */
+function malformedClock(tokens: ReadonlyArray<string>): string | undefined {
+  const [first, second] = tokens;
+  if (first === "at" && second !== undefined && /^\d/.test(second) && parseTimeToken(second) === undefined) {
+    return CLOCK_SHAPED.test(second) ? `at ${second}` : undefined;
+  }
+  if (first !== undefined && tokens.length === 1 && CLOCK_SHAPED.test(first) && parseTimeToken(first) === undefined) {
+    return first;
+  }
+  return undefined;
+}
+
+/** A malformed time clause at the start (`fromStart`) or end of the task words. */
+function malformedTimeClause(taskWords: ReadonlyArray<string>, fromStart: boolean): string | undefined {
+  for (const size of [3, 2, 1]) {
+    if (taskWords.length < size) continue;
+    const slice = fromStart ? taskWords.slice(0, size) : taskWords.slice(-size);
+    const clause = malformedClock(normalize(slice.join(" ")));
+    if (clause !== undefined) return clause;
+  }
+  return undefined;
+}
+
+function malformedTimeError(clause: string): { readonly kind: "error"; readonly message: string } {
+  return {
+    kind: "error",
+    message: `"${clause}" isn't a valid time. Try something like 'at 1pm' or 'at 13:00'.`,
+  };
 }
 
 /** Whether the timing phrase sets a clock time itself (vs. the 9:00 default). */
@@ -837,7 +884,11 @@ function mergeTrailingTime(found: TimingSplit): TimingSplit | { readonly kind: "
   const timingKind = found.result.timing.kind;
   if ((timingKind !== "calendar" && timingKind !== "at") || hasExplicitTime(found.timing)) return found;
   const size = trailingTimeClause(found.taskWords);
-  if (size === 0) return found;
+  if (size === 0) {
+    // A valid clock time here would be merged; an invalid one must not become task text.
+    const malformed = malformedTimeClause(found.taskWords, false);
+    return malformed === undefined ? found : malformedTimeError(malformed);
+  }
   const clause = found.taskWords.slice(-size).join(" ");
   const merged = `${found.timing} ${clause}`;
   const result = parseTiming(merged);
@@ -867,12 +918,21 @@ export function splitRoutineRequest(text: string): RoutineSplitResult {
     rest = rest.replace(AGENT_LEAD, "");
   }
   const words = rest.split(/\s+/).filter((word) => word.length > 0);
-  // Prefer a valid timing; fall back to a recognized-but-invalid one so the
-  // caller can surface its specific error (e.g. "too frequent").
-  const candidate =
-    findTiming(words, (result) => result.kind === "ok") ??
-    findTiming(words, (result) => result.kind === "invalid");
+  // A recognized-but-invalid timing is returned as-is so parseSchedule can
+  // surface its specific error (e.g. "too frequent").
+  const candidate = findTiming(words);
   if (candidate === undefined) return { kind: "error", message: GENERIC_PARSE_ERROR };
+  if (candidate.result.kind === "ok") {
+    // "tomorrow at 13pm to deploy": the timing stopped short of a broken clock
+    // time. Report it rather than scheduling 9am with "at 13pm" in the task.
+    const malformed = malformedTimeClause(candidate.taskWords, candidate.leading);
+    if (malformed !== undefined) return malformedTimeError(malformed);
+    // "tomorrow at 13 pm": "tomorrow at 13" parsed, leaving a stray meridiem.
+    const next = candidate.taskWords[0];
+    if (candidate.leading && next !== undefined && /^[ap]\.?m\.?$/i.test(next)) {
+      return malformedTimeError(`${candidate.timing.split(/\s+/).pop() ?? ""} ${next}`);
+    }
+  }
   const found = mergeTrailingTime(candidate);
   if ("kind" in found) return found;
   const { timing, taskWords } = found;

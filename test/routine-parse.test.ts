@@ -10,7 +10,7 @@ import {
   type ParseScheduleOptions,
   type ScheduleParseResult,
 } from "../src/routines/parse.ts";
-import { fromLocal, toLocal } from "../src/routines/zoned.ts";
+import { fromLocal, offsetTransitions, toLocal } from "../src/routines/zoned.ts";
 import { scheduleSpecSchema } from "../src/scheduler.ts";
 
 const NEW_YORK = "America/New_York";
@@ -445,5 +445,79 @@ describe("review regressions", () => {
     const result = ok(parseSchedule(text, ny));
     expect(result.schedule.recurrence).toEqual({ kind: "cron", expression, timeZone: NEW_YORK });
     expect(result.humanReadable).toBe(humanReadable);
+  });
+});
+
+describe("codex review regressions", () => {
+  const TOO_FREQUENT = "That's too frequent. Routines can repeat at most every 5 minutes.";
+
+  test.each([
+    ["remind me tomorrow at 13pm to deploy", "at 13pm"],
+    ["remind me tomorrow at 25:00 to deploy", "at 25:00"],
+    ["remind me tomorrow at 9:75 to deploy", "at 9:75"],
+    ["remind me tomorrow at 13 pm to deploy", "13 pm"],
+    ["remind me to deploy at 13pm tomorrow", "at 13pm"],
+    ["every monday at 25:00 send the report", "at 25:00"],
+    ["every monday send the report at 25:00", "at 25:00"],
+  ])("malformed clock after a timing phrase is an error, not a shortened schedule: %s", (text, clause) => {
+    const error = { kind: "error", message: `"${clause}" isn't a valid time. Try something like 'at 1pm' or 'at 13:00'.` };
+    expect(splitRoutineRequest(text)).toEqual(error as never);
+    expect(parseRoutineRequest(text, ny)).toEqual(error as never);
+  });
+
+  test("valid clock continuations are unaffected", () => {
+    const parsed = parseRoutineRequest("remind me tomorrow at 13 to deploy", ny);
+    if (parsed.kind !== "ok") throw new Error(parsed.message);
+    expect(parsed.task).toBe("deploy");
+    expect(parsed.nextRunAt).toBe("2026-10-07T17:00:00.000Z");
+  });
+
+  test.each([
+    ["every 2 minutes ping me at 5pm", "every 2 minutes", TOO_FREQUENT],
+    [
+      "every 3 days check backups at 5pm",
+      "every 3 days",
+      "Repeating every 3 days isn't supported yet. Try 'every day at 9am' or 'every monday at 9am'.",
+    ],
+  ])("an invalid leading schedule reports its error instead of using a trailing time: %s", (text, timing, message) => {
+    expect(splitRoutineRequest(text)).toMatchObject({ kind: "ok", timing });
+    expect(parseRoutineRequest(text, ny)).toEqual({ kind: "error", message });
+  });
+
+  test("offsetTransitions finds both New York DST changes in the next year", () => {
+    const transitions = offsetTransitions(NEW_YORK, NOW, new Date(NOW.getTime() + 366 * 86_400_000));
+    expect(transitions.map(({ at, deltaMs }) => [at.toISOString(), deltaMs])).toEqual([
+      ["2026-11-01T06:00:00.000Z", -3_600_000],
+      ["2027-03-14T07:00:00.000Z", 3_600_000],
+    ]);
+    expect(offsetTransitions(KOLKATA, NOW, new Date(NOW.getTime() + 366 * 86_400_000))).toEqual([]);
+  });
+
+  test("cron spacing accounts for a DST change months after creation", () => {
+    // 01:58 EST and 03:00 EDT on 2027-03-14 are only 2 minutes apart.
+    const cron = parseCron("0,58 1,3 * * *");
+    if (cron.kind !== "ok") throw new Error(cron.message);
+    const before = nextCronOccurrence(cron.cron, NEW_YORK, new Date("2027-03-14T06:00:00.000Z"));
+    expect(before?.toISOString()).toBe("2027-03-14T06:58:00.000Z");
+    expect(nextCronOccurrence(cron.cron, NEW_YORK, before as Date)?.toISOString()).toBe("2027-03-14T07:00:00.000Z");
+
+    expect(errorOf(parseSchedule("cron: 0,58 1,3 * * *", ny))).toBe(TOO_FREQUENT);
+    expect(errorOf(parseSchedule("cron: 0,59 1,3 * * *", ny))).toBe(TOO_FREQUENT);
+    // No DST in Kolkata; June-only runs never meet a New York transition.
+    expect(parseSchedule("cron: 0,58 1,3 * * *", ist).kind).toBe("ok");
+    expect(parseSchedule("cron: 0,58 1,3 * 6 *", ny).kind).toBe("ok");
+    expect(parseSchedule("cron: */5 * * * *", ny).kind).toBe("ok");
+  });
+
+  test.each([
+    ["cron: 0,10,20,30,40,58 0,2,4,6,8,10,20,21 * * *", TOO_FREQUENT], // 20:58 -> 21:00, late in the day
+    ["cron: 0,58 0,23 * * *", TOO_FREQUENT], // 23:58 -> 00:00 the next day
+  ])("cron wall-clock spacing is checked independent of creation time: %s", (text, message) => {
+    expect(errorOf(parseSchedule(text, ny))).toBe(message);
+    expect(errorOf(parseSchedule(text, ist))).toBe(message);
+  });
+
+  test("midnight wrap only counts when consecutive days both run", () => {
+    expect(parseSchedule("cron: 0,58 0,23 * * 1", ny).kind).toBe("ok");
   });
 });

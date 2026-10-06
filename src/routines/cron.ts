@@ -1,6 +1,14 @@
 import { z } from "zod";
 
-import { addDays, fromLocal, isValidTimeZone, toLocal, weekdayOf, type LocalDate } from "./zoned.ts";
+import {
+  addDays,
+  fromLocal,
+  isValidTimeZone,
+  offsetTransitions,
+  toLocal,
+  weekdayOf,
+  type LocalDate,
+} from "./zoned.ts";
 
 /**
  * Standard 5-field cron (minute hour day-of-month month day-of-week) evaluated
@@ -132,6 +140,56 @@ export function nextCronOccurrence(cron: CronExpression, timeZone: string, after
     if (best !== null) return new Date(best);
   }
   return null;
+}
+
+/** Weekday/date alignment repeats every 28 years (within 1901-2099). */
+const CONSECUTIVE_DAY_SCAN = 366 * 28 + 7;
+const SPACING_HORIZON_MS = 366 * 86_400_000;
+const MINUTES_PER_DAY = 1_440;
+
+function hasConsecutiveMatchingDays(cron: CronExpression, from: Date): boolean {
+  let date: LocalDate = { year: from.getUTCFullYear(), month: from.getUTCMonth() + 1, day: from.getUTCDate() };
+  let previous = dayMatches(cron, date);
+  for (let index = 0; index < CONSECUTIVE_DAY_SCAN; index += 1) {
+    date = addDays(date, 1);
+    const current = dayMatches(cron, date);
+    if (previous && current) return true;
+    previous = current;
+  }
+  return false;
+}
+
+/**
+ * Whether consecutive runs are always at least `minGapMs` apart.
+ *
+ * Outside UTC offset changes the real gap equals the wall-clock gap, which is
+ * checked analytically (independent of `from`). Offset changes can compress
+ * gaps (1:58 EST -> 3:00 EDT is 2 minutes), so the actual occurrences around
+ * every transition in the year after `from` are checked too; annual DST rules
+ * mean that covers every transition the schedule will meet.
+ */
+export function hasMinimumSpacing(cron: CronExpression, timeZone: string, from: Date, minGapMs: number): boolean {
+  const times: number[] = [];
+  for (const hour of cron.hours) for (const minute of cron.minutes) times.push(hour * 60 + minute);
+  for (let index = 1; index < times.length; index += 1) {
+    if (((times[index] ?? 0) - (times[index - 1] ?? 0)) * 60_000 < minGapMs) return false;
+  }
+  const wrap = (times[0] ?? 0) + MINUTES_PER_DAY - (times[times.length - 1] ?? 0);
+  if (wrap * 60_000 < minGapMs && hasConsecutiveMatchingDays(cron, from)) return false;
+
+  for (const transition of offsetTransitions(timeZone, from, new Date(from.getTime() + SPACING_HORIZON_MS))) {
+    // Occurrences shifted by the transition all fall within |delta| of it.
+    const margin = Math.abs(transition.deltaMs) + minGapMs;
+    const endMs = transition.at.getTime() + margin;
+    let previous = nextCronOccurrence(cron, timeZone, new Date(transition.at.getTime() - margin));
+    while (previous !== null && previous.getTime() <= endMs) {
+      const next = nextCronOccurrence(cron, timeZone, previous);
+      if (next === null) break;
+      if (next.getTime() - previous.getTime() < minGapMs) return false;
+      previous = next;
+    }
+  }
+  return true;
 }
 
 export const scheduleRecurrenceSchema = z
