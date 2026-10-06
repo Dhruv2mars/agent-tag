@@ -300,6 +300,58 @@ describe("agent-tag onboard (non-interactive)", () => {
     expect(harness.installs).toEqual([]);
   });
 
+  test("derives the model default from the selected provider, not the first one or the template", async () => {
+    const twoReady: T3ServerInfo = {
+      ...server,
+      providers: [
+        server.providers[1]!,
+        {
+          instanceId: "claudeAgent",
+          driver: "claudeAgent",
+          enabled: true,
+          installed: true,
+          status: "ready",
+          auth: { status: "authenticated" },
+          models: [
+            { slug: "claude-a", name: "A", capabilities: null },
+            { slug: "claude-default", name: "Default", isDefault: true, capabilities: null },
+          ],
+        },
+        { ...server.providers[1]!, instanceId: "bare", models: [] },
+      ],
+    };
+    const deps: OnboardDependencies = { ...harness.deps, listT3Providers: async () => twoReady };
+
+    const second = await runOnboard(flags(harness, { providerInstanceId: "claudeAgent" }), deps);
+    expect(second.config.profiles[0]).toMatchObject({ defaultProviderInstanceId: "claudeAgent", defaultModel: "claude-default" });
+
+    const first = await runOnboard(flags(harness, { force: true }), deps);
+    expect(first.config.profiles[0]).toMatchObject({ defaultProviderInstanceId: "codex", defaultModel: "gpt-default" });
+
+    for (const providerInstanceId of ["bare", "unlisted"]) {
+      await expect(runOnboard(flags(harness, { force: true, providerInstanceId }), deps)).rejects.toThrow(
+        `missing --model: T3 reports no default model for ${providerInstanceId}; pass the model for ${providerInstanceId}`,
+      );
+    }
+    const explicit = await runOnboard(flags(harness, { force: true, providerInstanceId: "bare", model: "bare-model" }), deps);
+    expect(explicit.config.profiles[0]).toMatchObject({ defaultProviderInstanceId: "bare", defaultModel: "bare-model" });
+  });
+
+  test("uses the template model only with the template provider when T3 cannot list providers", async () => {
+    const offline: OnboardDependencies = {
+      ...harness.deps,
+      fetch: async (input) => {
+        if (String(input).startsWith("https://slack.com/")) return json({ ok: true, team_id: "T0FIXTURE" });
+        throw new Error("connect ECONNREFUSED");
+      },
+    };
+    const templated = await runOnboard(flags(harness, { t3IssueToken: false }), offline);
+    expect(templated.config.profiles[0]).toMatchObject({ defaultProviderInstanceId: "codex", defaultModel: "gpt-5.6-sol" });
+    await expect(
+      runOnboard(flags(harness, { t3IssueToken: false, force: true, providerInstanceId: "claudeAgent" }), offline),
+    ).rejects.toThrow("missing --model: T3 did not list providers and the template's model belongs to codex");
+  });
+
   test("finds the T3 base dir through T3CODE_HOME", async () => {
     const { t3BaseDir: _flag, ...withoutBaseDir } = flags(harness);
     const result = await runOnboard(withoutBaseDir, {
@@ -465,6 +517,43 @@ test("interactive onboarding re-asks invalid answers and accepts defaults", asyn
     expect(harness.output).toContain("  Slack app-level token must start with xapp-");
     expect(harness.output.some((line) => line.includes("\"alice\" is not a Slack ID"))).toBe(true);
     expect(harness.output.join("\n")).not.toContain(APP_TOKEN);
+  } finally {
+    await rm(harness.directory, { recursive: true, force: true });
+  }
+});
+
+test("interactive onboarding offers the selected provider's model and asks when it has none", async () => {
+  const harness = await createHarness();
+  try {
+    const twoReady: T3ServerInfo = {
+      ...server,
+      providers: [
+        server.providers[1]!,
+        { ...server.providers[1]!, instanceId: "claudeAgent", models: [{ slug: "claude-default", name: "D", isDefault: true, capabilities: null }] },
+        { ...server.providers[1]!, instanceId: "bare", models: [] },
+      ],
+    };
+    const answers = (provider: string, model: string[]): string[] => [
+      "y", harness.home, APP_TOKEN, BOT_TOKEN, "", "", "y", harness.repo, "",
+      provider, ...model,
+      "", "", "U0ALICE", "C0ENG", "", "n",
+    ];
+    const run = async (prompter: ScriptedPrompter) =>
+      runOnboard(
+        { interactive: true, acceptRisk: false, force: true, skipSlackCheck: false, t3IssueToken: false, t3BaseDir: harness.t3BaseDir },
+        { ...harness.deps, env: {}, prompter, listT3Providers: async () => twoReady },
+      );
+
+    const selected = await run(new ScriptedPrompter(answers("claudeAgent", [""])));
+    expect(selected.config.profiles[0]).toMatchObject({ defaultProviderInstanceId: "claudeAgent", defaultModel: "claude-default" });
+
+    await rm(harness.home, { recursive: true, force: true }); // ask for the same secrets again
+    const prompter = new ScriptedPrompter(answers("bare", ["", "bare-model"]));
+    const bare = await run(prompter);
+    expect(bare.config.profiles[0]).toMatchObject({ defaultProviderInstanceId: "bare", defaultModel: "bare-model" });
+    expect(prompter.asked.filter((question) => question === "Model for bare")).toHaveLength(2);
+    expect(harness.output).toContain("  T3 reports no default model for bare; enter the model to use with bare");
+    expect(harness.output).toContain("  model is required");
   } finally {
     await rm(harness.directory, { recursive: true, force: true });
   }

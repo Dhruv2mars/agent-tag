@@ -523,12 +523,16 @@ async function revokeT3Session(
   deps.print(`  revoke it now with: ${command.join(" ")}`);
 }
 
-interface ProviderDefaults {
+type T3Provider = T3ServerInfo["providers"][number];
+
+interface ProviderDiscovery {
+  /** Every provider T3 reported; the model default follows whichever one the operator selects. */
+  readonly providers: readonly T3Provider[];
+  /** The first ready, authenticated provider. */
   readonly providerInstanceId?: string;
-  readonly model?: string;
 }
 
-async function providerDefaults(context: Context, t3: AgentTagConfig["t3"]): Promise<ProviderDefaults> {
+async function discoverProviders(context: Context, t3: AgentTagConfig["t3"]): Promise<ProviderDiscovery | undefined> {
   const { deps } = context;
   try {
     const server = await deps.listT3Providers(t3);
@@ -537,19 +541,33 @@ async function providerDefaults(context: Context, t3: AgentTagConfig["t3"]): Pro
     );
     if (ready.length === 0) {
       deps.print("  T3 reports no ready, authenticated provider; authenticate one in T3 before starting");
-      return {};
+      return { providers: server.providers };
     }
     deps.print("  ready T3 providers:");
     for (const provider of ready) {
       deps.print(`    ${provider.instanceId}: ${provider.models.map((model) => model.slug).join(", ")}`);
     }
-    const first = ready[0]!;
-    const model = first.models.find((candidate) => candidate.isDefault === true) ?? first.models[0];
-    return { providerInstanceId: first.instanceId, ...(model === undefined ? {} : { model: model.slug }) };
+    return { providers: server.providers, providerInstanceId: ready[0]!.instanceId };
   } catch (error) {
     deps.print(`  could not list T3 providers: ${errorMessage(error)}`);
-    return {};
+    return undefined;
   }
+}
+
+/**
+ * The model to offer for the selected provider: T3's default for that provider when T3 listed it, otherwise the
+ * template's model only when the template pairs it with the same provider. Undefined means the operator must choose.
+ */
+export function defaultModelForProvider(
+  providerInstanceId: string,
+  discovery: ProviderDiscovery | undefined,
+  template: { readonly defaultProviderInstanceId: string; readonly defaultModel: string },
+): string | undefined {
+  if (discovery !== undefined) {
+    const provider = discovery.providers.find((candidate) => candidate.instanceId === providerInstanceId);
+    return (provider?.models.find((candidate) => candidate.isDefault === true) ?? provider?.models[0])?.slug;
+  }
+  return providerInstanceId === template.defaultProviderInstanceId ? template.defaultModel : undefined;
 }
 
 export async function runOnboard(options: OnboardOptions, deps: OnboardDependencies): Promise<OnboardResult> {
@@ -696,25 +714,32 @@ export async function runOnboard(options: OnboardOptions, deps: OnboardDependenc
       return raw.trim();
     },
   });
-  const discovered = !t3.usable || t3Token === "missing" ? {} : await providerDefaults(context, { baseUrl: t3BaseUrl, tokenFile: paths.t3TokenFile });
+  const discovered =
+    !t3.usable || t3Token === "missing" ? undefined : await discoverProviders(context, { baseUrl: t3BaseUrl, tokenFile: paths.t3TokenFile });
   const providerInstanceId = await resolveValue(context, {
     flag: "provider",
     value: options.providerInstanceId,
     question: "T3 provider instance",
-    defaultValue: discovered.providerInstanceId ?? templateProfile.defaultProviderInstanceId,
+    defaultValue: discovered?.providerInstanceId ?? templateProfile.defaultProviderInstanceId,
     parse: (raw) => {
       if (!PROVIDER_ID.test(raw.trim())) throw new Error("provider instance IDs look like codex or claudeAgent");
       return raw.trim();
     },
   });
+  const defaultModel = defaultModelForProvider(providerInstanceId, discovered, templateProfile);
+  if (defaultModel === undefined && options.model === undefined) {
+    const reason =
+      discovered === undefined
+        ? `T3 did not list providers and the template's model belongs to ${templateProfile.defaultProviderInstanceId}`
+        : `T3 reports no default model for ${providerInstanceId}`;
+    if (!options.interactive) throw new Error(`missing --model: ${reason}; pass the model for ${providerInstanceId}`);
+    print(`  ${reason}; enter the model to use with ${providerInstanceId}`);
+  }
   const model = await resolveValue(context, {
     flag: "model",
     value: options.model,
-    question: "Model",
-    defaultValue:
-      providerInstanceId === discovered.providerInstanceId && discovered.model !== undefined
-        ? discovered.model
-        : templateProfile.defaultModel,
+    question: `Model for ${providerInstanceId}`,
+    ...(defaultModel === undefined ? {} : { defaultValue: defaultModel }),
     parse: (raw) => {
       if (raw.trim().length === 0) throw new Error("model is required");
       return raw.trim();
