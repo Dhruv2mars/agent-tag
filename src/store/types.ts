@@ -97,6 +97,8 @@ export interface OperationalStatus {
     readonly pending: number;
     readonly activeLease: number;
     readonly expiredLease: number;
+    /** Pending rows waiting out a retry backoff (blocked_until in the future). */
+    readonly retryBlocked: number;
     readonly outcomeUnknown: number;
   };
 }
@@ -150,6 +152,8 @@ export interface ClaimedOutboxMessage {
   readonly threadTs: string;
   readonly clientMessageId: string;
   readonly payload: SlackOutboxPayload;
+  /** "plain" once a deterministic block/length rejection scheduled the one plain-text fallback. */
+  readonly renderMode: "rich" | "plain";
   readonly attempt: number;
   readonly leaseExpiresAt: string;
 }
