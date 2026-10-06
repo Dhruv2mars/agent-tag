@@ -12,7 +12,7 @@ Agent Tag is not generally available yet. The source of truth is the [GA accepta
 4. [Slack setup](slack-setup.md)
 5. [Provider access and licensing](provider-licensing.md)
 
-The active continuation branch is `feat/t3-slack-spike`, with [draft PR #1](https://github.com/Dhruv2mars/agent-tag/pull/1). Use Bun and pinned T3 Code `0.0.42`.
+The active continuation branch is `feat/t3-slack-spike`, with [draft PR #1](https://github.com/Dhruv2mars/agent-tag/pull/1). Use Bun and pinned T3 Code `0.0.45` (orchestration protocol 1).
 
 ## Working baseline
 
@@ -23,7 +23,7 @@ The active continuation branch is `feat/t3-slack-spike`, with [draft PR #1](http
 - Approval, question, cancellation, memory, scheduling, ambient participation, backup/restore, status, audit verification, and secret scanning have executable coverage. One live approval remains intentionally unanswered and must remain a human decision.
 - A macOS per-user LaunchAgent completed install, upgrade, uninstall, and reinstall exercises. Clean GitHub-hosted macOS 15 and Ubuntu 24.04 gates pass.
 - The pinned T3 adapter can upload, download, and delete pending image/file attachments with the existing restricted token. [Transport evidence](evidence/2026-09-30-t3-attachments.md) covers real byte round trips; Slack file ingestion and artifact return remain unimplemented.
-- Provider/model selection is explicit. Real Claude catalog selections currently fail inside pinned T3 with `provider-api-errors`; Codex is the verified live provider.
+- Provider/model selection is explicit. Codex `gpt-5.6-sol` and Claude `claude-sonnet-4-6`/`claude-haiku-4-5` complete live through the adapter on T3 `0.0.45` ([evidence](evidence/2026-10-06-t3-0.0.45.md)). Earlier Claude failures came from an organization policy rejecting the Claude Code subscription login, not from T3; Agent Tag now reports that case as `T3ProviderAuthPolicy`.
 
 ## Required work
 

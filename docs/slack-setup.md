@@ -48,7 +48,7 @@ Keep ambient participation disabled for the first run. A normal channel route us
 
 ## 4. Verify and start
 
-Start the pinned T3 Code `0.0.42` server, then run:
+Start the pinned T3 Code `0.0.45` server, then run:
 
 ```sh
 bun install --frozen-lockfile
@@ -57,7 +57,7 @@ bun run doctor -- /absolute/path/to/agent-tag.json
 bun run start -- /absolute/path/to/agent-tag.json
 ```
 
-`doctor` opens and migrates SQLite, verifies the restricted T3 session, checks every configured provider and model, calls Slack `auth.test`, and rejects a bot installed in the wrong workspace. `start` repeats the T3/provider checks before opening Socket Mode.
+`doctor` opens and migrates SQLite, checks that T3 speaks orchestration protocol 1, verifies the restricted T3 session, checks every configured provider and model, calls Slack `auth.test`, and rejects a bot installed in the wrong workspace. `start` repeats the T3/provider checks before opening Socket Mode.
 
 Mention the app in an allowed channel. Agent Tag should acknowledge work in the message thread, dispatch through T3, and post the final result to that same thread. A DM route does not require a mention. Approval, question, and cancel controls use Slack interactivity over the same Socket Mode connection.
 
