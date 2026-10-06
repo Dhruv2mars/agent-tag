@@ -421,11 +421,23 @@ export interface T3ConnectionConfig {
   readonly tokenFile: string;
 }
 
-async function socketUrl(config: T3ConnectionConfig): Promise<string> {
+function signalOption(signal: AbortSignal | undefined): { readonly signal?: AbortSignal } {
+  return signal === undefined ? {} : { signal };
+}
+
+async function socketUrl(config: T3ConnectionConfig, signal?: AbortSignal): Promise<string> {
   const token = await readSecretFile(config.tokenFile);
-  const session = await inspectT3Session({ baseUrl: config.baseUrl, token });
+  const session = await inspectT3Session({ baseUrl: config.baseUrl, token, ...signalOption(signal) });
   assertRestrictedOrchestrationSession(session);
-  return issueT3WebSocketUrl({ baseUrl: config.baseUrl, token });
+  return issueT3WebSocketUrl({ baseUrl: config.baseUrl, token, ...signalOption(signal) });
+}
+
+/**
+ * Runs a scoped RPC program. Aborting `signal` interrupts the fiber, which closes the scoped
+ * WebSocket instead of leaving it open until T3 replies.
+ */
+function runRpc<A, E>(program: Effect.Effect<A, E>, signal: AbortSignal | undefined): Promise<A> {
+  return Effect.runPromise(program, signalOption(signal));
 }
 
 function protocolLayer(url: string) {
@@ -437,29 +449,35 @@ function protocolLayer(url: string) {
   );
 }
 
-export async function inspectT3(config: T3ConnectionConfig): Promise<T3ServerInfo> {
-  const url = await socketUrl(config);
+export async function inspectT3(config: T3ConnectionConfig, signal?: AbortSignal): Promise<T3ServerInfo> {
+  const url = await socketUrl(config, signal);
   const program = Effect.gen(function* () {
     const client = yield* RpcClient.make(rpcGroup);
     yield* client["server.probe"]({});
     const raw = yield* client["server.getConfig"]({});
     return serverConfigSchema.parse(raw);
   }).pipe(Effect.provide(protocolLayer(url)), Effect.scoped);
-  return Effect.runPromise(program);
+  return runRpc(program, signal);
 }
 
+/**
+ * Dispatches one orchestration command. Aborting `signal` interrupts the RPC and closes its socket;
+ * the command may or may not have reached T3, which is safe because T3 deduplicates by the stable
+ * `commandId`, so the caller can replay the same command after restart.
+ */
 export async function dispatchT3Command(input: {
   readonly config: T3ConnectionConfig;
   readonly command: T3Command;
+  readonly signal?: AbortSignal;
 }): Promise<T3DispatchResult> {
-  const url = await socketUrl(input.config);
+  const url = await socketUrl(input.config, input.signal);
   const command = t3CommandSchema.parse(input.command);
   const program = Effect.gen(function* () {
     const client = yield* RpcClient.make(rpcGroup);
     const raw = yield* client["orchestration.dispatchCommand"](command);
     return dispatchResultSchema.parse(raw);
   }).pipe(Effect.provide(protocolLayer(url)), Effect.scoped);
-  return Effect.runPromise(program);
+  return runRpc(program, input.signal);
 }
 
 export async function fetchT3ThreadSnapshot(input: {
@@ -469,7 +487,7 @@ export async function fetchT3ThreadSnapshot(input: {
 }): Promise<T3ThreadSnapshot> {
   const threadId = id.parse(input.threadId);
   const token = await readSecretFile(input.config.tokenFile);
-  const session = await inspectT3Session({ baseUrl: input.config.baseUrl, token });
+  const session = await inspectT3Session({ baseUrl: input.config.baseUrl, token, ...signalOption(input.signal) });
   assertRestrictedOrchestrationSession(session);
   const url = new URL(`/api/orchestration/threads/${encodeURIComponent(threadId)}`, input.config.baseUrl);
   const response = await fetch(url, {
@@ -500,7 +518,7 @@ export async function watchT3Thread(input: {
   readonly signal: AbortSignal;
   readonly onItem: (item: T3ThreadStreamItem) => Promise<void>;
 }): Promise<void> {
-  const url = await socketUrl(input.config);
+  const url = await socketUrl(input.config, input.signal);
   const payload = {
     threadId: id.parse(input.threadId),
     requestCompletionMarker: true,
@@ -545,18 +563,19 @@ export async function uploadT3Attachment(input: {
   readonly name: string;
   readonly mimeType: string;
   readonly data: Blob;
+  readonly signal?: AbortSignal;
 }): Promise<T3Attachment> {
   const attachment = t3AttachmentSchema.parse({
     type: input.type, id: "pending", name: input.name, mimeType: input.mimeType, sizeBytes: input.data.size,
   });
-  const url = await socketUrl(input.config);
+  const url = await socketUrl(input.config, input.signal);
   const program = Effect.gen(function* () {
     const client = yield* RpcClient.make(rpcGroup);
     return z.object({ attachmentId: id, relativeUrl: id }).parse(yield* client["attachments.createUploadUrl"]({
       type: attachment.type, name: attachment.name, mimeType: attachment.mimeType, sizeBytes: attachment.sizeBytes,
     }));
   }).pipe(Effect.provide(protocolLayer(url)), Effect.scoped);
-  const upload = await Effect.runPromise(program);
+  const upload = await runRpc(program, input.signal);
   try {
     const response = await fetch(assetTransferUrl(upload.relativeUrl, input.config, "/api/attachments/upload"), {
       method: "POST", body: input.data, redirect: "error", signal: AbortSignal.timeout(30_000),
@@ -574,16 +593,17 @@ export async function uploadT3Attachment(input: {
 export async function downloadT3Attachment(input: {
   readonly config: T3ConnectionConfig;
   readonly attachment: T3Attachment;
+  readonly signal?: AbortSignal;
 }): Promise<Uint8Array> {
   const attachment = t3AttachmentSchema.parse(input.attachment);
-  const url = await socketUrl(input.config);
+  const url = await socketUrl(input.config, input.signal);
   const program = Effect.gen(function* () {
     const client = yield* RpcClient.make(rpcGroup);
     return z.object({ relativeUrl: id }).parse(yield* client["assets.createUrl"]({
       resource: { _tag: "attachment", attachmentId: attachment.id, fileName: attachment.name, mimeType: attachment.mimeType },
     }));
   }).pipe(Effect.provide(protocolLayer(url)), Effect.scoped);
-  const asset = await Effect.runPromise(program);
+  const asset = await runRpc(program, input.signal);
   try {
     const response = await fetch(assetTransferUrl(asset.relativeUrl, input.config, "/api/assets"), {
       redirect: "error", signal: AbortSignal.timeout(30_000),
@@ -612,12 +632,13 @@ export async function downloadT3Attachment(input: {
 export async function deletePendingT3Attachment(input: {
   readonly config: T3ConnectionConfig;
   readonly attachmentId: string;
+  readonly signal?: AbortSignal;
 }): Promise<void> {
   const attachmentId = id.parse(input.attachmentId);
-  const url = await socketUrl(input.config);
+  const url = await socketUrl(input.config, input.signal);
   const program = Effect.gen(function* () {
     const client = yield* RpcClient.make(rpcGroup);
     yield* client["attachments.delete"]({ attachmentId });
   }).pipe(Effect.provide(protocolLayer(url)), Effect.scoped);
-  await Effect.runPromise(program);
+  await runRpc(program, input.signal);
 }

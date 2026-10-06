@@ -58,9 +58,11 @@ function bearerHeaders(token: SecretString): HeadersInit {
 export async function inspectT3Session(input: {
   readonly baseUrl: string;
   readonly token: SecretString;
+  readonly signal?: AbortSignal;
 }): Promise<T3Session> {
   const response = await fetch(new URL("/api/auth/session", input.baseUrl), {
     headers: bearerHeaders(input.token),
+    ...(input.signal === undefined ? {} : { signal: input.signal }),
   });
   if (!response.ok) throw new Error(`T3 session endpoint returned HTTP ${response.status}`);
   return sessionSchema.parse(await parseJson(response));
@@ -121,10 +123,12 @@ export async function mintRestrictedT3Token(input: {
 export async function issueT3WebSocketUrl(input: {
   readonly baseUrl: string;
   readonly token: SecretString;
+  readonly signal?: AbortSignal;
 }): Promise<string> {
   const response = await fetch(new URL("/api/auth/websocket-ticket", input.baseUrl), {
     method: "POST",
     headers: bearerHeaders(input.token),
+    ...(input.signal === undefined ? {} : { signal: input.signal }),
   });
   if (!response.ok) throw new Error(`T3 WebSocket ticket endpoint returned HTTP ${response.status}`);
   const issued = webSocketTicketSchema.parse(await parseJson(response));

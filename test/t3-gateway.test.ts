@@ -1,6 +1,10 @@
 import { describe, expect, test } from "bun:test";
+import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import {
+  dispatchT3Command,
   pendingT3Approvals,
   pendingT3UserInputs,
   t3CommandSchema,
@@ -149,5 +153,69 @@ describe("T3 gateway command boundary", () => {
         ],
       },
     ]);
+  });
+
+  test("aborting a dispatch interrupts the pending RPC and closes its WebSocket", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "agent-tag-t3-abort-"));
+    const tokenFile = join(directory, "t3-token");
+    await writeFile(tokenFile, "fixture-token\n");
+    await chmod(tokenFile, 0o600);
+    let sawDispatch = false;
+    let socketClosed = false;
+    // A T3 stand-in that authenticates and accepts the RPC but never replies.
+    const server = Bun.serve({
+      port: 0,
+      fetch(request, server) {
+        const url = new URL(request.url);
+        if (url.pathname === "/api/auth/session") {
+          return Response.json({
+            authenticated: true,
+            scopes: ["orchestration:read", "orchestration:operate"],
+            sessionMethod: "bearer-access-token",
+            expiresAt: "2099-01-01T00:00:00.000Z",
+          });
+        }
+        if (url.pathname === "/api/auth/websocket-ticket") {
+          return Response.json({ ticket: "ticket-1", expiresAt: "2099-01-01T00:00:00.000Z" });
+        }
+        if (url.pathname === "/ws" && server.upgrade(request)) return undefined;
+        return new Response("not found", { status: 404 });
+      },
+      websocket: {
+        message(_socket, message) {
+          if (String(message).includes("orchestration.dispatchCommand")) sawDispatch = true;
+        },
+        close() {
+          socketClosed = true;
+        },
+      },
+    });
+    try {
+      const controller = new AbortController();
+      const dispatched = dispatchT3Command({
+        config: { baseUrl: `http://127.0.0.1:${server.port}`, tokenFile },
+        command: {
+          type: "thread.turn.interrupt",
+          commandId: "command-1",
+          threadId: "thread-1",
+          createdAt: "2026-09-21T00:00:00.000Z",
+        },
+        signal: controller.signal,
+      });
+      const settled = dispatched.then(() => "resolved" as const, () => "rejected" as const);
+      for (let attempt = 0; attempt < 500 && !sawDispatch; attempt += 1) await Bun.sleep(2);
+      expect(sawDispatch).toBe(true);
+
+      controller.abort();
+      expect(await Promise.race([settled, Bun.sleep(1_000).then(() => "pending" as const)])).toBe("rejected");
+      for (let attempt = 0; attempt < 500 && !socketClosed; attempt += 1) await Bun.sleep(2);
+      expect(socketClosed).toBe(true);
+    } finally {
+      server.stop(true);
+      if (!directory.startsWith(`${tmpdir()}/agent-tag-t3-abort-`)) {
+        throw new Error(`refusing to remove unexpected fixture path ${directory}`);
+      }
+      await rm(directory, { recursive: true });
+    }
   });
 });

@@ -16,7 +16,8 @@ import {
 } from "./t3/gateway.ts";
 
 export interface T3CoordinatorGateway {
-  readonly dispatch: (command: T3Command) => Promise<T3DispatchResult>;
+  /** Implementations should stop the RPC (closing its socket) when `signal` aborts. */
+  readonly dispatch: (command: T3Command, signal?: AbortSignal) => Promise<T3DispatchResult>;
   readonly fetchThread: (threadId: string, signal?: AbortSignal) => Promise<T3ThreadSnapshot>;
 }
 
@@ -71,7 +72,8 @@ function turnTextWithMemory(
 
 function defaultT3Gateway(config: T3ConnectionConfig): T3CoordinatorGateway {
   return {
-    dispatch: (command) => dispatchT3Command({ config, command }),
+    dispatch: (command, signal) =>
+      dispatchT3Command({ config, command, ...(signal === undefined ? {} : { signal }) }),
     fetchThread: (threadId, signal) =>
       fetchT3ThreadSnapshot({ config, threadId, ...(signal === undefined ? {} : { signal }) }),
   };
@@ -417,6 +419,8 @@ export class AgentTagCoordinator {
       proposedText: turnTextWithMemory(operation.payload.text, memories),
       now: this.#now().toISOString(),
     });
+    // Shutdown aborts these dispatches (the gateway interrupts the RPC and closes its socket). Both
+    // commands use stable ids, so T3 deduplicates the replay when the released operation resumes.
     await abortable(this.#t3.dispatch({
       type: "project.create",
       commandId: `${task.projectOwnerTaskId}:project.create`,
@@ -425,7 +429,7 @@ export class AgentTagCoordinator {
       workspaceRoot: task.repositoryRoot,
       defaultModelSelection: modelSelection,
       createdAt: task.projectCreatedAt,
-    }), signal);
+    }, signal), signal);
 
     const turn = await abortable(this.#t3.dispatch({
       type: "thread.turn.start",
@@ -464,7 +468,7 @@ export class AgentTagCoordinator {
             },
           }),
       createdAt: this.#now().toISOString(),
-    }), signal);
+    }, signal), signal);
     this.#store.markT3ThreadStarted({ taskId: task.taskId, now: this.#now().toISOString() });
     this.#store.enqueueOutbox({
       taskId: operation.taskId,
