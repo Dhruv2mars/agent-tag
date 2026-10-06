@@ -6,6 +6,7 @@ import { basename, dirname, isAbsolute, join } from "node:path";
 
 import { z } from "zod";
 
+import { scheduleRecurrenceSchema, type ScheduleRecurrence } from "../routines/cron.ts";
 import { STORE_MIGRATIONS } from "./migrations.ts";
 
 const nonEmpty = z.string().min(1);
@@ -230,6 +231,25 @@ const memoryRowSchema = z.object({
 const memoryContent = z.string().trim().min(1).max(2_000);
 const resolvedOperationTextSchema = z.object({ resolved_text: z.string().nullable() });
 const schedulePrompt = z.string().trim().min(1).max(4_000);
+const recurrenceJson = z
+  .string()
+  .nullable()
+  .transform((raw, context): ScheduleRecurrence | null => {
+    if (raw === null) return null;
+    let value: unknown;
+    try {
+      value = JSON.parse(raw);
+    } catch {
+      context.addIssue({ code: "custom", message: "recurrence_json is not valid JSON" });
+      return z.NEVER;
+    }
+    const parsed = scheduleRecurrenceSchema.safeParse(value);
+    if (!parsed.success) {
+      context.addIssue({ code: "custom", message: "recurrence_json is invalid" });
+      return z.NEVER;
+    }
+    return parsed.data;
+  });
 const scheduleRowSchema = z.object({
   schedule_id: nonEmpty,
   task_id: nonEmpty,
@@ -242,6 +262,7 @@ const scheduleRowSchema = z.object({
   kind: z.enum(["agent", "reminder"]),
   prompt: schedulePrompt,
   cadence_seconds: z.number().int().min(60).nullable(),
+  recurrence_json: recurrenceJson,
   missed_run_policy: z.enum(["run-once", "skip"]),
   misfire_grace_seconds: z.number().int().nonnegative(),
   overlap_policy: z.enum(["skip", "queue"]),
@@ -483,6 +504,7 @@ export interface ClaimedSchedule {
   readonly kind: "agent" | "reminder";
   readonly prompt: string;
   readonly cadenceSeconds: number | null;
+  readonly recurrence: ScheduleRecurrence | null;
   readonly missedRunPolicy: "run-once" | "skip";
   readonly misfireGraceSeconds: number;
   readonly overlapPolicy: "skip" | "queue";
@@ -499,6 +521,7 @@ export interface ScheduleSummary {
   readonly state: "active" | "cancelled" | "completed";
   readonly nextRunAt: string;
   readonly cadenceSeconds: number | null;
+  readonly recurrence: ScheduleRecurrence | null;
   readonly missedRunPolicy: "run-once" | "skip";
   readonly overlapPolicy: "skip" | "queue";
 }
@@ -1075,6 +1098,7 @@ export class AgentTagStore {
     readonly prompt: string;
     readonly runAt: string;
     readonly cadenceSeconds?: number;
+    readonly recurrence?: ScheduleRecurrence;
     readonly missedRunPolicy: "run-once" | "skip";
     readonly misfireGraceSeconds: number;
     readonly overlapPolicy: "skip" | "queue";
@@ -1088,6 +1112,11 @@ export class AgentTagStore {
     ) {
       throw new Error("schedule cadence must be at least 60 seconds");
     }
+    if (input.cadenceSeconds !== undefined && input.recurrence !== undefined) {
+      throw new Error("schedule cadence and recurrence are mutually exclusive");
+    }
+    const recurrence =
+      input.recurrence === undefined ? null : scheduleRecurrenceSchema.parse(input.recurrence);
     if (
       !Number.isSafeInteger(input.misfireGraceSeconds) ||
       input.misfireGraceSeconds < 0 ||
@@ -1110,9 +1139,9 @@ export class AgentTagStore {
         .query(
           `INSERT INTO schedules (
             schedule_id, task_id, workspace_id, conversation_id, thread_ts, actor_user_id,
-            profile_id, repository_root, kind, prompt, cadence_seconds, missed_run_policy,
+            profile_id, repository_root, kind, prompt, cadence_seconds, recurrence_json, missed_run_policy,
             misfire_grace_seconds, overlap_policy, state, next_run_at, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)`,
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)`,
         )
         .run(
           scheduleId,
@@ -1126,6 +1155,7 @@ export class AgentTagStore {
           input.kind,
           schedulePrompt.parse(input.prompt),
           input.cadenceSeconds ?? null,
+          recurrence === null ? null : JSON.stringify(recurrence),
           input.missedRunPolicy,
           input.misfireGraceSeconds,
           input.overlapPolicy,
@@ -1144,7 +1174,7 @@ export class AgentTagStore {
         correlationId: scheduleId,
         metadata: {
           kind: input.kind,
-          recurring: input.cadenceSeconds !== undefined,
+          recurring: input.cadenceSeconds !== undefined || recurrence !== null,
           missedRunPolicy: input.missedRunPolicy,
           overlapPolicy: input.overlapPolicy,
         },
@@ -1158,6 +1188,7 @@ export class AgentTagStore {
         state: "active",
         nextRunAt: runAt,
         cadenceSeconds: input.cadenceSeconds ?? null,
+        recurrence,
         missedRunPolicy: input.missedRunPolicy,
         overlapPolicy: input.overlapPolicy,
       };
@@ -1174,12 +1205,13 @@ export class AgentTagStore {
       state: z.enum(["active", "cancelled", "completed"]),
       next_run_at: isoDateTime,
       cadence_seconds: z.number().int().min(60).nullable(),
+      recurrence_json: recurrenceJson,
       missed_run_policy: z.enum(["run-once", "skip"]),
       overlap_policy: z.enum(["skip", "queue"]),
     });
     return this.#database
       .query(
-        `SELECT schedule_id, task_id, kind, prompt, state, next_run_at, cadence_seconds,
+        `SELECT schedule_id, task_id, kind, prompt, state, next_run_at, cadence_seconds, recurrence_json,
                 missed_run_policy, overlap_policy
          FROM schedules WHERE task_id = ? ORDER BY created_at, schedule_id`,
       )
@@ -1194,6 +1226,7 @@ export class AgentTagStore {
           state: row.state,
           nextRunAt: row.next_run_at,
           cadenceSeconds: row.cadence_seconds,
+          recurrence: row.recurrence_json,
           missedRunPolicy: row.missed_run_policy,
           overlapPolicy: row.overlap_policy,
         };
@@ -1285,7 +1318,7 @@ export class AgentTagStore {
         this.#database
           .query(
             `SELECT schedule_id, task_id, workspace_id, conversation_id, thread_ts, actor_user_id,
-                    profile_id, repository_root, kind, prompt, cadence_seconds, missed_run_policy,
+                    profile_id, repository_root, kind, prompt, cadence_seconds, recurrence_json, missed_run_policy,
                     misfire_grace_seconds, overlap_policy, next_run_at, attempts, lease_expires_at
              FROM schedules WHERE schedule_id = ?`,
           )
@@ -1315,6 +1348,7 @@ export class AgentTagStore {
         kind: row.kind,
         prompt: row.prompt,
         cadenceSeconds: row.cadence_seconds,
+        recurrence: row.recurrence_json,
         missedRunPolicy: row.missed_run_policy,
         misfireGraceSeconds: row.misfire_grace_seconds,
         overlapPolicy: row.overlap_policy,
