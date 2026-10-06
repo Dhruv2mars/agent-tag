@@ -632,3 +632,10 @@ describe("links with backticks during splits", () => {
     expect(chunks.join("")).not.toContain("`");
   });
 });
+
+describe("heading closing hashes", () => {
+  test("keeps hashes that belong to heading text", () => {
+    expect(markdownToMrkdwn("## C#")).toBe("*C#*");
+    expect(markdownToMrkdwn("## Title ##")).toBe("*Title*");
+  });
+});

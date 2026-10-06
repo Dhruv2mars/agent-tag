@@ -136,7 +136,7 @@ function convertInline(line: string): string {
 }
 
 function convertLine(line: string): string {
-  const heading = /^\s{0,3}#{1,6}\s+(.*?)\s*#*\s*$/.exec(line);
+  const heading = /^\s{0,3}#{1,6}\s+(.*?)(?:\s+#+)?\s*$/.exec(line);
   if (heading !== null) {
     // Drop bold markers (the whole heading is bolded) but leave code spans untouched.
     const content = (heading[1] ?? "")
