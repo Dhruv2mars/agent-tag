@@ -8,7 +8,10 @@ import {
   uninstallLaunchAgent,
   upgradeLaunchAgent,
 } from "./launchd.ts";
+import type { ServiceUnitState } from "./service-unit.ts";
 import { createSystemdUserService, type SystemdUserService } from "./systemd.ts";
+
+export type { ServiceUnitState } from "./service-unit.ts";
 
 export type ServiceManagerKind = "launchd" | "systemd";
 
@@ -19,15 +22,6 @@ export interface ServiceStatusReport {
   readonly loaded: boolean;
   readonly running: boolean;
   readonly hints: readonly string[];
-}
-
-export interface ServiceUnitState {
-  readonly unitPath: string;
-  readonly installed: boolean;
-  /** The installed unit is byte-identical to what this checkout would generate now. */
-  readonly current: boolean;
-  /** The installed unit runs the same config path. */
-  readonly sameConfig: boolean;
 }
 
 export interface ServiceManager {

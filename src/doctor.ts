@@ -457,13 +457,31 @@ export async function checkService(
     if (!unit.sameConfig) {
       return { id, status: "warn", summary: `${service.kind} unit ${unit.unitPath} runs a different config` };
     }
+    // Only template drift is repaired automatically. Moving the service onto another checkout or Bun
+    // must be an explicit `service upgrade` from the intended checkout, never a side effect of `--fix`.
+    if (!unit.current && !unit.sameCheckout) {
+      return {
+        id,
+        status: "warn",
+        summary: `${service.kind} unit ${unit.unitPath} runs a different Agent Tag checkout (${unit.installedCheckout ?? "unrecognized unit"})`,
+        hint: `doctor --fix leaves it alone; to move the service, run \`agent-tag service upgrade ${configPath}\` from the checkout it should run`,
+      };
+    }
+    if (!unit.current && !unit.sameBun) {
+      return {
+        id,
+        status: "warn",
+        summary: `${service.kind} unit ${unit.unitPath} runs a different Bun (${unit.installedBunPath ?? "unrecognized unit"})`,
+        hint: `doctor --fix leaves it alone; run \`agent-tag service upgrade ${configPath}\` with the Bun the service should use`,
+      };
+    }
     let fixed: string | undefined;
     if (!unit.current) {
       if (!options.fix || options.blocked) {
         return {
           id,
           status: "warn",
-          summary: `${service.kind} unit ${unit.unitPath} is stale for this checkout`,
+          summary: `${service.kind} unit ${unit.unitPath} differs from the unit template this checkout generates`,
           hint: options.blocked ? "resolve the failed checks, then run `agent-tag doctor --fix`" : "run `agent-tag doctor --fix` or `agent-tag service upgrade`",
         };
       }

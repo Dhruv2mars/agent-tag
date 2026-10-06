@@ -8,6 +8,7 @@ import {
   AGENT_TAG_SYSTEMD_UNIT,
   lingerHint,
   parseSystemctlShow,
+  parseSystemdUnitPaths,
   renderSystemdUnit,
   type SystemdUnitDefinition,
   SystemdUserService,
@@ -34,6 +35,12 @@ describe("systemd unit rendering", () => {
     expect(unit).toContain("UMask=0077\n");
     expect(unit).toContain("WantedBy=default.target\n");
     expect(unit).toContain("After=network-online.target\n");
+  });
+
+  test("reads ExecStart and WorkingDirectory back, including escaped characters", () => {
+    const odd = { ...definition, configPath: '/srv/50% off/$USER "q" \\b.json', workingDirectory: "/srv/100% repo" };
+    expect(parseSystemdUnitPaths(renderSystemdUnit(odd))).toEqual(odd);
+    expect(parseSystemdUnitPaths("[Service]\nExecStart=/bin/true\n")).toEqual({});
   });
 
   test("escapes specifiers, variables, quotes, and backslashes", () => {
@@ -191,7 +198,22 @@ describe("systemd user service lifecycle", () => {
     expect(await service.unitState("/cfg/a.json")).toMatchObject({ installed: true, current: true, sameConfig: true });
     expect(await service.unitState("/cfg/other.json")).toMatchObject({ installed: true, current: false, sameConfig: false });
     await writeFile(service.unitPath, (await readFile(service.unitPath, "utf8")).replace("RestartSec=10", "RestartSec=5"));
-    expect(await service.unitState("/cfg/a.json")).toMatchObject({ installed: true, current: false, sameConfig: true });
+    expect(await service.unitState("/cfg/a.json")).toMatchObject({
+      installed: true,
+      current: false,
+      sameConfig: true,
+      sameCheckout: true,
+      sameBun: true,
+    });
+    await writeFile(service.unitPath, renderSystemdUnit({ ...definition, configPath: "/cfg/a.json", cliPath: "/srv/live/src/cli.ts", workingDirectory: "/srv/live" }));
+    expect(await service.unitState("/cfg/a.json")).toMatchObject({
+      current: false,
+      sameConfig: true,
+      sameCheckout: false,
+      installedCheckout: "/srv/live",
+    });
+    await writeFile(service.unitPath, renderSystemdUnit({ ...definition, configPath: "/cfg/a.json", bunPath: "/opt/bun" }));
+    expect(await service.unitState("/cfg/a.json")).toMatchObject({ sameCheckout: true, sameBun: false, installedBunPath: "/opt/bun" });
   });
 
   test("uninstall disables, removes the unit, and reloads", async () => {

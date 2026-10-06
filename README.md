@@ -55,7 +55,7 @@ AGENT_TAG_SLACK_APP_TOKEN=... AGENT_TAG_SLACK_BOT_TOKEN=... \
 bun run onboard -- --yes --accept-risk --repo /srv/repo --users U0123 --channels C0123 --t3-issue-token --install-service
 ```
 
-Check the install. `--fix` repairs safe problems: file modes, a missing data directory, and a stale or stopped service unit.
+Check the install. `--fix` repairs safe problems: file modes, a missing data directory, a drifted unit template, and a stopped service. It never moves the service to a different checkout or Bun.
 
 ```sh
 bun run doctor            # or: bun run doctor -- /absolute/path/to/agent-tag.json --fix

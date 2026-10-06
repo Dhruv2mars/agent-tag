@@ -89,7 +89,16 @@ const readyServer: T3ServerInfo = {
 
 class FakeService implements ServiceManager {
   readonly kind = "systemd" as const;
-  unit: ServiceUnitState = { unitPath: "/units/agent-tag.service", installed: true, current: true, sameConfig: true };
+  unit: ServiceUnitState = {
+    unitPath: "/units/agent-tag.service",
+    installed: true,
+    current: true,
+    sameConfig: true,
+    sameCheckout: true,
+    sameBun: true,
+    installedCheckout: "/srv/agent-tag",
+    installedBunPath: "/usr/local/bin/bun",
+  };
   running = true;
   readonly calls: string[] = [];
 
@@ -364,6 +373,24 @@ describe("agent-tag doctor", () => {
     world.slackAuth = { ok: false, error: "invalid_auth" };
     const report = await run(true);
     expect(check(report, "service").hint).toContain("resolve the failed checks");
+    expect(service.calls).toEqual([]);
+  });
+
+  test("service: --fix never moves a unit that runs another checkout or another Bun", async () => {
+    service.unit = { ...service.unit, current: false, sameCheckout: false, installedCheckout: "/srv/live-checkout" };
+    const otherCheckout = await run(true);
+    expect(check(otherCheckout, "service")).toMatchObject({ status: "warn" });
+    expect(check(otherCheckout, "service").summary).toContain("different Agent Tag checkout (/srv/live-checkout)");
+    expect(check(otherCheckout, "service").hint).toContain("from the checkout it should run");
+    expect(check(otherCheckout, "service").fixed).toBeUndefined();
+
+    service.running = false;
+    await run(true);
+    expect(service.calls).toEqual([]);
+
+    service.unit = { ...service.unit, sameCheckout: true, sameBun: false, installedBunPath: "/opt/other/bun" };
+    const otherBun = await run(true);
+    expect(check(otherBun, "service").summary).toContain("different Bun (/opt/other/bun)");
     expect(service.calls).toEqual([]);
   });
 

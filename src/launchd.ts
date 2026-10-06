@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 
 import { loadConfig } from "./config.ts";
+import { installedUnitPaths, NOT_INSTALLED, type ServiceUnitPaths, type ServiceUnitState, unitStateFor } from "./service-unit.ts";
 
 export const AGENT_TAG_LAUNCHD_LABEL = "dev.agent-tag.service";
 
@@ -304,23 +305,38 @@ export async function restartLaunchAgent(): Promise<LaunchAgentStatus> {
   return launchAgentStatus();
 }
 
+function xmlUnescape(value: string): string {
+  return value
+    .replaceAll("&lt;", "<")
+    .replaceAll("&gt;", ">")
+    .replaceAll("&quot;", '"')
+    .replaceAll("&apos;", "'")
+    .replaceAll("&amp;", "&");
+}
+
+/** Reads the program arguments and working directory back out of an installed plist. */
+export function parseLaunchAgentPaths(plist: string): Partial<ServiceUnitPaths> {
+  const argumentsXml = /<key>ProgramArguments<\/key>\s*<array>([\s\S]*?)<\/array>/.exec(plist)?.[1];
+  const programArguments = argumentsXml === undefined
+    ? []
+    : [...argumentsXml.matchAll(/<string>([\s\S]*?)<\/string>/g)].map((match) => xmlUnescape(match[1] ?? ""));
+  const workingDirectory = /<key>WorkingDirectory<\/key>\s*<string>([\s\S]*?)<\/string>/.exec(plist)?.[1];
+  return installedUnitPaths(programArguments, workingDirectory === undefined ? undefined : xmlUnescape(workingDirectory));
+}
+
 /** Compares the installed plist with the one this checkout would generate for `configPath`. */
-export async function launchAgentUnitState(configPath: string): Promise<{
-  readonly unitPath: string;
-  readonly installed: boolean;
-  readonly current: boolean;
-  readonly sameConfig: boolean;
-}> {
+export async function launchAgentUnitState(configPath: string): Promise<ServiceUnitState> {
   const path = plistPath();
-  if (!(await pathExists(path))) return { unitPath: path, installed: false, current: false, sameConfig: false };
+  if (!(await pathExists(path))) return { unitPath: path, ...NOT_INSTALLED };
   const existing = await readFile(path, "utf8");
   const input = await definition(configPath);
-  return {
+  return unitStateFor({
     unitPath: path,
-    installed: true,
-    current: existing === renderLaunchAgent(input),
-    sameConfig: existing.includes(xmlString(input.configPath)),
-  };
+    existing,
+    rendered: renderLaunchAgent(input),
+    installed: parseLaunchAgentPaths(existing),
+    expected: input,
+  });
 }
 
 export function launchAgentLogsCommand(input: { readonly lines: number; readonly follow: boolean }): string[] {

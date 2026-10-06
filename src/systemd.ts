@@ -4,6 +4,7 @@ import { dirname, isAbsolute, join, resolve } from "node:path";
 
 import { type CommandRunner, requireSuccess, runCommand } from "./command.ts";
 import { loadConfig } from "./config.ts";
+import { installedUnitPaths, NOT_INSTALLED, type ServiceUnitPaths, type ServiceUnitState, unitStateFor } from "./service-unit.ts";
 
 export const AGENT_TAG_SYSTEMD_UNIT = "agent-tag.service";
 
@@ -25,12 +26,7 @@ export interface SystemdServiceStatus {
   readonly hints: readonly string[];
 }
 
-export interface SystemdUnitState {
-  readonly unitPath: string;
-  readonly installed: boolean;
-  readonly current: boolean;
-  readonly sameConfig: boolean;
-}
+export type SystemdUnitState = ServiceUnitState;
 
 function assertUnitPath(path: string): void {
   if (!isAbsolute(path)) throw new Error("systemd unit paths must be absolute");
@@ -50,6 +46,33 @@ export function systemdQuote(argument: string): string {
 
 function systemdPathValue(path: string): string {
   return path.replaceAll("%", "%%");
+}
+
+/** Reverses `systemdQuote` for one argument body (without the surrounding quotes). */
+function systemdUnquote(body: string): string {
+  let result = "";
+  for (let index = 0; index < body.length; index += 1) {
+    const character = body[index]!;
+    const next = body[index + 1];
+    if (character === "\\" && next !== undefined) {
+      result += next;
+      index += 1;
+    } else if ((character === "%" || character === "$") && next === character) {
+      result += character;
+      index += 1;
+    } else {
+      result += character;
+    }
+  }
+  return result;
+}
+
+/** Reads ExecStart arguments and WorkingDirectory back out of an installed unit. */
+export function parseSystemdUnitPaths(unit: string): Partial<ServiceUnitPaths> {
+  const execStart = /^ExecStart=(.*)$/m.exec(unit)?.[1] ?? "";
+  const programArguments = [...execStart.matchAll(/"((?:[^"\\]|\\.)*)"/g)].map((match) => systemdUnquote(match[1] ?? ""));
+  const workingDirectory = /^WorkingDirectory=(.*)$/m.exec(unit)?.[1]?.replaceAll("%%", "%");
+  return installedUnitPaths(programArguments, workingDirectory);
 }
 
 export function renderSystemdUnit(input: SystemdUnitDefinition): string {
@@ -209,16 +232,15 @@ export class SystemdUserService {
 
   async unitState(configPath: string): Promise<SystemdUnitState> {
     const existing = await readOptional(this.unitPath);
-    if (existing === undefined) {
-      return { unitPath: this.unitPath, installed: false, current: false, sameConfig: false };
-    }
+    if (existing === undefined) return { unitPath: this.unitPath, ...NOT_INSTALLED };
     const definition = await this.#host.definition(configPath);
-    return {
+    return unitStateFor({
       unitPath: this.unitPath,
-      installed: true,
-      current: existing === renderSystemdUnit(definition),
-      sameConfig: existing.includes(systemdQuote(definition.configPath)),
-    };
+      existing,
+      rendered: renderSystemdUnit(definition),
+      installed: parseSystemdUnitPaths(existing),
+      expected: definition,
+    });
   }
 
   async #enableAndStart(description: string): Promise<void> {
@@ -256,12 +278,12 @@ export class SystemdUserService {
     try {
       await requireSuccess(this.#host.run, systemctl("daemon-reload"), "systemd daemon-reload");
       await requireSuccess(this.#host.run, systemctl("enable", AGENT_TAG_SYSTEMD_UNIT), "systemd enable");
-      await requireSuccess(this.#host.run, systemctl("restart", AGENT_TAG_SYSTEMD_UNIT), "systemd restart");
+        await requireSuccess(this.#host.run, systemctl("restart", AGENT_TAG_SYSTEMD_UNIT), "systemd restart");
       if (!(await this.#waitUntilRunning())) throw new Error("systemd unit did not reach running state");
     } catch (error) {
       await writeUnitFile(this.unitPath, prior);
       await this.#host.run(systemctl("daemon-reload"));
-      if (!wasRunning) {
+        if (!wasRunning) {
         await this.#host.run(systemctl("stop", AGENT_TAG_SYSTEMD_UNIT));
         throw error;
       }
