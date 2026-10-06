@@ -40,7 +40,7 @@ export interface DoctorDependencies {
   readonly bunRequirement: { readonly minimum: string; readonly pinned: string | undefined };
   readonly inspectSession: (input: { readonly baseUrl: string; readonly token: SecretString }) => Promise<T3Session>;
   readonly inspectT3: (config: AgentTagConfig["t3"]) => Promise<T3ServerInfo>;
-  readonly storeDiagnostics: (config: AgentTagConfig) => Promise<Readonly<Record<string, number>>>;
+  readonly storeDiagnostics: (config: AgentTagConfig) => Promise<{ readonly tasks?: number; readonly operations?: number }>;
   readonly service: ServiceManager | undefined;
 }
 
