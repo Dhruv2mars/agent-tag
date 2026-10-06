@@ -27,8 +27,15 @@ import {
 export const MIN_INTERVAL_SECONDS = 300;
 const DEFAULT_HOUR = 9;
 const TONIGHT_DEFAULT_HOUR = 20;
+/** am hours before this after "tonight" belong to the following calendar day. */
+const TONIGHT_EARLY_MORNING_END = 5;
 const MAX_CADENCE_SECONDS = 31_536_000;
 const MAX_TIMING_WORDS = 16;
+const MAX_RELATIVE_DAYS = 366;
+/** Monthly days that some months lack; cron skips those months. */
+const MAX_SAFE_MONTH_DAY = 28;
+
+const TOO_FAR_ERROR = "That's too far ahead. Pick something within a year.";
 
 export const GENERIC_PARSE_ERROR =
   "I couldn't understand that time. Try 'every weekday at 9am' or 'in 2 hours'.";
@@ -280,7 +287,7 @@ function parseRecurringBody(body: ReadonlyArray<string>, time: TimeOfDay | undef
     if (second === "hour" && others.length !== 0) return UNRECOGNIZED;
     return intervalResult(30, "minute");
   }
-  const compact = /^(\d+)(m|min|mins|h|hr|hrs)$/.exec(first);
+  const compact = /^(\d{1,4})(m|min|mins|h|hr|hrs)$/.exec(first);
   if (compact !== null && body.length === 1 && time === undefined) {
     return intervalResult(Number(compact[1]), UNITS[compact[2] ?? ""] ?? "minute");
   }
@@ -371,7 +378,7 @@ function parseRelative(tokens: ReadonlyArray<string>): TimingResult {
     }
     let amount: number | undefined;
     let unit: Unit | undefined;
-    const compact = /^(\d+)(m|min|mins|h|hr|hrs|d|w)$/.exec(token);
+    const compact = /^(\d{1,4})(m|min|mins|h|hr|hrs|d|w)$/.exec(token);
     if (compact !== null) {
       amount = Number(compact[1]);
       unit = UNITS[compact[2] ?? ""];
@@ -394,7 +401,7 @@ function parseRelative(tokens: ReadonlyArray<string>): TimingResult {
   }
   if (!matchedAny) return UNRECOGNIZED;
   if (days === 0 && minutes === 0) return { kind: "invalid", message: "That time is right now. Try 'in 5 minutes'." };
-  if (days > 366) return { kind: "invalid", message: "That's too far ahead. Pick something within a year." };
+  if (days * 1_440 + minutes > MAX_RELATIVE_DAYS * 1_440) return { kind: "invalid", message: TOO_FAR_ERROR };
   return { kind: "ok", timing: { kind: "relative", days, minutes } };
 }
 
@@ -556,13 +563,25 @@ function resolveAt(
     }
     case "today":
     case "tonight": {
+      let date = today;
       if (day.type === "tonight") {
         if (time === undefined) clock = { hour: TONIGHT_DEFAULT_HOUR, minute: 0, meridiem: true };
-        else if (!time.meridiem && time.hour < 12) clock = { ...time, hour: time.hour + 12 };
+        else if (!time.meridiem) {
+          // "tonight at 12" is midnight; "tonight at 8" is 8pm.
+          if (time.hour === 0 || time.hour === 12) {
+            clock = { ...time, hour: 0 };
+            date = addDays(today, 1);
+          } else if (time.hour < 12) {
+            clock = { ...time, hour: time.hour + 12 };
+          }
+        } else if (time.hour < TONIGHT_EARLY_MORNING_END) {
+          // "tonight at midnight" / "tonight at 1am" mean the coming night.
+          date = addDays(today, 1);
+        }
       } else if (time === undefined) {
         return { kind: "error", message: "What time today? Try 'today at 5pm'." };
       }
-      const candidate = at(today);
+      const candidate = at(date);
       return future(candidate) ? { kind: "ok", instant: candidate } : { kind: "error", message: PAST_ERROR };
     }
     case "tomorrow":
@@ -596,13 +615,16 @@ function resolveAt(
 function resolveTiming(timing: Timing, options: ParseScheduleOptions): ScheduleParseResult {
   const { now, timeZone } = options;
   const zone = ` (${timeZone})`;
-  const oneShot = (instant: Date, prefix = "once on"): ScheduleParseResult => ({
-    kind: "ok",
-    schedule: { runAt: instant.toISOString() },
-    recurring: false,
-    humanReadable: `${prefix} ${formatInstant(instant, timeZone)}${zone}`,
-    nextRunAt: instant.toISOString(),
-  });
+  const oneShot = (instant: Date, prefix = "once on"): ScheduleParseResult =>
+    Number.isNaN(instant.getTime())
+      ? { kind: "error", message: TOO_FAR_ERROR }
+      : {
+          kind: "ok",
+          schedule: { runAt: instant.toISOString() },
+          recurring: false,
+          humanReadable: `${prefix} ${formatInstant(instant, timeZone)}${zone}`,
+          nextRunAt: instant.toISOString(),
+        };
   const cronSchedule = (expression: string, description: string): ScheduleParseResult => {
     if (!minimumCronGapOk(expression, timeZone, now)) {
       return {
@@ -662,7 +684,11 @@ function resolveTiming(timing: Timing, options: ParseScheduleOptions): ScheduleP
               : pattern.days.length === 7
                 ? "* * *"
                 : `* * ${cronList(pattern.days)}`;
-      const description = `${describeCalendar(pattern, todayWeekday)} at ${formatTime(hour, minute)}`;
+      const skipNote =
+        pattern.type === "monthly" && pattern.day > MAX_SAFE_MONTH_DAY
+          ? `, skipping months without a ${ordinal(pattern.day)}`
+          : "";
+      const description = `${describeCalendar(pattern, todayWeekday)} at ${formatTime(hour, minute)}${skipNote}`;
       return cronSchedule(`${minute} ${hour} ${field}`, description);
     }
     case "cron":
@@ -739,23 +765,89 @@ function cleanTask(words: ReadonlyArray<string>): string {
 interface TimingSplit {
   readonly timing: string;
   readonly taskWords: ReadonlyArray<string>;
+  readonly leading: boolean;
+  readonly result: TimingResult;
+}
+
+/** A task ending in one of these still needs its object ("prepare for monday"). */
+const DANGLING_WORDS = new Set([
+  "about", "after", "at", "before", "by", "for", "from", "in", "of", "on", "since", "through", "till", "to",
+  "until", "with",
+]);
+/** Verbs that take "on" as part of the task ("check on sat", "follow up on friday"). */
+const ON_PARTICLE_WORDS = new Set([
+  "act", "catch", "check", "comment", "decide", "focus", "follow", "report", "reflect", "touch", "up", "update",
+  "vote", "weigh", "work",
+]);
+
+function lastWord(words: ReadonlyArray<string>): string {
+  return (words[words.length - 1] ?? "").toLowerCase().replace(/[^a-z]+$/g, "");
+}
+
+/** Whether a trailing timing phrase would leave the task grammatically incomplete. */
+function stealsFromTask(taskWords: ReadonlyArray<string>, timing: string): boolean {
+  const last = lastWord(taskWords);
+  if (DANGLING_WORDS.has(last)) return true;
+  return /^on\b/i.test(timing) && ON_PARTICLE_WORDS.has(last);
 }
 
 /**
  * Longest leading phrase, else longest trailing phrase, whose parse result is
- * accepted. Prefers the timing at the start ("<timing> <task>").
+ * accepted. Prefers the timing at the start ("<timing> <task>"). A trailing
+ * phrase is skipped if taking it would leave the task dangling.
  */
 function findTiming(words: ReadonlyArray<string>, accept: (result: TimingResult) => boolean): TimingSplit | undefined {
   const limit = Math.min(words.length, MAX_TIMING_WORDS);
   for (let size = limit; size >= 1; size -= 1) {
     const candidate = words.slice(0, size).join(" ");
-    if (accept(parseTiming(candidate))) return { timing: candidate, taskWords: words.slice(size) };
+    const result = parseTiming(candidate);
+    if (accept(result)) return { timing: candidate, taskWords: words.slice(size), leading: true, result };
   }
   for (let start = Math.max(1, words.length - MAX_TIMING_WORDS); start < words.length; start += 1) {
     const candidate = words.slice(start).join(" ");
-    if (accept(parseTiming(candidate))) return { timing: candidate, taskWords: words.slice(0, start) };
+    const taskWords = words.slice(0, start);
+    if (stealsFromTask(taskWords, candidate)) continue;
+    const result = parseTiming(candidate);
+    if (accept(result)) return { timing: candidate, taskWords, leading: false, result };
   }
   return undefined;
+}
+
+/** Whether the timing phrase sets a clock time itself (vs. the 9:00 default). */
+function hasExplicitTime(timing: string): boolean {
+  return extractTime(normalize(timing)).time !== undefined;
+}
+
+/** Length of a trailing "at 5pm" / "5:30pm" clause in the task words, or 0. */
+function trailingTimeClause(taskWords: ReadonlyArray<string>): number {
+  for (let size = Math.min(3, taskWords.length - 1); size >= 1; size -= 1) {
+    const tokens = normalize(taskWords.slice(-size).join(" "));
+    if (tokens.length === 2 && tokens[0] === "at" && parseTimeToken(tokens[1]) !== undefined) return size;
+    if (tokens.length === 1 && isStandaloneTime(tokens[0])) return size;
+  }
+  return 0;
+}
+
+/**
+ * "every monday send the report at 5pm": the day leads but the clock time
+ * trails the task. Fold the time into the timing instead of defaulting to 9:00.
+ */
+function mergeTrailingTime(found: TimingSplit): TimingSplit | { readonly kind: "error"; readonly message: string } {
+  if (!found.leading || found.result.kind !== "ok") return found;
+  const timingKind = found.result.timing.kind;
+  if ((timingKind !== "calendar" && timingKind !== "at") || hasExplicitTime(found.timing)) return found;
+  const size = trailingTimeClause(found.taskWords);
+  if (size === 0) return found;
+  const clause = found.taskWords.slice(-size).join(" ");
+  const merged = `${found.timing} ${clause}`;
+  const result = parseTiming(merged);
+  if (result.kind !== "ok") {
+    return {
+      kind: "error",
+      message: `I'm not sure whether "${clause}" is part of the schedule. Put the time first, like 'every monday at 5pm send the report'.`,
+    };
+  }
+  return { timing: merged, taskWords: found.taskWords.slice(0, -size), leading: true, result };
 }
 
 /**
@@ -777,10 +869,12 @@ export function splitRoutineRequest(text: string): RoutineSplitResult {
   const words = rest.split(/\s+/).filter((word) => word.length > 0);
   // Prefer a valid timing; fall back to a recognized-but-invalid one so the
   // caller can surface its specific error (e.g. "too frequent").
-  const found =
+  const candidate =
     findTiming(words, (result) => result.kind === "ok") ??
     findTiming(words, (result) => result.kind === "invalid");
-  if (found === undefined) return { kind: "error", message: GENERIC_PARSE_ERROR };
+  if (candidate === undefined) return { kind: "error", message: GENERIC_PARSE_ERROR };
+  const found = mergeTrailingTime(candidate);
+  if ("kind" in found) return found;
   const { timing, taskWords } = found;
   const task = cleanTask(taskWords);
   if (task.length === 0) {

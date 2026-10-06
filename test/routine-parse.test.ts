@@ -359,3 +359,91 @@ describe("scheduler spec conversion", () => {
     expect(scheduleSpecSchema.safeParse({ ...base, recurrence: { ...recurrence, timeZone: "Nope/Zone" } }).success).toBe(false);
   });
 });
+
+describe("review regressions", () => {
+  test.each([
+    "in 99999999999999999m",
+    "in 9999999999999h",
+    "in 9999 hours",
+    "in 367 days",
+    "in 366 days and 1 minute",
+    "in 53 weeks",
+  ])("rejects out-of-range relative offset %s without throwing", (text) => {
+    expect(() => parseSchedule(text, ny)).not.toThrow();
+    expect(parseSchedule(text, ny).kind).toBe("error");
+  });
+
+  test("relative offsets up to a year are still accepted", () => {
+    expect(runAt("in 366 days", ny)).toBe("2027-10-07T14:00:00.000Z");
+    expect(runAt("in 8784 hours", ny)).toBe("2027-10-07T14:00:00.000Z");
+  });
+
+  test("huge compact values in a routine request return an error", () => {
+    expect(() => parseRoutineRequest("remind me in 99999999999999m to x", ny)).not.toThrow();
+    expect(parseRoutineRequest("remind me in 99999999999999m to x", ny).kind).toBe("error");
+    expect(parseSchedule("every 99999999999999999m", ny).kind).toBe("error");
+  });
+
+  test.each([
+    ["every weekday post the standup at 9:30am", "every weekday at 9:30am", "post the standup", "30 9 * * 1-5"],
+    ["every monday send the report at 5pm", "every monday at 5pm", "send the report", "0 17 * * 1"],
+    ["every monday send the report 5:15pm", "every monday 5:15pm", "send the report", "15 17 * * 1"],
+  ])("merges a trailing clock time into a leading day: %s", (text, timing, task, expression) => {
+    expect(splitRoutineRequest(text)).toEqual({ kind: "ok", scheduleKind: "agent", timing, task });
+    const parsed = parseRoutineRequest(text, ny);
+    if (parsed.kind !== "ok") throw new Error(parsed.message);
+    expect(parsed.spec.recurrence).toEqual({ kind: "cron", expression, timeZone: NEW_YORK });
+  });
+
+  test("trailing time merges into a leading one-shot day", () => {
+    const parsed = parseRoutineRequest("tomorrow deploy the app at 3pm", ny);
+    if (parsed.kind !== "ok") throw new Error(parsed.message);
+    expect(parsed.task).toBe("deploy the app");
+    expect(parsed.nextRunAt).toBe("2026-10-07T19:00:00.000Z");
+  });
+
+  test.each([
+    ["tonight at midnight", "2026-10-07T04:00:00.000Z"],
+    ["tonight at 12am", "2026-10-07T04:00:00.000Z"],
+    ["tonight at 12", "2026-10-07T04:00:00.000Z"],
+    ["tonight at 12:30", "2026-10-07T04:30:00.000Z"],
+    ["tonight at 1am", "2026-10-07T05:00:00.000Z"],
+    ["tonight at 11pm", "2026-10-07T03:00:00.000Z"],
+    ["tonight", "2026-10-07T00:00:00.000Z"],
+  ])("%s rolls into the coming night", (text, expected) => {
+    expect(runAt(text, ny)).toBe(expected);
+  });
+
+  test("trailing bare day words that complete the task are not taken as timing", () => {
+    expect(splitRoutineRequest("remind me to prepare for monday")).toEqual({ kind: "error", message: GENERIC_PARSE_ERROR });
+    expect(splitRoutineRequest("remind me to check on sat")).toEqual({ kind: "error", message: GENERIC_PARSE_ERROR });
+    expect(splitRoutineRequest("remind me to prepare for monday at 9am")).toEqual({
+      kind: "ok",
+      scheduleKind: "reminder",
+      timing: "at 9am",
+      task: "prepare for monday",
+    });
+    expect(splitRoutineRequest("remind me to check on sat at 5pm")).toEqual({
+      kind: "ok",
+      scheduleKind: "reminder",
+      timing: "at 5pm",
+      task: "check on sat",
+    });
+    expect(splitRoutineRequest("remind me to call mom on friday")).toEqual({
+      kind: "ok",
+      scheduleKind: "reminder",
+      timing: "on friday",
+      task: "call mom",
+    });
+  });
+
+  test.each([
+    ["every month on the 31st", "0 9 31 * *", "every month on the 31st at 9:00 AM, skipping months without a 31st (America/New_York)"],
+    ["on the 30th of every month", "0 9 30 * *", "every month on the 30th at 9:00 AM, skipping months without a 30th (America/New_York)"],
+    ["every month on the 28th", "0 9 28 * *", "every month on the 28th at 9:00 AM (America/New_York)"],
+  ])("monthly days past the 28th warn about skipped months: %s", (text, expression, humanReadable) => {
+    const result = ok(parseSchedule(text, ny));
+    expect(result.schedule.recurrence).toEqual({ kind: "cron", expression, timeZone: NEW_YORK });
+    expect(result.humanReadable).toBe(humanReadable);
+  });
+});
