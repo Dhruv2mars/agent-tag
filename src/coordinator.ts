@@ -130,18 +130,48 @@ class T3TurnStalled extends Error {
   }
 }
 
-function t3TurnFailure(snapshot: T3ThreadSnapshot): CoordinatorFailure {
-  const detail = snapshot.thread.session?.lastError?.toLowerCase() ?? "";
-  if (["usage limit", "rate limit", "quota", "credits"].some((term) => detail.includes(term))) {
-    return new CoordinatorFailure(
-      "T3ProviderLimit",
-      "Agent Tag could not start this request because the configured provider has reached its usage limit. Ask the operator to configure an organization-approved provider, then retry.",
-    );
+/**
+ * Maps T3's free-text `session.lastError` to a stable failure code and a sanitized Slack message.
+ * Provider diagnostic text never reaches Slack; operators read the code in audit and status output.
+ */
+export function classifyT3TurnFailure(lastError: string | null | undefined): {
+  readonly code: string;
+  readonly userMessage: string;
+} {
+  const detail = lastError?.toLowerCase() ?? "";
+  // Claude subscription (OAuth) login blocked by the Anthropic organization's policy: HTTP 403
+  // `oauth_not_allowed_for_organization`. Retrying cannot help; the operator must switch credentials.
+  if (["oauth_not_allowed_for_organization", "oauth authentication is currently not allowed"].some((term) => detail.includes(term))) {
+    return {
+      code: "T3ProviderAuthPolicy",
+      userMessage:
+        "Agent Tag could not run this request because the provider's organization does not allow this login method (for Claude, subscription OAuth is disabled by organization policy). Ask the operator to configure an organization-approved credential, such as an API key, then retry.",
+    };
   }
-  return new CoordinatorFailure(
-    "T3TurnError",
-    "Agent Tag could not complete this request because T3 reported a provider or runtime error. Ask the operator to inspect service diagnostics.",
-  );
+  if (["could not authenticate", "authentication_failed", "authentication_error", "invalid api key", "invalid x-api-key", "not logged in", "please run /login"].some((term) => detail.includes(term))) {
+    return {
+      code: "T3ProviderAuth",
+      userMessage:
+        "Agent Tag could not run this request because the configured provider is not authenticated on the T3 host. Ask the operator to sign the provider in again, then retry.",
+    };
+  }
+  if (["usage limit", "rate limit", "quota", "credits"].some((term) => detail.includes(term))) {
+    return {
+      code: "T3ProviderLimit",
+      userMessage:
+        "Agent Tag could not start this request because the configured provider has reached its usage limit. Ask the operator to configure an organization-approved provider, then retry.",
+    };
+  }
+  return {
+    code: "T3TurnError",
+    userMessage:
+      "Agent Tag could not complete this request because T3 reported a provider or runtime error. Ask the operator to inspect service diagnostics.",
+  };
+}
+
+function t3TurnFailure(snapshot: T3ThreadSnapshot): CoordinatorFailure {
+  const failure = classifyT3TurnFailure(snapshot.thread.session?.lastError);
+  return new CoordinatorFailure(failure.code, failure.userMessage);
 }
 
 function snapshotHasCurrentTurn(snapshot: T3ThreadSnapshot, messageId: string): boolean {
