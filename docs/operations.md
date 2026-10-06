@@ -162,9 +162,10 @@ Check a deployment against the [threat model](../SECURITY.md):
 bun run security:audit -- /absolute/path/to/agent-tag.json
 bun run security:audit -- /absolute/path/to/agent-tag.json --json
 bun run security:audit -- /absolute/path/to/agent-tag.json --offline
+bun run security:audit -- /absolute/path/to/agent-tag.json --log-dir /var/log/agent-tag
 ```
 
-The audit reads the config, the files it references, the data directory, and the macOS LaunchAgent logs. It prints each finding with a severity of `high`, `medium`, `low`, or `info`, plus a fix where one applies. It exits `1` when any finding is `high`, so it can gate a deploy or a cron job. Reports name files and credential classes but never print credential values.
+The audit reads the config, the files it references, the data directory, and the service logs. Logs default to the macOS LaunchAgent directory, `~/Library/Logs/AgentTag`. On Linux, or under any other process manager, pass `--log-dir` with the directory your logs are written to. The audit checks the mode of every file at the top of that directory, including rotated logs, and scans the whole directory for credentials. If the directory does not exist, the audit reports `log-directory-missing` instead of passing silently. Logs that go only to journald or another log service are not checked. It prints each finding with a severity of `high`, `medium`, `low`, or `info`, plus a fix where one applies. It exits `1` when any finding is `high`, so it can gate a deploy or a cron job. Reports name files and credential classes but never print credential values.
 
 | Check | Severity |
 | --- | --- |
@@ -174,6 +175,7 @@ The audit reads the config, the files it references, the data directory, and the
 | Data directory or database grants group/world access | high (low for SQLite `-wal`/`-shm` files inside a private data directory) |
 | Config is group/world writable / world readable / group readable | high / medium / low |
 | Service logs are world / group accessible | medium / low |
+| Log directory not found, so logs were not checked (pass `--log-dir`) | low |
 | A credential pattern, or a `*token`/`*secret`/`*password` field with a value, appears inline in the config | high |
 | Config is not readable JSON (later checks are skipped) | high |
 | Config fails validation. The service refuses to start; the audit still runs every check below on the fields it can read, but does not query T3 | high |

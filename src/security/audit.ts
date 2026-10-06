@@ -121,6 +121,15 @@ export function checkPathPermissions(
         path,
       }];
     }
+    if (role === "log-directory") {
+      return [{
+        id: "log-directory-missing",
+        severity: "low",
+        message: "log directory does not exist; service logs were not checked for permissions or leaked credentials",
+        path,
+        remediation: "pass --log-dir with the directory your process manager writes Agent Tag logs to",
+      }];
+    }
     return [];
   }
   const sensitive = role !== "log" && role !== "log-directory";

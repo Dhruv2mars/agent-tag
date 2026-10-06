@@ -1,4 +1,4 @@
-import { lstat, realpath, stat } from "node:fs/promises";
+import { lstat, readdir, realpath, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 
@@ -30,10 +30,22 @@ import {
 import { readSecretFile } from "./secret-file.ts";
 import { scanForSecrets, type SecretCanary } from "./secret-scan.ts";
 
-/** LaunchAgent log locations written by scripts/manage-launchd.ts. */
-export function defaultLogPaths(home: string): { readonly directory: string; readonly files: readonly string[] } {
-  const directory = join(home, "Library", "Logs", "AgentTag");
-  return { directory, files: [join(directory, "service.stdout.log"), join(directory, "service.stderr.log")] };
+/** Where scripts/manage-launchd.ts points the macOS LaunchAgent logs. Other hosts pass `--log-dir`. */
+export function defaultLogDirectory(home: string): string {
+  return join(home, "Library", "Logs", "AgentTag");
+}
+
+/** Top-level files in the log directory (including rotated logs). An unreadable directory yields none. */
+async function listLogFiles(directory: string): Promise<string[]> {
+  try {
+    const entries = await readdir(directory, { withFileTypes: true });
+    return entries
+      .filter((entry) => entry.isFile() || entry.isSymbolicLink())
+      .map((entry) => join(directory, entry.name))
+      .sort();
+  } catch {
+    return [];
+  }
 }
 
 const DATABASE_SUFFIXES = ["", "-wal", "-shm"] as const;
@@ -187,7 +199,9 @@ export interface SecurityAuditOptions {
   readonly ownerUid?: number | undefined;
   /** Skip the T3 session request (scope and expiry). */
   readonly offline?: boolean;
+  /** Directory holding the service logs; defaults to the macOS LaunchAgent location. */
   readonly logDirectory?: string;
+  /** Log files to check; defaults to every top-level file in `logDirectory`. */
   readonly logFiles?: readonly string[];
   readonly inspectSession?: (input: { readonly baseUrl: string; readonly tokenFile: string }) => Promise<T3SessionFacts>;
 }
@@ -204,9 +218,8 @@ export async function runSecurityAudit(options: SecurityAuditOptions): Promise<S
   const now = options.now ?? new Date();
   const home = options.home ?? homedir();
   const ownerUid = "ownerUid" in options ? options.ownerUid : process.getuid?.();
-  const logs = defaultLogPaths(home);
-  const logDirectory = options.logDirectory ?? logs.directory;
-  const logFiles = options.logFiles ?? logs.files;
+  const logDirectory = options.logDirectory ?? defaultLogDirectory(home);
+  const logFiles = options.logFiles ?? (await listLogFiles(logDirectory));
   const findings: SecurityFinding[] = [];
   const finish = (): SecurityReport => summarizeFindings(findings, now.toISOString());
 

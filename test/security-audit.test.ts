@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { chmod, mkdir, mkdtemp, realpath, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -21,7 +21,7 @@ import {
 } from "../src/security/audit.ts";
 import { canonicalPath, readAuditInputs, runSecurityAudit } from "../src/security/audit-run.ts";
 import { T3HttpError } from "../src/t3/auth.ts";
-import { parseCliArguments } from "../src/security/cli.ts";
+import { parseCliArguments, runSecurityCli } from "../src/security/cli.ts";
 
 const uid = 501;
 const now = "2026-09-21T00:00:00.000Z";
@@ -65,6 +65,9 @@ describe("file permission checks", () => {
       "info:data-directory-missing",
     ]);
     expect(checkPathPermissions({ path: "/x", role: "log", state: { kind: "missing" } }, uid)).toEqual([]);
+    const noLogs = checkPathPermissions({ path: "/x", role: "log-directory", state: { kind: "missing" } }, uid);
+    expect(ids(noLogs)).toEqual(["low:log-directory-missing"]);
+    expect(noLogs[0]?.remediation).toContain("--log-dir");
     expect(checkPathPermissions({ path: "/x", role: "secret-file", state: { kind: "file", mode: 0o600, uid: 0 } }, undefined)).toEqual([]);
   });
 
@@ -309,6 +312,13 @@ describe("config checks", () => {
     expect(parsed.positionals).toEqual(["audit", "/c.json"]);
     expect([...parsed.flags]).toEqual(["--json"]);
     expect(() => parseCliArguments(["--force"], ["--json"])).toThrow("unknown option --force");
+    expect([...parseCliArguments(["audit", "--log-dir", "/var/log/at", "/c"], [], ["--log-dir"]).values]).toEqual([
+      ["--log-dir", "/var/log/at"],
+    ]);
+    expect(parseCliArguments(["--log-dir=/l", "/c"], [], ["--log-dir"]).values.get("--log-dir")).toBe("/l");
+    expect(() => parseCliArguments(["/c", "--log-dir"], [], ["--log-dir"])).toThrow("needs a value");
+    expect(() => parseCliArguments(["--log-dir", "--json"], ["--json"], ["--log-dir"])).toThrow("needs a value");
+    expect(() => parseCliArguments(["--json=1"], ["--json"])).toThrow("unknown option --json=1");
   });
 });
 
@@ -558,6 +568,36 @@ describe("security audit run", () => {
       const store = atRest.find((finding) => finding.path?.endsWith("agent-tag.sqlite"));
       expect(store?.remediation).toContain("#purging-content-from-the-store");
       expect(atRest.find((finding) => finding.path?.endsWith(".log"))?.remediation).not.toContain("VACUUM");
+    });
+  });
+
+  test("checks every file in a custom log directory and says when no logs were found", async () => {
+    await withHost(async ({ root, configPath }) => {
+      const missing = await runSecurityAudit({ configPath, now: new Date(now), home: "/nonexistent-home", offline: true });
+      expect(ids(missing.findings)).toContain("low:log-directory-missing");
+
+      const logs = join(root, "var-log");
+      await mkdir(logs, { mode: 0o700 });
+      await writeFile(join(logs, "agent-tag.log"), "{}\n", { mode: 0o600 });
+      await writeFile(join(logs, "agent-tag.log.1"), `x xoxb-${"C3".repeat(15)} x`, { mode: 0o644 });
+      const custom = await runSecurityAudit({ configPath, now: new Date(now), home: "/nonexistent-home", offline: true, logDirectory: logs });
+      expect(ids(custom.findings)).not.toContain("low:log-directory-missing");
+      expect(custom.findings.filter((finding) => finding.id === "log-world-accessible").map((finding) => finding.path)).toEqual([
+        join(logs, "agent-tag.log.1"),
+      ]);
+      expect(ids(custom.findings)).toContain("high:secret-at-rest");
+
+      const printed: string[] = [];
+      const log = spyOn(console, "log").mockImplementation((line: string) => {
+        printed.push(line);
+      });
+      try {
+        expect(await runSecurityCli(["security", "audit", configPath, "--json", "--offline", "--log-dir", logs])).toBe(1);
+      } finally {
+        log.mockRestore();
+      }
+      const report = JSON.parse(printed.join("\n")) as { findings: Array<{ id: string; path?: string }> };
+      expect(report.findings.some((finding) => finding.id === "log-world-accessible" && finding.path === join(logs, "agent-tag.log.1"))).toBe(true);
     });
   });
 });

@@ -78,6 +78,9 @@ Even in tier 2, the agent can still push to anything its own credentials reach, 
 ```sh
 bun run security:audit -- /absolute/path/to/agent-tag.json          # human-readable report
 bun run security:audit -- /absolute/path/to/agent-tag.json --json   # machine-readable report
+bun run security:audit -- /absolute/path/to/agent-tag.json --log-dir /var/log/agent-tag  # logs outside the macOS LaunchAgent
 ```
+
+Run it as the Agent Tag service user. In a tier 2 layout, another account cannot inspect the secret files, so the audit reports them as unreadable and fails.
 
 See [operations](docs/operations.md#security-audit) for every check and its severity. The command exits non-zero when any finding is `high`.
