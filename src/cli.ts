@@ -1,17 +1,29 @@
+#!/usr/bin/env bun
 import { resolve } from "node:path";
 
+import { runDoctorCommand, runOnboardCommand, runServiceCommand } from "./cli-commands.ts";
 import { loadConfig } from "./config.ts";
 import { isDistributionCommand, processDistributionContext, runDistributionCommand } from "./distribution.ts";
-import { createAgentTagService, diagnoseAgentTag } from "./service.ts";
+import { createAgentTagService } from "./service.ts";
 import { AgentTagSchedules } from "./scheduler.ts";
 import { AgentTagStore } from "./store/store.ts";
 
-const USAGE =
-  "usage: agent-tag <run|doctor|status|audit|backup> CONFIG [ARG] | agent-tag restore BACKUP NEW_DATA_DIR | agent-tag schedule-<add|list|cancel> CONFIG TASK ACTOR PROFILE [SPEC_OR_ID] | agent-tag <version|update|help>";
+const USAGE = [
+  "usage:",
+  "  agent-tag onboard [--yes --accept-risk ...]",
+  "  agent-tag doctor [CONFIG] [--fix] [--json]",
+  "  agent-tag service <install|upgrade|uninstall|status|restart|logs> [CONFIG] [--lines N] [--follow]",
+  "  agent-tag <run|status|audit|backup> CONFIG [ARG]",
+  "  agent-tag restore BACKUP NEW_DATA_DIR",
+  "  agent-tag schedule-<add|list|cancel> CONFIG TASK ACTOR PROFILE [SPEC_OR_ID]",
+  "  agent-tag <version|update|help>",
+].join("\n");
 
-const CONFIG_COMMANDS = new Set([
-  "run",
+const KNOWN_COMMANDS = new Set([
+  "onboard",
   "doctor",
+  "service",
+  "run",
   "status",
   "audit",
   "backup",
@@ -43,11 +55,26 @@ const command = process.argv[2];
 if (isDistributionCommand(command)) {
   process.exit(await runDistributionCommand(process.argv.slice(2), processDistributionContext()));
 }
-if (command === undefined || !CONFIG_COMMANDS.has(command)) usage(`unknown command: ${String(command)}`);
+if (command === undefined || !KNOWN_COMMANDS.has(command)) usage(`unknown command: ${String(command)}`);
 const configArgument = process.argv[3];
-if (configArgument === undefined) usage(`${command} requires an argument`);
 
-if (command === "restore") {
+const operatorCommands = new Map<string, (argv: readonly string[]) => Promise<number>>([
+  ["onboard", runOnboardCommand],
+  ["doctor", runDoctorCommand],
+  ["service", runServiceCommand],
+]);
+const operatorCommand = command === undefined ? undefined : operatorCommands.get(command);
+
+if (operatorCommand !== undefined) {
+  try {
+    process.exitCode = await operatorCommand(process.argv.slice(3));
+  } catch (error) {
+    console.error(`agent-tag ${command}: ${error instanceof Error ? error.message : String(error)}`);
+    process.exitCode = 1;
+  }
+} else if (configArgument === undefined) {
+  usage(`${command} requires an argument`);
+} else if (command === "restore") {
   const destinationDirectory = process.argv[4];
   if (destinationDirectory === undefined) usage();
   await AgentTagStore.restoreBackup({
@@ -57,7 +84,6 @@ if (command === "restore") {
 } else {
   if (
     command !== "run" &&
-    command !== "doctor" &&
     command !== "status" &&
     command !== "audit" &&
     command !== "backup" &&
@@ -66,9 +92,7 @@ if (command === "restore") {
     command !== "schedule-cancel"
   ) usage();
   const config = await loadConfig(resolve(configArgument));
-  if (command === "doctor") {
-    console.log(JSON.stringify(await diagnoseAgentTag(config), null, 2));
-  } else if (command === "status") {
+  if (command === "status") {
     const store = await AgentTagStore.open(resolve(config.dataDir, "agent-tag.sqlite"));
     try {
       console.log(JSON.stringify(store.operationalStatus(new Date().toISOString()), null, 2));
