@@ -1,6 +1,7 @@
 import type { AgentTagConfig } from "./config.ts";
 import { ExecutionAuthorityDenied, requireExecutionAuthority } from "./policy/execution.ts";
 import { AgentTagMemory } from "./memory.ts";
+import { escapeSlackText, markdownToMrkdwn, renderCodeBlock, splitForSlack, truncateBlockText } from "./slack/render.ts";
 import type { AgentTagStore, ClaimedOperation, SlackOutboxPayload } from "./store/store.ts";
 import {
   dispatchT3Command,
@@ -181,16 +182,22 @@ function snapshotHasCurrentTurn(snapshot: T3ThreadSnapshot, messageId: string): 
     new Date(latestTurn.requestedAt).getTime() >= new Date(userMessage.createdAt).getTime();
 }
 
-function escapeSlackText(text: string): string {
-  return text.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
-}
-
-function approvalMessage(interactionId: string, approval: T3PendingApproval): SlackOutboxPayload {
-  const detail = approval.detail === undefined ? "The agent requested permission." : escapeSlackText(approval.detail);
+export function approvalMessage(interactionId: string, approval: T3PendingApproval): SlackOutboxPayload {
+  const detail = approval.detail === undefined
+    ? "The agent requested permission."
+    : approval.detail.includes("\n")
+    ? renderCodeBlock(approval.detail)
+    : escapeSlackText(approval.detail);
   return {
-    text: `Approval required: ${approval.requestKind}`,
+    text: truncateBlockText(`Approval required: ${escapeSlackText(approval.requestKind)}`),
     blocks: [
-      { type: "section", text: { type: "mrkdwn", text: `*Approval required* · ${approval.requestKind}\n${detail}` } },
+      {
+        type: "section",
+        text: {
+          type: "mrkdwn",
+          text: truncateBlockText(`*Approval required* · ${escapeSlackText(approval.requestKind)}\n${detail}`),
+        },
+      },
       {
         type: "actions",
         block_id: `agent-tag:${interactionId}`,
@@ -222,7 +229,8 @@ function approvalMessage(interactionId: string, approval: T3PendingApproval): Sl
 }
 
 function truncateText(text: string, max: number): string {
-  return text.length <= max ? text : `${text.slice(0, max - 1)}…`;
+  const chars = Array.from(text);
+  return chars.length <= max ? text : `${chars.slice(0, max - 1).join("")}…`;
 }
 
 /**
@@ -257,9 +265,8 @@ export function questionMessage(interactionId: string, request: T3PendingUserInp
       type: "section",
       text: {
         type: "mrkdwn",
-        text: truncateText(
+        text: truncateBlockText(
           [`*${prefix}${escapeSlackText(question.header)}*`, escapeSlackText(question.question), ...optionLines].join("\n"),
-          3_000,
         ),
       },
     });
@@ -306,8 +313,8 @@ export function questionMessage(interactionId: string, request: T3PendingUserInp
   const first = request.questions[0];
   return {
     text: total === 1 && first !== undefined
-      ? `Question from the agent: ${first.question}`
-      : `The agent has ${total} questions: ${request.questions.map((question) => question.question).join(" / ")}`,
+      ? truncateBlockText(`Question from the agent: ${escapeSlackText(first.question)}`)
+      : truncateBlockText(`The agent has ${total} questions: ${request.questions.map((question) => escapeSlackText(question.question)).join(" / ")}`),
     blocks,
   };
 }
@@ -629,7 +636,7 @@ export class AgentTagCoordinator {
           resultSequence: Math.max(turn.sequence, snapshot.snapshotSequence),
           conversationId: operation.payload.conversationId,
           threadTs: operation.payload.threadTs,
-          text: assistant.text,
+          text: splitForSlack(markdownToMrkdwn(assistant.text)),
           now: this.#now().toISOString(),
         });
         return { kind: "completed", operationId: operation.operationId, outboxId };

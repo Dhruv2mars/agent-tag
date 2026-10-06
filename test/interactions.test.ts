@@ -278,6 +278,57 @@ describe("durable interactions", () => {
     });
   });
 
+  test("resolves an option-index answer from the stored prompt", async () => {
+    await withStore(async ({ store }) => {
+      const seeded = seedOperation(store);
+      const hugeLabel = "y".repeat(2_500);
+      const question = store.recordPendingInteraction({
+        ...seeded,
+        requestId: "question-big",
+        kind: "user-input",
+        prompt: {
+          requestId: "question-big",
+          dismissible: false,
+          questions: [{ id: "pkg", header: "Pick", question: "Which?", options: [{ label: "a" }, { label: hugeLabel }], multiSelect: false }],
+        },
+        conversationId: "C1",
+        threadTs: "1000.000001",
+        message: () => ({ text: "question" }),
+        now,
+      });
+      const router = new SlackActionRouter({ config, store, now: () => now });
+      expect(
+        router.ingest(
+          actionBody({
+            actionId: "agent-tag.user-input.answer",
+            value: JSON.stringify({ interactionId: question.interactionId, questionId: "pkg", optionIndex: 9 }),
+          }),
+        ),
+      ).toEqual({ kind: "ignored", reason: "invalid-action" });
+      expect(
+        router.ingest(
+          actionBody({
+            actionId: "agent-tag.user-input.answer",
+            value: JSON.stringify({ interactionId: question.interactionId, questionId: "pkg", optionIndex: 1 }),
+            actionTs: "1000.000022",
+          }),
+        ).kind,
+      ).toBe("accepted");
+      const commands: T3Command[] = [];
+      const t3: T3InteractionGateway = {
+        dispatch: async (command) => {
+          commands.push(command);
+          return { sequence: commands.length };
+        },
+      };
+      const worker = new InteractionWorker({ config, store, t3, workerId: "interaction-b", now: () => new Date(now) });
+      expect((await worker.processNext()).kind).toBe("resolved");
+      expect(commands).toContainEqual(
+        expect.objectContaining({ type: "thread.user-input.respond", answers: { pkg: hugeLabel } }),
+      );
+    });
+  });
+
   test("turn cancellation is authorized, durable, and dispatched as an interrupt", async () => {
     await withStore(async ({ store }) => {
       const seeded = seedOperation(store);

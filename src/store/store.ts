@@ -1813,7 +1813,8 @@ export class AgentTagStore {
     readonly resultSequence: number;
     readonly conversationId: string;
     readonly threadTs: string;
-    readonly text: string;
+    /** One reply, or ordered Slack-sized chunks of one reply (see splitForSlack). */
+    readonly text: string | readonly string[];
     readonly now: string;
   }): string {
     const now = isoDateTime.parse(input.now);
@@ -1840,33 +1841,45 @@ export class AgentTagStore {
         );
       if (result.changes !== 1) throw new Error("operation lease is missing, expired, or owned by another worker");
 
-      const clientMessageId = `${operationId}:final`;
-      const prior = outboxIdentitySchema.nullable().parse(
-        this.#database
-          .query("SELECT outbox_id FROM slack_outbox WHERE client_message_id = ?")
-          .get(clientMessageId),
-      );
-      const outboxId = prior?.outbox_id ?? crypto.randomUUID();
-      if (prior === null) {
-        this.#database
-          .query(
-            `INSERT INTO slack_outbox (
-              outbox_id, task_id, correlation_id, conversation_id, thread_ts,
-              client_message_id, payload_json, status, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
-          )
-          .run(
-            outboxId,
-            taskId,
-            operationId,
-            requiredId(input.conversationId, "conversationId"),
-            requiredId(input.threadTs, "threadTs"),
-            clientMessageId,
-            JSON.stringify(outboxPayloadSchema.parse({ text: input.text })),
-            now,
-            now,
-          );
-      }
+      // A single reply keeps the historical `:final` id; chunked replies get stable
+      // `:final-1..n` ids. Chunks are spaced 1ms apart so the outbox claim order
+      // (created_at first) delivers them in sequence.
+      const texts = typeof input.text === "string" ? [input.text] : [...input.text];
+      if (texts.length === 0) throw new Error("final reply must have at least one chunk");
+      const outboxIds = texts.map((text, index) => {
+        const clientMessageId = texts.length === 1 ? `${operationId}:final` : `${operationId}:final-${index + 1}`;
+        const createdAt = new Date(new Date(now).getTime() + index).toISOString();
+        const prior = outboxIdentitySchema.nullable().parse(
+          this.#database
+            .query("SELECT outbox_id FROM slack_outbox WHERE client_message_id = ?")
+            .get(clientMessageId),
+        );
+        const outboxId = prior?.outbox_id ?? crypto.randomUUID();
+        if (prior === null) {
+          this.#database
+            .query(
+              `INSERT INTO slack_outbox (
+                outbox_id, task_id, correlation_id, conversation_id, thread_ts,
+                client_message_id, payload_json, status, created_at, updated_at
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
+            )
+            .run(
+              outboxId,
+              taskId,
+              operationId,
+              requiredId(input.conversationId, "conversationId"),
+              requiredId(input.threadTs, "threadTs"),
+              clientMessageId,
+              JSON.stringify(outboxPayloadSchema.parse({ text })),
+              createdAt,
+              createdAt,
+            );
+        }
+        return { outboxId, clientMessageId };
+      });
+      const first = outboxIds[0];
+      if (first === undefined) throw new Error("final reply must have at least one chunk");
+      const outboxId = first.outboxId;
       writeAudit(this.#database, {
         actorType: "worker",
         actorId: input.workerId,
@@ -1888,7 +1901,7 @@ export class AgentTagStore {
         action: "slack.outbox.enqueued",
         result: "pending",
         correlationId: operationId,
-        metadata: { clientMessageId },
+        metadata: { clientMessageId: first.clientMessageId, chunks: outboxIds.length },
         createdAt: now,
       });
       return outboxId;
@@ -2398,6 +2411,7 @@ export class AgentTagStore {
     });
     return record.immediate();
   }
+
 
   submitInteractionResponse(input: {
     readonly interactionId: string;
