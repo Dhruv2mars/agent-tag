@@ -58,14 +58,24 @@ export function escapeSlackText(text: string): string {
 }
 
 /**
+ * Break every run of three or more backticks with U+200B (after each pair) so
+ * code content can never close a Slack code block, wherever it sits on a line.
+ */
+function breakFences(text: string): string {
+  return text.replace(/`{3,}/g, (run) => (run.match(/``?/g) ?? []).join(MENTION_BREAK));
+}
+
+/** Entity-escape one line of code-block content and break embedded fences. */
+function escapeCodeLine(line: string): string {
+  return breakFences(escapeEntities(line));
+}
+
+/**
  * Render untrusted verbatim text (commands, diffs) as a Slack code block. Only
- * entity escaping is applied; nested ``` lines are broken with U+200B.
+ * entity escaping is applied; embedded ``` sequences are broken with U+200B.
  */
 export function renderCodeBlock(text: string): string {
-  const body = escapeEntities(text.replace(PRIVATE_SENTINELS, "").replace(/\r\n?/g, "\n"))
-    .split("\n")
-    .map((line) => line.replace(/^(\s*)```/, "$1``\u200B`"))
-    .join("\n");
+  const body = escapeCodeLine(text.replace(PRIVATE_SENTINELS, "").replace(/\r\n?/g, "\n"));
   return `\`\`\`\n${body}\n\`\`\``;
 }
 
@@ -85,6 +95,7 @@ function renderLink(label: string, url: string): string {
 
 function convertEmphasis(text: string): string {
   return text
+    .replace(/\*\*\*(?=\S)([^\n]*?\S)\*\*\*/g, `${BOLD_OPEN}_$1_${BOLD_CLOSE}`)
     .replace(/\*\*(?=\S)([^\n]*?\S)\*\*/g, `${BOLD_OPEN}$1${BOLD_CLOSE}`)
     .replace(/(^|[^\w])__(?=\S)([^\n]*?\S)__(?!\w)/g, `$1${BOLD_OPEN}$2${BOLD_CLOSE}`)
     .replace(/~~(?=\S)([^\n]*?\S)~~/g, "~$1~")
@@ -96,21 +107,24 @@ function convertEmphasis(text: string): string {
 /** Convert one Markdown line (outside code fences and tables) to mrkdwn. */
 function convertInline(line: string): string {
   const tokens: string[] = [];
-  const hold = (rendered: string): string => {
+  // Raw text of each held token, used where formatting is impossible (link labels).
+  const plain: string[] = [];
+  const placeholder = new RegExp(`${PLACEHOLDER_OPEN}(\\d+)${PLACEHOLDER_CLOSE}`, "g");
+  const hold = (rendered: string, raw: string): string => {
     tokens.push(rendered);
+    plain.push(raw);
     return `${PLACEHOLDER_OPEN}${tokens.length - 1}${PLACEHOLDER_CLOSE}`;
   };
   const protectedLine = line
-    .replace(/`([^`\n]+)`/g, (_match, code: string) => hold(`\`${escapeEntities(code)}\``))
-    .replace(/!?\[([^\]\n]*)\]\(\s*<?((?:[^()\s>]|\([^()\s>]*\))+)>?(?:\s+"[^"\n]*")?\s*\)/g, (_match, label: string, url: string) =>
-      hold(renderLink(label, url))
-    )
-    .replace(/<((?:https?:\/\/|mailto:)[^>\s|]+)>/gi, (_match, url: string) => hold(`<${escapeUrl(url)}>`));
+    .replace(/`([^`\n]+)`/g, (_match, code: string) => hold(`\`${escapeEntities(code)}\``, code))
+    .replace(/!?\[([^\]\n]*)\]\(\s*<?((?:[^()\s>]|\([^()\s>]*\))+)>?(?:\s+"[^"\n]*")?\s*\)/g, (_match, label: string, url: string) => {
+      // Slack link labels cannot carry formatting: inline code becomes plain label text.
+      const rawLabel = label.replace(placeholder, (_token, index: string) => plain[Number(index)] ?? "");
+      return hold(renderLink(rawLabel, url), rawLabel);
+    })
+    .replace(/<((?:https?:\/\/|mailto:)[^>\s|]+)>/gi, (_match, url: string) => hold(`<${escapeUrl(url)}>`, url));
   const rendered = convertEmphasis(escapeEntities(neutralizeMentions(protectedLine)));
-  return rendered.replace(
-    new RegExp(`${PLACEHOLDER_OPEN}(\\d+)${PLACEHOLDER_CLOSE}`, "g"),
-    (_match, index: string) => tokens[Number(index)] ?? "",
-  );
+  return rendered.replace(placeholder, (_match, index: string) => tokens[Number(index)] ?? "");
 }
 
 function convertLine(line: string): string {
@@ -158,8 +172,8 @@ export function markdownToMrkdwn(markdown: string): string {
           (close[2] ?? "").trim() === "") {
           break;
         }
-        // A nested ``` line would end Slack's code block early; break it with U+200B.
-        output.push(escapeEntities(inner).replace(/^(\s*)```/, "$1``\u200B`"));
+        // Any embedded ``` would end Slack's code block early; break it with U+200B.
+        output.push(escapeCodeLine(inner));
       }
       output.push("```");
       continue;
@@ -167,7 +181,7 @@ export function markdownToMrkdwn(markdown: string): string {
     if (TABLE_ROW.test(line) && TABLE_SEPARATOR.test(lines[index + 1] ?? "")) {
       output.push("```");
       while (index < lines.length && TABLE_ROW.test(lines[index] ?? "")) {
-        output.push(escapeEntities((lines[index] ?? "").trim()));
+        output.push(escapeCodeLine((lines[index] ?? "").trim()));
         index += 1;
       }
       output.push("```");
@@ -197,10 +211,26 @@ function safeCutLength(text: string, max: number): number {
   return cut > 0 ? cut : Math.min(max, text.length);
 }
 
+const RENDERED_LINK = /<([^<>|\s]+)(?:\|([^<>]*))?>/g;
+
+/**
+ * Replace every `<url|label>` link longer than `max` with plain text ("label (url)")
+ * so it can be wrapped without leaving a partial `<...>` fragment in any message.
+ * Rendered text only contains `<` as link syntax; everything else is entity-escaped.
+ */
+function unlinkOversized(text: string, max: number): string {
+  if (text.length <= max) return text;
+  return text.replace(RENDERED_LINK, (link, url: string, label: string | undefined) => {
+    if (link.length <= max) return link;
+    const shown = label === undefined || label === "" || label === url ? url : `${label} (${url})`;
+    return neutralizeMentions(shown);
+  });
+}
+
 /** Break a single over-long line into pieces no longer than `max`, preferring whitespace. */
 function hardWrap(line: string, max: number): string[] {
   const pieces: string[] = [];
-  let rest = line;
+  let rest = unlinkOversized(line, max);
   while (rest.length > max) {
     let cut = safeCutLength(rest, max);
     // Prefer the last space, but only one whose cut is itself outside any link or entity.
@@ -247,6 +277,16 @@ export function splitForSlack(text: string, limit = SLACK_MESSAGE_TEXT_LIMIT): s
     const endsInFence = fenceStateAfter(openedInFence, body);
     while (body.length > 0 && body[body.length - 1] === "" && !endsInFence) body.pop();
     const parts = [...(openedInFence ? ["```"] : []), ...body, ...(endsInFence ? ["```"] : [])];
+    // Drop empty code blocks at chunk edges: a reopen immediately closed by the
+    // source fence, or a source fence opened on the chunk's last line.
+    if (openedInFence && body.length > 0 && isFenceToggle(body[0] ?? "")) {
+      parts.splice(0, 2);
+      while (parts[0] === "") parts.shift();
+    }
+    if (endsInFence && body.length > 0 && isFenceToggle(body[body.length - 1] ?? "")) {
+      parts.splice(-2, 2);
+      while (parts.length > 0 && parts[parts.length - 1] === "") parts.pop();
+    }
     chunks.push(parts.join("\n"));
     const rest = current.slice(count);
     while (rest.length > 0 && rest[0] === "" && !endsInFence) rest.shift();
@@ -287,7 +327,11 @@ export function truncateBlockText(text: string, limit = SLACK_SECTION_TEXT_LIMIT
   const note = (omitted: number): string => `…\n_(truncated ${omitted} more characters)_`;
   const reserve = note(text.length).length + "\n```".length + 1;
   if (limit <= reserve) throw new Error("truncateBlockText limit is too small");
-  let cut = safeCutLength(text, limit - reserve);
+  const budget = limit - reserve;
+  // A link longer than the budget would be cut mid-syntax; render it as plain text instead.
+  const linkSafe = unlinkOversized(text, budget);
+  if (linkSafe !== text) return truncateBlockText(linkSafe, limit);
+  let cut = safeCutLength(text, budget);
   const newline = text.lastIndexOf("\n", cut);
   if (newline > cut * 0.8) cut = newline;
   const head = text.slice(0, cut);

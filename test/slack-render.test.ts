@@ -134,6 +134,41 @@ describe("markdownToMrkdwn", () => {
     );
   });
 
+  test("keeps inline code inside link labels as plain label text", () => {
+    expect(markdownToMrkdwn("[the `foo` docs](https://example.com)")).toBe("<https://example.com|the foo docs>");
+    expect(markdownToMrkdwn("[`a<b>` and `*x*`](https://e.com) then `c`")).toBe(
+      "<https://e.com|a&lt;b&gt; and *x*> then `c`",
+    );
+    expect(markdownToMrkdwn("[`<!here>`](https://e.com)")).toBe(`<https://e.com|@${ZWSP}here>`);
+    expect(markdownToMrkdwn("[run `x`](javascript:x)")).toBe("run x (javascript:x)");
+  });
+
+  test("breaks triple backticks anywhere inside fenced code and tables", () => {
+    const rendered = markdownToMrkdwn(
+      ["```", "echo ``` done", "a ```` b `` c", "```", "| a | b |", "|---|---|", "| x```y | z |"].join("\n"),
+    );
+    expect(rendered.split("\n")).toEqual([
+      "```",
+      `echo \`\`${ZWSP}\` done`,
+      `a \`\`${ZWSP}\`\` b \`\` c`,
+      "```",
+      "```",
+      "| a | b |",
+      "|---|---|",
+      `| x\`\`${ZWSP}\`y | z |`,
+      "```",
+    ]);
+    for (const line of rendered.split("\n")) {
+      if (line !== "```") expect(line).not.toContain("```");
+    }
+  });
+
+  test("converts bold+italic triple emphasis", () => {
+    expect(markdownToMrkdwn("***both*** and ___both___ and **bold** *it*")).toBe(
+      "*_both_* and *_both_* and *bold* _it_",
+    );
+  });
+
   test("handles unicode text and emphasis", () => {
     expect(markdownToMrkdwn("**héllo 世界 🎉** _ñ_ ~~émoji 👩‍💻~~")).toBe("*héllo 世界 🎉* _ñ_ ~émoji 👩‍💻~");
   });
@@ -162,6 +197,12 @@ describe("escapeSlackText", () => {
 describe("renderCodeBlock", () => {
   test("wraps verbatim text and breaks nested fences", () => {
     expect(renderCodeBlock("a <b>\n```\nc")).toBe(`\`\`\`\na &lt;b&gt;\n\`\`${ZWSP}\`\nc\n\`\`\``);
+  });
+
+  test("breaks triple backticks embedded mid-line", () => {
+    expect(renderCodeBlock("run ```x``` now\n``````")).toBe(
+      `\`\`\`\nrun \`\`${ZWSP}\`x\`\`${ZWSP}\` now\n\`\`${ZWSP}\`\`${ZWSP}\`\`\n\`\`\``,
+    );
   });
 });
 
@@ -231,6 +272,63 @@ describe("splitForSlack", () => {
     const nearPieces = splitForSlack(near).map((chunk) => chunk.replace(/\n\(\d+\/\d+\)$/, ""));
     expect(nearPieces.some((piece) => piece.includes("<https://a.com|a b c d>"))).toBe(true);
     expect(nearPieces.join("")).toBe(near);
+  });
+
+  test("renders a link longer than the chunk budget as plain text instead of splitting it", () => {
+    const url = `https://example.com/${"p".repeat(300)}?a=1&amp;b=2`;
+    const assertNoPartialLinks = (chunks: string[]): void => {
+      for (const chunk of chunks) {
+        expect(chunk.length).toBeLessThanOrEqual(100);
+        expect(chunk).not.toContain("<");
+        expect(chunk).not.toContain(">");
+      }
+    };
+    const labelled = splitForSlack(`<${url}|the label> tail`, 100);
+    assertNoPartialLinks(labelled);
+    expect(labelled.map((chunk) => chunk.replace(/\n\(\d+\/\d+\)$/, "")).join("")).toBe(`the label (${url}) tail`);
+    const bare = splitForSlack(`intro\n<${url}>`, 100);
+    assertNoPartialLinks(bare);
+    expect(bare.map((chunk) => chunk.replace(/\n\(\d+\/\d+\)$/, "")).join("")).toBe(`intro${url}`);
+    const rendered = markdownToMrkdwn(`[docs @here](https://e.com/${"q".repeat(4_000)})`);
+    const chunks = splitForSlack(rendered);
+    expect(chunks.length).toBeGreaterThan(1);
+    for (const chunk of chunks) {
+      expect(chunk.length).toBeLessThanOrEqual(3_500);
+      expect(chunk).not.toMatch(/[<>]/);
+      assertNoControlSequences(chunk);
+    }
+    expect(chunks[0]?.startsWith(`docs @${ZWSP}here (https://e.com/qqq`)).toBe(true);
+  });
+
+  test("never emits empty code blocks at chunk edges", () => {
+    const opensAtEnd = ["a".repeat(70), "```", "b".repeat(70), "```", "c"].join("\n");
+    const closesAtStart = ["```", "b".repeat(76), "```", "c", "d".repeat(30)].join("\n");
+    for (const text of [opensAtEnd, closesAtStart]) {
+      const chunks = splitForSlack(text, 100);
+      expect(chunks.length).toBeGreaterThan(1);
+      for (const chunk of chunks) {
+        expect(chunk.length).toBeLessThanOrEqual(100);
+        expect(fenceCount(chunk) % 2).toBe(0);
+        expect(chunk).not.toMatch(/(^|\n)```\n```(\n|$)/);
+      }
+      const lines = chunks.flatMap((chunk) => chunk.split("\n"));
+      expect(lines).toContain("b".repeat(text === opensAtEnd ? 70 : 76));
+      expect(lines).toContain("c");
+    }
+    expect(splitForSlack(opensAtEnd, 100)).toEqual([
+      `${"a".repeat(70)}\n(1/2)`,
+      `\`\`\`\n${"b".repeat(70)}\n\`\`\`\nc\n(2/2)`,
+    ]);
+  });
+});
+
+describe("truncateBlockText oversized links", () => {
+  test("renders a link longer than the budget as plain text, never a partial <...>", () => {
+    const truncated = truncateBlockText(`<https://e.com/${"z".repeat(5_000)}|label> after`);
+    expect(truncated.length).toBeLessThanOrEqual(3_000);
+    expect(truncated).not.toMatch(/[<>]/);
+    expect(truncated.startsWith("label (https://e.com/zzz")).toBe(true);
+    expect(truncated).toMatch(/_\(truncated \d+ more characters\)_$/);
   });
 });
 
