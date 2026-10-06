@@ -571,3 +571,13 @@ describe("coordinator final replies", () => {
     }
   });
 });
+
+describe("markdownToMrkdwn code preservation", () => {
+  test("keeps underscores inside code spans in headings", () => {
+    expect(markdownToMrkdwn("# `__init__` and **bold**")).toBe("*`__init__` and bold*");
+  });
+
+  test("keeps backticks inside link destinations", () => {
+    expect(markdownToMrkdwn("[file](https://example.com/`file`)")).toBe("<https://example.com/`file`|file>");
+  });
+});

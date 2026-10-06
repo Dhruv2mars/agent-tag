@@ -119,8 +119,10 @@ function convertInline(line: string): string {
     .replace(/`([^`\n]+)`/g, (_match, code: string) => hold(`\`${escapeEntities(code)}\``, code))
     .replace(/!?\[([^\]\n]*)\]\(\s*<?((?:[^()\s>]|\([^()\s>]*\))+)>?(?:\s+"[^"\n]*")?\s*\)/g, (_match, label: string, url: string) => {
       // Slack link labels cannot carry formatting: inline code becomes plain label text.
+      const restore = (text: string): string => text.replace(placeholder, (_token, index: string) => `\`${plain[Number(index)] ?? ""}\``);
       const rawLabel = label.replace(placeholder, (_token, index: string) => plain[Number(index)] ?? "");
-      return hold(renderLink(rawLabel, url), rawLabel);
+      // Backticks inside a destination are literal URL characters, not code spans.
+      return hold(renderLink(rawLabel, restore(url)), rawLabel);
     })
     .replace(/<((?:https?:\/\/|mailto:)[^>\s|]+)>/gi, (_match, url: string) => hold(`<${escapeUrl(url)}>`, url));
   const rendered = convertEmphasis(escapeEntities(neutralizeMentions(protectedLine)));
@@ -130,7 +132,11 @@ function convertInline(line: string): string {
 function convertLine(line: string): string {
   const heading = /^\s{0,3}#{1,6}\s+(.*?)\s*#*\s*$/.exec(line);
   if (heading !== null) {
-    const content = (heading[1] ?? "").replace(/\*\*|__/g, "");
+    // Drop bold markers (the whole heading is bolded) but leave code spans untouched.
+    const content = (heading[1] ?? "")
+      .split(/(`[^`\n]+`)/)
+      .map((part) => (part.startsWith("`") && part.endsWith("`") && part.length > 1 ? part : part.replace(/\*\*|__/g, "")))
+      .join("");
     return content === "" ? "" : `*${convertInline(content)}*`;
   }
   if (/^\s{0,3}([-*_])(\s*\1){2,}\s*$/.test(line)) return "──────────";
