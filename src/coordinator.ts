@@ -229,7 +229,8 @@ export function approvalMessage(interactionId: string, approval: T3PendingApprov
 }
 
 function truncateText(text: string, max: number): string {
-  return text.length <= max ? text : `${text.slice(0, max - 1)}…`;
+  const chars = Array.from(text);
+  return chars.length <= max ? text : `${chars.slice(0, max - 1).join("")}…`;
 }
 
 /**

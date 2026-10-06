@@ -102,7 +102,7 @@ function convertInline(line: string): string {
   };
   const protectedLine = line
     .replace(/`([^`\n]+)`/g, (_match, code: string) => hold(`\`${escapeEntities(code)}\``))
-    .replace(/!?\[([^\]\n]*)\]\(\s*<?([^)\s>]+)>?(?:\s+"[^"\n]*")?\s*\)/g, (_match, label: string, url: string) =>
+    .replace(/!?\[([^\]\n]*)\]\(\s*<?((?:[^()\s>]|\([^()\s>]*\))+)>?(?:\s+"[^"\n]*")?\s*\)/g, (_match, label: string, url: string) =>
       hold(renderLink(label, url))
     )
     .replace(/<((?:https?:\/\/|mailto:)[^>\s|]+)>/gi, (_match, url: string) => hold(`<${escapeUrl(url)}>`));
@@ -145,7 +145,8 @@ export function markdownToMrkdwn(markdown: string): string {
       continue;
     }
     const fence = FENCE_LINE.exec(line);
-    if (fence !== null) {
+    // CommonMark: a backtick fence's info string cannot contain backticks.
+    if (fence !== null && !((fence[1] ?? "").startsWith("`") && (fence[2] ?? "").includes("`"))) {
       const marker = fence[1] ?? "```";
       output.push("```");
       index += 1;
@@ -202,8 +203,13 @@ function hardWrap(line: string, max: number): string[] {
   let rest = line;
   while (rest.length > max) {
     let cut = safeCutLength(rest, max);
-    const space = rest.lastIndexOf(" ", cut - 1);
-    if (space > max / 2) cut = space + 1;
+    // Prefer the last space, but only one whose cut is itself outside any link or entity.
+    for (let space = rest.lastIndexOf(" ", cut - 1); space > max / 2; space = rest.lastIndexOf(" ", space - 1)) {
+      if (safeCutLength(rest, space + 1) === space + 1) {
+        cut = space + 1;
+        break;
+      }
+    }
     pieces.push(rest.slice(0, cut));
     rest = rest.slice(cut);
   }

@@ -2412,6 +2412,24 @@ export class AgentTagStore {
     return record.immediate();
   }
 
+  /** Stored prompt for a user-input interaction, used to resolve option-index button values. */
+  interactionPrompt(interactionId: string): unknown {
+    const row = z
+      .object({ prompt_json: z.string() })
+      .nullable()
+      .parse(
+        this.#database
+          .query("SELECT prompt_json FROM interactions WHERE interaction_id = ? AND kind = 'user-input'")
+          .get(interactionId),
+      );
+    if (row === null) return null;
+    try {
+      return JSON.parse(row.prompt_json) as unknown;
+    } catch {
+      return null;
+    }
+  }
+
   submitInteractionResponse(input: {
     readonly interactionId: string;
     readonly workspaceId: string;

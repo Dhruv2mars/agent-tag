@@ -90,6 +90,21 @@ describe("markdownToMrkdwn", () => {
     expect(markdownToMrkdwn("```a **b**```")).toBe("`a **b**`");
   });
 
+  test("does not treat triple-backtick inline code with trailing text as a fence", () => {
+    const rendered = markdownToMrkdwn("```npm i``` then run it\n\n**done**");
+    expect(rendered).toContain("npm i");
+    expect(rendered).toContain("then run it");
+    expect(rendered.endsWith("\n*done*")).toBe(true);
+    expect(markdownToMrkdwn("```x``` trailing text")).toContain("trailing text");
+  });
+
+  test("keeps balanced parentheses in link URLs", () => {
+    expect(markdownToMrkdwn("[w](https://en.wikipedia.org/wiki/Foo_(bar))")).toBe(
+      "<https://en.wikipedia.org/wiki/Foo_(bar)|w>",
+    );
+    expect(markdownToMrkdwn("([w](https://e.com/a))")).toBe("(<https://e.com/a|w>)");
+  });
+
   test("wraps tables in a code block", () => {
     const rendered = markdownToMrkdwn("Results:\n| name | value |\n|---|:---:|\n| **a** | <b> |\nafter");
     expect(rendered).toBe("Results:\n```\n| name | value |\n|---|:---:|\n| **a** | &lt;b&gt; |\n```\nafter");
@@ -205,6 +220,18 @@ describe("splitForSlack", () => {
     expect(pieces.some((piece) => piece.includes("&amp;"))).toBe(true);
     expect(pieces.join("")).toBe(text);
   });
+
+  test("never moves a whitespace cut back inside a link label that contains spaces", () => {
+    const rendered = markdownToMrkdwn(`${"q".repeat(2_000)}[a b](https://a.com)${"z".repeat(3_000)}`);
+    const pieces = splitForSlack(rendered).map((chunk) => chunk.replace(/\n\(\d+\/\d+\)$/, ""));
+    expect(pieces.length).toBeGreaterThan(1);
+    expect(pieces.some((piece) => piece.includes("<https://a.com|a b>"))).toBe(true);
+    expect(pieces.join("")).toBe(rendered);
+    const near = `${"q".repeat(3_400)}<https://a.com|a b c d>${"z".repeat(500)}`;
+    const nearPieces = splitForSlack(near).map((chunk) => chunk.replace(/\n\(\d+\/\d+\)$/, ""));
+    expect(nearPieces.some((piece) => piece.includes("<https://a.com|a b c d>"))).toBe(true);
+    expect(nearPieces.join("")).toBe(near);
+  });
 });
 
 describe("truncateBlockText", () => {
@@ -266,6 +293,36 @@ describe("coordinator cards", () => {
     assertNoControlSequences(section.text.text);
     assertNoControlSequences(card.text);
     expect(card.text.length).toBeLessThanOrEqual(3_000);
+  });
+
+  test("question card buttons stay within Slack label and value limits", () => {
+    const longLabel = "x".repeat(200);
+    const hugeLabel = "y".repeat(2_500);
+    const card = questionMessage("interaction-3", {
+      requestId: "request-3",
+      dismissible: false,
+      questions: [
+        {
+          id: "q1",
+          header: "Pick",
+          question: "Which?",
+          options: [{ label: "short" }, { label: longLabel }, { label: hugeLabel }],
+          multiSelect: false,
+        },
+      ],
+    });
+    const actions = card.blocks?.find((block) => block.type === "actions");
+    if (actions?.type !== "actions") throw new Error("question card has no actions");
+    const buttons = actions.elements.filter((element) => element.action_id === "agent-tag.user-input.answer");
+    expect(buttons).toHaveLength(3);
+    for (const button of buttons) {
+      expect(Array.from(button.text.text).length).toBeLessThanOrEqual(75);
+      expect(button.value.length).toBeLessThanOrEqual(2_000);
+    }
+    expect(buttons[0]?.text.text).toBe("short");
+    expect(buttons[1]?.text.text).toBe(`${"x".repeat(74)}…`);
+    expect(JSON.parse(buttons[1]?.value ?? "")).toEqual({ interactionId: "interaction-3", questionId: "q1", answer: longLabel });
+    expect(JSON.parse(buttons[2]?.value ?? "")).toEqual({ interactionId: "interaction-3", optionIndex: 2 });
   });
 });
 
