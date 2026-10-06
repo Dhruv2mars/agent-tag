@@ -217,7 +217,17 @@ bun run prune -- /absolute/path/to/agent-tag.json --dry-run
 bun run prune -- /absolute/path/to/agent-tag.json
 ```
 
-`prune` is safe to run while the service is running. It prints the cutoffs and row counts as JSON, never content. Pruning does not shrink the SQLite file on disk, and older backups still contain the pruned data, so expire backups on the same schedule.
+`prune` is safe to run while the service is running. It prints the cutoffs and row counts as JSON, never content. Each real prune turns on SQLite `secure_delete`, so the pages it rewrites are zeroed rather than left in free space. It then checkpoints and truncates the write-ahead log (`agent-tag.sqlite-wal`), so old copies of those pages do not stay on disk. If a long read holds the log open for more than 5 seconds, the truncate is skipped and the next prune retries it. Pruning does not shrink the SQLite file on disk, and older backups still contain the pruned data, so expire backups on the same schedule.
+
+### Purging content from the store
+
+`prune` only redacts rows older than the retention window. It never touches interactions, schedules, schedule runs, memory entries, or recent messages. When `security audit` reports `secret-at-rest` on `agent-tag.sqlite` (or its `-wal` file), for example because someone pasted a credential into Slack:
+
+1. Rotate the credential first. Treat it as exposed, whatever happens to the copy on disk.
+2. Stop the service (`bun run service:uninstall`, or your process manager) and copy `dataDir` to a private location.
+3. Overwrite every row that holds the value. Message text can be in `slack_events.text`, `operations.payload_json` and `operations.resolved_text`, `slack_outbox.payload_json`, `interactions`, `memory_entries`, and `schedules`. Use `sqlite3` with `instr()`, and read the value from a file rather than typing it on the command line.
+4. Rebuild the file so no freed page keeps the old bytes. Either run `sqlite3 /path/to/agent-tag.sqlite 'VACUUM'`, or run `bun run backup` (it writes a compacted copy with `VACUUM INTO`) followed by `bun run restore` into a new data directory, and point the config at it.
+5. Start the service, re-run `bun run security:audit`, then delete the copy from step 2 and any older backups that hold the value.
 
 ## DM routes
 

@@ -74,6 +74,8 @@ function count(database: Database, table: string, where: string, cutoff: string)
 /**
  * Applies the configured retention policy. Audit rows are deleted; message bodies are replaced with
  * {@link PRUNED_TEXT} so IDs, idempotency keys, and lease state survive. Runs in one immediate transaction.
+ * Enables `secure_delete` on the connection first so replaced text is zeroed in the pages SQLite rewrites
+ * instead of lingering in free space (Bun's bundled SQLite does not enable it by default on every platform).
  */
 export function pruneRetainedData(
   database: Database,
@@ -81,6 +83,7 @@ export function pruneRetainedData(
 ): PruneResult {
   const cutoffs = retentionCutoffs(input.policy, input.now);
   const dryRun = input.dryRun ?? false;
+  if (!dryRun) database.exec("PRAGMA secure_delete = ON");
   const run = database.transaction((): PruneResult => {
     let auditDeleted = 0;
     let outboxRedacted = 0;
@@ -124,7 +127,11 @@ export function prunedRowCount(result: PruneResult): number {
   return result.auditDeleted + result.outboxRedacted + result.eventsRedacted + result.operationsRedacted;
 }
 
-/** Opens a short-lived connection beside the service store, prunes, and closes it. */
+/**
+ * Opens a short-lived connection beside the service store, prunes, and closes it. After a real prune it
+ * checkpoints and truncates the WAL so stale frames holding the old text do not stay on disk. If a reader
+ * blocks the truncate past the busy timeout, the frames are left for the next prune or checkpoint.
+ */
 export function pruneDatabaseFile(
   path: string,
   input: { readonly policy: RetentionPolicy; readonly now: string; readonly dryRun?: boolean },
@@ -133,7 +140,9 @@ export function pruneDatabaseFile(
   const database = new Database(path, { readwrite: true, create: false, strict: true });
   try {
     database.exec("PRAGMA busy_timeout = 5000");
-    return pruneRetainedData(database, input);
+    const result = pruneRetainedData(database, input);
+    if (!result.dryRun) database.query("PRAGMA wal_checkpoint(TRUNCATE)").get();
+    return result;
   } finally {
     database.close();
   }

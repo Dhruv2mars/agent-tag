@@ -9,6 +9,7 @@ import {
   createRetentionWorker,
   PRUNED_TEXT,
   pruneDatabaseFile,
+  pruneRetainedData,
   retentionCutoff,
   retentionEnabled,
 } from "../src/store/retention.ts";
@@ -175,6 +176,44 @@ describe("data retention", () => {
         operationsRedacted: 0,
         outboxRedacted: 0,
       });
+    });
+  });
+
+  test("pruned text is gone from the database file and its WAL", async () => {
+    await withSeededStore(async ({ path }) => {
+      const pruned = ["old delivered request", "old delivered reply", "old quarantined request"];
+      const onDisk = async (): Promise<Buffer> => {
+        const parts = await Promise.all(
+          ["", "-wal"].map(async (suffix) => {
+            const file = Bun.file(`${path}${suffix}`);
+            return (await file.exists()) ? Buffer.from(await file.bytes()) : Buffer.alloc(0);
+          }),
+        );
+        return Buffer.concat(parts);
+      };
+      const before = await onDisk();
+      for (const marker of pruned) expect(before.includes(marker)).toBe(true);
+
+      // Force the platform default that leaves freed bytes in place; pruning must override it.
+      const database = new Database(path, { readwrite: true, create: false, strict: true });
+      try {
+        database.exec("PRAGMA secure_delete = OFF");
+        expect(database.query<{ secure_delete: number }, []>("PRAGMA secure_delete").get()?.secure_delete).toBe(0);
+        expect(pruneRetainedData(database, { policy, now: nowAt })).toMatchObject({ eventsRedacted: 3 });
+        expect(database.query<{ secure_delete: number }, []>("PRAGMA secure_delete").get()?.secure_delete).toBe(1);
+      } finally {
+        database.close();
+      }
+
+      // pruneDatabaseFile truncates the WAL so stale frames cannot keep the old text, even while the
+      // seeded store (standing in for the running service) keeps its own connection open.
+      pruneDatabaseFile(path, { policy, now: nowAt });
+      const walFile = Bun.file(`${path}-wal`);
+      expect((await walFile.exists()) ? walFile.size : 0).toBe(0);
+      const after = await onDisk();
+      for (const marker of pruned) expect(after.includes(marker)).toBe(false);
+      expect(after.includes("old pending request")).toBe(true);
+      expect(after.includes("recent request")).toBe(true);
     });
   });
 
