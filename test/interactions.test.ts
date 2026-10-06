@@ -301,7 +301,7 @@ describe("durable interactions", () => {
         router.ingest(
           actionBody({
             actionId: "agent-tag.user-input.answer",
-            value: JSON.stringify({ interactionId: question.interactionId, optionIndex: 9 }),
+            value: JSON.stringify({ interactionId: question.interactionId, questionId: "pkg", optionIndex: 9 }),
           }),
         ),
       ).toEqual({ kind: "ignored", reason: "invalid-action" });
@@ -309,7 +309,7 @@ describe("durable interactions", () => {
         router.ingest(
           actionBody({
             actionId: "agent-tag.user-input.answer",
-            value: JSON.stringify({ interactionId: question.interactionId, optionIndex: 1 }),
+            value: JSON.stringify({ interactionId: question.interactionId, questionId: "pkg", optionIndex: 1 }),
             actionTs: "1000.000022",
           }),
         ).kind,

@@ -321,8 +321,8 @@ describe("coordinator cards", () => {
     }
     expect(buttons[0]?.text.text).toBe("short");
     expect(buttons[1]?.text.text).toBe(`${"x".repeat(74)}…`);
-    expect(JSON.parse(buttons[1]?.value ?? "")).toEqual({ interactionId: "interaction-3", questionId: "q1", answer: longLabel });
-    expect(JSON.parse(buttons[2]?.value ?? "")).toEqual({ interactionId: "interaction-3", optionIndex: 2 });
+    expect(JSON.parse(buttons[1]?.value ?? "")).toEqual({ interactionId: "interaction-3", questionId: "q1", optionIndex: 1 });
+    expect(JSON.parse(buttons[2]?.value ?? "")).toEqual({ interactionId: "interaction-3", questionId: "q1", optionIndex: 2 });
   });
 });
 
