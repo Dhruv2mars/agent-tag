@@ -95,10 +95,49 @@ interface WorkflowJob {
   readonly steps: readonly WorkflowStep[];
 }
 
-test("the GHCR push waits for every release gate and the published GitHub Release", async () => {
-  const workflow = Bun.YAML.parse(
+const PUBLISH_GATE = "github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && needs.version.outputs.publish == 'true'";
+
+async function loadReleaseWorkflow() {
+  return Bun.YAML.parse(
     await Bun.file(join(repository, ".github", "workflows", "release.yml")).text(),
   ) as { readonly jobs: Readonly<Record<string, WorkflowJob>> };
+}
+
+test("only a pushed v* tag publishes; manual runs on a tag and pull requests stay dry runs", async () => {
+  const workflow = await loadReleaseWorkflow();
+  const script = workflow.jobs.version?.steps[0]?.run;
+  expect(script).toBeDefined();
+  const resolve = async (eventName: string, ref: string) => {
+    const output = join(scratch, `github-output-${eventName}-${ref.replaceAll("/", "_")}`);
+    await Bun.write(output, "");
+    const result = await run(["/bin/sh", "-euc", script ?? ""], scratch, {
+      EVENT_NAME: eventName,
+      REF: ref,
+      REF_NAME: ref.replace(/^refs\/(tags|heads)\//, ""),
+      RUN_NUMBER: "42",
+      GITHUB_OUTPUT: output,
+    });
+    expect(result.exitCode).toBe(0);
+    return Object.fromEntries((await Bun.file(output).text()).trim().split("\n").map((line) => line.split("=", 2)));
+  };
+  expect(await resolve("push", "refs/tags/v0.1.0-rc.1")).toEqual({ version: "0.1.0-rc.1", publish: "true" });
+  expect(await resolve("workflow_dispatch", "refs/tags/v0.1.0-rc.1")).toEqual({ version: "0.1.0-rc.1", publish: "false" });
+  expect(await resolve("workflow_dispatch", "refs/heads/main")).toEqual({ version: "0.0.0-dryrun.42", publish: "false" });
+  expect(await resolve("pull_request", "refs/pull/7/merge")).toEqual({ version: "0.0.0-dryrun.42", publish: "false" });
+
+  // Every job that can create a release or push an image re-checks the event and ref itself.
+  const publishers = Object.entries(workflow.jobs)
+    .filter(([, job]) =>
+      job.steps.some((step) => /\bgh release create\b|\bdocker push\b|\bnpm publish\b/.test(step.run ?? "")),
+    )
+    .map(([name]) => name)
+    .sort();
+  expect(publishers).toEqual(["image", "publish"]);
+  for (const name of publishers) expect(workflow.jobs[name]?.if).toBe(PUBLISH_GATE);
+});
+
+test("the GHCR push waits for every release gate and the published GitHub Release", async () => {
+  const workflow = await loadReleaseWorkflow();
   const needs = (name: string): readonly string[] => {
     const value = workflow.jobs[name]?.needs ?? [];
     return typeof value === "string" ? [value] : value;
@@ -110,7 +149,7 @@ test("the GHCR push waits for every release gate and the published GitHub Releas
   expect(needs("image")).toEqual(expect.arrayContaining(["docker", "publish"]));
   expect(needs("publish")).toEqual(expect.arrayContaining(["build", "smoke", "docker"]));
   expect(workflow.jobs.build?.steps.some((step) => step.run === "bun run check")).toBe(true);
-  expect(workflow.jobs.image?.if).toBe("needs.version.outputs.publish == 'true'");
+  expect(workflow.jobs.image?.if).toBe(PUBLISH_GATE);
   expect(workflow.jobs.image?.permissions?.packages).toBe("write");
   // Only the push job may write packages; the PR-reachable verify job stays read-only.
   for (const [name, job] of Object.entries(workflow.jobs)) {

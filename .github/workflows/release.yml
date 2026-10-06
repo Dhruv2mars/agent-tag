@@ -1,8 +1,10 @@
 name: Release
 
-# Tags matching v* publish a GitHub Release with four standalone binaries plus SHA256SUMS.
-# Pull requests and manual runs execute the same build and native smoke tests as a dry run
-# and never publish anything.
+# Pushing a tag matching v* publishes a GitHub Release with four standalone binaries plus
+# SHA256SUMS. Pull requests and manual (workflow_dispatch) runs execute the same build and
+# native smoke tests as a dry run and never publish anything, even when dispatched on a tag.
+# Publishing requires both a `push` event and a `refs/tags/v*` ref; the version job computes
+# that once and the publish/image jobs re-check it.
 
 on:
   push:
@@ -36,17 +38,20 @@ jobs:
     steps:
       - id: version
         env:
-          REF_TYPE: ${{ github.ref_type }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
           REF_NAME: ${{ github.ref_name }}
           RUN_NUMBER: ${{ github.run_number }}
         run: |
-          if [ "$REF_TYPE" = "tag" ]; then
-            version="${REF_NAME#v}"
-            publish=true
-          else
-            version="0.0.0-dryrun.${RUN_NUMBER}"
-            publish=false
-          fi
+          # A manual run dispatched on a tag builds that tag's version but stays a dry run.
+          case "$REF" in
+            refs/tags/v*) version="${REF_NAME#v}" ;;
+            *) version="0.0.0-dryrun.${RUN_NUMBER}" ;;
+          esac
+          publish=false
+          case "$EVENT_NAME:$REF" in
+            push:refs/tags/v*) publish=true ;;
+          esac
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "publish=$publish" >> "$GITHUB_OUTPUT"
 
@@ -173,7 +178,7 @@ jobs:
   publish:
     name: Publish GitHub Release
     needs: [version, build, smoke, docker]
-    if: needs.version.outputs.publish == 'true'
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && needs.version.outputs.publish == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -218,7 +223,7 @@ jobs:
     # `:<version>` or `:latest`.
     name: Push image to GHCR
     needs: [version, docker, publish]
-    if: needs.version.outputs.publish == 'true'
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && needs.version.outputs.publish == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:

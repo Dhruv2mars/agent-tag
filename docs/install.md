@@ -107,7 +107,7 @@ See the [README](../README.md#development). Follow [operations](operations.md) f
    - writes `SHA256SUMS` and publishes the GitHub Release once the typecheck, tests, smoke tests, and image checks have passed. A hyphenated version is published as a prerelease.
    - pushes the verified image to GHCR only after the GitHub Release exists, so a failed gate never moves `:<version>` or `:latest`.
 
-Pull requests that touch the build inputs run the same build, smoke, and Docker jobs as a dry run. They never publish.
+Only a pushed `v*` tag publishes. Pull requests that touch the build inputs and manual `workflow_dispatch` runs (including one started on a tag) run the same build, smoke, and Docker jobs as a dry run. They never create a release or push an image.
 
 To build locally:
 
