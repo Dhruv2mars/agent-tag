@@ -154,6 +154,71 @@ bun run scan:secrets -- --config /absolute/path/to/agent-tag.json /absolute/path
 
 The JSON report names only the file, credential class, and configured canary label. It never returns matched values. The command skips `.git` and `node_modules`. A finding or skipped symbolic link sets a nonzero exit code, so a release check cannot silently claim a partial clean scan. Keep source secret files outside scanned roots when practical; if they are inside, the configured scan excludes those exact files and scans their siblings.
 
+## Security audit
+
+Check a deployment against the [threat model](../SECURITY.md):
+
+```sh
+bun run security:audit -- /absolute/path/to/agent-tag.json
+bun run security:audit -- /absolute/path/to/agent-tag.json --json
+bun run security:audit -- /absolute/path/to/agent-tag.json --offline
+```
+
+The audit reads the config, the files it references, the data directory, and the macOS LaunchAgent logs. It prints each finding with a severity of `high`, `medium`, `low`, or `info`, plus a fix where one applies. It exits `1` when any finding is `high`, so it can gate a deploy or a cron job. Reports name files and credential classes but never print credential values.
+
+| Check | Severity |
+| --- | --- |
+| Secret files or their directory are missing, not owned by the service user, or grant group/world access (expected `0600`/`0700`) | high |
+| Data directory or database grants group/world access | high (low for SQLite `-wal`/`-shm` files inside a private data directory) |
+| Config is group/world writable / world readable / group readable | high / medium / low |
+| Service logs are world / group accessible | medium / low |
+| A credential pattern, or a `*token`/`*secret`/`*password` field with a value, appears inline in the config | high |
+| Config does not parse or validate (later checks are skipped) | high |
+| Allowlist contains a wildcard / is empty | high / medium |
+| Allowed user and conversation counts, admin users | info |
+| T3 URL is non-loopback without TLS / non-loopback with TLS | high / medium |
+| T3 token expired or expires within 3 days / within 7 days | high / medium |
+| T3 token has scopes beyond `orchestration:read` and `orchestration:operate` | high |
+| T3 session unreachable (or `--offline`) and the token file is older than 30 days | medium |
+| A repository root is `/`, the home directory, or an ancestor of it | high |
+| A repository root contains the data directory or a secret file / the config | high / medium |
+| Profile runtime mode is `full-access` or `auto` / `auto-accept-edits` | high / medium |
+| Profile declares `os-account` or `container` isolation, which is not enforced | medium |
+| `externalWrites` is advisory | low |
+| No retention configured / partly configured | low / info |
+| Secret scan of the data and log directories finds a configured token or a known credential pattern (this includes the SQLite store) | high |
+
+The T3 check calls `/api/auth/session` on the configured loopback URL with a 5-second timeout. Use `--offline` to skip it.
+
+## Data retention
+
+By default Agent Tag keeps Slack message text, outbox payloads, and audit rows forever. Set a retention window in days:
+
+```json
+"retention": {
+  "messageDays": 30,
+  "outboxDays": 30,
+  "auditDays": 365
+}
+```
+
+Every field is optional. A missing field keeps that data forever.
+
+- `messageDays` replaces the stored Slack event text with `[pruned]` once the event is older than the window. It does the same for the turn text (and resolved turn text) of operations that settled before the window. Pending and in-flight operations keep their text so they can still run.
+- `outboxDays` replaces the payload of delivered or failed Slack replies with `{"text":"[pruned]"}` once they settled before the window. Rows quarantined as `delivery-outcome-unknown` keep their payload, because an operator must reconcile them first.
+- `auditDays` deletes audit rows older than the window.
+
+Row IDs, idempotency keys, statuses, and timestamps are kept, so duplicate Slack deliveries are still recognised after pruning. Memory entries keep using each profile's `memory.retentionDays`.
+
+The running service applies the policy once an hour from its maintenance loop. To apply it immediately, or to preview it:
+
+```sh
+bun run prune -- /absolute/path/to/agent-tag.json --dry-run
+bun run prune -- /absolute/path/to/agent-tag.json
+```
+
+`prune` is safe to run while the service is running. It prints the cutoffs and row counts as JSON, never content. Pruning does not shrink the SQLite file on disk, and older backups still contain the pruned data, so expire backups on the same schedule.
+
 ## DM routes
 
 Direct messages are off until an operator adds the DM conversation ID to `access.allowedChannelIds`, enables `memory.privateDm` on the profile, and binds the route to one allowed human:
