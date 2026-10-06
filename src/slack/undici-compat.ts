@@ -1,6 +1,3 @@
-import { createRequire } from "node:module";
-
-const require = createRequire(import.meta.url);
 // Bun resolves bare `undici` to its built-in module, which lacks the ping API
 // used by Slack Socket Mode. Keep the package WebSocket and frame API together.
 const websocketExports = [
@@ -32,6 +29,8 @@ export function copyUndiciWebSocketExports(
 
 export function installUndiciWebSocketCompat(): void {
   const target = asExports(require("undici"));
+  // A literal require keeps the npm package inside `bun build --compile` binaries,
+  // which cannot resolve node_modules from disk at runtime.
   const source = asExports(require("undici/index.js"));
   if (target === undefined || source === undefined) throw new Error("undici Socket Mode transport is unavailable");
   copyUndiciWebSocketExports(target, source);
