@@ -32,6 +32,7 @@ const APP_TOKEN = "xapp-1-fixture-app-token";
 const BOT_TOKEN = "xoxb-fixture-bot-token";
 const ADMIN_TOKEN = "t3-fixture-admin-session";
 const RESTRICTED_TOKEN = "t3-fixture-restricted-token";
+const ADMIN_SESSION_ID = "session-fixture-1";
 
 const server: T3ServerInfo = {
   environment: { environmentId: "env", capabilities: {} },
@@ -115,7 +116,9 @@ async function createHarness(): Promise<Harness> {
     },
     runCommand: async (command): Promise<CommandResult> => {
       harness.commands.push(command.join(" "));
-      return { exitCode: 0, stdout: `${ADMIN_TOKEN}\n`, stderr: "" };
+      if (command[3] === "revoke") return { exitCode: 0, stdout: `Revoked session ${ADMIN_SESSION_ID}.\n`, stderr: "" };
+      const issued = { sessionId: ADMIN_SESSION_ID, token: ADMIN_TOKEN, method: "bearer-access-token", scopes: ["access:write"] };
+      return { exitCode: 0, stdout: `${JSON.stringify(issued, null, 2)}\n`, stderr: "" };
     },
     enrollT3: async ({ administrativeToken }) => {
       harness.enrolled.push(administrativeToken.exposeToBoundary());
@@ -195,7 +198,10 @@ describe("agent-tag onboard (non-interactive)", () => {
       expect((await readFile(path, "utf8")).trim()).toBe(value);
     }
 
-    expect(harness.commands).toEqual([`t3 auth session issue --base-dir ${harness.t3BaseDir} --token-only`]);
+    expect(harness.commands).toEqual([
+      `t3 auth session issue --base-dir ${harness.t3BaseDir} --ttl 10m --label agent-tag-onboard --json`,
+      `t3 auth session revoke --base-dir ${harness.t3BaseDir} ${ADMIN_SESSION_ID}`,
+    ]);
     expect(harness.enrolled).toEqual([ADMIN_TOKEN]);
     expect(harness.installs).toEqual([configPath]);
 
@@ -329,6 +335,42 @@ describe("agent-tag onboard (non-interactive)", () => {
     const withFile = await runOnboard(flags(harness, { ...isolated, t3IssueToken: false, force: true, t3AdminTokenFile: adminTokenFile }), anyT3);
     expect(withFile.secrets.t3Token).toBe("created");
     expect(harness.enrolled).toEqual([ADMIN_TOKEN]);
+  });
+
+  test("revokes the onboarding admin session even when enrollment fails, and warns if revoke fails", async () => {
+    const enrollFails: OnboardDependencies = {
+      ...harness.deps,
+      enrollT3: async () => {
+        throw new Error("T3 pairing endpoint returned HTTP 401");
+      },
+    };
+    await expect(runOnboard(flags(harness), enrollFails)).rejects.toThrow("HTTP 401");
+    expect(harness.commands.at(-1)).toBe(`t3 auth session revoke --base-dir ${harness.t3BaseDir} ${ADMIN_SESSION_ID}`);
+
+    const revokeFails: OnboardDependencies = {
+      ...harness.deps,
+      runCommand: async (command) => {
+        if (command[3] === "revoke") return { exitCode: 1, stdout: "", stderr: "database is locked" };
+        return harness.deps.runCommand(command);
+      },
+    };
+    const result = await runOnboard(flags(harness, { force: true }), revokeFails);
+    expect(result.secrets.t3Token).toBe("created");
+    const printed = harness.output.join("\n");
+    expect(printed).toContain(`could not revoke the onboarding T3 admin session ${ADMIN_SESSION_ID} (exit code 1: database is locked); it expires in 10m`);
+    expect(printed).toContain(`revoke it now with: t3 auth session revoke --base-dir ${harness.t3BaseDir} ${ADMIN_SESSION_ID}`);
+    expect(printed).not.toContain(ADMIN_TOKEN);
+  });
+
+  test("unrecognized t3 issue output is rejected without echoing it", async () => {
+    const plain: OnboardDependencies = {
+      ...harness.deps,
+      runCommand: async () => ({ exitCode: 0, stdout: ADMIN_TOKEN, stderr: "" }),
+    };
+    const failure = await runOnboard(flags(harness), plain).catch((error: unknown) => error);
+    expect(String(failure)).toContain("printed output Agent Tag does not recognize");
+    expect(String(failure)).not.toContain(ADMIN_TOKEN);
+    expect(harness.enrolled).toEqual([]);
   });
 
   test("a failed t3 CLI is reported without echoing its output", async () => {

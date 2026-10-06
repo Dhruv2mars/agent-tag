@@ -389,6 +389,25 @@ async function slackWorkspace(context: Context, botToken: SecretString): Promise
   }
 }
 
+/** The onboarding admin session is short-lived, labeled, and revoked as soon as enrollment ends. */
+export const T3_ADMIN_SESSION_TTL = "10m";
+export const T3_ADMIN_SESSION_LABEL = "agent-tag-onboard";
+
+const issuedSessionSchema = z.object({ sessionId: z.string().min(1), token: z.string().min(1) });
+
+/** Parses `t3 auth session issue --json` output. Errors never include the output, which holds the token. */
+export function parseIssuedT3Session(stdout: string): { readonly sessionId: string; readonly token: SecretString } | undefined {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(stdout);
+  } catch {
+    return undefined;
+  }
+  const parsed = issuedSessionSchema.safeParse(raw);
+  if (!parsed.success) return undefined;
+  return { sessionId: parsed.data.sessionId, token: new SecretString(parsed.data.token) };
+}
+
 type T3Probe =
   | { readonly usable: true }
   | { readonly usable: false; readonly reachable: boolean; readonly problem: string };
@@ -419,10 +438,14 @@ async function provisionT3Token(
     return "kept";
   }
   const t3Bin = options.t3Bin ?? deps.env.AGENT_TAG_T3_BIN ?? "t3";
-  const issueCommand = [t3Bin, "auth", "session", "issue", "--base-dir", input.baseDir, "--token-only"];
+  const issueCommand = [
+    t3Bin, "auth", "session", "issue", "--base-dir", input.baseDir,
+    "--ttl", T3_ADMIN_SESSION_TTL, "--label", T3_ADMIN_SESSION_LABEL, "--json",
+  ];
   const enrollHint = `bun run enroll:t3 -- --base-url ${input.baseUrl} --admin-token-file ADMIN_TOKEN_FILE --output ${input.path}`;
 
   let administrativeToken: SecretString | undefined;
+  let issuedSessionId: string | undefined;
   let explicit = false;
   if (options.t3AdminTokenFile !== undefined) {
     explicit = true;
@@ -437,19 +460,22 @@ async function provisionT3Token(
     const issue = options.t3IssueToken ||
       (options.interactive &&
         (await deps.prompter.confirm(
-          `  Issue a T3 admin session now with \`${issueCommand.join(" ")}\`? It is used once to mint a restricted token and never stored`,
+          `  Issue a ${T3_ADMIN_SESSION_TTL} T3 admin session now with \`${issueCommand.join(" ")}\`? It mints one restricted token, is revoked right after, and is never stored`,
           true,
         )));
     explicit = options.t3IssueToken;
     if (issue) {
       const result = await deps.runCommand(issueCommand);
-      const output = result.stdout.trim();
-      if (result.exitCode !== 0 || output.length === 0) {
-        const reason = `\`${issueCommand.slice(0, 4).join(" ")}\` failed with exit code ${result.exitCode}${result.stderr.length > 0 ? `: ${result.stderr.split("\n")[0]}` : ""}`;
+      const issued = result.exitCode === 0 ? parseIssuedT3Session(result.stdout.trim()) : undefined;
+      if (issued === undefined) {
+        const reason = result.exitCode !== 0
+          ? `\`${issueCommand.slice(0, 4).join(" ")}\` failed with exit code ${result.exitCode}${result.stderr.length > 0 ? `: ${result.stderr.split("\n")[0]}` : ""}`
+          : `\`${issueCommand.slice(0, 4).join(" ")}\` printed output Agent Tag does not recognize; any session it issued expires in ${T3_ADMIN_SESSION_TTL} (see \`${t3Bin} auth session list --base-dir ${input.baseDir}\`)`;
         if (explicit) throw new Error(reason);
         deps.print(`  ${reason}`);
       } else {
-        administrativeToken = new SecretString(output);
+        administrativeToken = issued.token;
+        issuedSessionId = issued.sessionId;
       }
     }
   }
@@ -466,9 +492,35 @@ async function provisionT3Token(
     deps.print(`  T3 enrollment failed: ${errorMessage(error)}`);
     deps.print(`  retry later with: ${enrollHint}`);
     return "missing";
+  } finally {
+    if (issuedSessionId !== undefined) {
+      await revokeT3Session(context, { t3Bin, baseDir: input.baseDir, sessionId: issuedSessionId });
+    }
   }
   deps.print(`  wrote restricted T3 token (orchestration:read, orchestration:operate) to ${input.path}`);
   return "created";
+}
+
+/** Revokes the onboarding admin session; failure only warns because the session expires on its own. */
+async function revokeT3Session(
+  context: Context,
+  input: { readonly t3Bin: string; readonly baseDir: string; readonly sessionId: string },
+): Promise<void> {
+  const { deps } = context;
+  const command = [input.t3Bin, "auth", "session", "revoke", "--base-dir", input.baseDir, input.sessionId];
+  let failure: string | undefined;
+  try {
+    const result = await deps.runCommand(command);
+    if (result.exitCode !== 0) failure = `exit code ${result.exitCode}${result.stderr.length > 0 ? `: ${result.stderr.split("\n")[0]}` : ""}`;
+  } catch (error) {
+    failure = errorMessage(error);
+  }
+  if (failure === undefined) {
+    deps.print(`  revoked the onboarding T3 admin session ${input.sessionId}`);
+    return;
+  }
+  deps.print(`  warning: could not revoke the onboarding T3 admin session ${input.sessionId} (${failure}); it expires in ${T3_ADMIN_SESSION_TTL}`);
+  deps.print(`  revoke it now with: ${command.join(" ")}`);
 }
 
 interface ProviderDefaults {
