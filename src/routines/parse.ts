@@ -830,11 +830,14 @@ function findTiming(words: ReadonlyArray<string>): TimingSplit | undefined {
 /** Looks like a clock time (has am/pm or a colon) whether or not it is valid. */
 const CLOCK_SHAPED = /^\d{1,2}(?::\d{1,2})?(?:am|pm)$|^\d{1,2}:\d{1,2}$/;
 
-/** The clause if `tokens` holds a clock-shaped but invalid time ("at 13pm", "25:00"). */
+/** After "at", bare 24-hour hours count as clock times too ("at 25"). */
+const AT_CLOCK_SHAPED = /^\d{1,2}$/;
+
+/** The clause if `tokens` holds a clock-shaped but invalid time ("at 13pm", "at 25", "25:00"). */
 function malformedClock(tokens: ReadonlyArray<string>): string | undefined {
   const [first, second] = tokens;
-  if (first === "at" && second !== undefined && /^\d/.test(second) && parseTimeToken(second) === undefined) {
-    return CLOCK_SHAPED.test(second) ? `at ${second}` : undefined;
+  if (first === "at" && second !== undefined && parseTimeToken(second) === undefined) {
+    return CLOCK_SHAPED.test(second) || AT_CLOCK_SHAPED.test(second) ? `at ${second}` : undefined;
   }
   if (first !== undefined && tokens.length === 1 && CLOCK_SHAPED.test(first) && parseTimeToken(first) === undefined) {
     return first;

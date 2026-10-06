@@ -144,7 +144,8 @@ export function nextCronOccurrence(cron: CronExpression, timeZone: string, after
 
 /** Weekday/date alignment repeats every 28 years (within 1901-2099). */
 const CONSECUTIVE_DAY_SCAN = 366 * 28 + 7;
-const SPACING_HORIZON_MS = 366 * 86_400_000;
+/** Two years of transitions captures a zone's recurring DST rules. */
+const TRANSITION_HORIZON_MS = 2 * 366 * 86_400_000;
 const MINUTES_PER_DAY = 1_440;
 
 function hasConsecutiveMatchingDays(cron: CronExpression, from: Date): boolean {
@@ -159,34 +160,74 @@ function hasConsecutiveMatchingDays(cron: CronExpression, from: Date): boolean {
   return false;
 }
 
+interface ClockTransition {
+  /** Local minute of day (old offset) at which the offset changes. */
+  readonly minute: number;
+  /** New offset minus old offset, in minutes; positive for spring-forward. */
+  readonly delta: number;
+}
+
+/** Distinct (time of day, delta) offset changes the zone makes. */
+function clockTransitions(timeZone: string, from: Date): ClockTransition[] {
+  const unique = new Map<string, ClockTransition>();
+  const to = new Date(from.getTime() + TRANSITION_HORIZON_MS);
+  for (const { at, deltaMs } of offsetTransitions(timeZone, from, to)) {
+    const before = toLocal(new Date(at.getTime() - 60_000), timeZone);
+    const minute = (before.hour * 60 + before.minute + 1) % MINUTES_PER_DAY;
+    const delta = Math.round(deltaMs / 60_000);
+    unique.set(`${minute}/${delta}`, { minute, delta });
+  }
+  return [...unique.values()];
+}
+
 /**
- * Whether consecutive runs are always at least `minGapMs` apart.
- *
- * Outside UTC offset changes the real gap equals the wall-clock gap, which is
- * checked analytically (independent of `from`). Offset changes can compress
- * gaps (1:58 EST -> 3:00 EDT is 2 minutes), so the actual occurrences around
- * every transition in the year after `from` are checked too; annual DST rules
- * mean that covers every transition the schedule will meet.
+ * Real minutes (from local midnight, old offset) at which clock `times` fire
+ * on a day whose offset changes at `transition`. Mirrors `fromLocal`: times
+ * before the change keep the old offset (fall-back repeats resolve to the
+ * first occurrence), times in a spring-forward gap shift forward by the gap,
+ * and later times use the new offset.
+ */
+function realMinutes(times: ReadonlyArray<number>, transition: ClockTransition, at: number): number[] {
+  const unshiftedUntil = at + Math.max(transition.delta, 0);
+  const real = times.map((time) => (time < unshiftedUntil ? time : time - transition.delta));
+  // Times that land on the same instant fire once.
+  return [...new Set(real)].sort((left, right) => left - right);
+}
+
+function gapsAtLeast(sorted: ReadonlyArray<number>, minGapMs: number): boolean {
+  for (let index = 1; index < sorted.length; index += 1) {
+    if (((sorted[index] ?? 0) - (sorted[index - 1] ?? 0)) * 60_000 < minGapMs) return false;
+  }
+  return true;
+}
+
+/**
+ * Whether consecutive runs are always at least `minGapMs` apart, for any
+ * date. Outside UTC offset changes the real gap equals the wall-clock gap.
+ * Offset changes can compress gaps (1:58 EST -> 3:00 EDT is 2 minutes), so
+ * each of the zone's transition times is applied to the clock times as if a
+ * matching day fell on it, ignoring day/month restrictions (conservative).
+ * `from` only seeds the transition and consecutive-day searches.
  */
 export function hasMinimumSpacing(cron: CronExpression, timeZone: string, from: Date, minGapMs: number): boolean {
   const times: number[] = [];
   for (const hour of cron.hours) for (const minute of cron.minutes) times.push(hour * 60 + minute);
-  for (let index = 1; index < times.length; index += 1) {
-    if (((times[index] ?? 0) - (times[index - 1] ?? 0)) * 60_000 < minGapMs) return false;
-  }
-  const wrap = (times[0] ?? 0) + MINUTES_PER_DAY - (times[times.length - 1] ?? 0);
-  if (wrap * 60_000 < minGapMs && hasConsecutiveMatchingDays(cron, from)) return false;
+  if (!gapsAtLeast(times, minGapMs)) return false;
 
-  for (const transition of offsetTransitions(timeZone, from, new Date(from.getTime() + SPACING_HORIZON_MS))) {
-    // Occurrences shifted by the transition all fall within |delta| of it.
-    const margin = Math.abs(transition.deltaMs) + minGapMs;
-    const endMs = transition.at.getTime() + margin;
-    let previous = nextCronOccurrence(cron, timeZone, new Date(transition.at.getTime() - margin));
-    while (previous !== null && previous.getTime() <= endMs) {
-      const next = nextCronOccurrence(cron, timeZone, previous);
-      if (next === null) break;
-      if (next.getTime() - previous.getTime() < minGapMs) return false;
-      previous = next;
+  let consecutive: boolean | undefined;
+  const consecutiveDays = (): boolean => (consecutive ??= hasConsecutiveMatchingDays(cron, from));
+  const wrap = (times[0] ?? 0) + MINUTES_PER_DAY - (times[times.length - 1] ?? 0);
+  if (wrap * 60_000 < minGapMs && consecutiveDays()) return false;
+
+  for (const transition of clockTransitions(timeZone, from)) {
+    if (consecutiveDays()) {
+      // Two days in a row, with the change on either day, covers pairs across midnight.
+      const twoDays = [...times, ...times.map((time) => time + MINUTES_PER_DAY)];
+      for (const at of [transition.minute, transition.minute + MINUTES_PER_DAY]) {
+        if (!gapsAtLeast(realMinutes(twoDays, transition, at), minGapMs)) return false;
+      }
+    } else if (!gapsAtLeast(realMinutes(times, transition, transition.minute), minGapMs)) {
+      return false;
     }
   }
   return true;

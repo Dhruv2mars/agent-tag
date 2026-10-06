@@ -456,6 +456,9 @@ describe("codex review regressions", () => {
     ["remind me tomorrow at 25:00 to deploy", "at 25:00"],
     ["remind me tomorrow at 9:75 to deploy", "at 9:75"],
     ["remind me tomorrow at 13 pm to deploy", "13 pm"],
+    ["remind me tomorrow at 25 to deploy", "at 25"],
+    ["remind me tomorrow at 24 to deploy", "at 24"],
+    ["remind me tomorrow at 9:60 to deploy", "at 9:60"],
     ["remind me to deploy at 13pm tomorrow", "at 13pm"],
     ["every monday at 25:00 send the report", "at 25:00"],
     ["every monday send the report at 25:00", "at 25:00"],
@@ -503,9 +506,8 @@ describe("codex review regressions", () => {
 
     expect(errorOf(parseSchedule("cron: 0,58 1,3 * * *", ny))).toBe(TOO_FREQUENT);
     expect(errorOf(parseSchedule("cron: 0,59 1,3 * * *", ny))).toBe(TOO_FREQUENT);
-    // No DST in Kolkata; June-only runs never meet a New York transition.
+    // No DST in Kolkata.
     expect(parseSchedule("cron: 0,58 1,3 * * *", ist).kind).toBe("ok");
-    expect(parseSchedule("cron: 0,58 1,3 * 6 *", ny).kind).toBe("ok");
     expect(parseSchedule("cron: */5 * * * *", ny).kind).toBe("ok");
   });
 
@@ -519,5 +521,29 @@ describe("codex review regressions", () => {
 
   test("midnight wrap only counts when consecutive days both run", () => {
     expect(parseSchedule("cron: 0,58 0,23 * * 1", ny).kind).toBe("ok");
+  });
+
+  test("DST spacing is date independent: a March 13th-only cron meets DST on 2033-03-13", () => {
+    const cron = parseCron("0,58 1,3 13 3 *");
+    if (cron.kind !== "ok") throw new Error(cron.message);
+    const before = nextCronOccurrence(cron.cron, NEW_YORK, new Date("2033-03-13T06:30:00.000Z"));
+    expect(before?.toISOString()).toBe("2033-03-13T06:58:00.000Z");
+    expect(nextCronOccurrence(cron.cron, NEW_YORK, before as Date)?.toISOString()).toBe("2033-03-13T07:00:00.000Z");
+    expect(errorOf(parseSchedule("cron: 0,58 1,3 13 3 *", ny))).toBe(TOO_FREQUENT);
+    // Day/month restrictions are ignored on purpose: any date could be a DST day.
+    expect(errorOf(parseSchedule("cron: 0,58 1,3 * 6 *", ny))).toBe(TOO_FREQUENT);
+  });
+
+  test.each(["cron: 0 9,10 * * *", "cron: 0 1,3 * * *", "cron: 30 1,2 * * *", "every day at 2:30am", "cron: 30,58 1,2 * * *"])(
+    "ordinary schedules across New York DST are still accepted: %s",
+    (text) => {
+      expect(parseSchedule(text, ny).kind).toBe("ok");
+    },
+  );
+
+  test("the transition's size matters: Lord Howe's 30 minute shift compresses 01:58 -> 02:30", () => {
+    const lordHowe: ParseScheduleOptions = { now: NOW, timeZone: "Australia/Lord_Howe" };
+    expect(errorOf(parseSchedule("cron: 30,58 1,2 * * *", lordHowe))).toBe(TOO_FREQUENT);
+    expect(parseSchedule("cron: 0 1,3 * * *", lordHowe).kind).toBe("ok");
   });
 });
