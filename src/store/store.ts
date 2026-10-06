@@ -1,29 +1,16 @@
-import { Database } from "bun:sqlite";
-import { createHash } from "node:crypto";
-import { constants } from "node:fs";
-import { chmod, copyFile, link, mkdir, open, rm, stat } from "node:fs/promises";
-import { basename, dirname, isAbsolute, join } from "node:path";
+import type { Database } from "bun:sqlite";
 
 import { z } from "zod";
 
-import { scheduleRecurrenceSchema, type ScheduleRecurrence } from "../routines/cron.ts";
-import { STORE_MIGRATIONS } from "./migrations.ts";
+import { writeAudit } from "./audit.ts";
 import { requiredId, parseStoredJson } from "./context.ts";
 import { leaseExpiry } from "./lease.ts";
 import {
-  type AuditAction,
-  ambientDecisionSchema,
-  auditActionSchema,
-  auditMetadataSchema,
-  auditRowSchema,
-  auditWriteSchema,
   canonicalEventSchema,
   deliveryLookupSchema,
   interactionIdentitySchema,
   interactionRowSchema,
   isoDateTime,
-  memoryContent,
-  memoryRowSchema,
   nonEmpty,
   operationIdentitySchema,
   operationPayloadSchema,
@@ -32,11 +19,7 @@ import {
   outboxPayloadSchema,
   outboxRowSchema,
   partialUserInputSchema,
-  recurrenceJson,
   resolvedOperationTextSchema,
-  schedulePrompt,
-  scheduleRowSchema,
-  scheduleTargetSchema,
   taskExecutionSchema,
   taskLookupSchema,
   userInputPromptSchema,
@@ -44,7 +27,6 @@ import {
 import type {
   ActiveTaskBinding,
   AmbientDecision,
-  AuditCursor,
   AuditRecord,
   ClaimedInteractionResponse,
   ClaimedOperation,
@@ -64,6 +46,12 @@ import type {
   UserInputQuestionPrompt,
   UserInputSelection,
 } from "./types.ts";
+import * as files from "./files.ts";
+import * as audit from "./audit.ts";
+import * as memory from "./memory.ts";
+import * as schedules from "./schedules.ts";
+import * as ambient from "./ambient.ts";
+import * as diagnostics from "./diagnostics.ts";
 
 export { AUDIT_ACTIONS, type AuditAction } from "./schema.ts";
 export type {
@@ -89,6 +77,25 @@ export type {
   UserInputQuestionPrompt,
   UserInputSelection,
 } from "./types.ts";
+export type { StoreDiagnostics } from "./diagnostics.ts";
+export type { RestoreBackupInput } from "./files.ts";
+export type { ListAuditRecordsInput } from "./audit.ts";
+export type {
+  CreateMemoryInput,
+  ListMemoryInput,
+  UpdateMemoryInput,
+  ForgetMemoryInput,
+  RecordMemoryDenialInput,
+} from "./memory.ts";
+export type {
+  CreateScheduleInput,
+  CancelScheduleInput,
+  RevokeClaimedScheduleInput,
+  ClaimDueScheduleInput,
+  SettleScheduleRunInput,
+  RecordScheduleDenialInput,
+} from "./schedules.ts";
+export type { EvaluateAmbientInput } from "./ambient.ts";
 
 /** Applies T3's answer rules: custom text wins when allowed; multi-select yields a list; otherwise one label. */
 function resolveUserInputAnswer(
@@ -120,112 +127,6 @@ function escapeSlackText(text: string): string {
   return text.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
 }
 
-function projectMemoryRow(raw: unknown): MemoryRecord {
-  const row = memoryRowSchema.parse(raw);
-  return {
-    memoryId: row.memory_id,
-    workspaceId: row.workspace_id,
-    scope: row.scope,
-    profileId: row.profile_id,
-    taskId: row.task_id,
-    ownerUserId: row.owner_user_id,
-    content: row.content,
-    sourceType: row.source_type,
-    sourceId: row.source_id,
-    version: row.version,
-    expiresAt: row.expires_at,
-    createdBy: row.created_by,
-    createdAt: row.created_at,
-    updatedAt: row.updated_at,
-  };
-}
-
-async function requirePrivateDirectory(path: string): Promise<void> {
-  await mkdir(path, { recursive: true, mode: 0o700 });
-  const metadata = await stat(path);
-  if (!metadata.isDirectory()) throw new Error(`private path is not a directory: ${path}`);
-  if ((metadata.mode & 0o077) !== 0) {
-    throw new Error(`private directory must not grant group or world access: ${path}`);
-  }
-  const uid = process.getuid?.();
-  if (uid !== undefined && metadata.uid !== uid) {
-    throw new Error(`private directory must be owned by the Agent Tag user: ${path}`);
-  }
-}
-
-function verifyDatabaseFile(path: string): void {
-  const database = new Database(path, { readonly: true, strict: true });
-  try {
-    const row = z.object({ quick_check: z.literal("ok") }).parse(
-      database.query("PRAGMA quick_check").get(),
-    );
-    if (row.quick_check !== "ok") throw new Error("backup integrity check failed");
-  } finally {
-    database.close();
-  }
-}
-
-function temporarySibling(path: string): string {
-  return join(dirname(path), `.${basename(path)}.${crypto.randomUUID()}.tmp`);
-}
-
-async function installPrivateFile(input: {
-  readonly temporaryPath: string;
-  readonly destinationPath: string;
-}): Promise<void> {
-  try {
-    await chmod(input.temporaryPath, 0o600);
-    verifyDatabaseFile(input.temporaryPath);
-    const file = await open(input.temporaryPath, "r");
-    try {
-      await file.sync();
-    } finally {
-      await file.close();
-    }
-    await link(input.temporaryPath, input.destinationPath);
-  } finally {
-    await rm(input.temporaryPath, { force: true });
-  }
-}
-
-function writeAudit(
-  database: Database,
-  input: {
-    readonly actorType: string;
-    readonly actorId: string;
-    readonly authority: string;
-    readonly source: string;
-    readonly target: string;
-    readonly action: AuditAction;
-    readonly result: string;
-    readonly correlationId: string;
-    readonly metadata: Readonly<Record<string, string | number | boolean | null>>;
-    readonly createdAt: string;
-  },
-): void {
-  const record = auditWriteSchema.parse(input);
-  database
-    .query(
-      `INSERT INTO audit_log (
-        audit_id, actor_type, actor_id, authority, source, target, action, result,
-        correlation_id, metadata_json, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    )
-    .run(
-      crypto.randomUUID(),
-      record.actorType,
-      record.actorId,
-      record.authority,
-      record.source,
-      record.target,
-      record.action,
-      record.result,
-      record.correlationId,
-      JSON.stringify(record.metadata),
-      record.createdAt,
-    );
-}
-
 export class AgentTagStore {
   readonly #database: Database;
   readonly #faultInjector: (point: StoreFaultPoint) => void;
@@ -236,335 +137,47 @@ export class AgentTagStore {
   }
 
   static async open(path: string, options: StoreOpenOptions = {}): Promise<AgentTagStore> {
-    if (!isAbsolute(path)) throw new Error("store path must be absolute");
-    await requirePrivateDirectory(dirname(path));
-    const database = new Database(path, { create: true, strict: true });
-    try {
-      database.exec("PRAGMA foreign_keys = ON");
-      database.exec("PRAGMA journal_mode = WAL");
-      database.exec("PRAGMA synchronous = FULL");
-      database.exec("PRAGMA busy_timeout = 5000");
-      database.exec(
-        "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)",
-      );
-      const applied = new Set(
-        database
-          .query<{ version: number }, []>("SELECT version FROM schema_migrations")
-          .all()
-          .map((row) => row.version),
-      );
-      for (const migration of STORE_MIGRATIONS) {
-        if (applied.has(migration.version)) continue;
-        const apply = database.transaction(() => {
-          database.exec(migration.sql);
-          database
-            .query("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
-            .run(migration.version, new Date().toISOString());
-        });
-        apply.immediate();
-      }
-      await chmod(path, 0o600);
-      return new AgentTagStore(database, options);
-    } catch (error) {
-      database.close();
-      throw error;
-    }
+    return new AgentTagStore(await files.openDatabase(path), options);
   }
 
   close(): void {
     this.#database.close();
   }
 
-  async backupTo(path: string): Promise<void> {
-    if (!isAbsolute(path)) throw new Error("backup path must be absolute");
-    await requirePrivateDirectory(dirname(path));
-    const temporaryPath = temporarySibling(path);
-    try {
-      this.#database.query("VACUUM INTO ?").run(temporaryPath);
-      await installPrivateFile({ temporaryPath, destinationPath: path });
-    } catch (error) {
-      await rm(temporaryPath, { force: true });
-      throw error;
-    }
+  backupTo(path: string): Promise<void> {
+    return files.backupTo(this.#database, path);
   }
 
-  static async restoreBackup(input: {
-    readonly backupPath: string;
-    readonly destinationPath: string;
-  }): Promise<void> {
-    if (!isAbsolute(input.backupPath)) throw new Error("backup path must be absolute");
-    if (!isAbsolute(input.destinationPath)) throw new Error("destination path must be absolute");
-    verifyDatabaseFile(input.backupPath);
-    await requirePrivateDirectory(dirname(input.destinationPath));
-    const temporaryPath = temporarySibling(input.destinationPath);
-    try {
-      await copyFile(input.backupPath, temporaryPath, constants.COPYFILE_EXCL);
-      await installPrivateFile({ temporaryPath, destinationPath: input.destinationPath });
-    } catch (error) {
-      await rm(temporaryPath, { force: true });
-      throw error;
-    }
+  static restoreBackup(input: files.RestoreBackupInput): Promise<void> {
+    return files.restoreBackup(input);
   }
 
-  listAuditRecords(input: { readonly after?: AuditCursor; readonly limit?: number } = {}): ReadonlyArray<AuditRecord> {
-    const limit = input.limit ?? 1_000;
-    if (!Number.isSafeInteger(limit) || limit <= 0 || limit > 10_000) {
-      throw new Error("audit export limit must be between 1 and 10000");
-    }
-    const afterCreatedAt = input.after === undefined
-      ? "0000-01-01T00:00:00.000Z"
-      : isoDateTime.parse(input.after.createdAt);
-    const afterAuditId = input.after === undefined ? "" : requiredId(input.after.auditId, "auditId");
-    return this.#database
-      .query(
-        `SELECT audit_id, actor_type, actor_id, authority, source, target, action, result,
-                correlation_id, metadata_json, created_at
-         FROM audit_log
-         WHERE created_at > ? OR (created_at = ? AND audit_id > ?)
-         ORDER BY created_at, audit_id LIMIT ?`,
-      )
-      .all(afterCreatedAt, afterCreatedAt, afterAuditId, limit)
-      .map((raw) => {
-        const row = auditRowSchema.parse(raw);
-        return {
-          auditId: row.audit_id,
-          actorType: row.actor_type,
-          actorId: row.actor_id,
-          authority: row.authority,
-          source: row.source,
-          target: row.target,
-          action: auditActionSchema.parse(row.action),
-          result: row.result,
-          correlationId: row.correlation_id,
-          metadata: auditMetadataSchema.parse(parseStoredJson(row.metadata_json)),
-          createdAt: row.created_at,
-        };
-      });
+  listAuditRecords(input: audit.ListAuditRecordsInput = {}): ReadonlyArray<AuditRecord> {
+    return audit.listAuditRecords(this.#database, input);
   }
 
-  createMemory(input: {
-    readonly workspaceId: string;
-    readonly scope: "shared" | "profile" | "task" | "private";
-    readonly profileId?: string;
-    readonly taskId?: string;
-    readonly ownerUserId?: string;
-    readonly content: string;
-    readonly sourceType: string;
-    readonly sourceId: string;
-    readonly actorUserId: string;
-    readonly expiresAt: string;
-    readonly now: string;
-  }): MemoryRecord {
-    const now = isoDateTime.parse(input.now);
-    const expiresAt = isoDateTime.parse(input.expiresAt);
-    const memoryId = crypto.randomUUID();
-    const dimensions = {
-      profileId: input.profileId === undefined ? null : requiredId(input.profileId, "profileId"),
-      taskId: input.taskId === undefined ? null : requiredId(input.taskId, "taskId"),
-      ownerUserId: input.ownerUserId === undefined ? null : requiredId(input.ownerUserId, "ownerUserId"),
-    };
-    const create = this.#database.transaction((): MemoryRecord => {
-      this.#database
-        .query(
-          `INSERT INTO memory_entries (
-            memory_id, workspace_id, scope, profile_id, task_id, owner_user_id, content,
-            source_type, source_id, state, expires_at, created_by, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)`,
-        )
-        .run(
-          memoryId,
-          requiredId(input.workspaceId, "workspaceId"),
-          input.scope,
-          dimensions.profileId,
-          dimensions.taskId,
-          dimensions.ownerUserId,
-          memoryContent.parse(input.content),
-          requiredId(input.sourceType, "sourceType"),
-          requiredId(input.sourceId, "sourceId"),
-          expiresAt,
-          requiredId(input.actorUserId, "actorUserId"),
-          now,
-          now,
-        );
-      writeAudit(this.#database, {
-        actorType: "slack-user",
-        actorId: input.actorUserId,
-        authority: `memory:${input.scope}`,
-        source: input.sourceId,
-        target: memoryId,
-        action: "memory.created",
-        result: "active",
-        correlationId: memoryId,
-        metadata: { scope: input.scope, sourceType: input.sourceType, expiresAt },
-        createdAt: now,
-      });
-      return projectMemoryRow(
-        this.#database
-          .query(
-            `SELECT memory_id, workspace_id, scope, profile_id, task_id, owner_user_id,
-                    content, source_type, source_id, version, expires_at, created_by, created_at, updated_at
-             FROM memory_entries WHERE memory_id = ?`,
-          )
-          .get(memoryId),
-      );
-    });
-    return create.immediate();
+  createMemory(input: memory.CreateMemoryInput): MemoryRecord {
+    return memory.createMemory(this.#database, input);
   }
 
   getMemory(memoryId: string): MemoryRecord | null {
-    const raw = this.#database
-      .query(
-        `SELECT memory_id, workspace_id, scope, profile_id, task_id, owner_user_id,
-                content, source_type, source_id, version, expires_at, created_by, created_at, updated_at
-         FROM memory_entries WHERE memory_id = ? AND state = 'active'`,
-      )
-      .get(requiredId(memoryId, "memoryId"));
-    return raw === null ? null : projectMemoryRow(raw);
+    return memory.getMemory(this.#database, memoryId);
   }
 
-  listMemory(input: {
-    readonly workspaceId: string;
-    readonly profileId: string;
-    readonly taskId?: string;
-    readonly ownerUserId: string;
-    readonly includeShared: boolean;
-    readonly includePrivate: boolean;
-    readonly now: string;
-    readonly limit?: number;
-  }): ReadonlyArray<MemoryRecord> {
-    const limit = input.limit ?? 20;
-    if (!Number.isSafeInteger(limit) || limit <= 0 || limit > 100) {
-      throw new Error("memory list limit must be between 1 and 100");
-    }
-    const taskId = input.taskId === undefined ? "" : requiredId(input.taskId, "taskId");
-    return this.#database
-      .query(
-        `SELECT memory_id, workspace_id, scope, profile_id, task_id, owner_user_id,
-                content, source_type, source_id, version, expires_at, created_by, created_at, updated_at
-         FROM memory_entries
-         WHERE workspace_id = ? AND state = 'active' AND expires_at > ? AND (
-           (scope = 'shared' AND ? = 1) OR
-           (scope = 'profile' AND profile_id = ?) OR
-           (scope = 'task' AND task_id = ?) OR
-           (scope = 'private' AND profile_id = ? AND owner_user_id = ? AND ? = 1)
-         )
-         ORDER BY updated_at DESC, memory_id LIMIT ?`,
-      )
-      .all(
-        requiredId(input.workspaceId, "workspaceId"),
-        isoDateTime.parse(input.now),
-        input.includeShared ? 1 : 0,
-        requiredId(input.profileId, "profileId"),
-        taskId,
-        input.profileId,
-        requiredId(input.ownerUserId, "ownerUserId"),
-        input.includePrivate ? 1 : 0,
-        limit,
-      )
-      .map(projectMemoryRow);
+  listMemory(input: memory.ListMemoryInput): ReadonlyArray<MemoryRecord> {
+    return memory.listMemory(this.#database, input);
   }
 
-  updateMemory(input: {
-    readonly memoryId: string;
-    readonly actorUserId: string;
-    readonly content: string;
-    readonly now: string;
-  }): MemoryRecord {
-    const now = isoDateTime.parse(input.now);
-    const update = this.#database.transaction(() => {
-      const result = this.#database
-        .query(
-          `UPDATE memory_entries SET content = ?, version = version + 1, updated_at = ?
-           WHERE memory_id = ? AND state = 'active' AND expires_at > ?`,
-        )
-        .run(
-          memoryContent.parse(input.content),
-          now,
-          requiredId(input.memoryId, "memoryId"),
-          now,
-        );
-      if (result.changes !== 1) throw new Error("active memory not found");
-      writeAudit(this.#database, {
-        actorType: "slack-user",
-        actorId: input.actorUserId,
-        authority: "memory-edit",
-        source: input.memoryId,
-        target: input.memoryId,
-        action: "memory.updated",
-        result: "active",
-        correlationId: input.memoryId,
-        metadata: {},
-        createdAt: now,
-      });
-      const record = this.getMemory(input.memoryId);
-      if (record === null) throw new Error("updated memory not found");
-      return record;
-    });
-    return update.immediate();
+  updateMemory(input: memory.UpdateMemoryInput): MemoryRecord {
+    return memory.updateMemory(this.#database, input);
   }
 
-  forgetMemory(input: {
-    readonly memoryId: string;
-    readonly actorUserId: string;
-    readonly now: string;
-  }): void {
-    const now = isoDateTime.parse(input.now);
-    const forget = this.#database.transaction(() => {
-      const result = this.#database
-        .query(
-          `UPDATE memory_entries SET state = 'forgotten', forgotten_at = ?, updated_at = ?
-           WHERE memory_id = ? AND state = 'active'`,
-        )
-        .run(now, now, requiredId(input.memoryId, "memoryId"));
-      if (result.changes !== 1) throw new Error("active memory not found");
-      writeAudit(this.#database, {
-        actorType: "slack-user",
-        actorId: input.actorUserId,
-        authority: "memory-forget",
-        source: input.memoryId,
-        target: input.memoryId,
-        action: "memory.forgotten",
-        result: "forgotten",
-        correlationId: input.memoryId,
-        metadata: {},
-        createdAt: now,
-      });
-    });
-    forget.immediate();
+  forgetMemory(input: memory.ForgetMemoryInput): void {
+    memory.forgetMemory(this.#database, input);
   }
 
   expireMemory(nowInput: string): number {
-    const now = isoDateTime.parse(nowInput);
-    const expire = this.#database.transaction(() => {
-      const rows = this.#database
-        .query<{ memory_id: string }, [string]>(
-          "SELECT memory_id FROM memory_entries WHERE state = 'active' AND expires_at <= ?",
-        )
-        .all(now);
-      for (const row of rows) {
-        const memoryId = requiredId(row.memory_id, "memoryId");
-        this.#database
-          .query(
-            `UPDATE memory_entries SET state = 'forgotten', forgotten_at = ?, updated_at = ?
-             WHERE memory_id = ? AND state = 'active'`,
-          )
-          .run(now, now, memoryId);
-        writeAudit(this.#database, {
-          actorType: "service",
-          actorId: "agent-tag",
-          authority: "memory-retention",
-          source: memoryId,
-          target: memoryId,
-          action: "memory.expired",
-          result: "forgotten",
-          correlationId: memoryId,
-          metadata: {},
-          createdAt: now,
-        });
-      }
-      return rows.length;
-    });
-    return expire.immediate();
+    return memory.expireMemory(this.#database, nowInput);
   }
 
   taskBelongsToContext(input: {
@@ -589,26 +202,8 @@ export class AgentTagStore {
     return row.count === 1;
   }
 
-  recordMemoryDenial(input: {
-    readonly actorUserId: string;
-    readonly sourceId: string;
-    readonly reason: string;
-    readonly workspaceId: string;
-    readonly now: string;
-  }): void {
-    const now = isoDateTime.parse(input.now);
-    writeAudit(this.#database, {
-      actorType: "slack-user",
-      actorId: requiredId(input.actorUserId, "actorUserId"),
-      authority: "memory-policy",
-      source: requiredId(input.sourceId, "sourceId"),
-      target: requiredId(input.workspaceId, "workspaceId"),
-      action: "memory.denied",
-      result: requiredId(input.reason, "reason"),
-      correlationId: input.sourceId,
-      metadata: {},
-      createdAt: now,
-    });
+  recordMemoryDenial(input: memory.RecordMemoryDenialInput): void {
+    memory.recordMemoryDenial(this.#database, input);
   }
 
   resolveOperationTurnText(input: {
@@ -655,480 +250,43 @@ export class AgentTagStore {
   }
 
   countActiveSchedules(workspaceId: string): number {
-    const row = this.#database
-      .query<{ count: number }, [string]>(
-        "SELECT COUNT(*) AS count FROM schedules WHERE workspace_id = ? AND state = 'active'",
-      )
-      .get(requiredId(workspaceId, "workspaceId"));
-    if (row === null) throw new Error("failed to count active schedules");
-    return row.count;
+    return schedules.countActiveSchedules(this.#database, workspaceId);
   }
 
-  createSchedule(input: {
-    readonly taskId: string;
-    readonly actorUserId: string;
-    readonly kind: "agent" | "reminder";
-    readonly prompt: string;
-    readonly runAt: string;
-    readonly cadenceSeconds?: number;
-    readonly recurrence?: ScheduleRecurrence;
-    readonly missedRunPolicy: "run-once" | "skip";
-    readonly misfireGraceSeconds: number;
-    readonly overlapPolicy: "skip" | "queue";
-    readonly now: string;
-  }): ScheduleSummary {
-    const now = isoDateTime.parse(input.now);
-    const runAt = isoDateTime.parse(input.runAt);
-    if (
-      input.cadenceSeconds !== undefined &&
-      (!Number.isSafeInteger(input.cadenceSeconds) || input.cadenceSeconds < 60)
-    ) {
-      throw new Error("schedule cadence must be at least 60 seconds");
-    }
-    if (input.cadenceSeconds !== undefined && input.recurrence !== undefined) {
-      throw new Error("schedule cadence and recurrence are mutually exclusive");
-    }
-    const recurrence =
-      input.recurrence === undefined ? null : scheduleRecurrenceSchema.parse(input.recurrence);
-    if (
-      !Number.isSafeInteger(input.misfireGraceSeconds) ||
-      input.misfireGraceSeconds < 0 ||
-      input.misfireGraceSeconds > 86_400
-    ) {
-      throw new Error("schedule misfire grace must be between 0 and 86400 seconds");
-    }
-    const create = this.#database.transaction((): ScheduleSummary => {
-      const taskId = requiredId(input.taskId, "taskId");
-      const target = scheduleTargetSchema.parse(
-        this.#database
-          .query(
-            `SELECT workspace_id, conversation_id, thread_ts, profile_id, repository_root
-             FROM tasks WHERE task_id = ? AND state = 'active'`,
-          )
-          .get(taskId),
-      );
-      const scheduleId = crypto.randomUUID();
-      this.#database
-        .query(
-          `INSERT INTO schedules (
-            schedule_id, task_id, workspace_id, conversation_id, thread_ts, actor_user_id,
-            profile_id, repository_root, kind, prompt, cadence_seconds, recurrence_json, missed_run_policy,
-            misfire_grace_seconds, overlap_policy, state, next_run_at, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)`,
-        )
-        .run(
-          scheduleId,
-          taskId,
-          target.workspace_id,
-          target.conversation_id,
-          target.thread_ts,
-          requiredId(input.actorUserId, "actorUserId"),
-          target.profile_id,
-          target.repository_root,
-          input.kind,
-          schedulePrompt.parse(input.prompt),
-          input.cadenceSeconds ?? null,
-          recurrence === null ? null : JSON.stringify(recurrence),
-          input.missedRunPolicy,
-          input.misfireGraceSeconds,
-          input.overlapPolicy,
-          runAt,
-          now,
-          now,
-        );
-      writeAudit(this.#database, {
-        actorType: "slack-user",
-        actorId: input.actorUserId,
-        authority: "schedule-create",
-        source: taskId,
-        target: scheduleId,
-        action: "schedule.created",
-        result: "active",
-        correlationId: scheduleId,
-        metadata: {
-          kind: input.kind,
-          recurring: input.cadenceSeconds !== undefined || recurrence !== null,
-          missedRunPolicy: input.missedRunPolicy,
-          overlapPolicy: input.overlapPolicy,
-        },
-        createdAt: now,
-      });
-      return {
-        scheduleId,
-        taskId,
-        kind: input.kind,
-        prompt: input.prompt.trim(),
-        state: "active",
-        nextRunAt: runAt,
-        cadenceSeconds: input.cadenceSeconds ?? null,
-        recurrence,
-        missedRunPolicy: input.missedRunPolicy,
-        overlapPolicy: input.overlapPolicy,
-      };
-    });
-    return create.immediate();
+  createSchedule(input: schedules.CreateScheduleInput): ScheduleSummary {
+    return schedules.createSchedule(this.#database, input);
   }
 
   listSchedules(taskId: string): ReadonlyArray<ScheduleSummary> {
-    const schema = z.object({
-      schedule_id: nonEmpty,
-      task_id: nonEmpty,
-      kind: z.enum(["agent", "reminder"]),
-      prompt: schedulePrompt,
-      state: z.enum(["active", "cancelled", "completed"]),
-      next_run_at: isoDateTime,
-      cadence_seconds: z.number().int().min(60).nullable(),
-      recurrence_json: recurrenceJson,
-      missed_run_policy: z.enum(["run-once", "skip"]),
-      overlap_policy: z.enum(["skip", "queue"]),
-    });
-    return this.#database
-      .query(
-        `SELECT schedule_id, task_id, kind, prompt, state, next_run_at, cadence_seconds, recurrence_json,
-                missed_run_policy, overlap_policy
-         FROM schedules WHERE task_id = ? ORDER BY created_at, schedule_id`,
-      )
-      .all(requiredId(taskId, "taskId"))
-      .map((raw) => {
-        const row = schema.parse(raw);
-        return {
-          scheduleId: row.schedule_id,
-          taskId: row.task_id,
-          kind: row.kind,
-          prompt: row.prompt,
-          state: row.state,
-          nextRunAt: row.next_run_at,
-          cadenceSeconds: row.cadence_seconds,
-          recurrence: row.recurrence_json,
-          missedRunPolicy: row.missed_run_policy,
-          overlapPolicy: row.overlap_policy,
-        };
-      });
+    return schedules.listSchedules(this.#database, taskId);
   }
 
-  cancelSchedule(input: {
-    readonly scheduleId: string;
-    readonly taskId: string;
-    readonly actorUserId: string;
-    readonly now: string;
-  }): boolean {
-    const now = isoDateTime.parse(input.now);
-    const cancel = this.#database.transaction(() => {
-      const result = this.#database
-        .query(
-          `UPDATE schedules SET state = 'cancelled', lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
-           WHERE schedule_id = ? AND task_id = ? AND state = 'active'`,
-        )
-        .run(
-          now,
-          requiredId(input.scheduleId, "scheduleId"),
-          requiredId(input.taskId, "taskId"),
-        );
-      if (result.changes === 0) return false;
-      writeAudit(this.#database, {
-        actorType: "slack-user",
-        actorId: input.actorUserId,
-        authority: "schedule-cancel",
-        source: input.scheduleId,
-        target: input.scheduleId,
-        action: "schedule.cancelled",
-        result: "cancelled",
-        correlationId: input.scheduleId,
-        metadata: {},
-        createdAt: now,
-      });
-      return true;
-    });
-    return cancel.immediate();
+  cancelSchedule(input: schedules.CancelScheduleInput): boolean {
+    return schedules.cancelSchedule(this.#database, input);
   }
 
-  revokeClaimedSchedule(input: { readonly scheduleId: string; readonly workerId: string; readonly now: string }): void {
-    const now = isoDateTime.parse(input.now);
-    const revoke = this.#database.transaction(() => {
-      const result = this.#database.query(
-        `UPDATE schedules SET state = 'cancelled', lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
-         WHERE schedule_id = ? AND state = 'active' AND lease_owner = ? AND lease_expires_at > ?`,
-      ).run(now, requiredId(input.scheduleId, "scheduleId"), requiredId(input.workerId, "workerId"), now);
-      if (result.changes !== 1) throw new Error("schedule lease is missing, expired, or cancelled");
-      writeAudit(this.#database, {
-        actorType: "worker", actorId: input.workerId, authority: "schedule-dispatch",
-        source: input.scheduleId, target: input.scheduleId, action: "schedule.authority-revoked",
-        result: "cancelled", correlationId: input.scheduleId, metadata: {}, createdAt: now,
-      });
-    });
-    revoke.immediate();
+  revokeClaimedSchedule(input: schedules.RevokeClaimedScheduleInput): void {
+    schedules.revokeClaimedSchedule(this.#database, input);
   }
 
-  claimDueSchedule(input: {
-    readonly workerId: string;
-    readonly now: string;
-    readonly leaseMs: number;
-  }): ClaimedSchedule | null {
-    const now = isoDateTime.parse(input.now);
-    const workerId = requiredId(input.workerId, "workerId");
-    const expiresAt = leaseExpiry(now, input.leaseMs);
-    const claim = this.#database.transaction(() => {
-      const identity = z.object({ schedule_id: nonEmpty }).nullable().parse(
-        this.#database
-          .query(
-            `SELECT schedule_id FROM schedules
-             WHERE state = 'active' AND next_run_at <= ?
-               AND (lease_expires_at IS NULL OR lease_expires_at <= ?)
-             ORDER BY next_run_at, schedule_id LIMIT 1`,
-          )
-          .get(now, now),
-      );
-      if (identity === null) return null;
-      const result = this.#database
-        .query(
-          `UPDATE schedules SET attempts = attempts + 1, lease_owner = ?, lease_expires_at = ?, updated_at = ?
-           WHERE schedule_id = ? AND state = 'active'
-             AND (lease_expires_at IS NULL OR lease_expires_at <= ?)`,
-        )
-        .run(workerId, expiresAt, now, identity.schedule_id, now);
-      if (result.changes !== 1) return null;
-      const row = scheduleRowSchema.parse(
-        this.#database
-          .query(
-            `SELECT schedule_id, task_id, workspace_id, conversation_id, thread_ts, actor_user_id,
-                    profile_id, repository_root, kind, prompt, cadence_seconds, recurrence_json, missed_run_policy,
-                    misfire_grace_seconds, overlap_policy, next_run_at, attempts, lease_expires_at
-             FROM schedules WHERE schedule_id = ?`,
-          )
-          .get(identity.schedule_id),
-      );
-      writeAudit(this.#database, {
-        actorType: "worker",
-        actorId: workerId,
-        authority: "schedule-dispatch",
-        source: row.schedule_id,
-        target: row.task_id,
-        action: "schedule.claimed",
-        result: "inflight",
-        correlationId: row.schedule_id,
-        metadata: { attempt: row.attempts, dueAt: row.next_run_at },
-        createdAt: now,
-      });
-      return {
-        scheduleId: row.schedule_id,
-        taskId: row.task_id,
-        workspaceId: row.workspace_id,
-        conversationId: row.conversation_id,
-        threadTs: row.thread_ts,
-        actorUserId: row.actor_user_id,
-        profileId: row.profile_id,
-        repositoryRoot: row.repository_root,
-        kind: row.kind,
-        prompt: row.prompt,
-        cadenceSeconds: row.cadence_seconds,
-        recurrence: row.recurrence_json,
-        missedRunPolicy: row.missed_run_policy,
-        misfireGraceSeconds: row.misfire_grace_seconds,
-        overlapPolicy: row.overlap_policy,
-        dueAt: row.next_run_at,
-        attempt: row.attempts,
-        leaseExpiresAt: row.lease_expires_at,
-      };
-    });
-    return claim.immediate();
+  claimDueSchedule(input: schedules.ClaimDueScheduleInput): ClaimedSchedule | null {
+    return schedules.claimDueSchedule(this.#database, input);
   }
 
   hasOpenScheduleOperation(scheduleId: string): boolean {
-    const row = this.#database
-      .query<{ count: number }, [string]>(
-        `SELECT COUNT(*) AS count
-         FROM schedule_runs r JOIN operations o ON o.operation_id = r.operation_id
-         WHERE r.schedule_id = ? AND o.status IN ('pending', 'inflight')`,
-      )
-      .get(requiredId(scheduleId, "scheduleId"));
-    if (row === null) throw new Error("failed to check schedule overlap");
-    return row.count > 0;
+    return schedules.hasOpenScheduleOperation(this.#database, scheduleId);
   }
 
-  settleScheduleRun(input: {
-    readonly scheduleId: string;
-    readonly workerId: string;
-    readonly dueAt: string;
-    readonly disposition: "dispatched" | "missed-skipped" | "overlap-skipped";
-    readonly operationId?: string;
-    readonly nextRunAt?: string;
-    readonly now: string;
-  }): void {
-    const now = isoDateTime.parse(input.now);
-    const dueAt = isoDateTime.parse(input.dueAt);
-    const nextRunAt = input.nextRunAt === undefined ? null : isoDateTime.parse(input.nextRunAt);
-    const settle = this.#database.transaction(() => {
-      this.#database
-        .query(
-          `INSERT INTO schedule_runs (run_id, schedule_id, due_at, disposition, operation_id, created_at)
-           VALUES (?, ?, ?, ?, ?, ?)`,
-        )
-        .run(
-          `${input.scheduleId}:${dueAt}`,
-          requiredId(input.scheduleId, "scheduleId"),
-          dueAt,
-          input.disposition,
-          input.operationId ?? null,
-          now,
-        );
-      const result = this.#database
-        .query(
-          `UPDATE schedules SET state = ?, next_run_at = COALESCE(?, next_run_at),
-             lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
-           WHERE schedule_id = ? AND state = 'active' AND lease_owner = ? AND lease_expires_at > ?`,
-        )
-        .run(
-          nextRunAt === null ? "completed" : "active",
-          nextRunAt,
-          now,
-          input.scheduleId,
-          requiredId(input.workerId, "workerId"),
-          now,
-        );
-      if (result.changes !== 1) throw new Error("schedule lease is missing, expired, or cancelled");
-      writeAudit(this.#database, {
-        actorType: "worker",
-        actorId: input.workerId,
-        authority: "schedule-dispatch",
-        source: input.scheduleId,
-        target: input.operationId ?? input.scheduleId,
-        action: "schedule.run.settled",
-        result: input.disposition,
-        correlationId: input.scheduleId,
-        metadata: { dueAt, recurring: nextRunAt !== null },
-        createdAt: now,
-      });
-    });
-    settle.immediate();
+  settleScheduleRun(input: schedules.SettleScheduleRunInput): void {
+    schedules.settleScheduleRun(this.#database, input);
   }
 
-  recordScheduleDenial(input: {
-    readonly actorUserId: string;
-    readonly sourceId: string;
-    readonly reason: string;
-    readonly workspaceId: string;
-    readonly now: string;
-  }): void {
-    const now = isoDateTime.parse(input.now);
-    writeAudit(this.#database, {
-      actorType: "slack-user",
-      actorId: requiredId(input.actorUserId, "actorUserId"),
-      authority: "schedule-policy",
-      source: requiredId(input.sourceId, "sourceId"),
-      target: requiredId(input.workspaceId, "workspaceId"),
-      action: "schedule.denied",
-      result: requiredId(input.reason, "reason"),
-      correlationId: input.sourceId,
-      metadata: {},
-      createdAt: now,
-    });
+  recordScheduleDenial(input: schedules.RecordScheduleDenialInput): void {
+    schedules.recordScheduleDenial(this.#database, input);
   }
 
-  evaluateAmbient(input: {
-    readonly workspaceId: string;
-    readonly conversationId: string;
-    readonly eventKey: string;
-    readonly actorUserId: string;
-    readonly text: string;
-    readonly cooldownSeconds: number;
-    readonly maxTurnsPerHour: number;
-    readonly now: string;
-  }): AmbientDecision {
-    const now = isoDateTime.parse(input.now);
-    if (!Number.isSafeInteger(input.cooldownSeconds) || input.cooldownSeconds < 60) {
-      throw new Error("ambient cooldown must be at least 60 seconds");
-    }
-    if (!Number.isSafeInteger(input.maxTurnsPerHour) || input.maxTurnsPerHour <= 0) {
-      throw new Error("ambient hourly limit must be positive");
-    }
-    const workspaceId = requiredId(input.workspaceId, "workspaceId");
-    const conversationId = requiredId(input.conversationId, "conversationId");
-    const eventKey = requiredId(input.eventKey, "eventKey");
-    const normalized = input.text.trim().replaceAll(/\s+/g, " ").toLowerCase();
-    const fingerprint = createHash("sha256").update(normalized).digest("hex");
-    const evaluate = this.#database.transaction((): AmbientDecision => {
-      const prior = ambientDecisionSchema.nullable().parse(
-        this.#database
-          .query(
-            "SELECT disposition, reason FROM ambient_decisions WHERE workspace_id = ? AND event_key = ?",
-          )
-          .get(workspaceId, eventKey),
-      );
-      if (prior !== null) {
-        return prior.disposition === "triggered"
-          ? { kind: "triggered" }
-          : {
-              kind: "quiet",
-              reason: z.enum(["unchanged", "cooldown", "hourly-limit"]).parse(prior.reason),
-            };
-      }
-
-      const last = z
-        .object({ content_fingerprint: nonEmpty, created_at: isoDateTime })
-        .nullable()
-        .parse(
-          this.#database
-            .query(
-              `SELECT content_fingerprint, created_at FROM ambient_decisions
-               WHERE workspace_id = ? AND conversation_id = ? AND disposition = 'triggered'
-               ORDER BY created_at DESC LIMIT 1`,
-            )
-            .get(workspaceId, conversationId),
-        );
-      const cutoff = new Date(new Date(now).getTime() - 3_600_000).toISOString();
-      const count = this.#database
-        .query<{ count: number }, [string, string, string]>(
-          `SELECT COUNT(*) AS count FROM ambient_decisions
-           WHERE workspace_id = ? AND conversation_id = ? AND disposition = 'triggered' AND created_at > ?`,
-        )
-        .get(workspaceId, conversationId, cutoff)?.count;
-      if (count === undefined) throw new Error("failed to count ambient turns");
-
-      let decision: AmbientDecision = { kind: "triggered" };
-      if (last?.content_fingerprint === fingerprint) {
-        decision = { kind: "quiet", reason: "unchanged" };
-      } else if (
-        last !== null &&
-        new Date(now).getTime() < new Date(last.created_at).getTime() + input.cooldownSeconds * 1_000
-      ) {
-        decision = { kind: "quiet", reason: "cooldown" };
-      } else if (count >= input.maxTurnsPerHour) {
-        decision = { kind: "quiet", reason: "hourly-limit" };
-      }
-      const disposition = decision.kind === "triggered" ? "triggered" : "quiet";
-      const reason = decision.kind === "triggered" ? "relevant" : decision.reason;
-      this.#database
-        .query(
-          `INSERT INTO ambient_decisions (
-            workspace_id, conversation_id, event_key, actor_user_id, content_fingerprint,
-            disposition, reason, created_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-        )
-        .run(
-          workspaceId,
-          conversationId,
-          eventKey,
-          requiredId(input.actorUserId, "actorUserId"),
-          fingerprint,
-          disposition,
-          reason,
-          now,
-        );
-      writeAudit(this.#database, {
-        actorType: "slack-user",
-        actorId: input.actorUserId,
-        authority: "ambient-policy",
-        source: eventKey,
-        target: conversationId,
-        action: "ambient.decided",
-        result: disposition,
-        correlationId: eventKey,
-        metadata: { reason },
-        createdAt: now,
-      });
-      return decision;
-    });
-    return evaluate.immediate();
+  evaluateAmbient(input: ambient.EvaluateAmbientInput): AmbientDecision {
+    return ambient.evaluateAmbient(this.#database, input);
   }
 
   ingestSlackEvent(input: SlackEventInput): IngestReceipt {
@@ -2724,99 +1882,12 @@ export class AgentTagStore {
     return quarantine.immediate();
   }
 
-  diagnostics(): {
-    readonly events: number;
-    readonly deliveries: number;
-    readonly tasks: number;
-    readonly operations: number;
-    readonly outbox: number;
-    readonly memoryEntries: number;
-    readonly schedules: number;
-    readonly scheduleRuns: number;
-    readonly ambientDecisions: number;
-    readonly auditRecords: number;
-  } {
-    const count = (table: string): number => {
-      const allowed = new Set([
-        "slack_events",
-        "slack_deliveries",
-        "tasks",
-        "operations",
-        "slack_outbox",
-        "memory_entries",
-        "schedules",
-        "schedule_runs",
-        "ambient_decisions",
-        "audit_log",
-      ]);
-      if (!allowed.has(table)) throw new Error("unsupported diagnostics table");
-      const value = this.#database.query<{ count: number }, []>(`SELECT COUNT(*) AS count FROM ${table}`).get()
-        ?.count;
-      if (value === undefined) throw new Error(`failed to count ${table}`);
-      return value;
-    };
-    return {
-      events: count("slack_events"),
-      deliveries: count("slack_deliveries"),
-      tasks: count("tasks"),
-      operations: count("operations"),
-      outbox: count("slack_outbox"),
-      memoryEntries: count("memory_entries"),
-      schedules: count("schedules"),
-      scheduleRuns: count("schedule_runs"),
-      ambientDecisions: count("ambient_decisions"),
-      auditRecords: count("audit_log"),
-    };
+  diagnostics(): diagnostics.StoreDiagnostics {
+    return diagnostics.diagnostics(this.#database);
   }
 
   operationalStatus(nowInput: string): OperationalStatus {
-    const now = isoDateTime.parse(nowInput);
-    const operations = this.#database.query<{
-      ready: number;
-      deferred: number;
-      activeLease: number;
-      expiredLease: number;
-      stalledRetry: number;
-      stalledFailed: number;
-      oldestReadyAt: string | null;
-    }, [string, string, string, string, string]>(
-      `SELECT
-         COUNT(*) FILTER (WHERE status = 'pending' AND (blocked_until IS NULL OR blocked_until <= ?)) AS ready,
-         COUNT(*) FILTER (WHERE status = 'pending' AND blocked_until > ?) AS deferred,
-         COUNT(*) FILTER (WHERE status = 'inflight' AND lease_expires_at > ?) AS activeLease,
-         COUNT(*) FILTER (WHERE status = 'inflight' AND (lease_expires_at IS NULL OR lease_expires_at <= ?)) AS expiredLease,
-         COUNT(*) FILTER (WHERE status = 'pending' AND last_error_code = 'T3TurnStalled') AS stalledRetry,
-         COUNT(*) FILTER (WHERE status = 'failed' AND last_error_code = 'T3TurnStalled') AS stalledFailed,
-         MIN(CASE WHEN status = 'pending' AND (blocked_until IS NULL OR blocked_until <= ?)
-             THEN created_at END) AS oldestReadyAt
-       FROM operations`,
-    ).get(now, now, now, now, now);
-    const interactions = this.#database.query<{
-      awaitingHuman: number;
-      responseQueued: number;
-    }, []>(
-      `SELECT
-         COUNT(*) FILTER (WHERE state = 'pending') AS awaitingHuman,
-         COUNT(*) FILTER (WHERE state IN ('response-pending', 'inflight')) AS responseQueued
-       FROM interactions`,
-    ).get();
-    const outbox = this.#database.query<{
-      pending: number;
-      activeLease: number;
-      expiredLease: number;
-      outcomeUnknown: number;
-    }, [string, string]>(
-      `SELECT
-         COUNT(*) FILTER (WHERE status = 'pending') AS pending,
-         COUNT(*) FILTER (WHERE status = 'inflight' AND lease_expires_at > ?) AS activeLease,
-         COUNT(*) FILTER (WHERE status = 'inflight' AND (lease_expires_at IS NULL OR lease_expires_at <= ?)) AS expiredLease,
-         COUNT(*) FILTER (WHERE status = 'failed' AND last_error_code = 'delivery-outcome-unknown') AS outcomeUnknown
-       FROM slack_outbox`,
-    ).get(now, now);
-    if (operations === null || interactions === null || outbox === null) {
-      throw new Error("operational status query failed");
-    }
-    return { asOf: now, operations, interactions, outbox };
+    return diagnostics.operationalStatus(this.#database, nowInput);
   }
 
   #findOrCreateTask(event: {
