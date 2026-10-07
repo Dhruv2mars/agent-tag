@@ -115,6 +115,7 @@ test("t3 status prints the install fields as JSON without installing anything", 
     binary: null,
     binarySha256: null,
     binarySha256Verified: false,
+    filesVerified: false,
     installedAt: null,
     problem: t3ArtifactFor(PINNED_T3) === undefined ? `t3.lock.json pins no artifact for ${process.platform}-${process.arch}` : null,
   });

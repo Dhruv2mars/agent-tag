@@ -1,3 +1,4 @@
+import { Database } from "bun:sqlite";
 import { randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { chmod, mkdir, open, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
@@ -17,6 +18,10 @@ const MAX_T3_EXPANDED_BYTES = 1024 * 1024 * 1024;
 const DOWNLOAD_TIMEOUT_MS = 10 * 60 * 1000;
 const STALE_DOWNLOAD_MS = 60 * 60 * 1000;
 const INSTALL_RECORD = "agent-tag-install.json";
+const INSTALL_LOCK = "install.lock";
+const LOCK_POLL_MS = 100;
+/** Longer than one full download plus extraction, so a waiter outlasts a healthy holder. */
+const LOCK_WAIT_MS = DOWNLOAD_TIMEOUT_MS + 5 * 60 * 1000;
 
 export class T3ArtifactVerificationError extends Error {
   override readonly name = "T3ArtifactVerificationError";
@@ -64,6 +69,8 @@ const installRecordSchema = z.object({
   artifact: z.string(),
   archiveSha256: z.string().regex(/^[a-f0-9]{64}$/),
   binarySha256: z.string().regex(/^[a-f0-9]{64}$/),
+  /** {@link treeSha256} of the whole version directory, so missing or edited dependencies are caught. */
+  treeSha256: z.string().regex(/^[a-f0-9]{64}$/),
   installedAt: z.iso.datetime(),
 });
 type InstallRecord = z.infer<typeof installRecordSchema>;
@@ -134,25 +141,101 @@ async function readInstallRecord(root: string): Promise<InstallRecord | undefine
   }
 }
 
+/**
+ * sha256 over every entry under `root` except the install record: kind, relative path, exec bit,
+ * and content sha256, in sorted order. Anything but regular files and directories is rejected,
+ * because extraction only ever creates those.
+ */
+async function treeSha256(root: string): Promise<string> {
+  const lines: string[] = [];
+  const walk = async (dir: string, prefix: string): Promise<void> => {
+    const entries = (await readdir(dir, { withFileTypes: true }))
+      .sort((left, right) => (left.name < right.name ? -1 : left.name > right.name ? 1 : 0));
+    for (const entry of entries) {
+      const relative = prefix === "" ? entry.name : `${prefix}/${entry.name}`;
+      if (relative === INSTALL_RECORD) continue;
+      const path = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        lines.push(`d ${JSON.stringify(relative)}`);
+        await walk(path, relative);
+      } else if (entry.isFile()) {
+        const executable = ((await stat(path)).mode & 0o111) !== 0 ? "x" : "-";
+        lines.push(`f ${JSON.stringify(relative)} ${executable} ${await sha256File(path)}`);
+      } else {
+        throw new Error(`${relative} is not a regular file or directory`);
+      }
+    }
+  };
+  await walk(root, "");
+  return new Bun.CryptoHasher("sha256").update(`${lines.join("\n")}\n`).digest("hex");
+}
+
 type InstalledCheck =
   | { readonly kind: "missing" }
-  | { readonly kind: "tampered"; readonly reason: string }
+  | { readonly kind: "tampered"; readonly reason: string; readonly binaryVerified: boolean }
   | { readonly kind: "verified"; readonly record: InstallRecord };
 
-/** Checks `versions/<v>` against its install record and the pin, re-hashing the binary. */
+/**
+ * Checks `versions/<v>` against its install record and the pin, re-hashing the binary and then
+ * the whole tree. Never throws on a vanished or unreadable tree: that is reported as tampered.
+ */
 async function checkInstalled(root: string, pin: T3Pin, artifact: T3Artifact): Promise<InstalledCheck> {
   if (!(await exists(root))) return { kind: "missing" };
+  const tampered = (reason: string, binaryVerified = false): InstalledCheck => ({ kind: "tampered", reason, binaryVerified });
   const record = await readInstallRecord(root);
-  if (record === undefined) return { kind: "tampered", reason: `missing or invalid ${INSTALL_RECORD}` };
+  if (record === undefined) return tampered(`missing or invalid ${INSTALL_RECORD}`);
   if (record.version !== pin.version || record.artifact !== artifact.name || record.archiveSha256 !== artifact.sha256) {
-    return { kind: "tampered", reason: `${INSTALL_RECORD} does not match t3.lock.json` };
+    return tampered(`${INSTALL_RECORD} does not match t3.lock.json`);
   }
   const binary = join(root, "t3");
-  if (!(await exists(binary))) return { kind: "tampered", reason: "t3 binary is missing" };
-  if ((await sha256File(binary)) !== record.binarySha256) {
-    return { kind: "tampered", reason: "t3 binary sha256 differs from the install record" };
+  try {
+    if (!(await exists(binary))) return tampered("t3 binary is missing");
+    if ((await sha256File(binary)) !== record.binarySha256) return tampered("t3 binary sha256 differs from the install record");
+    if ((await treeSha256(root)) !== record.treeSha256) {
+      return tampered("runtime files differ from the install record (missing, added, or modified files)", true);
+    }
+  } catch (error) {
+    return tampered(`runtime files could not be verified: ${error instanceof Error ? error.message : String(error)}`);
   }
   return { kind: "verified", record };
+}
+
+function isSqliteBusy(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "code" in error
+    && (error.code === "SQLITE_BUSY" || error.code === "SQLITE_LOCKED");
+}
+
+/**
+ * Serializes installs and repairs of one runtime directory, across processes and within one.
+ * The lock is an exclusive SQLite transaction on `<runtimeDir>/install.lock`: the kernel drops the
+ * underlying fcntl lock when its holder exits, so a crashed install never leaves a stale lock and
+ * no pid or mtime heuristics are needed. Waiters poll without blocking the event loop.
+ */
+async function withInstallLock<T>(runtimeDir: string, body: () => Promise<T>): Promise<T> {
+  const path = join(runtimeDir, INSTALL_LOCK);
+  await writeFile(path, "", { flag: "a", mode: 0o600 });
+  const db = new Database(path);
+  try {
+    db.run("PRAGMA busy_timeout = 0");
+    const deadline = Date.now() + LOCK_WAIT_MS;
+    for (;;) {
+      try {
+        db.run("BEGIN EXCLUSIVE");
+        break;
+      } catch (error) {
+        if (!isSqliteBusy(error)) throw error;
+        if (Date.now() >= deadline) throw new Error(`timed out waiting for another T3 install to release ${path}`);
+        await Bun.sleep(LOCK_POLL_MS);
+      }
+    }
+    try {
+      return await body();
+    } finally {
+      db.run("ROLLBACK");
+    }
+  } finally {
+    db.close();
+  }
 }
 
 async function assertNoDowngrade(runtimeDir: string, pin: T3Pin): Promise<void> {
@@ -400,22 +483,32 @@ function installed(root: string, target: string, record: InstallRecord, download
 /**
  * Installs the pinned T3 release under `<runtimeDir>/versions/<version>`: download, sha256 check
  * against t3.lock.json, listing check, extract into `downloads/<nonce>`, `t3 --version` check, then
- * one atomic rename. A verified existing install is reused; a tampered one is replaced.
+ * one atomic rename. An existing install is reused only when its record, file tree, and
+ * `t3 --version` all check out; otherwise it is replaced. The whole sequence runs under the
+ * runtime's install lock, so concurrent installs and repairs converge on one verified tree.
  */
 export async function installPinnedT3(options: InstallPinnedT3Options): Promise<InstalledT3> {
+  const artifact = requireArtifact(options.pin, options.platform ?? process.platform, options.arch ?? process.arch);
+  await ensurePrivateDirectory(options.runtimeDir);
+  return withInstallLock(options.runtimeDir, () => installLocked(options, artifact));
+}
+
+async function installLocked(options: InstallPinnedT3Options, artifact: T3Artifact): Promise<InstalledT3> {
   const { pin, runtimeDir } = options;
   const run = options.runCommand ?? defaultRunCommand;
   const now = options.now ?? (() => new Date());
-  const artifact = requireArtifact(pin, options.platform ?? process.platform, options.arch ?? process.arch);
-  await ensurePrivateDirectory(runtimeDir);
   await assertNoDowngrade(runtimeDir, pin);
 
   const versionsDir = join(runtimeDir, "versions");
   const root = join(versionsDir, pin.version);
-  const existing = await checkInstalled(root, pin, artifact);
+  let existing = await checkInstalled(root, pin, artifact);
   if (existing.kind === "verified") {
-    await verifyT3Binary({ pin, binary: join(root, "t3") });
-    return installed(root, artifact.target, existing.record, false);
+    const failure = await verifyT3Binary({ pin, binary: join(root, "t3") }).then(
+      () => undefined,
+      (error: unknown) => (error instanceof Error ? error.message : String(error)),
+    );
+    if (failure === undefined) return installed(root, artifact.target, existing.record, false);
+    existing = { kind: "tampered", reason: `t3 --version check failed: ${failure}`, binaryVerified: true };
   }
   if (existing.kind === "tampered") {
     options.log?.("t3.install.tampered", `${root}: ${existing.reason}; reinstalling`);
@@ -462,17 +555,12 @@ export async function installPinnedT3(options: InstallPinnedT3Options): Promise<
       artifact: artifact.name,
       archiveSha256,
       binarySha256: await sha256File(stagedBinary),
+      treeSha256: await treeSha256(stagedRoot),
       installedAt: now().toISOString(),
     };
     await writeFile(join(stagedRoot, INSTALL_RECORD), `${JSON.stringify(record, null, 2)}\n`, { mode: 0o644 });
-    try {
-      await rename(stagedRoot, root);
-    } catch (error) {
-      // A concurrent install won the rename; reuse it if it verifies.
-      const raced = await checkInstalled(root, pin, artifact);
-      if (raced.kind !== "verified") throw error;
-      return installed(root, artifact.target, raced.record, false);
-    }
+    // The install lock guarantees nobody else is creating or replacing `root` right now.
+    await rename(stagedRoot, root);
     options.log?.("t3.install.installed", `${pin.version} at ${root}`);
     await prune(versionsDir, pin.version, options.log);
     return installed(root, artifact.target, record, true);
@@ -491,11 +579,16 @@ export interface T3InstallStatus {
   readonly binary: string | null;
   readonly binarySha256: string | null;
   readonly binarySha256Verified: boolean;
+  /** True only when the record, the binary, and every file in the version directory verify. */
+  readonly filesVerified: boolean;
   readonly installedAt: string | null;
   readonly problem: string | null;
 }
 
-/** Read-only view of the managed install: never downloads, creates directories, or runs T3. */
+/**
+ * Read-only view of the managed install: never downloads, creates directories, takes the install
+ * lock, or runs T3. Re-hashes the binary and the whole tree against the install record.
+ */
 export async function inspectInstalledT3(input: {
   readonly pin: T3Pin;
   readonly runtimeDir: string;
@@ -521,6 +614,7 @@ export async function inspectInstalledT3(input: {
       binary: join(root, "t3"),
       binarySha256: check.record.binarySha256,
       binarySha256Verified: true,
+      filesVerified: true,
       installedAt: check.record.installedAt,
       problem: null,
     };
@@ -532,7 +626,8 @@ export async function inspectInstalledT3(input: {
     version: record?.version ?? null,
     binary: check.kind === "tampered" ? join(root, "t3") : null,
     binarySha256: record?.binarySha256 ?? null,
-    binarySha256Verified: false,
+    binarySha256Verified: check.kind === "tampered" && check.binaryVerified,
+    filesVerified: false,
     installedAt: record?.installedAt ?? null,
     problem: check.kind === "tampered"
       ? `${check.reason}; run agent-tag t3 install to replace it`

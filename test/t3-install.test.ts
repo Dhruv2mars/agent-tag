@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { chmod, mkdir, mkdtemp, readdir, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -123,6 +123,7 @@ describe("installPinnedT3", () => {
       artifact: t3ArtifactName(pin.version),
       archiveSha256: tarball.sha256,
       binarySha256: installed.binarySha256,
+      treeSha256: expect.stringMatching(/^[a-f0-9]{64}$/),
       installedAt: "2026-10-08T00:00:00.000Z",
     });
     expect(await listing(root)).toEqual(["agent-tag-install.json", "client", "node_modules", "t3"]);
@@ -179,6 +180,120 @@ describe("installPinnedT3", () => {
     expect(events[0]).toContain("t3.install.tampered");
     expect(mirror.requests).toHaveLength(2);
     expect((await inspectInstalledT3({ pin, runtimeDir: dir })).binarySha256Verified).toBe(true);
+  });
+
+  test("repairs a runtime whose bundled dependencies were deleted, and status flags it first", async () => {
+    const tarball = await buildFakeT3Tarball();
+    const pin = fixturePin({ sha256: tarball.sha256 });
+    const mirror = mirrorFor(pin, tarball);
+    const dir = await runtimeDir();
+    const first = await installPinnedT3({ pin, runtimeDir: dir, downloadBaseUrl: mirror.baseUrl });
+    await rm(join(first.root, "node_modules"), { recursive: true });
+    const broken = Bun.spawnSync([first.binary, "--version"], { stderr: "pipe" });
+    expect(broken.exitCode).not.toBe(0);
+    expect(broken.stderr.toString()).toContain("MODULE_NOT_FOUND");
+
+    const status = await inspectInstalledT3({ pin, runtimeDir: dir });
+    expect(status).toMatchObject({ installed: true, binarySha256Verified: true, filesVerified: false });
+    expect(status.problem).toContain("runtime files differ from the install record");
+
+    const events: string[] = [];
+    const second = await installPinnedT3({
+      pin,
+      runtimeDir: dir,
+      downloadBaseUrl: mirror.baseUrl,
+      log: (event, detail) => events.push(`${event} ${detail}`),
+    });
+    expect(second.downloaded).toBe(true);
+    expect(events[0]).toContain("t3.install.tampered");
+    expect(await listing(second.root)).toEqual(["agent-tag-install.json", "client", "node_modules", "t3"]);
+    expect(Bun.spawnSync([second.binary, "--version"]).stdout.toString().trim()).toBe(`t3 v${pin.version}`);
+    expect(await inspectInstalledT3({ pin, runtimeDir: dir })).toMatchObject({ filesVerified: true, problem: null });
+  });
+
+  test("reinstalls an existing runtime whose t3 --version check fails even though its files verify", async () => {
+    const tarball = await buildFakeT3Tarball();
+    const pin = fixturePin({ sha256: tarball.sha256 });
+    const mirror = mirrorFor(pin, tarball);
+    const dir = await runtimeDir();
+    const first = await installPinnedT3({ pin, runtimeDir: dir, downloadBaseUrl: mirror.baseUrl });
+    expect((await inspectInstalledT3({ pin, runtimeDir: dir })).filesVerified).toBe(true);
+
+    const events: string[] = [];
+    // Outside the version directory, so the tree still verifies but the existing t3 fails to start.
+    await writeFile(`${first.root}.broken`, "");
+    const second = await installPinnedT3({
+      pin,
+      runtimeDir: dir,
+      downloadBaseUrl: mirror.baseUrl,
+      log: (event, detail) => events.push(`${event} ${detail}`),
+    });
+    expect(second.downloaded).toBe(true);
+    expect(events[0]).toContain("t3.install.tampered");
+    expect(events[0]).toContain("t3 --version check failed");
+    expect(events[0]).toContain("MODULE_NOT_FOUND");
+    expect(mirror.requests).toHaveLength(2);
+  });
+
+  test("concurrent repairs of a tampered runtime all succeed and leave one valid runtime", async () => {
+    const tarball = await buildFakeT3Tarball();
+    const pin = fixturePin({ sha256: tarball.sha256 });
+    const mirror = mirrorFor(pin, tarball);
+    const dir = await runtimeDir();
+    const first = await installPinnedT3({ pin, runtimeDir: dir, downloadBaseUrl: mirror.baseUrl });
+    await writeFile(first.binary, "#!/bin/sh\necho 't3 v0.0.45'\n# implant\n");
+    await rm(join(first.root, "node_modules"), { recursive: true });
+
+    const install = (): Promise<unknown> => installPinnedT3({ pin, runtimeDir: dir, downloadBaseUrl: mirror.baseUrl });
+    const inspect = (): Promise<unknown> => inspectInstalledT3({ pin, runtimeDir: dir });
+    const results = await Promise.all([install(), inspect(), install(), install(), inspect(), install(), install()]);
+    const installs = results.filter((result): result is { binarySha256: string; downloaded: boolean } =>
+      typeof result === "object" && result !== null && "downloaded" in result);
+    expect(installs).toHaveLength(5);
+    expect(new Set(installs.map((result) => result.binarySha256))).toEqual(new Set([first.binarySha256]));
+    // The lock serializes them: exactly one repair downloads, the rest reuse its verified tree.
+    expect(installs.filter((result) => result.downloaded)).toHaveLength(1);
+    expect(mirror.requests).toHaveLength(2);
+    expect(await listing(join(dir, "versions"))).toEqual([pin.version]);
+    expect(await listing(join(dir, "downloads"))).toEqual([]);
+    expect(await inspectInstalledT3({ pin, runtimeDir: dir })).toMatchObject({ filesVerified: true, problem: null });
+  });
+
+  test("waits for an install lock held by another process and recovers when that holder dies", async () => {
+    const tarball = await buildFakeT3Tarball();
+    const pin = fixturePin({ sha256: tarball.sha256 });
+    const mirror = mirrorFor(pin, tarball);
+    const dir = await runtimeDir();
+    await mkdir(dir, { recursive: true, mode: 0o700 });
+    const holder = Bun.spawn([
+      process.execPath,
+      "-e",
+      `const { Database } = require("bun:sqlite");
+       const db = new Database(${JSON.stringify(join(dir, "install.lock"))}, { create: true });
+       db.run("BEGIN EXCLUSIVE");
+       console.log("locked");
+       setInterval(() => {}, 1000);`,
+    ], { stdout: "pipe", stderr: "inherit" });
+    try {
+      const reader = holder.stdout.getReader();
+      expect(new TextDecoder().decode((await reader.read()).value)).toContain("locked");
+
+      let settled = false;
+      const pending = installPinnedT3({ pin, runtimeDir: dir, downloadBaseUrl: mirror.baseUrl }).finally(() => {
+        settled = true;
+      });
+      await Bun.sleep(400);
+      expect(settled).toBe(false);
+      expect(mirror.requests).toEqual([]);
+
+      // SIGKILL skips any cleanup: the kernel alone releases the lock.
+      holder.kill("SIGKILL");
+      await holder.exited;
+      expect((await pending).downloaded).toBe(true);
+    } finally {
+      holder.kill("SIGKILL");
+    }
+    expect(await inspectInstalledT3({ pin, runtimeDir: dir })).toMatchObject({ filesVerified: true, problem: null });
   });
 
   test("rejects an archive whose sha256 differs from the lock and leaves nothing behind", async () => {
@@ -300,6 +415,7 @@ describe("inspectInstalledT3", () => {
       binary: null,
       binarySha256: null,
       binarySha256Verified: false,
+      filesVerified: false,
       installedAt: null,
       problem: null,
     });
@@ -325,6 +441,7 @@ describe("inspectInstalledT3", () => {
       binary: installed.binary,
       binarySha256: installed.binarySha256,
       binarySha256Verified: true,
+      filesVerified: true,
       installedAt: installed.installedAt,
       problem: null,
     });

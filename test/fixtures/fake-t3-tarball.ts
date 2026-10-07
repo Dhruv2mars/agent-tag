@@ -8,9 +8,18 @@ import type { T3Pin } from "../../src/t3/pin.ts";
 
 export const CURRENT_TARGET = `${process.platform}-${process.arch}`;
 
-/** A POSIX shell stand-in for the T3 CLI that answers `--version`. */
+/**
+ * A POSIX shell stand-in for the T3 CLI that answers `--version`. Like the real Node-based CLI it
+ * fails with MODULE_NOT_FOUND when its bundled dependencies are gone. It also fails when a
+ * `<its directory>.broken` sibling exists, so tests can break one runtime without touching its files.
+ */
 export function fakeT3Script(reportedVersion: string): string {
   return `#!/bin/sh
+root=$(dirname "$0")
+if [ ! -f "$root/node_modules/example/index.js" ] || [ -e "$root.broken" ]; then
+  echo "Error: Cannot find module 'example' (MODULE_NOT_FOUND)" >&2
+  exit 1
+fi
 if [ "$1" = "--version" ]; then echo "t3 v${reportedVersion}"; exit 0; fi
 echo "fake t3" >&2
 exit 2
