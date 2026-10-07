@@ -36,6 +36,7 @@ describe("Agent Tag config", () => {
       timeoutSeconds: 300,
       retryDelaySeconds: 30,
       maxAttempts: 5,
+      maxTurnSeconds: 21_600,
     });
     expect(() =>
       agentTagConfigSchema.parse({
@@ -46,6 +47,36 @@ describe("Agent Tag config", () => {
         },
       }),
     ).toThrow();
+  });
+
+  test("defaults and validates the turn ceiling and interaction expiry", () => {
+    const parsed = agentTagConfigSchema.parse(baseConfig);
+    expect(parsed.limits.interactionExpirySeconds).toBe(86_400);
+    const withLimits = (limits: Record<string, unknown>) => ({
+      ...baseConfig,
+      limits: { ...baseConfig.limits, ...limits },
+    });
+    // An explicit stalledTurn without the newer key still gets the 6h ceiling.
+    expect(
+      agentTagConfigSchema.parse(
+        withLimits({ stalledTurn: { timeoutSeconds: 120, retryDelaySeconds: 30, maxAttempts: 5 } }),
+      ).limits.stalledTurn.maxTurnSeconds,
+    ).toBe(21_600);
+    // A pre-ceiling config with a stall timeout above 6h stays valid; the ceiling follows the timeout.
+    expect(
+      agentTagConfigSchema.parse(
+        withLimits({ stalledTurn: { timeoutSeconds: 86_400, retryDelaySeconds: 30, maxAttempts: 5 } }),
+      ).limits.stalledTurn.maxTurnSeconds,
+    ).toBe(86_400);
+    expect(() =>
+      agentTagConfigSchema.parse(
+        withLimits({ stalledTurn: { timeoutSeconds: 600, retryDelaySeconds: 30, maxAttempts: 5, maxTurnSeconds: 300 } }),
+      ),
+    ).toThrow("maxTurnSeconds must be at least timeoutSeconds");
+    expect(() => agentTagConfigSchema.parse(withLimits({ interactionExpirySeconds: 59 }))).toThrow();
+    expect(() => agentTagConfigSchema.parse(withLimits({ interactionExpirySeconds: 1.5 }))).toThrow();
+    expect(agentTagConfigSchema.parse(withLimits({ interactionExpirySeconds: 3_600 })).limits.interactionExpirySeconds)
+      .toBe(3_600);
   });
 
   test("rejects a remote T3 endpoint", () => {

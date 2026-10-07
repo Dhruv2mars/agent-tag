@@ -627,7 +627,7 @@ if (!enabled) {
             },
             workerId: `live-before-restart-${crypto.randomUUID()}`,
             pollMs: 250,
-            maxWaitMs: 60_000,
+            stallMs: 60_000,
           });
           expect(await firstCoordinator.processNext()).toMatchObject({
             kind: "retry-scheduled",
@@ -642,7 +642,7 @@ if (!enabled) {
             workerId: `live-after-restart-${crypto.randomUUID()}`,
             now: () => new Date(Date.now() + 2_000),
             pollMs: 250,
-            maxWaitMs: 60_000,
+            stallMs: 60_000,
           });
           const outcome = await restartedCoordinator.processNext();
           expect(outcome).toMatchObject({ kind: "completed", operationId: receipt.operationId });

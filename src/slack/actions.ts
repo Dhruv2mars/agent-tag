@@ -75,7 +75,8 @@ type IgnoredReason =
   | "workspace-denied"
   | "channel-denied"
   | "user-denied"
-  | "interaction-denied";
+  | "interaction-denied"
+  | "interaction-expired";
 
 export type SlackActionResult =
   | { readonly kind: "accepted" | "duplicate"; readonly commandId: string }
@@ -256,9 +257,11 @@ export class SlackActionRouter {
         threadTs,
         actorUserId: body.user.id,
         sourceActionId,
+        expirySeconds: this.#config.limits.interactionExpirySeconds,
         now: this.#now(),
       });
       if (result.kind === "denied") return { kind: "ignored", reason: "interaction-denied" };
+      if (result.kind === "expired") return { kind: "ignored", reason: "interaction-expired" };
       if (result.kind === "invalid") return { kind: "ignored", reason: "invalid-action" };
       return result;
     }
@@ -286,9 +289,11 @@ export class SlackActionRouter {
       actorUserId: body.user.id,
       sourceActionId,
       response,
+      expirySeconds: this.#config.limits.interactionExpirySeconds,
       now: this.#now(),
     });
     if (result.kind === "denied") return { kind: "ignored", reason: "interaction-denied" };
+    if (result.kind === "expired") return { kind: "ignored", reason: "interaction-expired" };
     return { kind: result.kind, commandId: result.commandId };
   }
 
@@ -324,9 +329,13 @@ export class SlackActionRouter {
       threadTs: metadata.threadTs,
       actorUserId: body.user.id,
       sourceActionId: `${body.team.id}:${body.user.id}:${body.view.id}:view_submission`,
+      expirySeconds: this.#config.limits.interactionExpirySeconds,
       now: this.#now(),
     });
     if (result.kind === "denied") return { kind: "ignored", reason: "interaction-denied" };
+    if (result.kind === "expired") {
+      return { kind: "invalid-input", errors: { [errorBlock]: "This question has expired and can no longer be answered." } };
+    }
     if (result.kind === "invalid") {
       return { kind: "invalid-input", errors: { [errorBlock]: "That answer is not allowed for this question." } };
     }

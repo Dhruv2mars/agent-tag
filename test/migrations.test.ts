@@ -88,9 +88,11 @@ function seedVersionOne(database: Database): void {
 }
 
 test("upgrades every historical SQLite schema while preserving existing work", async () => {
-  expect(STORE_MIGRATIONS.map((migration) => migration.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+  // 13 belongs to an independent branch; 14 must apply whether or not it is present.
+  const versions = STORE_MIGRATIONS.map((migration) => migration.version);
+  expect(versions).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14]);
 
-  for (const startingVersion of STORE_MIGRATIONS.map((migration) => migration.version)) {
+  for (const startingVersion of versions) {
     const directory = await mkdtemp(join(tmpdir(), `agent-tag-migration-v${startingVersion}-`));
     const path = join(directory, "agent-tag.sqlite");
     try {
@@ -101,8 +103,8 @@ test("upgrades every historical SQLite schema while preserving existing work", a
       );
       applyMigration(historical, 1);
       seedVersionOne(historical);
-      for (let version = 2; version <= startingVersion; version += 1) {
-        applyMigration(historical, version);
+      for (const version of versions) {
+        if (version > 1 && version <= startingVersion) applyMigration(historical, version);
       }
       historical.close();
 
@@ -127,9 +129,10 @@ test("upgrades every historical SQLite schema while preserving existing work", a
             source_order_key: string;
             blocked_until: string | null;
             resolved_text: string | null;
-          }, []>("SELECT source_order_key, blocked_until, resolved_text FROM operations")
+            turn_active_ms: number;
+          }, []>("SELECT source_order_key, blocked_until, resolved_text, turn_active_ms FROM operations")
           .get(),
-      ).toEqual({ source_order_key: createdAt, blocked_until: null, resolved_text: null });
+      ).toEqual({ source_order_key: createdAt, blocked_until: null, resolved_text: null, turn_active_ms: 0 });
       expect(
         upgraded
           .query<{ conversation_type: string; owner_user_id: string | null }, []>(

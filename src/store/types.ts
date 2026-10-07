@@ -76,6 +76,8 @@ export interface ClaimedOperation {
   readonly payload: z.infer<typeof operationPayloadSchema>;
   readonly attempt: number;
   readonly leaseExpiresAt: string;
+  /** Milliseconds this turn has already spent being polled, summed over earlier claims. */
+  readonly turnActiveMs: number;
 }
 
 export interface OperationalStatus {
@@ -144,6 +146,7 @@ export type UserInputAnswerResult =
   | { readonly kind: "accepted" | "duplicate"; readonly commandId: string }
   | { readonly kind: "partial"; readonly commandId: string; readonly answered: number; readonly total: number }
   | { readonly kind: "invalid" }
+  | { readonly kind: "expired" }
   | { readonly kind: "denied" };
 
 export interface ClaimedOutboxMessage {

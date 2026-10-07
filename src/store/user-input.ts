@@ -5,6 +5,7 @@ import { z } from "zod";
 
 import { writeAudit } from "./audit.ts";
 import { requiredId, parseStoredJson } from "./context.ts";
+import { interactionResponseExpired, operationAcceptsResponses } from "./interactions.ts";
 import { insertOutboxMessage } from "./outbox.ts";
 import {
   isoDateTime,
@@ -95,6 +96,8 @@ export interface SubmitUserInputAnswerInput {
   readonly threadTs: string;
   readonly actorUserId: string;
   readonly sourceActionId: string;
+  /** The configured approval/question expiry; answers at or past the deadline are refused. */
+  readonly expirySeconds: number;
   readonly now: string;
 }
 
@@ -120,14 +123,17 @@ export function submitUserInputAnswer(
         state: z.enum(["pending", "response-pending", "inflight", "resolved", "failed"]),
         prompt_json: nonEmpty,
         partial_response_json: z.string().nullable(),
+        created_at: isoDateTime,
+        operation_status: nonEmpty,
       })
       .nullable()
       .parse(
         database
           .query(
             `SELECT i.interaction_id, i.task_id, i.response_command_id, i.source_action_id, i.state,
-                    i.prompt_json, i.partial_response_json
+                    i.prompt_json, i.partial_response_json, i.created_at, o.status AS operation_status
              FROM interactions i JOIN tasks t ON t.task_id = i.task_id
+               JOIN operations o ON o.operation_id = i.operation_id
              WHERE i.interaction_id = ? AND i.kind = 'user-input'
                AND t.workspace_id = ? AND t.conversation_id = ? AND t.thread_ts = ? AND t.state = 'active'
                AND (t.conversation_type = 'channel' OR t.owner_user_id = ?)`,
@@ -153,6 +159,8 @@ export function submitUserInputAnswer(
     ) {
       return { kind: "duplicate", commandId: row.response_command_id };
     }
+    if (!operationAcceptsResponses(row.operation_status)) return { kind: "expired" };
+    if (interactionResponseExpired(row.created_at, input.expirySeconds, now)) return { kind: "expired" };
     const prompt = userInputPromptSchema.parse(parseStoredJson(row.prompt_json));
     const question = prompt.questions.find((candidate) => candidate.id === input.questionId);
     if (question === undefined) return { kind: "invalid" };
