@@ -152,7 +152,92 @@ Add `--config` to load the three configured service credentials as exact canarie
 bun run scan:secrets -- --config /absolute/path/to/agent-tag.json /absolute/path/to/agent-tag
 ```
 
-The JSON report names only the file, credential class, and configured canary label. It never returns matched values. The command skips `.git` and `node_modules`. A finding or skipped symbolic link sets a nonzero exit code, so a release check cannot silently claim a partial clean scan. Keep source secret files outside scanned roots when practical; if they are inside, the configured scan excludes those exact files and scans their siblings.
+The JSON report names only the file, credential class, and configured canary label. It never returns matched values. The command skips `.git` and `node_modules`. A file or directory that cannot be read (for example `EACCES`) does not stop the scan: findings from every readable file are still reported, and the unreadable paths are listed under `skippedEntries` with an error code. A finding, skipped symbolic link, or skipped entry sets a nonzero exit code, so a release check cannot silently claim a partial clean scan. The scan re-lists the tree after reading it and reads any file it has not seen yet or whose size or modification time changed, so a log rotated or appended to mid-scan is still checked; a file that is still changing after four passes is reported as `changed during the scan`. Keep source secret files outside scanned roots when practical; if they are inside, the configured scan excludes those exact files and scans their siblings.
+
+## Security audit
+
+Check a deployment against the [threat model](../SECURITY.md):
+
+```sh
+bun run security:audit -- /absolute/path/to/agent-tag.json
+bun run security:audit -- /absolute/path/to/agent-tag.json --json
+bun run security:audit -- /absolute/path/to/agent-tag.json --offline
+bun run security:audit -- /absolute/path/to/agent-tag.json --log-dir /var/log/agent-tag
+```
+
+The audit reads the config, the files it references, the data directory, and the service logs. Logs default to the macOS LaunchAgent directory, `~/Library/Logs/AgentTag`. On Linux, or under any other process manager, pass `--log-dir` with the directory your logs are written to. The audit checks the mode of every file at the top of that directory, including rotated logs, and scans the whole directory for credentials. If the directory does not exist, the audit reports `log-directory-missing` instead of passing silently. Logs that go only to journald or another log service are not checked. It prints each finding with a severity of `high`, `medium`, `low`, or `info`, plus a fix where one applies. It exits `1` when any finding is `high`, so it can gate a deploy or a cron job. Reports name files and credential classes but never print credential values.
+
+| Check | Severity |
+| --- | --- |
+| Secret files or their directory are missing, not owned by the service user, or grant group/world access (expected `0600`/`0700`) | high |
+| A checked path is a symbolic link in a directory other users can write (they can repoint it) / any other symbolic link (owner and mode are then checked on the target) | high (medium for logs) / info |
+| The auditing user cannot inspect a config, secret, data, or database path (for example `EACCES`); run the audit as the service user | high (low for logs) |
+| Data directory or database grants group/world access | high (low for SQLite `-wal`/`-shm` files inside a private data directory) |
+| Config is group/world writable / world readable / group readable | high / medium / low |
+| The config, secret directory, data directory, or log directory (or a symlink's target) is in a directory that is group/world writable without the sticky bit, or owned by another non-root user, so it can be replaced regardless of its own mode | high (medium for the log directory) |
+| Service logs are world / group accessible | medium / low |
+| Log directory not found, so logs were not checked (pass `--log-dir`) | low |
+| A credential pattern, or a `*token`/`*secret`/`*password` field with a value, appears inline in the config | high |
+| Config is not readable JSON (later checks are skipped) | high |
+| Config fails validation. The service refuses to start; the audit still runs every check below on the fields it can read, but does not query T3 | high |
+| Allowlist contains a wildcard / is empty | high / medium |
+| Allowed user and conversation counts, admin users | info |
+| T3 URL is non-loopback without TLS / non-loopback with TLS | high / medium |
+| T3 refuses the token (HTTP 401 or 403: expired, revoked, or not a T3 token) | high |
+| T3 token expired or expires within 3 days / within 7 days | high / medium |
+| T3 token has scopes beyond `orchestration:read` and `orchestration:operate` | high |
+| T3 session unreachable (or `--offline`) and the token file is older than 30 days | medium |
+| A repository root is `/`, the home directory, or an ancestor of it | high |
+| A repository root contains the data directory or a secret file / the config | high / medium |
+| Profile runtime mode is `full-access` or `auto` / `auto-accept-edits` | high / medium |
+| Profile declares `os-account` or `container` isolation, which is not enforced | medium |
+| `externalWrites` is advisory | low |
+| No retention configured / partly configured | low / info |
+| Secret scan of the data and log directories finds a configured token or a known credential pattern. For the SQLite store the fix links to [purging content](#purging-content-from-the-store) | high |
+| Secret scan could not read a file or directory, or the scan could not run at all. Findings from readable files are still reported; each unchecked path is listed (up to 20) | high |
+
+Repository-root containment is decided after resolving every symbolic link in each root, the home directory, and each protected path, including parent directories, so a root that links to the home directory (or a data directory under macOS `/tmp`, which links to `/private/tmp`) is still caught.
+
+The T3 check calls `/api/auth/session` on the configured loopback URL with a 5-second timeout. Use `--offline` to skip it. Runtime approval settings are only checked in the profile: Agent Tag sends the profile's `runtimeMode` with every turn it starts, so the defaults of the T3 provider instance never apply to its turns.
+
+## Data retention
+
+By default Agent Tag keeps Slack message text, outbox payloads, and audit rows forever. Set a retention window in days:
+
+```json
+"retention": {
+  "messageDays": 30,
+  "outboxDays": 30,
+  "auditDays": 365
+}
+```
+
+Every field is optional. A missing field keeps that data forever.
+
+- `messageDays` replaces the stored Slack event text with `[pruned]` once the event is older than the window. It does the same for the turn text (and resolved turn text) of operations that settled before the window. Pending and in-flight operations keep their text so they can still run.
+- `outboxDays` replaces the payload of delivered or failed Slack replies with `{"text":"[pruned]"}` once they settled before the window. Rows quarantined as `delivery-outcome-unknown` keep their payload, because an operator must reconcile them first.
+- `auditDays` deletes audit rows older than the window.
+
+Row IDs, idempotency keys, statuses, and timestamps are kept, so duplicate Slack deliveries are still recognised after pruning. Memory entries keep using each profile's `memory.retentionDays`.
+
+The running service applies the policy once an hour from its maintenance loop. To apply it immediately, or to preview it:
+
+```sh
+bun run prune -- /absolute/path/to/agent-tag.json --dry-run
+bun run prune -- /absolute/path/to/agent-tag.json
+```
+
+`prune` is safe to run while the service is running. It prints the cutoffs and row counts as JSON, never content. Each real prune turns on SQLite `secure_delete`, so the pages it rewrites are zeroed rather than left in free space. It then checkpoints and truncates the write-ahead log (`agent-tag.sqlite-wal`), so old copies of those pages do not stay on disk. If a long read holds the log open for more than 5 seconds, the truncate is skipped and the next prune retries it. Pruning does not shrink the SQLite file on disk, and older backups still contain the pruned data, so expire backups on the same schedule.
+
+### Purging content from the store
+
+`prune` only redacts rows older than the retention window. It never touches interactions, schedules, schedule runs, memory entries, or recent messages. When `security audit` reports `secret-at-rest` on `agent-tag.sqlite` (or its `-wal` file), for example because someone pasted a credential into Slack:
+
+1. Rotate the credential first. Treat it as exposed, whatever happens to the copy on disk.
+2. Stop the service (`bun run service:uninstall`, or your process manager) and copy `dataDir` to a private location.
+3. Overwrite every row that holds the value. Message text can be in `slack_events.text`, `operations.payload_json` and `operations.resolved_text`, `slack_outbox.payload_json`, `interactions`, `memory_entries`, and `schedules`. Use `sqlite3` with `instr()`, and read the value from a file rather than typing it on the command line.
+4. Rebuild the file so no freed page keeps the old bytes. Either run `sqlite3 /path/to/agent-tag.sqlite 'VACUUM'`, or run `bun run backup` (it writes a compacted copy with `VACUUM INTO`) followed by `bun run restore` into a new data directory, and point the config at it.
+5. Start the service, re-run `bun run security:audit`, then delete the copy from step 2 and any older backups that hold the value.
 
 ## DM routes
 
