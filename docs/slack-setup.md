@@ -2,6 +2,8 @@
 
 This is the shortest supported path to a live Agent Tag mention. File transfer is not implemented yet, so the manifest does not request Slack file scopes.
 
+`bun run onboard` automates steps 1–3. It prints a create-from-manifest link, stores both tokens at mode `0600` under `~/.agent-tag/secrets/`, checks `auth.test`, and writes a config with one route per channel. See [Onboarding](operations.md#onboarding). For unattended runs, pass the tokens through `AGENT_TAG_SLACK_APP_TOKEN` and `AGENT_TAG_SLACK_BOT_TOKEN` in a process environment that is not logged, and never as command-line arguments. The manual steps below remain the reference.
+
 ## 1. Create the app
 
 In Slack's app dashboard, create an app from [`config/slack-manifest.example.json`](../config/slack-manifest.example.json). The manifest enables Socket Mode, interactivity, and a writable App Home Messages tab for DMs. Its bot token scopes are exactly:
