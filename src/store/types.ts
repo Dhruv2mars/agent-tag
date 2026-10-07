@@ -146,6 +146,7 @@ export type UserInputAnswerResult =
   | { readonly kind: "accepted" | "duplicate"; readonly commandId: string }
   | { readonly kind: "partial"; readonly commandId: string; readonly answered: number; readonly total: number }
   | { readonly kind: "invalid" }
+  | { readonly kind: "expired" }
   | { readonly kind: "denied" };
 
 export interface ClaimedOutboxMessage {

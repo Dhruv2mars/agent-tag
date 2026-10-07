@@ -455,6 +455,7 @@ describe("approval wake-up race (B5)", () => {
           actorUserId: "U1",
           sourceActionId: "action-1",
           response: { decision: "accept" },
+          expirySeconds: 86_400,
           now: new Date(harness.clock.ms).toISOString(),
         }).kind,
       ).toBe("accepted");
@@ -506,6 +507,7 @@ describe("approval wake-up race (B5)", () => {
           actorUserId: "U1",
           sourceActionId: action,
           response: { decision: "accept" },
+          expirySeconds: 86_400,
           now: at(0),
         });
       const decide = (requestIds: readonly string[]) =>
@@ -593,6 +595,7 @@ describe("approval and question expiry (B7)", () => {
           actorUserId: "U1",
           sourceActionId: "late-click",
           response: { decision: "accept" },
+          expirySeconds: 3_600,
           now: new Date(harness.clock.ms).toISOString(),
         }).kind,
       ).toBe("duplicate");
@@ -635,6 +638,7 @@ describe("approval and question expiry (B7)", () => {
         actorUserId: "U1",
         sourceActionId: "action-1",
         response: { decision: "decline" },
+        expirySeconds: 3_600,
         now: new Date(harness.clock.ms).toISOString(),
       });
       // Past the expiry, T3 still shows the request, but a response is queued: keep polling, then stall
@@ -643,6 +647,48 @@ describe("approval and question expiry (B7)", () => {
       expect(await coordinator.processNext()).toMatchObject({ kind: "retry-scheduled", errorCode: "T3TurnStalled" });
       expect(readInteractions(harness.path)[0]).toMatchObject({ state: "response-pending" });
       expect(readOperation(harness.path, receipt.operationId)?.last_error_code).toBe("T3TurnStalled");
+    });
+  });
+  test("a response arriving after the deadline but before the expiry poll is refused", async () => {
+    await withHarness("turn-late", async (harness) => {
+      const config = configWith({ interactionExpirySeconds: 3_600 });
+      const coordinator = coordinatorFor(harness, config, () => snapshot({ ...harness.turn, approvals: ["approval-1"] }));
+      const receipt = ingest(harness.store, 1);
+      expect((await coordinator.processNext()).kind).toBe("waiting-interaction");
+      const approval = readInteractions(harness.path)[0];
+      if (approval === undefined) throw new Error("approval interaction missing");
+
+      // The click lands at the deadline, before the coordinator has polled the expired wait.
+      harness.clock.ms += 3_600_000;
+      expect(
+        harness.store.submitInteractionResponse({
+          interactionId: approval.interaction_id,
+          workspaceId: "T1",
+          conversationId: "C1",
+          threadTs: "1000.000001",
+          actorUserId: "U1",
+          sourceActionId: "late-click",
+          response: { decision: "accept" },
+          expirySeconds: 3_600,
+          now: new Date(harness.clock.ms).toISOString(),
+        }),
+      ).toEqual({ kind: "expired" });
+      expect(readInteractions(harness.path)[0]).toMatchObject({ state: "pending" });
+
+      expect(await coordinator.processNext()).toMatchObject({ kind: "expired", operationId: receipt.operationId });
+      const workerCommands: T3Command[] = [];
+      const worker = new InteractionWorker({
+        config,
+        store: harness.store,
+        t3: { dispatch: async (command) => (workerCommands.push(command), { sequence: 1 }) },
+        now: () => new Date(harness.clock.ms),
+      });
+      expect((await worker.processNext()).kind).toBe("resolved");
+      expect((await worker.processNext()).kind).toBe("idle");
+      // Only the interrupt reaches T3; the late approval is never delivered.
+      expect(workerCommands).toEqual([
+        expect.objectContaining({ type: "thread.turn.interrupt", threadId: harness.turn.threadId }),
+      ]);
     });
   });
 });

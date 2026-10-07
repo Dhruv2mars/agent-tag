@@ -25,7 +25,20 @@ export type RecordPendingInteractionResult = {
 
 export type SubmitInteractionResponseResult =
   | { readonly kind: "accepted" | "duplicate"; readonly commandId: string }
+  | { readonly kind: "expired" }
   | { readonly kind: "denied" };
+
+/**
+ * True once an approval or question has waited `expirySeconds` since it was posted. Responses are
+ * refused from that instant, even before the coordinator's next poll closes the wait, so a late click
+ * can never be delivered to T3 (B7).
+ */
+export function interactionResponseExpired(createdAt: string, expirySeconds: number, now: string): boolean {
+  if (!Number.isSafeInteger(expirySeconds) || expirySeconds <= 0) {
+    throw new Error("expirySeconds must be a positive integer");
+  }
+  return new Date(now).getTime() >= new Date(isoDateTime.parse(createdAt)).getTime() + expirySeconds * 1_000;
+}
 
 export type RequestTaskCancellationResult =
   | { readonly kind: "accepted" | "duplicate"; readonly interactionId: string; readonly commandId: string }
@@ -128,6 +141,8 @@ export interface SubmitInteractionResponseInput {
   readonly actorUserId: string;
   readonly sourceActionId: string;
   readonly response: unknown;
+  /** The configured approval/question expiry; responses at or past the deadline are refused. */
+  readonly expirySeconds: number;
   readonly now: string;
 }
 
@@ -142,11 +157,12 @@ export function submitInteractionResponse(
       response_command_id: nonEmpty,
       source_action_id: nonEmpty.nullable(),
       state: z.enum(["pending", "response-pending", "inflight", "resolved", "failed"]),
+      created_at: isoDateTime,
     });
     const row = rowSchema.nullable().parse(
       database
         .query(
-          `SELECT i.interaction_id, i.response_command_id, i.source_action_id, i.state
+          `SELECT i.interaction_id, i.response_command_id, i.source_action_id, i.state, i.created_at
            FROM interactions i JOIN tasks t ON t.task_id = i.task_id
            WHERE i.interaction_id = ? AND t.workspace_id = ? AND t.conversation_id = ?
              AND t.thread_ts = ? AND t.state = 'active'
@@ -164,6 +180,7 @@ export function submitInteractionResponse(
     if (row.source_action_id === input.sourceActionId || row.state !== "pending") {
       return { kind: "duplicate" as const, commandId: row.response_command_id };
     }
+    if (interactionResponseExpired(row.created_at, input.expirySeconds, now)) return { kind: "expired" as const };
     const updated = database
       .query(
         `UPDATE interactions SET state = 'response-pending', response_json = ?,

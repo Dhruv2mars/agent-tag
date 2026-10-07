@@ -61,7 +61,7 @@ for (const revocation of revocations) {
       expect(store.submitInteractionResponse({
         interactionId: interaction.interactionId, workspaceId: "T1", conversationId,
         threadTs: "1000.000001", actorUserId: "U1", sourceActionId: "action-1",
-        response: { decision: "accept" }, now,
+        response: { decision: "accept" }, expirySeconds: 86_400, now,
       }).kind).toBe("accepted");
       const schedules = new AgentTagSchedules({ config: originalConfig, store });
       for (const kind of ["reminder", "agent"] as const) {
