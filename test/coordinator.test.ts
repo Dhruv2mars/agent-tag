@@ -5,7 +5,7 @@ import { join } from "node:path";
 
 import { agentTagConfigSchema } from "../src/config.ts";
 import { AgentTagCoordinator, classifyT3TurnFailure, type T3CoordinatorGateway } from "../src/coordinator.ts";
-import { InteractionWorker } from "../src/interaction-worker.ts";
+import { InteractionWorker, T3_BOOTSTRAP_WINDOW_MS } from "../src/interaction-worker.ts";
 import { AgentTagMemory } from "../src/memory.ts";
 import { AgentTagStore } from "../src/store/store.ts";
 import { T3ThreadNotFoundError, type T3Command, type T3ThreadSnapshot } from "../src/t3/gateway.ts";
@@ -706,6 +706,7 @@ describe("Agent Tag coordinator", () => {
     const store = await AgentTagStore.open(join(directory, "agent-tag.sqlite"));
     let current = new Date(now);
     let threadId = "not-dispatched";
+    let messageId = "not-dispatched";
     let receiptsLost = 1;
     let interrupted = false;
     const commands: T3Command[] = [];
@@ -720,7 +721,10 @@ describe("Agent Tag coordinator", () => {
           return { sequence: commands.length };
         },
         fetchThread: async () => {
-          throw new Error("a live operation's cancel must wait for the coordinator, not read T3");
+          // Before the replay is confirmed the cancel waits without reading T3; afterwards it checks
+          // that the replayed turn is the thread's current one before interrupting.
+          if (messageId === "not-dispatched") throw new Error("the cancel read T3 before the turn was confirmed");
+          return runningSnapshot(threadId, messageId);
         },
       },
       workerId: "interaction-a",
@@ -739,6 +743,7 @@ describe("Agent Tag coordinator", () => {
               receiptsLost -= 1;
               throw new Error("socket closed before the dispatch receipt arrived");
             }
+            messageId = command.message.messageId;
           }
           return { sequence: commands.length };
         },
@@ -802,6 +807,7 @@ describe("Agent Tag coordinator", () => {
   async function cancelAfterEveryReceiptLost(
     prefix: string,
     snapshotFor: (threadId: string, messageId: string) => T3ThreadSnapshot,
+    sinceLastDispatchMs = 60_000,
   ): Promise<{ readonly outcome: unknown; readonly interrupts: ReadonlyArray<T3Command> }> {
     const directory = await mkdtemp(join(tmpdir(), prefix));
     const store = await AgentTagStore.open(join(directory, "agent-tag.sqlite"));
@@ -880,7 +886,7 @@ describe("Agent Tag coordinator", () => {
         expect(outcome.kind).toBe(attempt === 5 ? "failed" : "retry-scheduled");
       }
       expect(settled).toBe(true);
-      current = new Date(current.getTime() + 60_000);
+      current = new Date(current.getTime() + sinceLastDispatchMs);
       const outcome = await worker.processNext();
       return { outcome, interrupts: commands.filter((command) => command.type === "thread.turn.interrupt") };
     } finally {
@@ -902,13 +908,39 @@ describe("Agent Tag coordinator", () => {
     expect(interrupts[0]).toMatchObject({ turnId: "turn-1" });
   });
 
+  const messageAbsent = (threadId: string): T3ThreadSnapshot => {
+    const base = runningSnapshot(threadId, "other-message");
+    return { ...base, thread: { ...base.thread, latestTurn: null, messages: [] } };
+  };
+  const threadAbsent = (threadId: string): never => {
+    throw new T3ThreadNotFoundError(threadId);
+  };
+
+  test("a cancel stays pending while a detached T3 bootstrap could still persist the lost turn.start's message", async () => {
+    const { outcome, interrupts } = await cancelAfterEveryReceiptLost(
+      "agent-tag-coordinator-receipts-lost-absent-bootstrapping-",
+      messageAbsent,
+      T3_BOOTSTRAP_WINDOW_MS - 1,
+    );
+    expect(outcome).toMatchObject({ kind: "retry-scheduled", errorCode: "T3TurnNotStarted" });
+    expect(interrupts).toHaveLength(0);
+  });
+
+  test("a cancel stays pending while a detached T3 bootstrap could still create the lost turn.start's thread", async () => {
+    const { outcome, interrupts } = await cancelAfterEveryReceiptLost(
+      "agent-tag-coordinator-receipts-lost-no-thread-bootstrapping-",
+      threadAbsent,
+      T3_BOOTSTRAP_WINDOW_MS - 1,
+    );
+    expect(outcome).toMatchObject({ kind: "retry-scheduled", errorCode: "T3TurnNotStarted" });
+    expect(interrupts).toHaveLength(0);
+  });
+
   test("a cancel settles without interrupting when T3 never received the lost turn.start", async () => {
     const { outcome, interrupts } = await cancelAfterEveryReceiptLost(
       "agent-tag-coordinator-receipts-lost-absent-",
-      (threadId) => {
-        const base = runningSnapshot(threadId, "other-message");
-        return { ...base, thread: { ...base.thread, latestTurn: null, messages: [] } };
-      },
+      messageAbsent,
+      T3_BOOTSTRAP_WINDOW_MS,
     );
     expect(outcome).toMatchObject({ kind: "failed", errorCode: "OperationNotRunning" });
     expect(interrupts).toHaveLength(0);
@@ -917,9 +949,8 @@ describe("Agent Tag coordinator", () => {
   test("a cancel settles without interrupting when T3 confirms the lost turn.start's thread does not exist", async () => {
     const { outcome, interrupts } = await cancelAfterEveryReceiptLost(
       "agent-tag-coordinator-receipts-lost-no-thread-",
-      (threadId) => {
-        throw new T3ThreadNotFoundError(threadId);
-      },
+      threadAbsent,
+      T3_BOOTSTRAP_WINDOW_MS,
     );
     expect(outcome).toMatchObject({ kind: "failed", errorCode: "OperationNotRunning" });
     expect(interrupts).toHaveLength(0);

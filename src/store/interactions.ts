@@ -601,6 +601,7 @@ export function claimNextInteractionResponse(
       operationErrorCode: row.operation_error_code,
       operationMessageId: row.operation_message_id,
       turnDispatched: row.t3_turn_dispatched_at !== null || row.t3_turn_started_at !== null,
+      turnDispatchedAt: row.t3_turn_dispatched_at ?? row.t3_turn_started_at,
       turnStarted: row.t3_turn_started_at !== null,
       turnId: row.t3_turn_id,
     };

@@ -367,14 +367,16 @@ export interface MarkOperationTurnDispatchedInput {
 }
 
 /**
- * Records, before `thread.turn.start` is sent, that T3 may receive this operation's turn. A lost
+ * Records, before each `thread.turn.start` is sent, that T3 may receive this operation's turn. A lost
  * receipt leaves the turn's state unknown, so cancellation must not treat the operation as queued.
+ * The latest attempt's time is kept: a replay may be the first send T3 receives, and cancellation
+ * measures its bootstrap window from it.
  */
 export function markOperationTurnDispatched(database: Database, input: MarkOperationTurnDispatchedInput): void {
   const now = isoDateTime.parse(input.now);
   const result = database
     .query(
-      `UPDATE operations SET t3_turn_dispatched_at = COALESCE(t3_turn_dispatched_at, ?), updated_at = ?
+      `UPDATE operations SET t3_turn_dispatched_at = ?, updated_at = ?
        WHERE operation_id = ? AND status = 'inflight' AND lease_owner = ? AND lease_expires_at > ?`,
     )
     .run(now, now, requiredId(input.operationId, "operationId"), requiredId(input.workerId, "workerId"), now);

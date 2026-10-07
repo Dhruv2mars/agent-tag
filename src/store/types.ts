@@ -143,6 +143,8 @@ export interface ClaimedInteractionResponse {
    * failed operation's turn is reconciled against T3 instead of assumed never started.
    */
   readonly turnDispatched: boolean;
+  /** When `thread.turn.start` was last sent (or the start confirmed), or null if it never was. */
+  readonly turnDispatchedAt: string | null;
   /** Whether a T3 receipt confirmed the target operation's turn start. */
   readonly turnStarted: boolean;
   /** The T3 turn id once the coordinator has observed it; interrupts pass it when known. */

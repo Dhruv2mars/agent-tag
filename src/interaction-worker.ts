@@ -59,6 +59,13 @@ export const DEFAULT_INTERACTION_RETRY_POLICY: InteractionRetryPolicy = {
   maxAttempts: 8,
 };
 
+/**
+ * How long after the latest `thread.turn.start` a missing T3 thread or message may still appear,
+ * because a detached worktree bootstrap (git fetch, thread create) is still running. Until then a
+ * cancel for a failed operation stays pending instead of being settled as never received.
+ */
+export const T3_BOOTSTRAP_WINDOW_MS = 15 * 60_000;
+
 export const NO_LONGER_PENDING_NOTICE = "This request is no longer pending.";
 export const RETRIES_EXHAUSTED_NOTICE =
   "Agent Tag could not deliver this response to T3 after several attempts. Ask the operator to check service diagnostics.";
@@ -194,54 +201,76 @@ export class InteractionWorker {
     }
   }
 
+  // Cancellation invariants. Every path through #interruptCommand, #ownRunningTurn, and #fail must keep
+  // these; the store side (requestTaskCancellation) keeps 5 and 6.
+  //  1. Never interrupt a turn the operation does not own. T3 0.0.45 ignores the interrupt's turn id
+  //     and stops whatever the provider session is running, so every interrupt is preceded by a
+  //     thread snapshot whose current turn (latestTurn, and session.activeTurnId when set) is this
+  //     operation's and still running. A stored turn id alone is not enough: a newer turn may have
+  //     replaced it. The check-then-dispatch gap is unavoidable with T3's API and kept to one RPC.
+  //  2. Never settle locally while T3 could still start the operation's turn. Terminal settlement
+  //     needs proof: the turn was never sent, T3 reported or shows it ended, a later turn replaced
+  //     it, or T3 shows neither the thread nor the message after the bootstrap window measured from
+  //     the latest `thread.turn.start` (a detached worktree bootstrap may still create both).
+  //  3. A live operation's cancel waits (retryably) for the coordinator to confirm the turn start.
+  //  4. Retries are bounded by maxAttempts; exhaustion is recoverable: a fresh click requeues the same
+  //     cancellation and command id, so T3's command-id dedup also covers a lost interrupt receipt.
+  //  5. Redeliveries of an accepted click stay duplicates and never target a later operation.
+  //  6. An operation that never sent `thread.turn.start` is cancelled in the store, never in T3.
+
   /**
-   * Interrupts only a turn this operation actually started, naming it when the turn id is known.
-   * An operation whose T3 turn is confirmed ended has nothing left to cancel. A locally failed one
-   * (for example after the settlement timeout) may still be running in T3, so its started turn is
-   * interrupted anyway. A failed operation whose `thread.turn.start` was sent but never confirmed
-   * (every receipt lost) is reconciled against the T3 thread. A live operation whose turn has not
-   * been confirmed yet is retried with backoff until the coordinator starts (and records) it.
+   * Builds the interrupt for a cancel, or settles it. An operation whose T3 turn is confirmed ended,
+   * or was never sent, has nothing left to cancel. A live operation whose turn has not been confirmed
+   * yet is retried until the coordinator starts (and records) it. Everything else, including a locally
+   * failed operation whose turn may still be running, is checked against the T3 thread first.
    */
   async #interruptCommand(response: ClaimedInteractionResponse): Promise<T3Command> {
     const live = response.operationStatus === "pending" || response.operationStatus === "inflight";
-    let turnId = response.turnId;
     if (!live) {
       const remoteEnded = response.operationStatus === "succeeded" ||
         (response.operationErrorCode !== null && T3_TURN_ENDED_FAILURE_CODES.has(response.operationErrorCode));
       // A failed operation is never replayed, so an unsent turn will not be recorded later.
       if (remoteEnded || !response.turnDispatched) throw new InteractionSettled("OperationNotRunning", true);
-      if (!response.turnStarted) turnId = await this.#reconcileUnconfirmedTurn(response);
     } else if (!response.turnStarted) {
       throw new InteractionSettled("T3TurnNotStarted", false);
     }
+    const turnId = await this.#ownRunningTurn(response);
     return {
       type: "thread.turn.interrupt",
       commandId: response.commandId,
       threadId: response.threadId,
-      ...(turnId === null ? {} : { turnId }),
+      turnId,
       createdAt: this.#now().toISOString(),
     };
   }
 
   /**
-   * Finds, in T3, the turn of a failed operation whose start was sent but never confirmed. Returns
-   * its id when it is still running. Settles the cancel when T3 never received the message (or has no
-   * such thread) or the
-   * turn already ended, and retries while T3 holds the message without having started its turn.
+   * Returns the id of this operation's turn when it is the T3 thread's current, running turn, which
+   * is the only turn T3's session-wide interrupt may stop. Settles the cancel when that turn ended or
+   * a later turn replaced it, and retries while T3 holds the message without having started the turn
+   * or (within the bootstrap window) does not show the thread or message yet.
    */
-  async #reconcileUnconfirmedTurn(response: ClaimedInteractionResponse): Promise<string> {
+  async #ownRunningTurn(response: ClaimedInteractionResponse): Promise<string> {
     let snapshot: T3ThreadSnapshot;
     try {
       snapshot = await this.#t3.fetchThread(response.threadId);
     } catch (error) {
-      // T3 confirmed the thread does not exist, so it never received this operation's turn.
-      if (error instanceof T3ThreadNotFoundError) throw new InteractionSettled("OperationNotRunning", true);
+      if (error instanceof T3ThreadNotFoundError) this.#settleAbsent(response);
       throw error;
+    }
+    const latest = snapshot.thread.latestTurn;
+    const activeTurnId = snapshot.thread.session?.activeTurnId ?? null;
+    const isCurrentRunning = (turnId: string): boolean =>
+      latest !== null && latest.turnId === turnId && latest.state === "running" &&
+      (activeTurnId === null || activeTurnId === turnId);
+    if (response.turnId !== null) {
+      if (isCurrentRunning(response.turnId)) return response.turnId;
+      // The recorded turn ended or a newer turn is current; interrupting would stop the newer one.
+      throw new InteractionSettled("OperationNotRunning", true);
     }
     const userMessages = snapshot.thread.messages.filter((message) => message.role === "user");
     const message = userMessages.find((candidate) => candidate.id === response.operationMessageId);
-    if (message === undefined) throw new InteractionSettled("OperationNotRunning", true);
-    const latest = snapshot.thread.latestTurn;
+    if (message === undefined) this.#settleAbsent(response);
     const sentAt = new Date(message.createdAt).getTime();
     const nextMessageAt = userMessages
       .map((candidate) => new Date(candidate.createdAt).getTime())
@@ -254,7 +283,7 @@ export class InteractionWorker {
       ? message.turnId === latest.turnId
       : requestedAt !== null && requestedAt >= sentAt && requestedAt < nextMessageAt);
     if (latestIsOurs) {
-      if (latest.state === "running") return latest.turnId;
+      if (isCurrentRunning(latest.turnId)) return latest.turnId;
       throw new InteractionSettled("OperationNotRunning", true);
     }
     // T3 tied the message to an older turn, or a later message's turn is current: ours has ended.
@@ -262,6 +291,20 @@ export class InteractionWorker {
       throw new InteractionSettled("OperationNotRunning", true);
     }
     throw new InteractionSettled("T3TurnNotStarted", false);
+  }
+
+  /**
+   * T3 shows neither this operation's message nor (for a 404) its thread. T3 0.0.45 runs a new
+   * thread's worktree bootstrap in a detached fiber that outlives a dropped connection and creates
+   * the thread and message only after fetching the base branch, so absence proves nothing until the
+   * bootstrap window after the latest `thread.turn.start` has passed.
+   */
+  #settleAbsent(response: ClaimedInteractionResponse): never {
+    const dispatchedAt = response.turnDispatchedAt === null ? Number.NaN : Date.parse(response.turnDispatchedAt);
+    if (!(this.#now().getTime() - dispatchedAt >= T3_BOOTSTRAP_WINDOW_MS)) {
+      throw new InteractionSettled("T3TurnNotStarted", false);
+    }
+    throw new InteractionSettled("OperationNotRunning", true);
   }
 
   #fail(response: ClaimedInteractionResponse, error: unknown): InteractionWorkerOutcome {

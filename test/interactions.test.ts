@@ -18,7 +18,7 @@ import {
 } from "../src/interaction-worker.ts";
 import { SlackActionRouter } from "../src/slack/actions.ts";
 import { AgentTagStore } from "../src/store/store.ts";
-import type { T3Command } from "../src/t3/gateway.ts";
+import type { T3Command, T3ThreadSnapshot } from "../src/t3/gateway.ts";
 
 const now = "2026-09-21T00:00:00.000Z";
 const config = agentTagConfigSchema.parse({
@@ -109,6 +109,48 @@ function viewSubmissionBody(input: {
 
 async function unexpectedThreadFetch(): Promise<never> {
   throw new Error("unexpected T3 thread fetch");
+}
+
+/** A T3 thread whose current turn is `turnId` (running unless `state` says otherwise). */
+function threadWithTurn(
+  threadId: string,
+  turnId: string,
+  options: { readonly state?: "running" | "completed" | "interrupted"; readonly activeTurnId?: string | null } = {},
+): T3ThreadSnapshot {
+  const state = options.state ?? "running";
+  return {
+    snapshotSequence: 1,
+    thread: {
+      id: threadId,
+      projectId: "project-1",
+      title: "Fixture",
+      modelSelection: { instanceId: "codex", model: "gpt-5.6-sol" },
+      runtimeMode: "approval-required",
+      interactionMode: "default",
+      branch: null,
+      worktreePath: null,
+      latestTurn: {
+        turnId,
+        state,
+        requestedAt: now,
+        startedAt: now,
+        completedAt: state === "running" ? null : now,
+        assistantMessageId: null,
+      },
+      messages: [],
+      activities: [],
+      session: {
+        threadId,
+        status: state === "running" ? "running" : "ready",
+        providerName: "codex",
+        providerInstanceId: "codex",
+        runtimeMode: "approval-required",
+        activeTurnId: options.activeTurnId !== undefined ? options.activeTurnId : state === "running" ? turnId : null,
+        lastError: null,
+        updatedAt: now,
+      },
+    },
+  };
 }
 
 function seedOperation(store: AgentTagStore): {
@@ -886,7 +928,7 @@ describe("interaction retries and cancellation", () => {
         config,
         store,
         t3: {
-          fetchThread: unexpectedThreadFetch,
+          fetchThread: async (threadId) => threadWithTurn(threadId, "turn-1"),
           dispatch: async (command) => {
             commands.push(command);
             return { sequence: 1 };
@@ -933,7 +975,7 @@ describe("interaction retries and cancellation", () => {
         config,
         store,
         t3: {
-          fetchThread: unexpectedThreadFetch,
+          fetchThread: async (threadId) => threadWithTurn(threadId, "turn-1"),
           dispatch: async (command) => {
             commands.push(command);
             if (t3Down) throw new Error("socket closed before the receipt arrived");
@@ -993,7 +1035,7 @@ describe("interaction retries and cancellation", () => {
         config,
         store,
         t3: {
-          fetchThread: unexpectedThreadFetch,
+          fetchThread: async (threadId) => threadWithTurn(threadId, "turn-1"),
           dispatch: async () => {
             if (t3Down) throw new Error("socket closed before the receipt arrived");
             return { sequence: 1 };
@@ -1028,7 +1070,11 @@ describe("interaction retries and cancellation", () => {
     });
   });
 
-  async function exhaustCancelThenFailOperation(errorCode: string) {
+  async function exhaustCancelThenFailOperation(
+    errorCode: string,
+    /** The T3 thread after the operation failed; by default its turn-1 is still running. */
+    threadAfterFailure: (threadId: string) => T3ThreadSnapshot = (threadId) => threadWithTurn(threadId, "turn-1"),
+  ) {
     let result: {
       readonly first: ReturnType<SlackActionRouter["ingest"]>;
       readonly fresh: ReturnType<SlackActionRouter["ingest"]>;
@@ -1046,12 +1092,13 @@ describe("interaction retries and cancellation", () => {
       expect(first.kind).toBe("accepted");
       const commands: T3Command[] = [];
       let t3Down = true;
+      let operationFailed = false;
       let current = new Date(now);
       const worker = new InteractionWorker({
         config,
         store,
         t3: {
-          fetchThread: unexpectedThreadFetch,
+          fetchThread: async (threadId) => (operationFailed ? threadAfterFailure(threadId) : threadWithTurn(threadId, "turn-1")),
           dispatch: async (command) => {
             commands.push(command);
             if (t3Down) throw new Error("socket closed before the receipt arrived");
@@ -1067,6 +1114,7 @@ describe("interaction retries and cancellation", () => {
       expect((await worker.processNext()).kind).toBe("failed");
       // The operation then fails too, while T3 is still unreachable.
       store.failOperation({ operationId: seeded.operationId, workerId: "coordinator-a", errorCode, retryable: false, now });
+      operationFailed = true;
       t3Down = false;
       const fresh = cancel("1000.000030");
       current = new Date(current.getTime() + 3_600_000);
@@ -1084,6 +1132,62 @@ describe("interaction retries and cancellation", () => {
     expect(commands).toHaveLength(3);
     expect(new Set(commands.map((command) => command.commandId)).size).toBe(1);
     expect(commands[2]).toMatchObject({ type: "thread.turn.interrupt", turnId: "turn-1" });
+  });
+
+  test("a requeued cancellation never interrupts a newer turn that replaced its locally failed operation's turn", async () => {
+    // T3 0.0.45 interrupts whatever the session runs and ignores the turn id, so turn-1 must be current.
+    const { fresh, outcome, commands } = await exhaustCancelThenFailOperation(
+      "T3TurnStalled",
+      (threadId) => threadWithTurn(threadId, "turn-2"),
+    );
+    expect(fresh.kind).toBe("accepted");
+    expect(outcome).toBe("failed");
+    expect(commands).toHaveLength(2);
+  });
+
+  test("a requeued cancellation settles without interrupting once its known turn has ended in T3", async () => {
+    const { outcome, commands } = await exhaustCancelThenFailOperation(
+      "T3TurnStalled",
+      (threadId) => threadWithTurn(threadId, "turn-1", { state: "completed" }),
+    );
+    expect(outcome).toBe("failed");
+    expect(commands).toHaveLength(2);
+  });
+
+  test("a cancel never interrupts when the T3 session's active turn is not the operation's", async () => {
+    await withStore(async ({ store, path }) => {
+      const seeded = seedOperation(store);
+      claimRunningOperation(store, seeded.operationId);
+      store.markOperationTurnStarted({ operationId: seeded.operationId, workerId: "coordinator-a", turnId: "turn-1", now });
+      const cancel = store.requestTaskCancellation({
+        taskId: seeded.taskId,
+        workspaceId: "T1",
+        conversationId: "C1",
+        threadTs: "1000.000001",
+        actorUserId: "U1",
+        sourceActionId: "cancel-other-active-turn",
+        now,
+      });
+      if (cancel.kind === "denied") throw new Error("cancel was denied");
+      const commands: T3Command[] = [];
+      const worker = new InteractionWorker({
+        config,
+        store,
+        t3: {
+          // The projection still names turn-1, but the provider session already runs turn-2.
+          fetchThread: async (threadId) => threadWithTurn(threadId, "turn-1", { activeTurnId: "turn-2" }),
+          dispatch: async (command) => {
+            commands.push(command);
+            return { sequence: 1 };
+          },
+        },
+        workerId: "interaction-a",
+        now: () => new Date(now),
+      });
+      expect(await worker.processNext()).toMatchObject({ kind: "failed", errorCode: "OperationNotRunning" });
+      expect(commands).toEqual([]);
+      expect(noticesFor(path, cancel.interactionId)).toEqual([NO_LONGER_PENDING_NOTICE]);
+    });
   });
 
   test("a fresh cancel does not requeue an exhausted cancellation whose T3 turn is confirmed ended", async () => {
@@ -1112,7 +1216,7 @@ describe("interaction retries and cancellation", () => {
         config,
         store,
         t3: {
-          fetchThread: unexpectedThreadFetch,
+          fetchThread: async (threadId) => threadWithTurn(threadId, "turn-1"),
           dispatch: async () => {
             dispatches += 1;
             throw {
@@ -1152,7 +1256,7 @@ describe("interaction retries and cancellation", () => {
         config,
         store,
         t3: {
-          fetchThread: unexpectedThreadFetch,
+          fetchThread: async (threadId) => threadWithTurn(threadId, "turn-2"),
           dispatch: async (command) => {
             commands.push(command);
             return { sequence: 1 };
@@ -1207,7 +1311,7 @@ describe("interaction retries and cancellation", () => {
         config,
         store,
         t3: {
-          fetchThread: unexpectedThreadFetch,
+          fetchThread: async (threadId) => threadWithTurn(threadId, "turn-4"),
           dispatch: async (command) => {
             commands.push(command);
             return { sequence: 1 };
