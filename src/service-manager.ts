@@ -4,6 +4,7 @@ import {
   launchAgentStatus,
   launchAgentUnitState,
   type LaunchAgentStatus,
+  type LaunchdHost,
   restartLaunchAgent,
   uninstallLaunchAgent,
   upgradeLaunchAgent,
@@ -57,14 +58,15 @@ function fromLaunchAgent(status: LaunchAgentStatus): ServiceStatusReport & { rea
   };
 }
 
-export function launchdServiceManager(): ServiceManager {
+/** `host` lets tests drive status and restart through a fake launchctl; production uses the real user domain. */
+export function launchdServiceManager(host?: LaunchdHost): ServiceManager {
   return {
     kind: "launchd",
-    status: async () => fromLaunchAgent(await launchAgentStatus()),
+    status: async () => fromLaunchAgent(await launchAgentStatus(host)),
     install: async (configPath) => fromLaunchAgent(await installLaunchAgent(configPath)),
     upgrade: async (configPath) => fromLaunchAgent(await upgradeLaunchAgent(configPath)),
     uninstall: async () => fromLaunchAgent(await uninstallLaunchAgent()),
-    restart: async () => fromLaunchAgent(await restartLaunchAgent()),
+    restart: async () => fromLaunchAgent(await restartLaunchAgent(host)),
     unitState: launchAgentUnitState,
     logsCommand: launchAgentLogsCommand,
   };

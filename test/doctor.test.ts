@@ -12,7 +12,9 @@ import {
   formatDoctorReport,
   runDoctor,
 } from "../src/doctor.ts";
-import type { ServiceManager, ServiceStatusReport, ServiceUnitState } from "../src/service-manager.ts";
+import type { CommandResult } from "../src/command.ts";
+import { AGENT_TAG_LAUNCHD_LABEL } from "../src/launchd.ts";
+import { launchdServiceManager, type ServiceManager, type ServiceStatusReport, type ServiceUnitState } from "../src/service-manager.ts";
 import type { T3Session } from "../src/t3/auth.ts";
 import type { T3ServerInfo } from "../src/t3/gateway.ts";
 import { parseT3Pin } from "../src/t3/pin.ts";
@@ -416,8 +418,8 @@ describe("agent-tag doctor", () => {
     service.unit = { ...service.unit, current: false, sameCheckout: false, installedCheckout: "/srv/live-checkout" };
     const otherCheckout = await run(true);
     expect(check(otherCheckout, "service")).toMatchObject({ status: "warn" });
-    expect(check(otherCheckout, "service").summary).toContain("different Agent Tag checkout (/srv/live-checkout)");
-    expect(check(otherCheckout, "service").hint).toContain("from the checkout it should run");
+    expect(check(otherCheckout, "service").summary).toContain("different Agent Tag install (checkout /srv/live-checkout)");
+    expect(check(otherCheckout, "service").hint).toContain("from the checkout or release binary it should run");
     expect(check(otherCheckout, "service").fixed).toBeUndefined();
 
     service.running = false;
@@ -428,6 +430,49 @@ describe("agent-tag doctor", () => {
     const otherBun = await run(true);
     expect(check(otherBun, "service").summary).toContain("different Bun (/opt/other/bun)");
     expect(service.calls).toEqual([]);
+
+    // A release binary unit is never replaced by a checkout's unit (or vice versa) through --fix.
+    service.unit = {
+      unitPath: service.unit.unitPath,
+      installed: true,
+      current: false,
+      sameConfig: true,
+      sameCheckout: false,
+      sameBun: false,
+      installedBinary: "/home/agent/.local/bin/agent-tag",
+    };
+    const otherBinary = await run(true);
+    expect(check(otherBinary, "service").summary).toContain("different Agent Tag install (binary /home/agent/.local/bin/agent-tag)");
+    expect(service.calls).toEqual([]);
+  });
+
+  test("service: --fix bootstraps an installed LaunchAgent that is not loaded before starting it", async () => {
+    // launchctl reports the job missing from gui/4242 although its plist is installed (for example after
+    // `launchctl bootout`): `kickstart` alone cannot reach it, so the repair must bootstrap the plist first.
+    const plistPath = join(fixture.root, `${AGENT_TAG_LAUNCHD_LABEL}.plist`);
+    await writeFile(plistPath, "<plist/>");
+    const target = `gui/4242/${AGENT_TAG_LAUNCHD_LABEL}`;
+    const commands: string[] = [];
+    let loaded = false;
+    const launchctl = async (command: readonly string[]): Promise<CommandResult> => {
+      commands.push(command.slice(1).join(" "));
+      const verb = command[1];
+      if (verb === "print") {
+        return loaded ? { exitCode: 0, stdout: "\tstate = running\n", stderr: "" } : { exitCode: 113, stdout: "", stderr: "Could not find service" };
+      }
+      if (verb === "bootstrap") loaded = true;
+      if (verb === "kickstart" && !loaded) return { exitCode: 113, stdout: "", stderr: "Could not find service" };
+      return { exitCode: 0, stdout: "", stderr: "" };
+    };
+    const launchd: ServiceManager = {
+      ...launchdServiceManager({ run: launchctl, sleep: async () => {}, uid: 4242, plistPath }),
+      unitState: async () => ({ ...service.unit, unitPath: plistPath }),
+    };
+    const report = await runDoctor({ configPath: fixture.configPath, fix: true, dependencies: dependencies(world, launchd) });
+    expect(check(report, "service")).toMatchObject({ status: "pass", fixed: "restarted the service" });
+    expect(commands).toContain(`bootstrap gui/4242 ${plistPath}`);
+    expect(commands.indexOf(`bootstrap gui/4242 ${plistPath}`)).toBeLessThan(commands.indexOf(`kickstart ${target}`));
+    expect(commands).not.toContain(`kickstart -k ${target}`);
   });
 
   test("service is skipped on unsupported platforms", async () => {

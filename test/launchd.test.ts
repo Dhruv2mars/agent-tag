@@ -12,13 +12,12 @@ import {
   renderLaunchAgent,
   restartLaunchAgent,
 } from "../src/launchd.ts";
-import { unitStateFor } from "../src/service-unit.ts";
+import { describeInstalledProgram, unitStateFor } from "../src/service-unit.ts";
 
 test("renders a private macOS LaunchAgent with absolute executable arguments", () => {
   const plist = renderLaunchAgent({
     label: "dev.agent-tag.fixture",
-    bunPath: "/opt/homebrew/bin/bun",
-    cliPath: "/srv/agent-tag/src/cli.ts",
+    program: { kind: "source", bunPath: "/opt/homebrew/bin/bun", cliPath: "/srv/agent-tag/src/cli.ts" },
     configPath: "/var/lib/agent-tag/config & live.json",
     workingDirectory: "/srv/agent-tag",
     stdoutPath: "/Users/test/Library/Logs/AgentTag/service.stdout.log",
@@ -35,8 +34,7 @@ test("rejects relative LaunchAgent paths", () => {
   expect(() =>
     renderLaunchAgent({
       label: "dev.agent-tag.fixture",
-      bunPath: "bun",
-      cliPath: "/srv/agent-tag/src/cli.ts",
+      program: { kind: "source", bunPath: "bun", cliPath: "/srv/agent-tag/src/cli.ts" },
       configPath: "/var/lib/agent-tag/config.json",
       workingDirectory: "/srv/agent-tag",
       stdoutPath: "/Users/test/Library/Logs/AgentTag/service.stdout.log",
@@ -48,8 +46,7 @@ test("rejects relative LaunchAgent paths", () => {
 test("reads paths back from an installed plist and tells a different checkout from template drift", () => {
   const live: LaunchAgentDefinition = {
     label: "dev.agent-tag.service",
-    bunPath: "/opt/homebrew/bin/bun",
-    cliPath: "/Users/test/agent-tag/src/cli.ts",
+    program: { kind: "source", bunPath: "/opt/homebrew/bin/bun", cliPath: "/Users/test/agent-tag/src/cli.ts" },
     configPath: "/Users/test/host/agent-tag <live> & 'q'.json",
     workingDirectory: "/Users/test/agent-tag",
     stdoutPath: "/Users/test/Library/Logs/AgentTag/service.stdout.log",
@@ -57,13 +54,16 @@ test("reads paths back from an installed plist and tells a different checkout fr
   };
   const installed = renderLaunchAgent(live);
   expect(parseLaunchAgentPaths(installed)).toEqual({
-    bunPath: live.bunPath,
-    cliPath: live.cliPath,
+    program: live.program,
     configPath: live.configPath,
     workingDirectory: live.workingDirectory,
   });
 
-  const worktree = { ...live, cliPath: "/Users/test/agent-tag-wt/x/src/cli.ts", workingDirectory: "/Users/test/agent-tag-wt/x" };
+  const worktree: LaunchAgentDefinition = {
+    ...live,
+    program: { kind: "source", bunPath: "/opt/homebrew/bin/bun", cliPath: "/Users/test/agent-tag-wt/x/src/cli.ts" },
+    workingDirectory: "/Users/test/agent-tag-wt/x",
+  };
   const fromWorktree = unitStateFor({
     unitPath: "/p.plist",
     existing: installed,
@@ -84,6 +84,48 @@ test("reads paths back from an installed plist and tells a different checkout fr
     unitStateFor({ unitPath: "/p.plist", existing: drifted, rendered: installed, installed: parseLaunchAgentPaths(drifted), expected: live }),
   ).toMatchObject({ current: false, sameConfig: true, sameCheckout: true, sameBun: true });
   expect(parseLaunchAgentPaths("<plist></plist>")).toEqual({});
+});
+
+test("a release binary LaunchAgent runs the binary itself and is never the same install as a checkout", () => {
+  const binary: LaunchAgentDefinition = {
+    label: "dev.agent-tag.service",
+    program: { kind: "binary", binaryPath: "/Users/test/.local/bin/agent-tag" },
+    configPath: "/Users/test/.agent-tag/agent-tag.json",
+    workingDirectory: "/Users/test/.agent-tag",
+    stdoutPath: "/Users/test/Library/Logs/AgentTag/service.stdout.log",
+    stderrPath: "/Users/test/Library/Logs/AgentTag/service.stderr.log",
+  };
+  const plist = renderLaunchAgent(binary);
+  expect(plist).toContain(
+    "<array>\n      <string>/Users/test/.local/bin/agent-tag</string>\n      <string>run</string>\n      <string>/Users/test/.agent-tag/agent-tag.json</string>\n  </array>",
+  );
+  expect(plist).not.toContain("cli.ts");
+  expect(parseLaunchAgentPaths(plist)).toEqual({
+    program: binary.program,
+    configPath: binary.configPath,
+    workingDirectory: binary.workingDirectory,
+  });
+
+  const checkout: LaunchAgentDefinition = {
+    ...binary,
+    program: { kind: "source", bunPath: "/opt/homebrew/bin/bun", cliPath: "/Users/test/agent-tag/src/cli.ts" },
+    workingDirectory: "/Users/test/agent-tag",
+  };
+  const state = unitStateFor({
+    unitPath: "/p.plist",
+    existing: plist,
+    rendered: renderLaunchAgent(checkout),
+    installed: parseLaunchAgentPaths(plist),
+    expected: checkout,
+  });
+  expect(state).toMatchObject({ current: false, sameConfig: true, sameCheckout: false, sameBun: false, installedBinary: "/Users/test/.local/bin/agent-tag" });
+  expect(describeInstalledProgram(state)).toBe("binary /Users/test/.local/bin/agent-tag");
+
+  // The same binary at another path (for example a second copy) is a different install.
+  const moved: LaunchAgentDefinition = { ...binary, program: { kind: "binary", binaryPath: "/opt/agent-tag/agent-tag" } };
+  expect(
+    unitStateFor({ unitPath: "/p.plist", existing: plist, rendered: renderLaunchAgent(moved), installed: parseLaunchAgentPaths(plist), expected: moved }),
+  ).toMatchObject({ sameCheckout: false, sameBun: false });
 });
 
 /** A scripted launchctl for a fake uid: models a job that is registered (loaded) or not, and running or not. */

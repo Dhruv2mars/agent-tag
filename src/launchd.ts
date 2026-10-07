@@ -4,16 +4,21 @@ import { dirname, isAbsolute, join, resolve } from "node:path";
 
 import { type CommandRunner, requireSuccess, runCommand } from "./command.ts";
 import { loadConfig } from "./config.ts";
-import { installedUnitPaths, NOT_INSTALLED, type ServiceUnitPaths, type ServiceUnitState, unitStateFor } from "./service-unit.ts";
+import {
+  currentServiceUnitPaths,
+  installedUnitPaths,
+  NOT_INSTALLED,
+  serviceProgramArguments,
+  serviceProgramPaths,
+  type ServiceUnitPaths,
+  type ServiceUnitState,
+  unitStateFor,
+} from "./service-unit.ts";
 
 export const AGENT_TAG_LAUNCHD_LABEL = "dev.agent-tag.service";
 
-export interface LaunchAgentDefinition {
+export interface LaunchAgentDefinition extends ServiceUnitPaths {
   readonly label: string;
-  readonly bunPath: string;
-  readonly cliPath: string;
-  readonly configPath: string;
-  readonly workingDirectory: string;
   readonly stdoutPath: string;
   readonly stderrPath: string;
 }
@@ -41,8 +46,7 @@ function xmlString(value: string): string {
 
 export function renderLaunchAgent(input: LaunchAgentDefinition): string {
   const paths = [
-    input.bunPath,
-    input.cliPath,
+    ...serviceProgramPaths(input.program),
     input.configPath,
     input.workingDirectory,
     input.stdoutPath,
@@ -52,7 +56,7 @@ export function renderLaunchAgent(input: LaunchAgentDefinition): string {
     throw new Error("LaunchAgent paths must be absolute");
   }
   if (!/^[a-zA-Z0-9.-]+$/.test(input.label)) throw new Error("invalid LaunchAgent label");
-  const argumentsXml = [input.bunPath, "run", input.cliPath, "run", input.configPath]
+  const argumentsXml = serviceProgramArguments(input.program, "run", input.configPath)
     .map((argument) => `      ${xmlString(argument)}`)
     .join("\n");
   return `<?xml version="1.0" encoding="UTF-8"?>
@@ -183,14 +187,10 @@ export async function launchAgentDefinition(configPathInput: string): Promise<La
 async function definition(configPathInput: string): Promise<LaunchAgentDefinition> {
   const configPath = resolve(configPathInput);
   await loadConfig(configPath);
-  const repositoryRoot = resolve(import.meta.dir, "..");
   const logDirectory = join(homedir(), "Library", "Logs", "AgentTag");
   return {
     label: AGENT_TAG_LAUNCHD_LABEL,
-    bunPath: process.execPath,
-    cliPath: join(repositoryRoot, "src", "cli.ts"),
-    configPath,
-    workingDirectory: repositoryRoot,
+    ...(await currentServiceUnitPaths(configPath)),
     stdoutPath: join(logDirectory, "service.stdout.log"),
     stderrPath: join(logDirectory, "service.stderr.log"),
   };
@@ -199,7 +199,7 @@ async function definition(configPathInput: string): Promise<LaunchAgentDefinitio
 async function doctor(input: LaunchAgentDefinition): Promise<void> {
   await requireSuccess(
     runCommand,
-    [input.bunPath, "run", input.cliPath, "doctor", input.configPath],
+    serviceProgramArguments(input.program, "doctor", input.configPath),
     "Agent Tag doctor",
   );
 }
@@ -321,7 +321,7 @@ export function parseLaunchAgentPaths(plist: string): Partial<ServiceUnitPaths> 
   return installedUnitPaths(programArguments, workingDirectory === undefined ? undefined : xmlUnescape(workingDirectory));
 }
 
-/** Compares the installed plist with the one this checkout would generate for `configPath`. */
+/** Compares the installed plist with the one this process would generate for `configPath`. */
 export async function launchAgentUnitState(configPath: string): Promise<ServiceUnitState> {
   const path = plistPath();
   if (!(await pathExists(path))) return { unitPath: path, ...NOT_INSTALLED };

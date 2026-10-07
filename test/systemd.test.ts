@@ -17,9 +17,10 @@ import {
   systemdUnitDirectory,
 } from "../src/systemd.ts";
 
+const sourceProgram = { kind: "source", bunPath: "/home/agent/.bun/bin/bun", cliPath: "/srv/agent-tag/src/cli.ts" } as const;
+
 const definition: SystemdUnitDefinition = {
-  bunPath: "/home/agent/.bun/bin/bun",
-  cliPath: "/srv/agent-tag/src/cli.ts",
+  program: sourceProgram,
   configPath: "/home/agent/.agent-tag/agent-tag.json",
   workingDirectory: "/srv/agent-tag",
 };
@@ -47,6 +48,20 @@ describe("systemd unit rendering", () => {
     expect(parseSystemdUnitPaths("[Service]\nExecStart=/bin/true\n")).toEqual({});
   });
 
+  test("runs a release binary directly instead of bun and src/cli.ts", () => {
+    const binary: SystemdUnitDefinition = {
+      program: { kind: "binary", binaryPath: "/home/agent/.local/bin/agent-tag" },
+      configPath: "/home/agent/.agent-tag/agent-tag.json",
+      workingDirectory: "/home/agent/.agent-tag",
+    };
+    const unit = renderSystemdUnit(binary);
+    expect(unit).toContain('ExecStart="/home/agent/.local/bin/agent-tag" "run" "/home/agent/.agent-tag/agent-tag.json"\n');
+    expect(unit).toContain("WorkingDirectory=/home/agent/.agent-tag\n");
+    expect(unit).not.toContain("cli.ts");
+    expect(parseSystemdUnitPaths(unit)).toEqual(binary);
+    expect(() => renderSystemdUnit({ ...binary, program: { kind: "binary", binaryPath: "agent-tag" } })).toThrow("must be absolute");
+  });
+
   test("escapes specifiers, variables, quotes, and backslashes", () => {
     expect(systemdQuote('/srv/a "b"\\c%h$HOME')).toBe('"/srv/a \\"b\\"\\\\c%%h$$HOME"');
     const unit = renderSystemdUnit({ ...definition, configPath: "/srv/50% off/$USER.json", workingDirectory: "/srv/100%" });
@@ -55,7 +70,7 @@ describe("systemd unit rendering", () => {
   });
 
   test("rejects relative paths and control characters", () => {
-    expect(() => renderSystemdUnit({ ...definition, bunPath: "bun" })).toThrow("must be absolute");
+    expect(() => renderSystemdUnit({ ...definition, program: { ...sourceProgram, bunPath: "bun" } })).toThrow("must be absolute");
     expect(() => renderSystemdUnit({ ...definition, configPath: "/srv/a\nExecStartPre=/bin/sh" })).toThrow(
       "control characters",
     );
@@ -211,15 +226,39 @@ describe("systemd user service lifecycle", () => {
       sameCheckout: true,
       sameBun: true,
     });
-    await writeFile(service.unitPath, renderSystemdUnit({ ...definition, configPath: "/cfg/a.json", cliPath: "/srv/live/src/cli.ts", workingDirectory: "/srv/live" }));
+    await writeFile(
+      service.unitPath,
+      renderSystemdUnit({
+        ...definition,
+        configPath: "/cfg/a.json",
+        program: { ...sourceProgram, cliPath: "/srv/live/src/cli.ts" },
+        workingDirectory: "/srv/live",
+      }),
+    );
     expect(await service.unitState("/cfg/a.json")).toMatchObject({
       current: false,
       sameConfig: true,
       sameCheckout: false,
       installedCheckout: "/srv/live",
     });
-    await writeFile(service.unitPath, renderSystemdUnit({ ...definition, configPath: "/cfg/a.json", bunPath: "/opt/bun" }));
+    await writeFile(service.unitPath, renderSystemdUnit({ ...definition, configPath: "/cfg/a.json", program: { ...sourceProgram, bunPath: "/opt/bun" } }));
     expect(await service.unitState("/cfg/a.json")).toMatchObject({ sameCheckout: true, sameBun: false, installedBunPath: "/opt/bun" });
+    // A release binary and a checkout are never the same install, even for the same config.
+    await writeFile(
+      service.unitPath,
+      renderSystemdUnit({
+        program: { kind: "binary", binaryPath: "/home/agent/.local/bin/agent-tag" },
+        configPath: "/cfg/a.json",
+        workingDirectory: "/cfg",
+      }),
+    );
+    expect(await service.unitState("/cfg/a.json")).toMatchObject({
+      current: false,
+      sameConfig: true,
+      sameCheckout: false,
+      sameBun: false,
+      installedBinary: "/home/agent/.local/bin/agent-tag",
+    });
   });
 
   test("uninstall disables, removes the unit, and reloads", async () => {

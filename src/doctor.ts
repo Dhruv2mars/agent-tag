@@ -12,6 +12,7 @@ import { type AgentTagConfig, agentTagConfigSchema } from "./config.ts";
 import { validateConfiguredProviders } from "./policy/provider.ts";
 import { SecretString } from "./security/secret-file.ts";
 import type { ServiceManager } from "./service-manager.ts";
+import { describeInstalledProgram } from "./service-unit.ts";
 import { AgentTagStore } from "./store/store.ts";
 import { assertRestrictedOrchestrationSession, inspectT3Session, type T3Session } from "./t3/auth.ts";
 import { inspectT3, type T3ServerInfo } from "./t3/gateway.ts";
@@ -462,21 +463,21 @@ export async function checkService(
     if (!unit.sameConfig) {
       return { id, status: "warn", summary: `${service.kind} unit ${unit.unitPath} runs a different config` };
     }
-    // Only template drift is repaired automatically. Moving the service onto another checkout or Bun
-    // must be an explicit `service upgrade` from the intended checkout, never a side effect of `--fix`.
+    // Only template drift is repaired automatically. Moving the service onto another checkout, Bun, or binary
+    // must be an explicit `service upgrade` from the intended install, never a side effect of `--fix`.
     if (!unit.current && !unit.sameCheckout) {
       return {
         id,
         status: "warn",
-        summary: `${service.kind} unit ${unit.unitPath} runs a different Agent Tag checkout (${unit.installedCheckout ?? "unrecognized unit"})`,
-        hint: `doctor --fix leaves it alone; to move the service, run \`agent-tag service upgrade ${configPath}\` from the checkout it should run`,
+        summary: `${service.kind} unit ${unit.unitPath} runs a different Agent Tag install (${describeInstalledProgram(unit)})`,
+        hint: `doctor --fix leaves it alone; to move the service, run \`agent-tag service upgrade ${configPath}\` from the checkout or release binary it should run`,
       };
     }
     if (!unit.current && !unit.sameBun) {
       return {
         id,
         status: "warn",
-        summary: `${service.kind} unit ${unit.unitPath} runs a different Bun (${unit.installedBunPath ?? "unrecognized unit"})`,
+        summary: `${service.kind} unit ${unit.unitPath} runs a different Bun (${unit.installedBunPath ?? describeInstalledProgram(unit)})`,
         hint: `doctor --fix leaves it alone; run \`agent-tag service upgrade ${configPath}\` with the Bun the service should use`,
       };
     }

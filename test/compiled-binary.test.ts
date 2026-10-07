@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, expect, test } from "bun:test";
-import { mkdtemp, readdir, rm } from "node:fs/promises";
+import { mkdtemp, readdir, realpath, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -145,6 +145,33 @@ test.skipIf(host === undefined)(
     const result = await run([probe]);
     expect(result.stderr).toBe("");
     expect(result.stdout.trim()).toBe("socket-mode-transport-ok");
+  },
+  60_000,
+);
+
+test.skipIf(host === undefined)(
+  "a compiled binary generates service units that run the binary itself",
+  async () => {
+    const probe = join(outdir, "service-unit-probe");
+    const build = await run([
+      process.execPath,
+      "build",
+      "--compile",
+      resolve(import.meta.dir, "fixtures", "compiled-service-unit-probe.ts"),
+      "--outfile",
+      probe,
+    ]);
+    expect(build.exitCode).toBe(0);
+    // Invoked through a symlink, the unit still names the real file that `agent-tag update` replaces.
+    const link = join(outdir, "service-unit-probe-link");
+    await symlink(probe, link);
+    const result = await run([link, "/cfg/agent-tag.json"]);
+    expect(result.stderr).toBe("");
+    expect(JSON.parse(result.stdout)).toEqual({
+      program: { kind: "binary", binaryPath: await realpath(probe) },
+      configPath: "/cfg/agent-tag.json",
+      workingDirectory: "/cfg",
+    });
   },
   60_000,
 );
