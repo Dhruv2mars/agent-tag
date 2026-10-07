@@ -34,8 +34,13 @@ const stalledTurnSchema = z
     timeoutSeconds: z.number().int().positive().max(86_400),
     retryDelaySeconds: z.number().int().positive().max(3_600),
     maxAttempts: z.number().int().positive().max(10),
-    maxTurnSeconds: z.number().int().positive().max(604_800).default(21_600),
+    maxTurnSeconds: z.number().int().positive().max(604_800).optional(),
   })
+  // An omitted ceiling defaults to 6h, raised to the stall timeout so older configs stay valid.
+  .transform(({ maxTurnSeconds, ...policy }) => ({
+    ...policy,
+    maxTurnSeconds: maxTurnSeconds ?? Math.max(21_600, policy.timeoutSeconds),
+  }))
   .refine((policy) => policy.maxTurnSeconds >= policy.timeoutSeconds, {
     path: ["maxTurnSeconds"],
     message: "maxTurnSeconds must be at least timeoutSeconds",

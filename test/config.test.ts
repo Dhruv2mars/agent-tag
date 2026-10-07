@@ -62,6 +62,12 @@ describe("Agent Tag config", () => {
         withLimits({ stalledTurn: { timeoutSeconds: 120, retryDelaySeconds: 30, maxAttempts: 5 } }),
       ).limits.stalledTurn.maxTurnSeconds,
     ).toBe(21_600);
+    // A pre-ceiling config with a stall timeout above 6h stays valid; the ceiling follows the timeout.
+    expect(
+      agentTagConfigSchema.parse(
+        withLimits({ stalledTurn: { timeoutSeconds: 86_400, retryDelaySeconds: 30, maxAttempts: 5 } }),
+      ).limits.stalledTurn.maxTurnSeconds,
+    ).toBe(86_400);
     expect(() =>
       agentTagConfigSchema.parse(
         withLimits({ stalledTurn: { timeoutSeconds: 600, retryDelaySeconds: 30, maxAttempts: 5, maxTurnSeconds: 300 } }),
