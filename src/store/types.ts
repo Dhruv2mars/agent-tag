@@ -149,6 +149,11 @@ export interface ClaimedInteractionResponse {
   readonly turnStarted: boolean;
   /** The T3 turn id once the coordinator has observed it; interrupts pass it when known. */
   readonly turnId: string | null;
+  /**
+   * T3 request ids of the target operation's user-input questions. A message-mode answer starts a
+   * continuation turn from user message `async-answer:<requestId>`, which the operation also owns.
+   */
+  readonly userInputRequestIds: ReadonlyArray<string>;
 }
 
 export type UserInputQuestionPrompt = z.infer<typeof userInputQuestionPromptSchema>;

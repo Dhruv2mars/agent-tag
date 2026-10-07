@@ -70,6 +70,14 @@ export const NO_LONGER_PENDING_NOTICE = "This request is no longer pending.";
 export const RETRIES_EXHAUSTED_NOTICE =
   "Agent Tag could not deliver this response to T3 after several attempts. Ask the operator to check service diagnostics.";
 
+/**
+ * The user message T3 0.0.45 creates for a message-mode answer to `requestId`; it starts the
+ * operation's continuation turn (decider.ts `thread.user-input.respond`).
+ */
+function asyncAnswerMessageId(requestId: string): string {
+  return `async-answer:${requestId}`;
+}
+
 export function interactionRetryDelayMs(policy: InteractionRetryPolicy, attempt: number): number {
   const exponent = Math.max(0, attempt - 1);
   return Math.min(policy.maxDelayMs, policy.baseDelayMs * 2 ** exponent);
@@ -208,6 +216,12 @@ export class InteractionWorker {
   //     thread snapshot whose current turn (latestTurn, and session.activeTurnId when set) is this
   //     operation's and still running. A stored turn id alone is not enough: a newer turn may have
   //     replaced it. The check-then-dispatch gap is unavoidable with T3's API and kept to one RPC.
+  //     The operation owns its recorded turn, the turn started from its own message, and every
+  //     continuation turn T3 starts from a message-mode answer to one of its questions (user
+  //     message `async-answer:<requestId>`, decider.ts `thread.user-input.respond`). Approval and
+  //     callback-mode answers resume the same provider turn, so they need no extra tracking. A
+  //     continuation counts only if its message precedes every other user message after the
+  //     operation's own, so a newer operation's turn (or one it steered) is never the operation's.
   //  2. Never settle locally while T3 could still start the operation's turn. Terminal settlement
   //     needs proof: the turn was never sent, T3 reported or shows it ended, a later turn replaced
   //     it, or T3 shows neither the thread nor the message after the bootstrap window measured from
@@ -251,9 +265,11 @@ export class InteractionWorker {
 
   /**
    * Returns the id of this operation's turn when it is the T3 thread's current, running turn, which
-   * is the only turn T3's session-wide interrupt may stop. Settles the cancel when that turn ended or
-   * a later turn replaced it, and retries while T3 holds the message without having started the turn
-   * or (within the bootstrap window) does not show the thread or message yet.
+   * is the only turn T3's session-wide interrupt may stop. The operation's turns are its recorded
+   * turn, the turn of its own message, and continuation turns from message-mode answers to its
+   * questions (invariant 1). Settles the cancel when none of them is current and running, and
+   * retries while T3 holds one of its messages without having started the turn or (within the
+   * bootstrap window) does not show the thread or message yet.
    */
   async #ownRunningTurn(response: ClaimedInteractionResponse): Promise<string> {
     let snapshot: T3ThreadSnapshot;
@@ -268,34 +284,42 @@ export class InteractionWorker {
     const isCurrentRunning = (turnId: string): boolean =>
       latest !== null && latest.turnId === turnId && latest.state === "running" &&
       (activeTurnId === null || activeTurnId === turnId);
-    if (response.turnId !== null) {
-      if (isCurrentRunning(response.turnId)) return response.turnId;
-      // The recorded turn ended or a newer turn is current; interrupting would stop the newer one.
-      throw new InteractionSettled("OperationNotRunning", true);
-    }
+    if (response.turnId !== null && isCurrentRunning(response.turnId)) return response.turnId;
     const userMessages = snapshot.thread.messages.filter((message) => message.role === "user");
     const message = userMessages.find((candidate) => candidate.id === response.operationMessageId);
-    if (message === undefined) this.#settleAbsent(response);
-    const sentAt = new Date(message.createdAt).getTime();
-    const nextMessageAt = userMessages
-      .map((candidate) => new Date(candidate.createdAt).getTime())
-      .filter((createdAt) => createdAt > sentAt)
+    if (message === undefined) {
+      // A recorded turn proves T3 created the thread and message; neither is current any more.
+      if (response.turnId !== null) throw new InteractionSettled("OperationNotRunning", true);
+      this.#settleAbsent(response);
+    }
+    const timeOf = (candidate: { readonly createdAt: string }): number => new Date(candidate.createdAt).getTime();
+    const sentAt = timeOf(message);
+    const continuationIds = new Set(response.userInputRequestIds.map(asyncAnswerMessageId));
+    const laterMessages = userMessages.filter((candidate) => timeOf(candidate) > sentAt);
+    // The first user message after ours that no answer of ours produced: a newer operation's.
+    const foreignAt = laterMessages
+      .filter((candidate) => !continuationIds.has(candidate.id))
+      .map(timeOf)
       .reduce((earliest, createdAt) => Math.min(earliest, createdAt), Number.POSITIVE_INFINITY);
+    const ownedMessages = [
+      message,
+      ...laterMessages.filter((candidate) => continuationIds.has(candidate.id) && timeOf(candidate) < foreignAt),
+    ];
     const requestedAt = latest === null ? null : new Date(latest.requestedAt).getTime();
-    // The latest turn is this operation's when T3 tied the message to it, or when it was requested
-    // after this message and before any later one.
-    const latestIsOurs = latest !== null && (message.turnId !== null
-      ? message.turnId === latest.turnId
-      : requestedAt !== null && requestedAt >= sentAt && requestedAt < nextMessageAt);
-    if (latestIsOurs) {
-      if (isCurrentRunning(latest.turnId)) return latest.turnId;
-      throw new InteractionSettled("OperationNotRunning", true);
-    }
-    // T3 tied the message to an older turn, or a later message's turn is current: ours has ended.
-    if (message.turnId !== null || nextMessageAt !== Number.POSITIVE_INFINITY) {
-      throw new InteractionSettled("OperationNotRunning", true);
-    }
-    throw new InteractionSettled("T3TurnNotStarted", false);
+    // A message's turn is the one T3 tied it to, or else one requested after it and before any
+    // newer operation's message.
+    const latestIsOurs = latest !== null && requestedAt !== null && (latest.turnId === response.turnId ||
+      ownedMessages.some((owned) => owned.turnId !== null
+        ? owned.turnId === latest.turnId
+        : requestedAt >= timeOf(owned) && requestedAt < foreignAt));
+    if (latestIsOurs && isCurrentRunning(latest.turnId)) return latest.turnId;
+    // T3 accepted a message of ours after the latest turn was requested and has not started its
+    // turn yet; with no newer operation's message since, that turn will be ours.
+    const awaitingStart = foreignAt === Number.POSITIVE_INFINITY && ownedMessages.some((owned) =>
+      owned.turnId === null && (requestedAt === null || timeOf(owned) > requestedAt));
+    if (awaitingStart) throw new InteractionSettled("T3TurnNotStarted", false);
+    // Our turns ended, or a newer operation's turn is current: interrupting would stop that one.
+    throw new InteractionSettled("OperationNotRunning", true);
   }
 
   /**

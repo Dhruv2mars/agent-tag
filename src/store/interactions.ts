@@ -571,6 +571,14 @@ export function claimNextInteractionResponse(
         )
         .get(candidate.interaction_id),
     );
+    const userInputRequestIds = z.array(z.object({ request_id: z.string() })).parse(
+      database
+        .query(
+          `SELECT request_id FROM interactions WHERE operation_id = ? AND kind = 'user-input'
+           ORDER BY created_at, interaction_id`,
+        )
+        .all(row.operation_id),
+    ).map((entry) => entry.request_id);
     writeAudit(database, {
       actorType: "worker",
       actorId: workerId,
@@ -602,6 +610,7 @@ export function claimNextInteractionResponse(
       turnDispatchedAt: row.t3_turn_dispatched_at ?? row.t3_turn_started_at,
       turnStarted: row.t3_turn_started_at !== null,
       turnId: row.t3_turn_id,
+      userInputRequestIds,
     };
   });
   return claim.immediate();

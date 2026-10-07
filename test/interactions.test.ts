@@ -11,6 +11,7 @@ import { questionMessage } from "../src/coordinator.ts";
 import {
   DEFAULT_INTERACTION_RETRY_POLICY,
   InteractionWorker,
+  type InteractionWorkerOutcome,
   NO_LONGER_PENDING_NOTICE,
   RETRIES_EXHAUSTED_NOTICE,
   interactionRetryDelayMs,
@@ -1188,6 +1189,238 @@ describe("interaction retries and cancellation", () => {
       expect(commands).toEqual([]);
       expect(noticesFor(path, cancel.interactionId)).toEqual([NO_LONGER_PENDING_NOTICE]);
     });
+  });
+
+  /** A thread snapshot with the given user messages and latest turn. */
+  function threadWithMessages(
+    threadId: string,
+    latest: { readonly turnId: string; readonly requestedAt: string; readonly state?: "running" | "completed" },
+    messages: ReadonlyArray<{ readonly id: string; readonly turnId: string | null; readonly createdAt: string }>,
+  ): T3ThreadSnapshot {
+    const base = threadWithTurn(threadId, latest.turnId, { state: latest.state ?? "running" });
+    return {
+      ...base,
+      thread: {
+        ...base.thread,
+        latestTurn: base.thread.latestTurn === null ? null : { ...base.thread.latestTurn, requestedAt: latest.requestedAt },
+        messages: messages.map((message) => ({
+          ...message,
+          role: "user" as const,
+          text: message.id,
+          streaming: false,
+          updatedAt: message.createdAt,
+        })),
+      },
+    };
+  }
+
+  const minutesAfterNow = (minutes: number): string => new Date(Date.parse(now) + minutes * 60_000).toISOString();
+
+  /** Records a message-mode (dismissible) question for the operation and answers it from Slack. */
+  function answerAsyncQuestion(
+    store: AgentTagStore,
+    seeded: ReturnType<typeof seedOperation>,
+    requestId: string,
+    answerActionTs: string | null,
+  ): void {
+    const prompt = {
+      requestId,
+      dismissible: true,
+      questions: [
+        { id: "package", header: "Package", question: "Which package?", options: [{ label: "core" }], multiSelect: false },
+      ],
+    };
+    const pending = store.recordPendingInteraction({
+      ...seeded,
+      requestId,
+      kind: "user-input",
+      prompt,
+      conversationId: "C1",
+      threadTs: "1000.000001",
+      message: (interactionId) => questionMessage(interactionId, prompt),
+      now,
+    });
+    if (answerActionTs === null) return;
+    const router = new SlackActionRouter({ config, store, now: () => now });
+    expect(
+      router.ingest(
+        actionBody({
+          actionId: "agent-tag.user-input.answer",
+          value: JSON.stringify({ interactionId: pending.interactionId, questionId: "package", answer: "core" }),
+          actionTs: answerActionTs,
+        }),
+      ).kind,
+    ).toBe("accepted");
+  }
+
+  for (const tied of [true, false]) {
+    test(`a cancel after a message-mode answer interrupts the operation's continuation turn (message ${tied ? "tied to" : "untied from"} its turn)`, async () => {
+      await withStore(async ({ store, path }) => {
+        const seeded = seedOperation(store);
+        claimRunningOperation(store, seeded.operationId);
+        store.markOperationTurnStarted({ operationId: seeded.operationId, workerId: "coordinator-a", turnId: "turn-1", now });
+        const messageId = readRows<{ message_id: string }>(
+          path,
+          "SELECT message_id FROM operations WHERE operation_id = ?",
+          seeded.operationId,
+        )[0]?.message_id ?? "";
+        answerAsyncQuestion(store, seeded, "question-1", "1000.000031");
+        store.deferOperation({
+          operationId: seeded.operationId,
+          workerId: "coordinator-a",
+          blockedUntil: new Date(Date.parse(now) + 24 * 3_600_000).toISOString(),
+          now,
+        });
+        // T3 0.0.45 answers a message-mode question with user message `async-answer:<requestId>`
+        // and a continuation turn (turn-2) that replaces the operation's original turn-1.
+        let phase: "original" | "answered" | "continuation" = "original";
+        const fetchThread = async (threadId: string): Promise<T3ThreadSnapshot> => {
+          const original = { id: messageId, turnId: "turn-1", createdAt: now };
+          if (phase === "original") return threadWithMessages(threadId, { turnId: "turn-1", requestedAt: now }, [original]);
+          const answer = { id: "async-answer:question-1", turnId: tied && phase === "continuation" ? "turn-2" : null, createdAt: minutesAfterNow(1) };
+          return phase === "answered"
+            ? threadWithMessages(threadId, { turnId: "turn-1", requestedAt: now, state: "completed" }, [original, answer])
+            : threadWithMessages(threadId, { turnId: "turn-2", requestedAt: minutesAfterNow(1) }, [original, answer]);
+        };
+        const commands: T3Command[] = [];
+        let current = new Date(now);
+        const worker = new InteractionWorker({
+          config,
+          store,
+          t3: {
+            fetchThread,
+            dispatch: async (command) => {
+              commands.push(command);
+              if (command.type === "thread.user-input.respond") phase = "answered";
+              return { sequence: commands.length };
+            },
+          },
+          workerId: "interaction-a",
+          now: () => current,
+        });
+        expect((await worker.processNext()).kind).toBe("resolved");
+        expect(commands[0]).toMatchObject({ type: "thread.user-input.respond", requestId: "question-1" });
+
+        const router = new SlackActionRouter({ config, store, now: () => now });
+        expect(router.ingest(actionBody({ actionId: "agent-tag.turn.cancel", value: seeded.taskId })).kind).toBe(
+          "accepted",
+        );
+        // T3 holds the answer but has not started its turn: wait instead of settling.
+        const waiting = await worker.processNext();
+        expect(waiting).toMatchObject({ kind: "retry-scheduled", errorCode: "T3TurnNotStarted" });
+        if (waiting.kind !== "retry-scheduled") throw new Error("expected a retry");
+        phase = "continuation";
+        current = new Date(waiting.blockedUntil);
+        expect((await worker.processNext()).kind).toBe("resolved");
+        expect(commands.slice(1)).toEqual([
+          expect.objectContaining({ type: "thread.turn.interrupt", threadId: seeded.threadId, turnId: "turn-2" }),
+        ]);
+      });
+    });
+  }
+
+  /**
+   * The older operation answered a message-mode question (continuation turn-2), its cancel exhausted
+   * retries, and it failed locally. A newer operation on the task then runs turn-3, and a fresh click
+   * requeues the older cancellation against a thread whose user messages after the newer one's are
+   * `afterNewer`. Returns the requeued cancel's outcome and the interrupts sent after the requeue.
+   */
+  async function requeueOlderCancelWhileNewerRuns(
+    afterNewer: ReadonlyArray<{ readonly id: string; readonly turnId: string | null; readonly createdAt: string }>,
+  ) {
+    let result: { readonly outcome: InteractionWorkerOutcome; readonly interrupts: T3Command[] } | undefined;
+    await withStore(async ({ store, path }) => {
+      const older = seedOperation(store);
+      claimRunningOperation(store, older.operationId);
+      store.markOperationTurnStarted({ operationId: older.operationId, workerId: "coordinator-a", turnId: "turn-1", now });
+      answerAsyncQuestion(store, older, "question-1", "1000.000031");
+      // Asked by the older operation too; any answer to it arrives only after the newer one started.
+      answerAsyncQuestion(store, older, "question-2", null);
+      const messageIdOf = (operationId: string): string => {
+        const [row] = readRows<{ message_id: string }>(
+          path,
+          "SELECT message_id FROM operations WHERE operation_id = ?",
+          operationId,
+        );
+        if (row === undefined) throw new Error("operation not found");
+        return row.message_id;
+      };
+      const olderMessages = [
+        { id: messageIdOf(older.operationId), turnId: "turn-1", createdAt: now },
+        { id: "async-answer:question-1", turnId: "turn-2", createdAt: minutesAfterNow(1) },
+      ];
+      let snapshot = (threadId: string) =>
+        threadWithMessages(threadId, { turnId: "turn-2", requestedAt: minutesAfterNow(1) }, olderMessages);
+      const commands: T3Command[] = [];
+      let t3Down = false;
+      let current = new Date(now);
+      const worker = new InteractionWorker({
+        config,
+        store,
+        t3: {
+          fetchThread: async (threadId) => snapshot(threadId),
+          dispatch: async (command) => {
+            commands.push(command);
+            if (t3Down) throw new Error("socket closed before the receipt arrived");
+            return { sequence: commands.length };
+          },
+        },
+        workerId: "interaction-a",
+        retry: { baseDelayMs: 1_000, maxDelayMs: 1_000, maxAttempts: 1 },
+        now: () => current,
+      });
+      expect((await worker.processNext()).kind).toBe("resolved");
+
+      const router = new SlackActionRouter({ config, store, now: () => now });
+      const cancel = (actionTs: string) =>
+        router.ingest(actionBody({ actionId: "agent-tag.turn.cancel", value: older.taskId, actionTs }));
+      expect(cancel("1000.000040").kind).toBe("accepted");
+      t3Down = true;
+      expect((await worker.processNext()).kind).toBe("failed");
+      // It did target the continuation while the older operation owned the current turn.
+      expect(commands.at(-1)).toMatchObject({ type: "thread.turn.interrupt", turnId: "turn-2" });
+      store.failOperation({
+        operationId: older.operationId,
+        workerId: "coordinator-a",
+        errorCode: "T3TurnStalled",
+        retryable: false,
+        now,
+      });
+
+      const newer = seedOperation(store);
+      expect(newer.taskId).toBe(older.taskId);
+      claimRunningOperation(store, newer.operationId);
+      store.markOperationTurnStarted({ operationId: newer.operationId, workerId: "coordinator-a", turnId: "turn-3", now });
+      snapshot = (threadId) => threadWithMessages(threadId, { turnId: "turn-3", requestedAt: minutesAfterNow(2) }, [
+        ...olderMessages,
+        { id: messageIdOf(newer.operationId), turnId: "turn-3", createdAt: minutesAfterNow(2) },
+        ...afterNewer,
+      ]);
+      t3Down = false;
+      const dispatched = commands.length;
+      expect(cancel("1000.000050").kind).toBe("accepted");
+      current = new Date(current.getTime() + 3_600_000);
+      const outcome = await worker.processNext();
+      result = { outcome, interrupts: commands.slice(dispatched) };
+    });
+    if (result === undefined) throw new Error("fixture did not run");
+    return result;
+  }
+
+  test("a cancel after a message-mode answer never interrupts a newer operation's turn", async () => {
+    const { outcome, interrupts } = await requeueOlderCancelWhileNewerRuns([]);
+    expect(outcome).toMatchObject({ kind: "failed", errorCode: "OperationNotRunning" });
+    expect(interrupts).toEqual([]);
+  });
+
+  test("a late message-mode answer that steers a newer operation's turn does not make that turn the older operation's", async () => {
+    for (const turnId of ["turn-3", null]) {
+      const { outcome, interrupts } = await requeueOlderCancelWhileNewerRuns([
+        { id: "async-answer:question-2", turnId, createdAt: minutesAfterNow(3) },
+      ]);
+      expect(outcome).toMatchObject({ kind: "failed", errorCode: "OperationNotRunning" });
+      expect(interrupts).toEqual([]);
+    }
   });
 
   test("a fresh cancel does not requeue an exhausted cancellation whose T3 turn is confirmed ended", async () => {
