@@ -260,6 +260,7 @@ export class InteractionWorker {
     let code: string;
     let terminal: boolean;
     let notice: string | undefined;
+    let retriesExhausted = false;
     if (error instanceof z.ZodError || error instanceof ExecutionAuthorityDenied) {
       // Invalid stored input or revoked authority: never deliverable, and nothing to tell the thread.
       code = error.name;
@@ -277,6 +278,7 @@ export class InteractionWorker {
     if (!terminal && response.attempt >= this.#retry.maxAttempts) {
       terminal = true;
       notice = RETRIES_EXHAUSTED_NOTICE;
+      retriesExhausted = true;
     }
     if (terminal) {
       this.#store.failInteractionResponse({
@@ -285,6 +287,7 @@ export class InteractionWorker {
         errorCode: code,
         retryable: false,
         ...(notice === undefined ? {} : { notice }),
+        ...(retriesExhausted ? { retriesExhausted } : {}),
         now: now.toISOString(),
       });
       return { kind: "failed", interactionId: response.interactionId, errorCode: code };

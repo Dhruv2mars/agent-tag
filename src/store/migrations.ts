@@ -313,4 +313,13 @@ export const STORE_MIGRATIONS: readonly StoreMigration[] = [
           WHERE correlation_id = operations.operation_id AND action = 'operation.claimed'));
     `,
   },
+  {
+    version: 14,
+    sql: `
+      -- A response that failed only because transient errors exhausted its retry budget. A fresh
+      -- Slack cancel may requeue such a cancellation once T3 recovers; terminal failures stay final.
+      ALTER TABLE interactions ADD COLUMN retries_exhausted INTEGER NOT NULL DEFAULT 0
+        CHECK (retries_exhausted IN (0, 1));
+    `,
+  },
 ];

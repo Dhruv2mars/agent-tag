@@ -303,14 +303,46 @@ export function requestTaskCancellation(
     );
     if (target === null) return { kind: "denied" };
     const requestId = `cancel:${target.operation_id}`;
-    const prior = priorRowSchema.nullable().parse(
+    const prior = priorRowSchema.extend({ state: nonEmpty, retries_exhausted: z.number().int() }).nullable().parse(
       database
         .query(
-          `SELECT interaction_id, response_command_id, prompt_json FROM interactions
+          `SELECT interaction_id, response_command_id, prompt_json, state, retries_exhausted FROM interactions
            WHERE thread_id = ? AND request_id = ? AND kind = 'cancel'`,
         )
         .get(task.thread_id, requestId),
     );
+    if (prior !== null && prior.state === "failed" && prior.retries_exhausted === 1) {
+      // Transient T3 errors exhausted the earlier attempt's retries while the operation still runs.
+      // A fresh action (redeliveries were deduplicated above) requeues it with the same command id,
+      // so T3 deduplicates the interrupt if an earlier attempt landed without a receipt.
+      const requeued = database
+        .query(
+          `UPDATE interactions SET state = 'response-pending', attempts = 0, retries_exhausted = 0,
+             last_error_code = NULL, blocked_until = NULL, lease_owner = NULL, lease_expires_at = NULL,
+             response_actor_id = ?, source_action_id = ?, updated_at = ?
+           WHERE interaction_id = ? AND state = 'failed' AND retries_exhausted = 1`,
+        )
+        .run(actorUserId, sourceActionId, now, prior.interaction_id);
+      if (requeued.changes !== 1) throw new Error("exhausted cancellation changed during requeue");
+      writeAudit(database, {
+        actorType: "slack-user",
+        actorId: actorUserId,
+        authority: "task-cancel",
+        source: sourceActionId,
+        target: target.operation_id,
+        action: "task.cancellation.requested",
+        result: "requeued",
+        correlationId: target.operation_id,
+        metadata: { disposition: cancelDisposition(prior.prompt_json), interactionId: prior.interaction_id },
+        createdAt: now,
+      });
+      return {
+        kind: "accepted",
+        interactionId: prior.interaction_id,
+        commandId: prior.response_command_id,
+        disposition: cancelDisposition(prior.prompt_json),
+      };
+    }
     if (prior !== null) {
       return {
         kind: "duplicate",
@@ -552,6 +584,8 @@ export interface FailInteractionResponseInput {
   readonly blockedUntil?: string;
   /** For a terminal failure: one Slack notice posted to the task thread, at most once per interaction. */
   readonly notice?: string;
+  /** A terminal failure caused only by transient errors exhausting the retry budget. */
+  readonly retriesExhausted?: boolean;
   readonly now: string;
 }
 
@@ -566,14 +600,15 @@ export function failInteractionResponse(database: Database, input: FailInteracti
   const fail = database.transaction(() => {
     const result = database
       .query(
-        `UPDATE interactions SET state = ?, last_error_code = ?, blocked_until = ?, lease_owner = NULL,
-           lease_expires_at = NULL, updated_at = ?
+        `UPDATE interactions SET state = ?, last_error_code = ?, blocked_until = ?, retries_exhausted = ?,
+           lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
          WHERE interaction_id = ? AND state = 'inflight' AND lease_owner = ? AND lease_expires_at > ?`,
       )
       .run(
         state,
         requiredId(input.errorCode, "errorCode"),
         blockedUntil,
+        !input.retryable && input.retriesExhausted === true ? 1 : 0,
         now,
         interactionId,
         requiredId(input.workerId, "workerId"),

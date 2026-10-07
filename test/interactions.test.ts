@@ -910,6 +910,106 @@ describe("interaction retries and cancellation", () => {
     });
   });
 
+  test("a fresh cancel requeues a cancellation whose transient retries were exhausted", async () => {
+    await withStore(async ({ store, path }) => {
+      const seeded = seedOperation(store);
+      claimRunningOperation(store, seeded.operationId);
+      store.markOperationTurnStarted({
+        operationId: seeded.operationId,
+        workerId: "coordinator-a",
+        turnId: "turn-1",
+        now,
+      });
+      const router = new SlackActionRouter({ config, store, now: () => now });
+      const cancel = (actionTs: string) =>
+        router.ingest(actionBody({ actionId: "agent-tag.turn.cancel", value: seeded.taskId, actionTs }));
+      const first = cancel("1000.000020");
+      expect(first.kind).toBe("accepted");
+
+      const commands: T3Command[] = [];
+      let t3Down = true;
+      let current = new Date(now);
+      const worker = new InteractionWorker({
+        config,
+        store,
+        t3: {
+          fetchThread: unexpectedThreadFetch,
+          dispatch: async (command) => {
+            commands.push(command);
+            if (t3Down) throw new Error("socket closed before the receipt arrived");
+            return { sequence: 1 };
+          },
+        },
+        workerId: "interaction-a",
+        retry: { baseDelayMs: 1_000, maxDelayMs: 1_000, maxAttempts: 2 },
+        now: () => current,
+      });
+      const outcomes: string[] = [];
+      for (let iteration = 0; iteration < 4; iteration += 1) {
+        outcomes.push((await worker.processNext()).kind);
+        current = new Date(current.getTime() + 3_600_000);
+      }
+      expect(outcomes).toEqual(["retry-scheduled", "failed", "idle", "idle"]);
+
+      // A redelivery of the original click stays deduplicated and does not requeue.
+      expect(cancel("1000.000020").kind).toBe("duplicate");
+      expect((await worker.processNext()).kind).toBe("idle");
+
+      // After T3 recovers, a fresh click requeues the same cancellation and command id once.
+      t3Down = false;
+      const fresh = cancel("1000.000030");
+      expect(fresh).toMatchObject({ kind: "accepted", commandId: "commandId" in first ? first.commandId : "" });
+      expect(cancel("1000.000030").kind).toBe("duplicate");
+      expect(cancel("1000.000031").kind).toBe("duplicate");
+      expect((await worker.processNext()).kind).toBe("resolved");
+      expect((await worker.processNext()).kind).toBe("idle");
+      expect(commands).toHaveLength(3);
+      expect(new Set(commands.map((command) => command.commandId)).size).toBe(1);
+      expect(commands[2]).toMatchObject({ type: "thread.turn.interrupt", turnId: "turn-1" });
+      expect(
+        readRows(path, "SELECT state, attempts, retries_exhausted FROM interactions WHERE kind = 'cancel'"),
+      ).toEqual([{ state: "resolved", attempts: 1, retries_exhausted: 0 }]);
+    });
+  });
+
+  test("a fresh cancel does not requeue a cancellation T3 rejected", async () => {
+    await withStore(async ({ store }) => {
+      const seeded = seedOperation(store);
+      claimRunningOperation(store, seeded.operationId);
+      store.markOperationTurnStarted({
+        operationId: seeded.operationId,
+        workerId: "coordinator-a",
+        turnId: "turn-1",
+        now,
+      });
+      const router = new SlackActionRouter({ config, store, now: () => now });
+      const cancel = (actionTs: string) =>
+        router.ingest(actionBody({ actionId: "agent-tag.turn.cancel", value: seeded.taskId, actionTs }));
+      expect(cancel("1000.000020").kind).toBe("accepted");
+      let dispatches = 0;
+      const worker = new InteractionWorker({
+        config,
+        store,
+        t3: {
+          fetchThread: unexpectedThreadFetch,
+          dispatch: async () => {
+            dispatches += 1;
+            throw {
+              _tag: "OrchestrationDispatchCommandError",
+              message: `Orchestration command invariant failed (thread.turn.interrupt): Thread '${seeded.threadId}' does not exist for command 'thread.turn.interrupt'.`,
+            };
+          },
+        },
+        workerId: "interaction-a",
+        now: () => new Date(now),
+      });
+      expect((await worker.processNext()).kind).toBe("failed");
+      expect(cancel("1000.000030").kind).toBe("duplicate");
+      expect((await worker.processNext()).kind).toBe("idle");
+      expect(dispatches).toBe(1);
+    });
+  });
+
   test("a cancel that races the turn start waits for the turn instead of interrupting blindly", async () => {
     await withStore(async ({ store }) => {
       const seeded = seedOperation(store);

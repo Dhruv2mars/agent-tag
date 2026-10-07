@@ -88,7 +88,7 @@ function seedVersionOne(database: Database): void {
 }
 
 test("upgrades every historical SQLite schema while preserving existing work", async () => {
-  expect(STORE_MIGRATIONS.map((migration) => migration.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
+  expect(STORE_MIGRATIONS.map((migration) => migration.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]);
 
   for (const startingVersion of STORE_MIGRATIONS.map((migration) => migration.version)) {
     const directory = await mkdtemp(join(tmpdir(), `agent-tag-migration-v${startingVersion}-`));
