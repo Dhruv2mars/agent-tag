@@ -117,6 +117,9 @@ class FakeSystemctl {
   failRestart = false;
   failDisable = false;
   failShow = false;
+  failStop = false;
+  /** The unit file is gone, so systemd reports `LoadState=not-found` even while the service still runs. */
+  unitMissing = false;
   /** Starts never reach `running`: the service stays `activating`. */
   stuckActivating = false;
   linger = "no";
@@ -132,7 +135,7 @@ class FakeSystemctl {
       if (this.failShow) return { exitCode: 1, stdout: "", stderr: "Failed to connect to bus: No medium found" };
       return ok(
         [
-          `LoadState=${this.enabled || this.active ? "loaded" : "not-found"}`,
+          `LoadState=${!this.unitMissing && (this.enabled || this.active) ? "loaded" : "not-found"}`,
           `ActiveState=${this.active ? (this.stuckActivating ? "activating" : "active") : "inactive"}`,
           `SubState=${this.active ? (this.stuckActivating ? "start" : "running") : "dead"}`,
           `UnitFileState=${this.enabled ? "enabled" : ""}`,
@@ -159,7 +162,10 @@ class FakeSystemctl {
       if (command.includes("--now")) this.active = false;
       return ok();
     }
-    if (verb === "stop") this.active = false;
+    if (verb === "stop") {
+      if (this.failStop) return { exitCode: 1, stdout: "", stderr: "Failed to stop unit: Access denied\n" };
+      this.active = false;
+    }
     return ok();
   };
 }
@@ -256,6 +262,50 @@ describe("systemd user service lifecycle", () => {
     );
     expect(await readFile(service.unitPath, "utf8")).toContain('"/cfg/b.json"');
     expect(fake.commands.filter((command) => command.endsWith("daemon-reload")).length).toBeGreaterThanOrEqual(3);
+  });
+
+  test("upgrade rollback restores a previously disabled unit to disabled", async () => {
+    await service.install("/cfg/a.json");
+    // Operator disabled and stopped the bot but kept the unit installed.
+    fake.enabled = false;
+    fake.active = false;
+
+    fake.failRestart = true;
+    await expect(service.upgrade("/cfg/b.json")).rejects.toThrow("systemd restart failed");
+    expect(await readFile(service.unitPath, "utf8")).toContain('"/cfg/a.json"');
+    expect(fake.enabled).toBe(false);
+    expect(fake.active).toBe(false);
+    expect(fake.commands).toContain(`systemctl --user disable ${AGENT_TAG_SYSTEMD_UNIT}`);
+  });
+
+  test("upgrade rollback leaves a previously enabled unit enabled", async () => {
+    await service.install("/cfg/a.json");
+    fake.active = false;
+    fake.commands.length = 0;
+    fake.failRestart = true;
+    await expect(service.upgrade("/cfg/b.json")).rejects.toThrow("systemd restart failed");
+    expect(fake.enabled).toBe(true);
+    expect(fake.commands.some((command) => command.includes(" disable"))).toBe(false);
+  });
+
+  test("uninstall stops a service that still runs after its unit file was deleted", async () => {
+    await service.install("/cfg/a.json");
+    await rm(service.unitPath);
+    fake.unitMissing = true;
+    fake.enabled = false;
+    fake.commands.length = 0;
+
+    fake.failStop = true;
+    await expect(service.uninstall()).rejects.toThrow(
+      `systemd stop failed with exit code 1: Failed to stop unit: Access denied; ${AGENT_TAG_SYSTEMD_UNIT} is still running`,
+    );
+    expect(fake.active).toBe(true);
+    expect(fake.commands).not.toContain("systemctl --user daemon-reload");
+
+    fake.failStop = false;
+    expect(await service.uninstall()).toMatchObject({ installed: false, running: false });
+    expect(fake.active).toBe(false);
+    expect(fake.commands).toContain(`systemctl --user stop ${AGENT_TAG_SYSTEMD_UNIT}`);
   });
 
   test("upgrade and restart require an installed unit", async () => {

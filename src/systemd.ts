@@ -314,7 +314,7 @@ export class SystemdUserService {
     if (prior === undefined) throw new Error("Agent Tag systemd unit is not installed");
     const definition = await this.#host.definition(configPath);
     await this.#host.preflight(definition);
-    const wasRunning = (await this.#runtime()).running;
+    const { running: wasRunning, enabled: wasEnabled } = await this.#runtime();
     await writeUnitFile(this.unitPath, renderSystemdUnit(definition));
     try {
       await requireSuccess(this.#host.run, systemctl("daemon-reload"), "systemd daemon-reload");
@@ -326,6 +326,8 @@ export class SystemdUserService {
       await writeUnitFile(this.unitPath, prior);
       await this.#host.run(systemctl("daemon-reload"));
       await this.#resetFailed();
+      // Upgrade enabled the unit before restarting; a previously disabled bot must not start at the next login.
+      if (!wasEnabled) await this.#host.run(systemctl("disable", AGENT_TAG_SYSTEMD_UNIT));
       if (!wasRunning) {
         await this.#host.run(systemctl("stop", AGENT_TAG_SYSTEMD_UNIT));
         throw error;
@@ -351,13 +353,23 @@ export class SystemdUserService {
   }
 
   async uninstall(): Promise<SystemdServiceStatus> {
-    if ((await this.#runtime(true)).loaded) {
+    const runtime = await this.#runtime(true);
+    if (runtime.loaded) {
       // Keep the unit file when systemd could not stop it, so the operator can fix the cause and retry.
       const disabled = await this.#host.run(systemctl("disable", "--now", AGENT_TAG_SYSTEMD_UNIT));
       if (disabled.exitCode !== 0) {
         throw new Error(
           `systemd disable --now failed with exit code ${disabled.exitCode}: ${disabled.stderr.trim()}; ` +
             `kept ${this.unitPath} so you can retry \`agent-tag service uninstall\``,
+        );
+      }
+    } else if (runtime.active) {
+      // A unit whose file was deleted (LoadState=not-found) keeps running until it is stopped explicitly.
+      const stopped = await this.#host.run(systemctl("stop", AGENT_TAG_SYSTEMD_UNIT));
+      if (stopped.exitCode !== 0) {
+        throw new Error(
+          `systemd stop failed with exit code ${stopped.exitCode}: ${stopped.stderr.trim()}; ` +
+            `${AGENT_TAG_SYSTEMD_UNIT} is still running, retry \`agent-tag service uninstall\``,
         );
       }
     }
