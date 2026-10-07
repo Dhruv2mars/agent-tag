@@ -353,6 +353,10 @@ export class AgentTagStore {
     return interactions.claimNextInteractionResponse(this.#database, input);
   }
 
+  answeredOperationQuestions(operationId: string): ReadonlySet<string> {
+    return interactions.answeredOperationQuestions(this.#database, operationId);
+  }
+
   checkInteractionDispatch(
     input: interactions.CheckInteractionDispatchInput,
   ): interactions.CheckInteractionDispatchResult {

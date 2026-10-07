@@ -1184,7 +1184,6 @@ describe("interactions of an abandoned turn (B7)", () => {
 });
 
 describe("accepted answers outlive the turn that asked (B7)", () => {
-  const askedAt = start;
   const questionActivity = {
     id: "requested-question-1",
     tone: "approval" as const,
@@ -1198,146 +1197,256 @@ describe("accepted answers outlive the turn that asked (B7)", () => {
       ],
     },
     turnId: "turn-1",
-    createdAt: askedAt,
+    createdAt: start,
   };
 
-  /** Simulates T3 0.0.45 answering a message-mode question: resolve it and start a continuation turn. */
+  type TurnState = "running" | "completed";
+
+  /**
+   * A thread whose turn-1 asks a message-mode question, modelled on T3 0.0.45's decider: answering
+   * appends `user-input.resolved` and issues `thread.turn.start` with the answer, both at the answer's
+   * `createdAt`. That turn start resumes an idle session in a new turn (turn-2), or steers a running
+   * turn-1, which depending on the provider keeps turn-1 or opens turn-2.
+   */
   function messageModeThread(harness: Harness) {
-    const t3: { answeredAt: string | null; continuation: "none" | "running" | "completed" } = {
-      answeredAt: null,
-      continuation: "none",
-    };
+    const t3: {
+      turn1: TurnState;
+      turn1EndedAt: string;
+      turn1Text: string;
+      answeredAt: string | null;
+      turn2: TurnState | null;
+      extraActivities: T3ThreadSnapshot["thread"]["activities"];
+    } = { turn1: "completed", turn1EndedAt: start, turn1Text: "Which one?", answeredAt: null, turn2: null, extraActivities: [] };
     const read = (): T3ThreadSnapshot => {
-      const base = snapshot({ ...harness.turn, state: "completed", text: "Which one?" });
-      if (t3.answeredAt === null) {
-        return { ...base, thread: { ...base.thread, activities: [questionActivity] } };
-      }
+      const base = snapshot(harness.turn);
+      const activities: T3ThreadSnapshot["thread"]["activities"] = [...t3.extraActivities, questionActivity];
+      const messages: T3ThreadSnapshot["thread"]["messages"] = [...base.thread.messages];
       const answeredAt = t3.answeredAt;
-      const resolved = {
-        id: "async-answer:question-1",
-        tone: "info" as const,
-        kind: "user-input.resolved",
-        summary: "User input submitted",
-        payload: { requestId: "question-1", responseMode: "message", answers: { q1: "A" } },
+      if (t3.turn1 === "completed") {
+        messages.push({ id: "assistant-1", role: "assistant", text: t3.turn1Text, turnId: "turn-1", streaming: false, createdAt: t3.turn1EndedAt, updatedAt: t3.turn1EndedAt });
+      }
+      if (answeredAt !== null) {
+        activities.push({
+          id: "async-answer:question-1",
+          tone: "info",
+          kind: "user-input.resolved",
+          summary: "User input submitted",
+          payload: { requestId: "question-1", responseMode: "message", answers: { q1: "A" } },
+          turnId: "turn-1",
+          createdAt: answeredAt,
+        });
+        messages.push({ id: "async-answer:question-1", role: "user", text: "Which one?\nA", turnId: null, streaming: false, createdAt: answeredAt, updatedAt: answeredAt });
+      }
+      let latestTurn: T3ThreadSnapshot["thread"]["latestTurn"] = {
         turnId: "turn-1",
-        createdAt: answeredAt,
+        state: t3.turn1,
+        requestedAt: start,
+        startedAt: start,
+        completedAt: t3.turn1 === "completed" ? t3.turn1EndedAt : null,
+        assistantMessageId: t3.turn1 === "completed" ? "assistant-1" : null,
       };
-      const reply = {
-        id: "async-answer:question-1",
-        role: "user" as const,
-        text: "Which one?\nA",
-        turnId: null,
-        streaming: false,
-        createdAt: answeredAt,
-        updatedAt: answeredAt,
-      };
-      const thread = { ...base.thread, activities: [questionActivity, resolved], messages: [...base.thread.messages, reply] };
-      if (t3.continuation === "none") return { ...base, thread };
-      const completed = t3.continuation === "completed";
-      return {
-        ...base,
-        thread: {
-          ...thread,
-          latestTurn: {
-            turnId: "turn-2",
-            state: t3.continuation,
-            requestedAt: answeredAt,
-            startedAt: answeredAt,
-            completedAt: completed ? answeredAt : null,
-            assistantMessageId: completed ? "assistant-2" : null,
-          },
-          messages: [
-            ...thread.messages,
-            ...(completed
-              ? [{
-                  id: "assistant-2",
-                  role: "assistant" as const,
-                  text: "continued with A",
-                  turnId: "turn-2",
-                  streaming: false,
-                  createdAt: answeredAt,
-                  updatedAt: answeredAt,
-                }]
-              : []),
-          ],
-        },
-      };
+      if (t3.turn2 !== null && answeredAt !== null) {
+        const completed = t3.turn2 === "completed";
+        if (completed) {
+          messages.push({ id: "assistant-2", role: "assistant", text: "continued with A", turnId: "turn-2", streaming: false, createdAt: answeredAt, updatedAt: answeredAt });
+        }
+        latestTurn = {
+          turnId: "turn-2",
+          state: t3.turn2,
+          requestedAt: answeredAt,
+          startedAt: answeredAt,
+          completedAt: completed ? answeredAt : null,
+          assistantMessageId: completed ? "assistant-2" : null,
+        };
+      }
+      return { ...base, thread: { ...base.thread, latestTurn, activities, messages } };
     };
     return { t3, read };
+  }
+
+  function answerQuestion(harness: Harness) {
+    const question = readInteractions(harness.path).find((row) => row.request_id === "question-1");
+    if (question === undefined) throw new Error("question interaction was not recorded");
+    expect(
+      harness.store.submitUserInputAnswer({
+        interactionId: question.interaction_id,
+        questionId: "q1",
+        selection: { optionIndexes: [0] },
+        workspaceId: "T1",
+        conversationId: "C1",
+        threadTs: "1000.000001",
+        actorUserId: "U1",
+        sourceActionId: "answer-1",
+        expirySeconds: 86_400,
+        now: new Date(harness.clock.ms).toISOString(),
+      }).kind,
+    ).toBe("accepted");
+    expect(readInteractions(harness.path).find((row) => row.request_id === "question-1")?.state).toBe("response-pending");
+  }
+
+  function answerWorker(harness: Harness, config: AgentTagConfig, t3: { answeredAt: string | null }) {
+    const delivered: T3Command[] = [];
+    const worker = new InteractionWorker({
+      config,
+      store: harness.store,
+      t3: {
+        dispatch: async (command) => {
+          delivered.push(command);
+          if (command.type === "thread.user-input.respond") t3.answeredAt = command.createdAt;
+          return { sequence: 1 };
+        },
+      },
+      now: () => new Date(harness.clock.ms),
+    });
+    return { worker, delivered };
+  }
+
+  /**
+   * Defers on the pending question, answers it, then wakes the coordinator before the worker runs.
+   * `afterWake(n)` advances T3 before the coordinator's n-th fetch after waking.
+   */
+  async function answerAndWake(
+    harness: Harness,
+    config: AgentTagConfig,
+    sim: ReturnType<typeof messageModeThread>,
+    afterWake: (fetch: number, worker: InteractionWorker) => Promise<void>,
+  ) {
+    const { worker, delivered } = answerWorker(harness, config, sim.t3);
+    const seen: string[] = [];
+    let woken = false;
+    let wakeFetches = 0;
+    const coordinator = coordinatorFor(harness, config, async () => {
+      if (woken) {
+        wakeFetches += 1;
+        await afterWake(wakeFetches, worker);
+      }
+      const current = sim.read();
+      seen.push(`${current.thread.latestTurn?.turnId}:${current.thread.latestTurn?.state}`);
+      return current;
+    });
+    const receipt = ingest(harness.store, 1);
+    expect(await coordinator.processNext()).toMatchObject({ kind: "waiting-interaction", questionCount: 1 });
+    harness.clock.ms += MINUTE;
+    answerQuestion(harness);
+    woken = true;
+    const result = await coordinator.processNext();
+    return { receipt, result, seen, delivered, worker, wakeFetches: () => wakeFetches };
+  }
+
+  function expectAnswerDelivered(harness: Harness, delivered: readonly T3Command[]) {
+    expect(delivered).toEqual([
+      expect.objectContaining({ type: "thread.user-input.respond", requestId: "question-1", answers: { q1: "A" } }),
+    ]);
+    expect(readInteractions(harness.path).find((row) => row.request_id === "question-1")).toMatchObject({
+      state: "resolved",
+      last_error_code: null,
+    });
   }
 
   test("an answer to a message-mode question pending after its turn completed is delivered, and the operation settles after the continuation", async () => {
     await withHarness("message-mode-continuation", async (harness) => {
       const config = configWith({ interactionExpirySeconds: 86_400 });
-      const { t3, read } = messageModeThread(harness);
-      const delivered: T3Command[] = [];
-      const worker = new InteractionWorker({
-        config,
-        store: harness.store,
-        t3: {
-          dispatch: async (command) => {
-            delivered.push(command);
-            if (command.type === "thread.user-input.respond") t3.answeredAt = command.createdAt;
-            return { sequence: 1 };
-          },
-        },
-        now: () => new Date(harness.clock.ms),
+      const sim = messageModeThread(harness);
+      // The turn completes with the message-mode question still pending: the operation waits for Slack.
+      const run = await answerAndWake(harness, config, sim, async (fetch, worker) => {
+        // 1st: the coordinator wakes before the worker runs and sees the pre-answer snapshot.
+        // 2nd: the worker has sent the answer; T3 resolved it but has not started the new turn.
+        // 3rd: the continuation turn runs. 4th: it completes.
+        if (fetch === 2) expect((await worker.processNext()).kind).toBe("resolved");
+        if (fetch === 3) sim.t3.turn2 = "running";
+        if (fetch === 4) sim.t3.turn2 = "completed";
       });
-      const seen: string[] = [];
-      let wakeFetches = 0;
-      let woken = false;
-      const coordinator = coordinatorFor(harness, config, async () => {
-        if (woken) {
-          wakeFetches += 1;
-          // 1st: the coordinator wakes before the worker runs and sees the pre-answer snapshot.
-          // 2nd: the worker has sent the answer; T3 resolved it but has not started the new turn.
-          // 3rd: the continuation turn runs. 4th: it completes.
-          if (wakeFetches === 2) expect((await worker.processNext()).kind).toBe("resolved");
-          if (wakeFetches === 3) t3.continuation = "running";
-          if (wakeFetches === 4) t3.continuation = "completed";
+
+      expect(run.result).toMatchObject({ kind: "completed", operationId: run.receipt.operationId });
+      expect(run.wakeFetches()).toBe(4);
+      expect(run.seen.slice(-4)).toEqual(["turn-1:completed", "turn-1:completed", "turn-2:running", "turn-2:completed"]);
+      expectAnswerDelivered(harness, run.delivered);
+      expect(readOperation(harness.path, run.receipt.operationId)).toMatchObject({ status: "succeeded" });
+      expect(drainOutboxTexts(harness.store, harness.clock.ms).at(-1)).toBe("continued with A");
+      expect(await run.worker.processNext()).toEqual({ kind: "idle" });
+    });
+  });
+
+  test("an answer that steers the running turn settles when that same turn completes, without stalling", async () => {
+    await withHarness("message-mode-steer-same", async (harness) => {
+      const config = configWith({
+        interactionExpirySeconds: 86_400,
+        stalledTurn: { timeoutSeconds: 60, retryDelaySeconds: 30, maxAttempts: 1 },
+      });
+      const sim = messageModeThread(harness);
+      sim.t3.turn1 = "running";
+      const run = await answerAndWake(harness, config, sim, async (fetch, worker) => {
+        // 2nd: the answer steers turn-1, which keeps its id (Codex/Claude). 3rd: turn-1 completes.
+        if (fetch === 2) expect((await worker.processNext()).kind).toBe("resolved");
+        if (fetch === 3) {
+          sim.t3.turn1 = "completed";
+          sim.t3.turn1EndedAt = new Date(harness.clock.ms).toISOString();
+          sim.t3.turn1Text = "steered with A";
         }
-        const current = read();
-        seen.push(`${current.thread.latestTurn?.turnId}:${current.thread.latestTurn?.state}`);
-        return current;
+      });
+
+      expect(run.result).toMatchObject({ kind: "completed", operationId: run.receipt.operationId });
+      expect(run.wakeFetches()).toBe(3);
+      expect(run.seen.slice(-3)).toEqual(["turn-1:running", "turn-1:running", "turn-1:completed"]);
+      expectAnswerDelivered(harness, run.delivered);
+      expect(readOperation(harness.path, run.receipt.operationId)).toMatchObject({ status: "succeeded", last_error_code: null });
+      expect(drainOutboxTexts(harness.store, harness.clock.ms).at(-1)).toBe("steered with A");
+    });
+  });
+
+  test("an answer that steers the running turn into a new turn settles after the new turn", async () => {
+    await withHarness("message-mode-steer-new", async (harness) => {
+      const config = configWith({ interactionExpirySeconds: 86_400 });
+      const sim = messageModeThread(harness);
+      sim.t3.turn1 = "running";
+      const run = await answerAndWake(harness, config, sim, async (fetch, worker) => {
+        // 2nd: the answer is resolved while turn-1 still runs. 3rd: the provider opens turn-2 for it
+        // (opencode), superseding turn-1. 4th: turn-2 completes.
+        if (fetch === 2) expect((await worker.processNext()).kind).toBe("resolved");
+        if (fetch === 3) {
+          sim.t3.turn1 = "completed";
+          sim.t3.turn1EndedAt = new Date(harness.clock.ms).toISOString();
+          sim.t3.turn2 = "running";
+        }
+        if (fetch === 4) sim.t3.turn2 = "completed";
+      });
+
+      expect(run.result).toMatchObject({ kind: "completed", operationId: run.receipt.operationId });
+      expect(run.wakeFetches()).toBe(4);
+      expect(run.seen.slice(-4)).toEqual(["turn-1:running", "turn-1:running", "turn-2:running", "turn-2:completed"]);
+      expectAnswerDelivered(harness, run.delivered);
+      expect(drainOutboxTexts(harness.store, harness.clock.ms).at(-1)).toBe("continued with A");
+    });
+  });
+
+  test("another operation's message-mode answer does not hold this operation's completed turn", async () => {
+    await withHarness("message-mode-other-op", async (harness) => {
+      const config = configWith({ stalledTurn: { timeoutSeconds: 60, retryDelaySeconds: 30, maxAttempts: 1 } });
+      const sim = messageModeThread(harness);
+      sim.t3.turn1Text = "done";
+      // A question this operation never answered was answered (e.g. in T3) after its turn ended.
+      sim.t3.extraActivities = [{
+        id: "async-answer:question-other",
+        tone: "info",
+        kind: "user-input.resolved",
+        summary: "User input submitted",
+        payload: { requestId: "question-other", responseMode: "message", answers: { q1: "B" } },
+        turnId: "turn-1",
+        createdAt: new Date(startMs + MINUTE).toISOString(),
+      }];
+      const coordinator = coordinatorFor(harness, config, () => {
+        const current = sim.read();
+        // Only the unrelated answer remains; question-1 is not reported, so nothing waits for Slack.
+        return { ...current, thread: { ...current.thread, activities: current.thread.activities.filter((activity) => activity.id !== "requested-question-1") } };
       });
       const receipt = ingest(harness.store, 1);
 
-      // The turn completes with the message-mode question still pending: the operation waits for Slack.
-      expect(await coordinator.processNext()).toMatchObject({ kind: "waiting-interaction", questionCount: 1 });
-      const question = readInteractions(harness.path).find((row) => row.request_id === "question-1");
-      if (question === undefined) throw new Error("question interaction was not recorded");
-      harness.clock.ms += MINUTE;
-      expect(
-        harness.store.submitUserInputAnswer({
-          interactionId: question.interaction_id,
-          questionId: "q1",
-          selection: { optionIndexes: [0] },
-          workspaceId: "T1",
-          conversationId: "C1",
-          threadTs: "1000.000001",
-          actorUserId: "U1",
-          sourceActionId: "answer-1",
-          expirySeconds: 86_400,
-          now: new Date(harness.clock.ms).toISOString(),
-        }).kind,
-      ).toBe("accepted");
-      expect(readInteractions(harness.path).find((row) => row.request_id === "question-1")?.state).toBe("response-pending");
-
-      // The answer wakes the coordinator first; it must not settle from the pre-answer snapshot.
-      woken = true;
       expect(await coordinator.processNext()).toMatchObject({ kind: "completed", operationId: receipt.operationId });
-      expect(wakeFetches).toBe(4);
-      expect(seen.slice(-4)).toEqual(["turn-1:completed", "turn-1:completed", "turn-2:running", "turn-2:completed"]);
-      expect(delivered).toEqual([
-        expect.objectContaining({ type: "thread.user-input.respond", requestId: "question-1", answers: { q1: "A" } }),
-      ]);
-      expect(readInteractions(harness.path).find((row) => row.request_id === "question-1")).toMatchObject({
-        state: "resolved",
-        last_error_code: null,
-      });
-      expect(readOperation(harness.path, receipt.operationId)).toMatchObject({ status: "succeeded" });
-      expect(drainOutboxTexts(harness.store, harness.clock.ms).at(-1)).toBe("continued with A");
-      expect(await worker.processNext()).toEqual({ kind: "idle" });
+      expect(drainOutboxTexts(harness.store, harness.clock.ms).at(-1)).toBe("done");
+      // The same snapshot would hold the operation that gave that answer.
+      const held = sim.read();
+      expect(awaitingT3AnswerContinuation(held, new Set(["question-other"]))).toBe(true);
+      expect(awaitingT3AnswerContinuation(held, new Set(["question-1"]))).toBe(false);
     });
   });
 
@@ -1347,26 +1456,11 @@ describe("accepted answers outlive the turn that asked (B7)", () => {
         interactionExpirySeconds: 86_400,
         stalledTurn: { timeoutSeconds: 60, retryDelaySeconds: 30, maxAttempts: 1 },
       });
-      const { read } = messageModeThread(harness);
-      const coordinator = coordinatorFor(harness, config, read);
+      const sim = messageModeThread(harness);
+      const coordinator = coordinatorFor(harness, config, sim.read);
       const receipt = ingest(harness.store, 1);
       expect(await coordinator.processNext()).toMatchObject({ kind: "waiting-interaction", questionCount: 1 });
-      const question = readInteractions(harness.path).find((row) => row.request_id === "question-1");
-      if (question === undefined) throw new Error("question interaction was not recorded");
-      expect(
-        harness.store.submitUserInputAnswer({
-          interactionId: question.interaction_id,
-          questionId: "q1",
-          selection: { optionIndexes: [0] },
-          workspaceId: "T1",
-          conversationId: "C1",
-          threadTs: "1000.000001",
-          actorUserId: "U1",
-          sourceActionId: "answer-1",
-          expirySeconds: 86_400,
-          now: new Date(harness.clock.ms).toISOString(),
-        }).kind,
-      ).toBe("accepted");
+      answerQuestion(harness);
 
       // No worker ever sends the answer, so T3 never moves: the stall policy fails the operation.
       expect(await coordinator.processNext()).toMatchObject({ kind: "failed", errorCode: "T3TurnStalled" });
@@ -1395,6 +1489,6 @@ describe("accepted answers outlive the turn that asked (B7)", () => {
         }],
       },
     };
-    expect(awaitingT3AnswerContinuation(dismissed)).toBe(false);
+    expect(awaitingT3AnswerContinuation(dismissed, new Set(["question-1"]))).toBe(false);
   });
 });

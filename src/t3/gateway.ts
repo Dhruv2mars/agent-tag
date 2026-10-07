@@ -374,22 +374,40 @@ const messageAnswerPayloadSchema = z.object({
 });
 
 /**
- * Whether T3 has accepted an answer to a message-mode question but its continuation turn is not yet
- * the thread's latest turn. T3 answers such a question in one command: it appends
- * `user-input.resolved` (with the answers) and starts a new turn carrying them, both stamped with the
- * answer's `createdAt`. Until that turn shows up, `latestTurn` is still the turn that asked, so its
- * state (often `completed`) says nothing about the answer. A dismissal has no answers and starts no turn.
+ * Whether T3 has accepted one of `requestIds`' answers to a message-mode question, but the latest turn
+ * does not reflect it yet, so its state must not settle the operation that asked.
+ *
+ * T3 (0.0.45 decider, `thread.user-input.respond`) answers such a question in one command: it appends
+ * `user-input.resolved` with the answers and issues `thread.turn.start` with the answer as a user
+ * message, both stamped with the answer's `createdAt`. That turn start resumes an idle session in a
+ * new turn, or steers a running one; when steered, some providers open a new turn and others keep the
+ * same turn id. So the latest turn reflects the answer once it was requested at or after the answer
+ * (a new turn), or ended at or after it (the turn the answer steered, which was still running). A
+ * latest turn that ended before the answer is the one that asked: its continuation has not started.
+ * A running latest turn is never settled from, so it needs no wait here. A dismissal has no answers
+ * and starts no turn. Answers to other operations' requests are ignored: their turns are not this
+ * operation's to wait for.
  */
-export function awaitingT3AnswerContinuation(snapshot: T3ThreadSnapshot): boolean {
+export function awaitingT3AnswerContinuation(snapshot: T3ThreadSnapshot, requestIds: ReadonlySet<string>): boolean {
+  if (requestIds.size === 0) return false;
   let answeredAt: number | null = null;
   for (const activity of snapshot.thread.activities) {
     if (activity.kind !== "user-input.resolved") continue;
-    if (!messageAnswerPayloadSchema.safeParse(activity.payload).success) continue;
+    const parsed = messageAnswerPayloadSchema.safeParse(activity.payload);
+    if (!parsed.success || !requestIds.has(parsed.data.requestId)) continue;
     answeredAt = Math.max(answeredAt ?? 0, Date.parse(activity.createdAt));
   }
   if (answeredAt === null) return false;
   const latestTurn = snapshot.thread.latestTurn;
-  return latestTurn === null || Date.parse(latestTurn.requestedAt) < answeredAt;
+  if (latestTurn === null) return true;
+  if (Date.parse(latestTurn.requestedAt) >= answeredAt) return false;
+  if (latestTurn.state === "running") return false;
+  // T3 stamps a turn's end as completedAt; when the session leaves "running" it settles the turn at
+  // the session's updatedAt.
+  const session = snapshot.thread.session;
+  const endedAt = latestTurn.completedAt ??
+    (session !== null && session.status !== "running" && session.status !== "starting" ? session.updatedAt : null);
+  return endedAt === null || Date.parse(endedAt) < answeredAt;
 }
 
 const threadStreamItemSchema = z.discriminatedUnion("kind", [

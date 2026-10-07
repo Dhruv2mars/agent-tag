@@ -345,7 +345,8 @@ export interface ClaimNextInteractionResponseInput {
  * The counterpart: an accepted response is never closed while its operation still waits for it. The
  * coordinator settles an operation only from a T3 snapshot that reflects every accepted response: it
  * keeps polling while T3 still reports a request that has a response (queued, in flight or delivered),
- * and while a delivered message-mode answer's continuation turn is not yet T3's latest turn. So when
+ * and while T3's latest turn ended before one of the operation's delivered message-mode answers (the
+ * turn that continues from it, a new turn or the running turn it steered, has not shown up). So when
  * completion or interruption closes queued and in-flight responses, those are only ones T3 no longer
  * awaits, which T3 would refuse anyway. A response whose delivery never lands ends with its operation
  * via the stall, ceiling or failure paths.
@@ -493,6 +494,24 @@ export function checkInteractionDispatch(
     return { kind: "refused", errorCode: OPERATION_SETTLED };
   });
   return check.immediate();
+}
+
+/**
+ * The request ids of an operation's answered questions (queued, in flight or delivered). The
+ * coordinator waits for T3 to reflect these answers before settling the operation from a turn's state.
+ */
+export function answeredOperationQuestions(database: Database, operationId: string): ReadonlySet<string> {
+  const rows = z
+    .array(z.object({ request_id: nonEmpty }))
+    .parse(
+      database
+        .query(
+          `SELECT request_id FROM interactions
+           WHERE operation_id = ? AND kind = 'user-input' AND state IN ('response-pending', 'inflight', 'resolved')`,
+        )
+        .all(requiredId(operationId, "operationId")),
+    );
+  return new Set(rows.map((row) => row.request_id));
 }
 
 export interface CompleteInteractionResponseInput {

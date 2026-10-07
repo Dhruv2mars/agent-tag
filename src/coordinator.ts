@@ -736,9 +736,10 @@ export class AgentTagCoordinator {
         }
         // "stale": every reported request is one an earlier operation gave up on; the turn decides.
       }
-      if (awaitingT3AnswerContinuation(snapshot)) {
-        // T3 took a message-mode answer but has not started the turn that continues from it; the
-        // latest turn is still the one that asked. Settle only from the continuation turn.
+      if (awaitingT3AnswerContinuation(snapshot, this.#store.answeredOperationQuestions(operation.operationId))) {
+        // T3 took this operation's message-mode answer, but the latest turn is still the one that
+        // asked and ended before it. Settle only from the turn that continues from the answer (a new
+        // turn, or the running turn the answer steered).
         await this.#pollAgain(progressAt, signal);
         continue;
       }
