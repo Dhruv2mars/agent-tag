@@ -87,7 +87,7 @@ The configured `maxConcurrentTasks` creates that many independent coordinator wo
 
 ## Background service
 
-One command works on both platforms: `agent-tag service install|upgrade|uninstall|status|restart|logs [CONFIG]`. The `bun run service:<action>` scripts call it, and `scripts/manage-launchd.ts` still works on macOS. `logs` accepts `--lines N` (default 200) and `--follow`. `status` prints JSON with `installed`, `loaded`, `running`, the unit path, and hints. Both platforms run `doctor` before installing or upgrading.
+One command works on both platforms: `agent-tag service install|upgrade|uninstall|status|restart|logs [CONFIG]`. Each `bun run service:<action>` script runs exactly that command, so the scripts behave the same on macOS (launchd) and Linux (systemd). `logs` accepts `--lines N` (default 200) and `--follow`. `status` prints JSON with `installed`, `loaded`, `running`, the unit path, and hints. Both platforms run `doctor` before installing or upgrading.
 
 ### macOS (launchd)
 

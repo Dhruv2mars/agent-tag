@@ -4,7 +4,7 @@ import { checkT3Environment } from "../src/doctor.ts";
 import { SecretString } from "../src/security/secret-file.ts";
 import { issueT3WebSocketUrl } from "../src/t3/auth.ts";
 import { inspectT3 } from "../src/t3/gateway.ts";
-import { assertSupportedT3Protocol, T3ProtocolMismatchError } from "../src/t3/protocol.ts";
+import { assertSupportedT3Protocol, T3EnvironmentRequestError, T3ProtocolMismatchError } from "../src/t3/protocol.ts";
 
 const servers: ReturnType<typeof Bun.serve>[] = [];
 afterEach(() => {
@@ -59,6 +59,7 @@ describe("T3 orchestration protocol gate", () => {
   });
 
   test("doctor and onboarding accept exactly the servers the runtime gate accepts", async () => {
+    const redirectTarget = fakeT3(() => Response.json({ ...environment, orchestrationProtocolVersion: 1 }));
     const cases: [string, (() => Response) | undefined][] = [
       ["protocol omitted", () => Response.json(environment)],
       ["protocol 1", () => Response.json({ ...environment, orchestrationProtocolVersion: 1 })],
@@ -67,6 +68,7 @@ describe("T3 orchestration protocol gate", () => {
       ["not json", () => new Response("<html></html>", { status: 200 })],
       ["legacy 404", undefined],
       ["server error", () => new Response("boom", { status: 500 })],
+      ["redirect to a valid descriptor", () => Response.redirect(`${redirectTarget.baseUrl}/.well-known/t3/environment`, 302)],
     ];
     for (const [name, descriptor] of cases) {
       const t3 = fakeT3(descriptor);
@@ -77,6 +79,26 @@ describe("T3 orchestration protocol gate", () => {
       const { check } = await checkT3Environment({ t3: { baseUrl: t3.baseUrl } }, { fetch });
       expect({ name, accepted: check.status !== "fail" }).toEqual({ name, accepted: runtimeAccepts });
     }
+  });
+
+  test("doctor and onboarding reject a redirected environment endpoint, like the runtime gate", async () => {
+    const target = fakeT3(() => Response.json({ ...environment, orchestrationProtocolVersion: 1 }));
+    const t3 = fakeT3(() => Response.redirect(`${target.baseUrl}/.well-known/t3/environment`, 302));
+    await expect(assertSupportedT3Protocol({ baseUrl: t3.baseUrl })).rejects.toBeInstanceOf(T3EnvironmentRequestError);
+    const result = await checkT3Environment({ t3: { baseUrl: t3.baseUrl } }, { fetch });
+    expect(result.reachable).toBe(false);
+    expect(result.check.status).toBe("fail");
+    expect(target.paths).toEqual([]);
+
+    // The shared probe passes the redirect policy even to an injected fetch.
+    const seen: (RequestRedirect | undefined)[] = [];
+    await checkT3Environment({ t3: { baseUrl: t3.baseUrl } }, {
+      fetch: async (_input, init) => {
+        seen.push(init?.redirect);
+        return Response.json(environment);
+      },
+    });
+    expect(seen).toEqual(["error"]);
   });
 
   test("startup and doctor probing stop before presenting the token to an incompatible server", async () => {

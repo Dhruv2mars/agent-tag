@@ -32,7 +32,7 @@ import {
 import { readSecretFile } from "./secret-file.ts";
 import { scanForSecrets, type SecretCanary } from "./secret-scan.ts";
 
-/** Where scripts/manage-launchd.ts points the macOS LaunchAgent logs. Other hosts pass `--log-dir`. */
+/** Where the launchd service (src/launchd.ts) points the macOS LaunchAgent logs. Other hosts pass `--log-dir`. */
 export function defaultLogDirectory(home: string): string {
   return join(home, "Library", "Logs", "AgentTag");
 }

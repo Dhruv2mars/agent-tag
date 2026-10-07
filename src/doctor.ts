@@ -18,11 +18,12 @@ import { assertRestrictedOrchestrationSession, inspectT3Session, type T3Session 
 import { inspectT3, type T3ServerInfo } from "./t3/gateway.ts";
 import { parseT3Pin, type T3Pin } from "./t3/pin.ts";
 import {
+  fetchT3EnvironmentDescriptor,
   isSupportedT3Protocol,
-  readT3EnvironmentDescriptor,
   SUPPORTED_T3_ORCHESTRATION_PROTOCOL,
   SUPPORTED_T3_RANGE,
   type T3EnvironmentDescriptor,
+  T3EnvironmentRequestError,
   T3EnvironmentUnavailableError,
 } from "./t3/protocol.ts";
 
@@ -134,8 +135,14 @@ export async function checkConfig(
       check: {
         id: "config",
         status: "fail",
-        summary: errno(error) === "ENOENT" ? `config not found at ${configPath}` : `config is not valid JSON: ${errorMessage(error)}`,
-        hint: "run `agent-tag onboard` to create one",
+        summary: errno(error) === "ENOENT"
+          ? `config not found at ${configPath}`
+          : errno(error) !== undefined
+            ? `config ${configPath} is not readable (${errno(error)})`
+            : `config is not valid JSON: ${errorMessage(error)}`,
+        hint: errno(error) === "ENOENT" || errno(error) === undefined
+          ? "run `agent-tag onboard` to create one"
+          : "make sure the Agent Tag user can read the config and search its parent directories",
       },
     };
   }
@@ -156,6 +163,11 @@ export async function checkConfig(
   };
 }
 
+/** Names a filesystem failure by its errno code when it has one (EACCES, EROFS, ...). */
+function fsFailure(error: unknown): string {
+  return errno(error) ?? errorMessage(error);
+}
+
 export async function checkDataDirectory(
   config: AgentTagConfig,
   dependencies: Pick<DoctorDependencies, "uid">,
@@ -164,6 +176,27 @@ export async function checkDataDirectory(
   const id = "data-dir";
   const path = config.dataDir;
   const fixes: string[] = [];
+  try {
+    return await inspectDataDirectory(path, dependencies, fix, fixes);
+  } catch (error) {
+    // Metadata and --fix failures (EACCES on a parent, EROFS, ...) are diagnostics, never doctor aborts.
+    return {
+      id,
+      status: "fail",
+      summary: `data directory ${path} could not be checked (${fsFailure(error)})`,
+      hint: "make sure the Agent Tag user owns the data directory and can search its parent directories",
+      ...(fixes.length === 0 ? {} : { fixed: fixes.join(", ") }),
+    };
+  }
+}
+
+async function inspectDataDirectory(
+  path: string,
+  dependencies: Pick<DoctorDependencies, "uid">,
+  fix: boolean,
+  fixes: string[],
+): Promise<DoctorCheck> {
+  const id = "data-dir";
   let metadata = await statOptional(path);
   if (metadata === undefined) {
     if (!fix) return { id, status: "fail", summary: `data directory ${path} does not exist`, hint: "run `agent-tag doctor --fix` to create it with mode 0700" };
@@ -187,10 +220,17 @@ export async function checkDataDirectory(
   try {
     await writeFile(probe, "", { flag: "wx", mode: 0o600 });
   } catch (error) {
-    return { id, status: "fail", summary: `data directory ${path} is not writable: ${errno(error) ?? errorMessage(error)}` };
-  } finally {
-    await rm(probe, { force: true });
+    // The probe was never created, so there is nothing to clean up (and cleanup would hit the same EACCES).
+    return {
+      id,
+      status: "fail",
+      summary: `data directory ${path} is not writable: ${fsFailure(error)}`,
+      hint: "the data directory must be mode 0700 and owned by the Agent Tag user",
+      ...(fixes.length === 0 ? {} : { fixed: fixes.join(", ") }),
+    };
   }
+  // Only the probe this check created is removed; a cleanup failure never replaces the result.
+  await rm(probe, { force: true }).catch(() => undefined);
   return {
     id,
     status: "pass",
@@ -234,8 +274,30 @@ export async function checkSecretFile(
   dependencies: Pick<DoctorDependencies, "uid">,
   fix: boolean,
 ): Promise<{ readonly check: DoctorCheck; readonly secret?: SecretString }> {
-  const { id, path } = spec;
   const fixes: string[] = [];
+  try {
+    return await inspectSecretFile(spec, dependencies, fix, fixes);
+  } catch (error) {
+    // EACCES on a parent without owner search permission, EROFS during --fix, ...: report, never abort doctor.
+    return {
+      check: {
+        id: spec.id,
+        status: "fail",
+        summary: `secret file ${spec.path} could not be checked (${fsFailure(error)})`,
+        hint: `make sure the Agent Tag user owns ${dirname(spec.path)} with mode 0700 and the secret file with mode 0600`,
+        ...(fixes.length === 0 ? {} : { fixed: fixes.join(", ") }),
+      },
+    };
+  }
+}
+
+async function inspectSecretFile(
+  spec: SecretFileSpec,
+  dependencies: Pick<DoctorDependencies, "uid">,
+  fix: boolean,
+  fixes: string[],
+): Promise<{ readonly check: DoctorCheck; readonly secret?: SecretString }> {
+  const { id, path } = spec;
   const fixedField = (): { readonly fixed?: string } => (fixes.length === 0 ? {} : { fixed: fixes.join(", ") });
   const parent = dirname(path);
   let parentMetadata = await statOptional(parent);
@@ -313,22 +375,23 @@ export async function checkT3Environment(
   dependencies: Pick<DoctorDependencies, "fetch">,
 ): Promise<{ readonly check: DoctorCheck; readonly reachable: boolean; readonly serverVersion?: string }> {
   const id = "t3-environment";
-  const url = new URL("/.well-known/t3/environment", config.t3.baseUrl);
-  let response: Response;
-  try {
-    response = await fetchWithTimeout(dependencies, url);
-  } catch (error) {
-    return {
-      reachable: false,
-      check: { id, status: "fail", summary: `T3 is not reachable at ${config.t3.baseUrl}: ${errorMessage(error)}`, hint: "start the pinned T3 server and check t3.baseUrl" },
-    };
-  }
-  // Same interpretation as the runtime gate (`assertSupportedT3Protocol`), so onboarding never accepts a
-  // server that startup, provider discovery, or the installer's doctor preflight would reject.
+  // The same request (redirects rejected) and interpretation as the runtime gate (`assertSupportedT3Protocol`),
+  // so onboarding never accepts a server that startup, provider discovery, or the installer's doctor
+  // preflight would reject.
   let descriptor: T3EnvironmentDescriptor;
   try {
-    descriptor = await readT3EnvironmentDescriptor(response);
+    descriptor = await fetchT3EnvironmentDescriptor({
+      baseUrl: config.t3.baseUrl,
+      fetch: dependencies.fetch,
+      signal: AbortSignal.timeout(NETWORK_TIMEOUT_MS),
+    });
   } catch (error) {
+    if (error instanceof T3EnvironmentRequestError) {
+      return {
+        reachable: false,
+        check: { id, status: "fail", summary: `T3 is not reachable at ${config.t3.baseUrl}: ${error.message}`, hint: "start the pinned T3 server and check t3.baseUrl; redirects are not followed" },
+      };
+    }
     if (error instanceof T3EnvironmentUnavailableError && error.status === 404) {
       return {
         reachable: true,

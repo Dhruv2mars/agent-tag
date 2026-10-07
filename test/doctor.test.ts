@@ -297,6 +297,97 @@ describe("agent-tag doctor", () => {
     await chmod(path, 0o600);
   });
 
+  /** Rewrites one config field, so a test can point a path somewhere the fixture does not own. */
+  async function rewriteConfig(change: (config: Record<string, any>) => void): Promise<void> {
+    const config = await Bun.file(fixture.configPath).json();
+    change(config);
+    await writeFile(fixture.configPath, JSON.stringify(config));
+  }
+
+  /** Every check still yields a result and the report still serializes for `doctor --json`. */
+  function expectCompleteReport(report: DoctorReport): void {
+    expect(report.checks.map((item) => item.id)).toEqual([
+      "bun-version", "config", "data-dir", "secret:slack-app-token", "secret:slack-bot-token", "secret:t3-token",
+      "store", "t3-environment", "t3-version", "t3-session", "t3-providers", "slack-bot-auth", "slack-app-auth", "service",
+    ]);
+    expect(JSON.parse(JSON.stringify(report)).checks).toHaveLength(14);
+  }
+
+  test.skipIf(process.getuid?.() === 0)("reports a data dir without owner search permission as a failed check instead of aborting", async () => {
+    await chmod(fixture.dataDir, 0o600);
+    try {
+      const report = await run();
+      expectCompleteReport(report);
+      expect(check(report, "data-dir")).toMatchObject({ status: "fail", summary: `data directory ${fixture.dataDir} is not writable: EACCES` });
+      expect(check(report, "store").status).toBe("skip");
+      expect(report.ok).toBe(false);
+    } finally {
+      await chmod(fixture.dataDir, 0o700);
+    }
+  });
+
+  test.skipIf(process.getuid?.() === 0)("reports a data dir under an unsearchable parent as a failed check, with and without --fix", async () => {
+    const locked = join(fixture.root, "locked");
+    await mkdir(locked, { mode: 0o700 });
+    const dataDir = join(locked, "data");
+    await rewriteConfig((config) => { config.dataDir = dataDir; });
+    await chmod(locked, 0o600);
+    try {
+      for (const fix of [false, true]) {
+        const report = await run(fix);
+        expectCompleteReport(report);
+        expect(check(report, "data-dir")).toMatchObject({ status: "fail", summary: `data directory ${dataDir} could not be checked (EACCES)` });
+      }
+    } finally {
+      await chmod(locked, 0o700);
+    }
+  });
+
+  test.skipIf(process.getuid?.() === 0)("reports secrets under an unsearchable parent as failed checks instead of aborting", async () => {
+    await chmod(fixture.secretsDir, 0o600);
+    try {
+      for (const fix of [false, true]) {
+        const report = await run(fix);
+        expectCompleteReport(report);
+        for (const name of ["slack-app-token", "slack-bot-token", "t3-token"]) {
+          const path = join(fixture.secretsDir, name);
+          expect(check(report, `secret:${name}`)).toMatchObject({ status: "fail", summary: `secret file ${path} could not be checked (EACCES)` });
+        }
+        expect(check(report, "t3-session").status).toBe("skip");
+        expect(check(report, "slack-bot-auth").status).toBe("skip");
+        expect(report.ok).toBe(false);
+      }
+    } finally {
+      await chmod(fixture.secretsDir, 0o700);
+    }
+  });
+
+  test.skipIf(process.getuid?.() === 0)("reports a --fix that cannot create a secret parent as a failed check", async () => {
+    const readOnly = join(fixture.root, "read-only");
+    await mkdir(readOnly, { mode: 0o500 });
+    const tokenFile = join(readOnly, "secrets", "t3-token");
+    await rewriteConfig((config) => { config.t3.tokenFile = tokenFile; });
+    try {
+      const report = await run(true);
+      expectCompleteReport(report);
+      expect(check(report, "secret:t3-token")).toMatchObject({ status: "fail", summary: `secret file ${tokenFile} could not be checked (EACCES)` });
+      expect(check(report, "secret:slack-bot-token").status).toBe("pass");
+    } finally {
+      await chmod(readOnly, 0o700);
+    }
+  });
+
+  test.skipIf(process.getuid?.() === 0)("reports an unreadable config as unreadable, not as invalid JSON", async () => {
+    await chmod(fixture.configPath, 0o000);
+    try {
+      const report = await run();
+      expect(check(report, "config")).toMatchObject({ status: "fail", summary: `config ${fixture.configPath} is not readable (EACCES)` });
+      expect(report.checks).toHaveLength(2);
+    } finally {
+      await chmod(fixture.configPath, 0o600);
+    }
+  });
+
   test("detects swapped Slack tokens without revealing them", async () => {
     await writeFile(join(fixture.secretsDir, "slack-app-token"), `${BOT_TOKEN}\n`, { mode: 0o600 });
     const report = await run();

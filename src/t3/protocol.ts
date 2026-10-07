@@ -39,17 +39,47 @@ export class T3ProtocolMismatchError extends Error {
   }
 }
 
+/** The environment request itself failed (connection refused, timeout, or a redirect, which is never followed). */
+export class T3EnvironmentRequestError extends Error {
+  constructor(cause: unknown) {
+    super(cause instanceof Error ? cause.message : String(cause), { cause });
+    this.name = "T3EnvironmentRequestError";
+  }
+}
+
+export type EnvironmentFetch = (input: string | URL, init?: RequestInit) => Promise<Response>;
+
+/**
+ * The single environment probe, shared by the runtime gate, doctor, and onboarding, so they agree on the
+ * request policy as well as the interpretation. Redirects are rejected (`redirect: "error"`): compatibility
+ * is checked against the configured origin before any authenticated request is sent to it.
+ * Throws `T3EnvironmentRequestError` when the request fails, otherwise as `readT3EnvironmentDescriptor`.
+ */
+export async function fetchT3EnvironmentDescriptor(input: {
+  readonly baseUrl: string;
+  readonly signal?: AbortSignal;
+  readonly fetch?: EnvironmentFetch;
+}): Promise<T3EnvironmentDescriptor> {
+  const request = input.fetch ?? fetch;
+  let response: Response;
+  try {
+    response = await request(new URL("/.well-known/t3/environment", input.baseUrl), {
+      headers: { accept: "application/json" },
+      redirect: "error",
+      signal: input.signal ?? AbortSignal.timeout(10_000),
+    });
+  } catch (error) {
+    throw new T3EnvironmentRequestError(error);
+  }
+  return readT3EnvironmentDescriptor(response);
+}
+
 /** Reads the unauthenticated environment descriptor and returns its orchestration protocol. */
 export async function fetchT3OrchestrationProtocol(input: {
   readonly baseUrl: string;
   readonly signal?: AbortSignal;
 }): Promise<number> {
-  const response = await fetch(new URL("/.well-known/t3/environment", input.baseUrl), {
-    headers: { accept: "application/json" },
-    redirect: "error",
-    signal: input.signal ?? AbortSignal.timeout(10_000),
-  });
-  return (await readT3EnvironmentDescriptor(response)).orchestrationProtocol;
+  return (await fetchT3EnvironmentDescriptor(input)).orchestrationProtocol;
 }
 
 /**
