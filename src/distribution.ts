@@ -10,8 +10,16 @@ import {
 export const HELP_TEXT = `agent-tag: a self-hosted Slack coworker that delegates work to T3 Code agents.
 
 Usage:
+  agent-tag onboard [--yes --accept-risk ...]
+                                       Set up the Slack app, T3 token, config, and service
+  agent-tag doctor [CONFIG] [--fix] [--json]
+                                       Check SQLite, T3, providers, Slack, and the service;
+                                       --fix repairs permissions and a stale or stopped service
+  agent-tag service install|upgrade|uninstall|status|restart [CONFIG]
+                                       Manage the per-user service (launchd on macOS, systemd on Linux)
+  agent-tag service logs [--lines N] [--follow]
+                                       Show the service logs
   agent-tag run CONFIG                 Start the Slack service in the foreground
-  agent-tag doctor CONFIG              Check SQLite, T3, providers, and the Slack identity
   agent-tag status CONFIG              Print operational status from the local store
   agent-tag audit CONFIG               Export audit records as JSON lines
   agent-tag backup CONFIG DESTINATION  Write a consistent SQLite backup
@@ -23,6 +31,9 @@ Usage:
   agent-tag update [--check] [--version X]
                                        Download, verify, and replace this release binary
   agent-tag help                       Show this help
+
+For doctor and service, CONFIG defaults to $AGENT_TAG_CONFIG, then agent-tag.json in $AGENT_TAG_HOME
+(default ~/.agent-tag), where onboard writes it.
 
 Docs: https://github.com/Dhruv2mars/agent-tag#readme
 `;

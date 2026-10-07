@@ -42,3 +42,13 @@ test("a known command without its argument prints usage without a stack trace", 
   expect(restore.stderr.startsWith("usage: agent-tag")).toBe(true);
   expect(restore.stderr).not.toContain("cli.ts:");
 });
+
+test("agent-tag help lists the onboarding, doctor, and service commands", async () => {
+  const result = await runCli(["help"]);
+  expect(result.exitCode).toBe(0);
+  for (const command of ["onboard", "doctor", "service install|upgrade|uninstall|status|restart", "service logs", "run", "update"]) {
+    expect(result.stdout).toContain(`agent-tag ${command}`);
+  }
+  expect(result.stdout).toContain("--fix");
+  expect(result.stdout).toContain("$AGENT_TAG_CONFIG");
+});

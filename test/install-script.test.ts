@@ -87,9 +87,8 @@ test("installs the latest verified release into ~/.local/bin by default", async 
   expect(result.stdout).toContain("agent-tag 0.3.0 (linux-x64, binary)");
   expect(result.stdout).toContain("is not on your PATH");
   expect(result.stdout).toContain("docs/slack-setup.md");
-  expect(result.stdout).toContain("agent-tag doctor /absolute/path/to/agent-tag.json");
-  // The hint must name only commands this build ships.
-  expect(result.stdout).not.toContain("onboard");
+  // The hint names only commands this build ships ("install.sh only suggests commands the CLI ships").
+  expect(result.stdout).toContain("run the setup wizard: agent-tag onboard");
   expect((await readdir(installDir)).sort()).toEqual(["agent-tag"]);
 });
 
