@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 
+import { checkT3Environment } from "../src/doctor.ts";
 import { SecretString } from "../src/security/secret-file.ts";
 import { issueT3WebSocketUrl } from "../src/t3/auth.ts";
 import { inspectT3 } from "../src/t3/gateway.ts";
@@ -55,6 +56,27 @@ describe("T3 orchestration protocol gate", () => {
     await expect(assertSupportedT3Protocol({ baseUrl: t3.baseUrl })).rejects.toThrow(
       "T3 environment endpoint returned HTTP 404",
     );
+  });
+
+  test("doctor and onboarding accept exactly the servers the runtime gate accepts", async () => {
+    const cases: [string, (() => Response) | undefined][] = [
+      ["protocol omitted", () => Response.json(environment)],
+      ["protocol 1", () => Response.json({ ...environment, orchestrationProtocolVersion: 1 })],
+      ["protocol 2", () => Response.json({ ...environment, orchestrationProtocolVersion: 2 })],
+      ["malformed protocol", () => Response.json({ ...environment, orchestrationProtocolVersion: "one" })],
+      ["not json", () => new Response("<html></html>", { status: 200 })],
+      ["legacy 404", undefined],
+      ["server error", () => new Response("boom", { status: 500 })],
+    ];
+    for (const [name, descriptor] of cases) {
+      const t3 = fakeT3(descriptor);
+      const runtimeAccepts = await assertSupportedT3Protocol({ baseUrl: t3.baseUrl }).then(
+        () => true,
+        () => false,
+      );
+      const { check } = await checkT3Environment({ t3: { baseUrl: t3.baseUrl } }, { fetch });
+      expect({ name, accepted: check.status !== "fail" }).toEqual({ name, accepted: runtimeAccepts });
+    }
   });
 
   test("startup and doctor probing stop before presenting the token to an incompatible server", async () => {

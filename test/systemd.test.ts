@@ -122,6 +122,8 @@ class FakeSystemctl {
   unitMissing = false;
   /** Starts never reach `running`: the service stays `activating`. */
   stuckActivating = false;
+  /** SubState reported while `stuckActivating`, e.g. `auto-restart` between Restart= retries. */
+  activatingSubState = "start";
   linger = "no";
   preflights = 0;
 
@@ -137,7 +139,7 @@ class FakeSystemctl {
         [
           `LoadState=${!this.unitMissing && (this.enabled || this.active) ? "loaded" : "not-found"}`,
           `ActiveState=${this.active ? (this.stuckActivating ? "activating" : "active") : "inactive"}`,
-          `SubState=${this.active ? (this.stuckActivating ? "start" : "running") : "dead"}`,
+          `SubState=${this.active ? (this.stuckActivating ? this.activatingSubState : "running") : "dead"}`,
           `UnitFileState=${this.enabled ? "enabled" : ""}`,
         ].join("\n"),
       );
@@ -286,6 +288,20 @@ describe("systemd user service lifecycle", () => {
     await expect(service.upgrade("/cfg/b.json")).rejects.toThrow("systemd restart failed");
     expect(fake.enabled).toBe(true);
     expect(fake.commands.some((command) => command.includes(" disable"))).toBe(false);
+  });
+
+  test("upgrade rollback restarts a prior unit that was activating/auto-restart instead of stopping it", async () => {
+    await service.install("/cfg/a.json");
+    // The bot is between Restart= retries (e.g. while T3 recovers): active but not yet running.
+    fake.stuckActivating = true;
+    fake.activatingSubState = "auto-restart";
+    fake.commands.length = 0;
+    await expect(service.upgrade("/cfg/b.json")).rejects.toThrow("systemd unit did not reach running state");
+    expect(await readFile(service.unitPath, "utf8")).toContain('"/cfg/a.json"');
+    expect(fake.commands).not.toContain(`systemctl --user stop ${AGENT_TAG_SYSTEMD_UNIT}`);
+    expect(fake.commands.filter((command) => command === `systemctl --user restart ${AGENT_TAG_SYSTEMD_UNIT}`)).toHaveLength(2);
+    expect(fake.active).toBe(true);
+    expect(fake.enabled).toBe(true);
   });
 
   test("uninstall stops a service that still runs after its unit file was deleted", async () => {

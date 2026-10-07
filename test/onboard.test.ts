@@ -300,6 +300,30 @@ describe("agent-tag onboard (non-interactive)", () => {
     expect(harness.installs).toEqual([]);
   });
 
+  test("rejects a legacy T3 server without the environment endpoint, as the runtime gate does", async () => {
+    const legacy: OnboardDependencies = {
+      ...harness.deps,
+      fetch: async (input) => {
+        if (String(input).startsWith("https://slack.com/")) return json({ ok: true, team_id: "T0FIXTURE" });
+        return new Response("not found", { status: 404 });
+      },
+      listT3Providers: async () => {
+        throw new Error("providers must not be listed on a server the runtime rejects");
+      },
+    };
+    await expect(runOnboard(flags(harness), legacy)).rejects.toThrow(
+      "cannot enroll a T3 token: T3 at http://127.0.0.1:3774 does not publish /.well-known/t3/environment; " +
+        "Agent Tag requires T3 0.0.42–0.0.45 (run the T3 version pinned in t3.lock.json)",
+    );
+    expect(harness.commands).toEqual([]);
+    expect(harness.enrolled).toEqual([]);
+
+    await expect(
+      runOnboard(flags(harness, { t3IssueToken: false, force: true, installService: true }), legacy),
+    ).rejects.toThrow("service not installed: T3 at http://127.0.0.1:3774 does not publish /.well-known/t3/environment");
+    expect(harness.installs).toEqual([]);
+  });
+
   test("derives the model default from the selected provider, not the first one or the template", async () => {
     const twoReady: T3ServerInfo = {
       ...server,

@@ -323,7 +323,11 @@ describe("agent-tag doctor", () => {
     expect(check(await run(), "t3-environment")).toMatchObject({ status: "pass" });
 
     world.environment = new Response("not found", { status: 404 });
-    expect(check(await run(), "t3-environment").status).toBe("warn");
+    expect(check(await run(), "t3-environment")).toMatchObject({
+      status: "fail",
+      summary: expect.stringContaining("does not publish /.well-known/t3/environment; Agent Tag requires T3 0.0.42–0.0.45"),
+      hint: "run the T3 version pinned in t3.lock.json",
+    });
   });
 
   test("never sends the T3 token to a server that fails the environment check", async () => {
@@ -331,6 +335,8 @@ describe("agent-tag doctor", () => {
       json({ serverVersion: "0.1.0", orchestrationProtocolVersion: 2 }),
       json({ orchestrationProtocolVersion: "one" }),
       new Response("<html>not json</html>", { status: 200 }),
+      // A server without the environment endpoint is rejected by the runtime gate, so doctor rejects it too.
+      new Response("not found", { status: 404 }),
     ]) {
       world = healthyWorld();
       world.environment = environment;
@@ -344,15 +350,6 @@ describe("agent-tag doctor", () => {
       expect(world.seenAuthorization.some((value) => value.includes(T3_TOKEN))).toBe(false);
       expect(report.ok).toBe(false);
     }
-
-    // An older server without the endpoint warns and implies protocol 1, so the authenticated checks still run.
-    world = healthyWorld();
-    world.environment = new Response("not found", { status: 404 });
-    const legacy = await run();
-    expect(check(legacy, "t3-environment").status).toBe("warn");
-    expect(check(legacy, "t3-session").status).toBe("pass");
-    expect(check(legacy, "t3-providers").status).toBe("pass");
-    expect(world.t3TokenRequests).toEqual(["session", "providers"]);
   });
 
   test("warns when T3 differs from t3.lock.json", async () => {

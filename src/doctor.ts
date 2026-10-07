@@ -17,6 +17,14 @@ import { AgentTagStore } from "./store/store.ts";
 import { assertRestrictedOrchestrationSession, inspectT3Session, type T3Session } from "./t3/auth.ts";
 import { inspectT3, type T3ServerInfo } from "./t3/gateway.ts";
 import { parseT3Pin, type T3Pin } from "./t3/pin.ts";
+import {
+  isSupportedT3Protocol,
+  readT3EnvironmentDescriptor,
+  SUPPORTED_T3_ORCHESTRATION_PROTOCOL,
+  SUPPORTED_T3_RANGE,
+  type T3EnvironmentDescriptor,
+  T3EnvironmentUnavailableError,
+} from "./t3/protocol.ts";
 
 export type DoctorStatus = "pass" | "warn" | "fail" | "skip";
 
@@ -49,14 +57,9 @@ export interface DoctorDependencies {
   readonly service: ServiceManager | undefined;
 }
 
-export const T3_ORCHESTRATION_PROTOCOL_VERSION = 1;
+export const T3_ORCHESTRATION_PROTOCOL_VERSION = SUPPORTED_T3_ORCHESTRATION_PROTOCOL;
 const TOKEN_EXPIRY_WARNING_DAYS = 7;
 const NETWORK_TIMEOUT_MS = 5_000;
-
-const environmentSchema = z.object({
-  serverVersion: z.string().min(1).optional(),
-  orchestrationProtocolVersion: z.number().int().positive().optional(),
-});
 
 const slackAuthSchema = z.union([
   z.object({ ok: z.literal(true), team_id: z.string().min(1), user_id: z.string().min(1) }),
@@ -320,23 +323,32 @@ export async function checkT3Environment(
       check: { id, status: "fail", summary: `T3 is not reachable at ${config.t3.baseUrl}: ${errorMessage(error)}`, hint: "start the pinned T3 server and check t3.baseUrl" },
     };
   }
-  if (response.status === 404) {
-    return {
-      reachable: true,
-      check: { id, status: "warn", summary: `T3 at ${config.t3.baseUrl} does not publish /.well-known/t3/environment; assuming protocol ${T3_ORCHESTRATION_PROTOCOL_VERSION}` },
-    };
-  }
-  if (!response.ok) {
-    return { reachable: false, check: { id, status: "fail", summary: `T3 environment endpoint returned HTTP ${response.status}` } };
-  }
-  const parsed = environmentSchema.safeParse(await response.json().catch(() => undefined));
-  if (!parsed.success) {
+  // Same interpretation as the runtime gate (`assertSupportedT3Protocol`), so onboarding never accepts a
+  // server that startup, provider discovery, or the installer's doctor preflight would reject.
+  let descriptor: T3EnvironmentDescriptor;
+  try {
+    descriptor = await readT3EnvironmentDescriptor(response);
+  } catch (error) {
+    if (error instanceof T3EnvironmentUnavailableError && error.status === 404) {
+      return {
+        reachable: true,
+        check: {
+          id,
+          status: "fail",
+          summary: `T3 at ${config.t3.baseUrl} does not publish /.well-known/t3/environment; Agent Tag requires ${SUPPORTED_T3_RANGE}`,
+          hint: "run the T3 version pinned in t3.lock.json",
+        },
+      };
+    }
+    if (error instanceof T3EnvironmentUnavailableError) {
+      return { reachable: false, check: { id, status: "fail", summary: error.message } };
+    }
     return { reachable: true, check: { id, status: "fail", summary: "T3 environment response is not recognized" } };
   }
-  const protocol = parsed.data.orchestrationProtocolVersion ?? 1;
-  const serverVersion = parsed.data.serverVersion;
+  const protocol = descriptor.orchestrationProtocol;
+  const serverVersion = descriptor.serverVersion;
   const versionText = serverVersion === undefined ? "unknown version" : `T3 ${serverVersion}`;
-  if (protocol !== T3_ORCHESTRATION_PROTOCOL_VERSION) {
+  if (!isSupportedT3Protocol(protocol)) {
     return {
       reachable: true,
       ...(serverVersion === undefined ? {} : { serverVersion }),

@@ -314,7 +314,8 @@ export class SystemdUserService {
     if (prior === undefined) throw new Error("Agent Tag systemd unit is not installed");
     const definition = await this.#host.definition(configPath);
     await this.#host.preflight(definition);
-    const { running: wasRunning, enabled: wasEnabled } = await this.#runtime();
+    // `active` (not just `running`) so a unit waiting in activating/auto-restart is restored, not stopped.
+    const { active: wasActive, enabled: wasEnabled } = await this.#runtime();
     await writeUnitFile(this.unitPath, renderSystemdUnit(definition));
     try {
       await requireSuccess(this.#host.run, systemctl("daemon-reload"), "systemd daemon-reload");
@@ -328,7 +329,7 @@ export class SystemdUserService {
       await this.#resetFailed();
       // Upgrade enabled the unit before restarting; a previously disabled bot must not start at the next login.
       if (!wasEnabled) await this.#host.run(systemctl("disable", AGENT_TAG_SYSTEMD_UNIT));
-      if (!wasRunning) {
+      if (!wasActive) {
         await this.#host.run(systemctl("stop", AGENT_TAG_SYSTEMD_UNIT));
         throw error;
       }
