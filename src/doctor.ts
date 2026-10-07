@@ -270,7 +270,15 @@ export async function checkSecretFile(
     await chmod(path, 0o600);
     fixes.push(`chmod 0600 ${path}`);
   }
-  const text = (await readFile(path, "utf8")).trim();
+  let text: string;
+  try {
+    text = (await readFile(path, "utf8")).trim();
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code ?? "unknown error";
+    return {
+      check: { id, status: "fail", summary: `secret file ${path} is not readable (${code})`, hint: "run `chmod 0600` on the file so its owner can read it", ...fixedField() },
+    };
+  }
   if (text.length === 0) {
     return { check: { id, status: "fail", summary: `secret file ${path} is empty`, hint: spec.missingHint, ...fixedField() } };
   }

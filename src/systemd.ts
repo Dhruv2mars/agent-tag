@@ -184,11 +184,24 @@ export class SystemdUserService {
     return join(this.#host.unitDirectory, AGENT_TAG_SYSTEMD_UNIT);
   }
 
-  async #runtime(): Promise<{ readonly loaded: boolean; readonly enabled: boolean; readonly running: boolean }> {
+  /**
+   * Reads the unit's runtime state. `systemctl show` succeeds with `LoadState=not-found` for an absent unit,
+   * so a non-zero exit means the user manager itself is unreachable. With `strict`, that throws instead of
+   * being reported as an unloaded unit.
+   */
+  async #runtime(strict = false): Promise<{ readonly loaded: boolean; readonly enabled: boolean; readonly running: boolean }> {
     const result = await this.#host.run(
       systemctl("show", AGENT_TAG_SYSTEMD_UNIT, "--property=LoadState,ActiveState,SubState,UnitFileState"),
     );
-    if (result.exitCode !== 0) return { loaded: false, enabled: false, running: false };
+    if (result.exitCode !== 0) {
+      if (strict) {
+        throw new Error(
+          `systemd show failed with exit code ${result.exitCode}: ${result.stderr.trim()}; ` +
+            `could not confirm the service is stopped, so kept ${this.unitPath}`,
+        );
+      }
+      return { loaded: false, enabled: false, running: false };
+    }
     const values = parseSystemctlShow(result.stdout);
     return {
       loaded: values.get("LoadState") === "loaded",
@@ -319,7 +332,7 @@ export class SystemdUserService {
   }
 
   async uninstall(): Promise<SystemdServiceStatus> {
-    if ((await this.#runtime()).loaded) {
+    if ((await this.#runtime(true)).loaded) {
       // Keep the unit file when systemd could not stop it, so the operator can fix the cause and retry.
       const disabled = await this.#host.run(systemctl("disable", "--now", AGENT_TAG_SYSTEMD_UNIT));
       if (disabled.exitCode !== 0) {

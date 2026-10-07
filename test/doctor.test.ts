@@ -283,6 +283,20 @@ describe("agent-tag doctor", () => {
     expect(report.ok).toBe(false);
   });
 
+  test.skipIf(process.getuid?.() === 0)("reports an owner-unreadable secret file as a failed check instead of aborting", async () => {
+    const path = join(fixture.secretsDir, "slack-bot-token");
+    for (const mode of [0o000, 0o200]) {
+      await chmod(path, mode);
+      const report = await run();
+      const unreadable = check(report, "secret:slack-bot-token");
+      expect(unreadable.status).toBe("fail");
+      expect(unreadable.summary).toBe(`secret file ${path} is not readable (EACCES)`);
+      expect(check(report, "secret:slack-app-token").status).toBe("pass");
+      expect(report.ok).toBe(false);
+    }
+    await chmod(path, 0o600);
+  });
+
   test("detects swapped Slack tokens without revealing them", async () => {
     await writeFile(join(fixture.secretsDir, "slack-app-token"), `${BOT_TOKEN}\n`, { mode: 0o600 });
     const report = await run();

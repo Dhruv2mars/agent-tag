@@ -101,6 +101,7 @@ class FakeSystemctl {
   failEnable = false;
   failRestart = false;
   failDisable = false;
+  failShow = false;
   linger = "no";
   preflights = 0;
 
@@ -111,6 +112,7 @@ class FakeSystemctl {
     if (command[0] === "loginctl") return ok(`Linger=${this.linger}`);
     const verb = command[2];
     if (verb === "show") {
+      if (this.failShow) return { exitCode: 1, stdout: "", stderr: "Failed to connect to bus: No medium found" };
       return ok(
         [
           `LoadState=${this.enabled || this.active ? "loaded" : "not-found"}`,
@@ -284,6 +286,23 @@ describe("systemd user service lifecycle", () => {
     fake.failDisable = false;
     expect(await service.uninstall()).toMatchObject({ installed: false, running: false });
     expect(await Bun.file(service.unitPath).exists()).toBe(false);
+  });
+
+  test("uninstall keeps the unit when the user manager cannot report whether the service is stopped", async () => {
+    await service.install("/cfg/a.json");
+    const unit = await readFile(service.unitPath, "utf8");
+    fake.failShow = true;
+    fake.commands.length = 0;
+    await expect(service.uninstall()).rejects.toThrow(
+      `systemd show failed with exit code 1: Failed to connect to bus: No medium found; could not confirm the service is stopped, so kept ${service.unitPath}`,
+    );
+    expect(await readFile(service.unitPath, "utf8")).toBe(unit);
+    expect(fake.commands).not.toContain(`systemctl --user disable --now ${AGENT_TAG_SYSTEMD_UNIT}`);
+    expect(fake.commands).not.toContain("systemctl --user daemon-reload");
+
+    fake.failShow = false;
+    expect(await service.uninstall()).toMatchObject({ installed: false, running: false });
+    expect(fake.commands).toContain(`systemctl --user disable --now ${AGENT_TAG_SYSTEMD_UNIT}`);
   });
 
   test("restart waits for the running state", async () => {

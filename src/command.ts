@@ -29,7 +29,9 @@ export async function requireSuccess(
 ): Promise<CommandResult> {
   const result = await run(command);
   if (result.exitCode !== 0) {
-    throw new Error(`${description} failed with exit code ${result.exitCode}: ${result.stderr}`);
+    // Tools such as `agent-tag doctor` report failures on stdout, so keep both streams in the error.
+    const output = [result.stderr, result.stdout].filter((text) => text.length > 0).join("\n");
+    throw new Error(`${description} failed with exit code ${result.exitCode}: ${output}`);
   }
   return result;
 }
