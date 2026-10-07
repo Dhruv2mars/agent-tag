@@ -37,3 +37,17 @@ test("a known command without its argument prints usage without a stack trace", 
   expect(restore.stderr.startsWith("usage: agent-tag")).toBe(true);
   expect(restore.stderr).not.toContain("cli.ts:");
 });
+
+test("security and prune argument mistakes print usage without a stack trace", async () => {
+  expectCleanUsageError(await runCli(["security", "audit"]), "invalid security arguments");
+  expectCleanUsageError(await runCli(["security", "audit", "/x.json", "--bogus"]), "unknown option --bogus");
+  expectCleanUsageError(await runCli(["prune"]), "invalid prune arguments");
+});
+
+test("security audit prints its report and exits 1 on a high finding", async () => {
+  const result = await runCli(["security", "audit", "/nonexistent/agent-tag.json", "--json", "--offline"]);
+  expect(result.exitCode).toBe(1);
+  const report = JSON.parse(result.stdout) as { result: string; findings: Array<{ id: string }> };
+  expect(report.result).toBe("fail");
+  expect(report.findings.map((finding) => finding.id)).toContain("config-unreadable");
+});

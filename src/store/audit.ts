@@ -1,6 +1,7 @@
 // Append-only audit log: the single writer used by every module, and paged export.
 import type { Database } from "bun:sqlite";
 
+import { redactAuditMetadata } from "../security/redact.ts";
 import { requiredId, parseStoredJson } from "./context.ts";
 import {
   type AuditAction,
@@ -27,7 +28,7 @@ export function writeAudit(
     readonly createdAt: string;
   },
 ): void {
-  const record = auditWriteSchema.parse(input);
+  const record = auditWriteSchema.parse({ ...input, metadata: redactAuditMetadata(input.metadata) });
   database
     .query(
       `INSERT INTO audit_log (

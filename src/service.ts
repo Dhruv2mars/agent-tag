@@ -6,6 +6,7 @@ import { InteractionWorker } from "./interaction-worker.ts";
 import { validateConfiguredProviders } from "./policy/provider.ts";
 import { ScheduleWorker } from "./scheduler.ts";
 import { SlackSocketBridge } from "./slack/bridge.ts";
+import { createRetentionWorker } from "./store/retention.ts";
 import { AgentTagStore } from "./store/store.ts";
 import { inspectT3 } from "./t3/gateway.ts";
 
@@ -212,7 +213,8 @@ export async function createAgentTagService(input: {
 }): Promise<AgentTagService> {
   const now = input.now ?? (() => new Date());
   const logger = input.logger ?? defaultLogger;
-  const store = await AgentTagStore.open(join(input.config.dataDir, "agent-tag.sqlite"));
+  const databasePath = join(input.config.dataDir, "agent-tag.sqlite");
+  const store = await AgentTagStore.open(databasePath);
   const quarantined = store.quarantineExpiredOutbox(now().toISOString());
   try {
     validateConfiguredProviders(input.config, await inspectT3(input.config.t3));
@@ -238,6 +240,7 @@ export async function createAgentTagService(input: {
             return { kind: count === 0 ? "idle" : "memory-expired" };
           },
         },
+        createRetentionWorker({ databasePath, policy: input.config.retention, now }),
       ],
       logger,
       now,

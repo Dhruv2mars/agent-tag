@@ -47,6 +47,22 @@ const webSocketTicketSchema = z.object({
 
 export type T3Session = z.infer<typeof sessionSchema>;
 
+/** A non-2xx answer from T3. `status` lets callers tell a rejected credential from an outage. */
+export class T3HttpError extends Error {
+  readonly status: number;
+
+  constructor(endpoint: string, status: number) {
+    super(`T3 ${endpoint} endpoint returned HTTP ${status}`);
+    this.name = "T3HttpError";
+    this.status = status;
+  }
+}
+
+/** True when T3 answered and refused the credential itself (as opposed to being unreachable). */
+export function isT3CredentialRejection(error: unknown): error is T3HttpError {
+  return error instanceof T3HttpError && (error.status === 401 || error.status === 403);
+}
+
 async function parseJson(response: Response): Promise<unknown> {
   const body: unknown = await response.json();
   return body;
@@ -65,7 +81,7 @@ export async function inspectT3Session(input: {
     headers: bearerHeaders(input.token),
     ...(input.signal === undefined ? {} : { signal: input.signal }),
   });
-  if (!response.ok) throw new Error(`T3 session endpoint returned HTTP ${response.status}`);
+  if (!response.ok) throw new T3HttpError("session", response.status);
   return sessionSchema.parse(await parseJson(response));
 }
 
