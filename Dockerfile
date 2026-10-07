@@ -14,6 +14,8 @@ COPY package.json bun.lock ./
 RUN bun install --frozen-lockfile
 COPY tsconfig.json ./
 COPY src ./src
+COPY t3.lock.json ./
+COPY config/agent-tag.example.json config/slack-manifest.example.json ./config/
 ARG AGENT_TAG_VERSION=0.0.0
 ARG AGENT_TAG_COMMIT=
 RUN bun build src/cli.ts \
