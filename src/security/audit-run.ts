@@ -1,6 +1,6 @@
-import { lstat, readdir, realpath, stat } from "node:fs/promises";
+import { lstat, readdir, readlink, realpath, stat } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 
 import { z } from "zod";
 
@@ -11,6 +11,7 @@ import {
   checkAccess,
   checkInlineCredentials,
   checkPathPermissions,
+  checkReplaceableAncestors,
   checkProfiles,
   checkRepositoryRoots,
   checkRetention,
@@ -20,7 +21,7 @@ import {
   summarizeFindings,
   type PathFact,
   type PathLink,
-  type PathParent,
+  type GuardDirectory,
   type PathRole,
   type PathState,
   type ProfileSecurityFacts,
@@ -63,14 +64,47 @@ function replaceableByOthers(mode: number): boolean {
   return (mode & 0o022) !== 0 && (mode & 0o1000) === 0;
 }
 
-/** Mode and owner of the directory holding a path; whoever can write it can replace the path. */
-async function parentState(path: string): Promise<PathParent | undefined> {
-  try {
-    const metadata = await stat(path);
-    return { path, mode: metadata.mode, uid: metadata.uid };
-  } catch {
-    return undefined; // An unreadable parent already makes the path itself unreadable or is reported on its own.
+const MAX_SYMLINK_HOPS = 40;
+
+/**
+ * Every real directory whose entries decide what `path` resolves to: each real ancestor up to `/`, plus the
+ * directory holding each symlink met on the way (including links inside link targets). Walking stops at a
+ * missing or unreadable component; the directories before it still count, since they decide what gets created there.
+ */
+export async function guardDirectories(path: string): Promise<string[]> {
+  const guards = new Set<string>();
+  // Components are consumed one at a time so `..` after a symlink climbs from the link target, as the kernel does.
+  const components = (from: string) => from.split(sep).filter((part) => part.length > 0 && part !== ".");
+  let pending = components(isAbsolute(path) ? path : join(process.cwd(), path));
+  let current: string = sep;
+  let hops = 0;
+  while (pending.length > 0) {
+    const [part, ...rest] = pending as [string, ...string[]];
+    pending = rest;
+    if (part === "..") {
+      current = dirname(current);
+      continue;
+    }
+    guards.add(current);
+    const candidate = join(current, part);
+    let target: string | undefined;
+    try {
+      const metadata = await lstat(candidate);
+      if (metadata.isSymbolicLink()) target = await readlink(candidate);
+    } catch {
+      break;
+    }
+    if (target === undefined) {
+      current = candidate;
+      continue;
+    }
+    hops += 1;
+    if (hops > MAX_SYMLINK_HOPS) break;
+    // Continue from the link target, with the rest of the path appended.
+    if (isAbsolute(target)) current = sep;
+    pending = [...components(target), ...rest];
   }
+  return [...guards];
 }
 
 /**
@@ -88,15 +122,7 @@ async function pathState(path: string): Promise<PathState & { readonly mtime?: D
       : undefined;
     const metadata = link === undefined ? own : await stat(path);
     const kind = metadata.isFile() ? "file" : metadata.isDirectory() ? "directory" : "other";
-    const parent = await parentState(dirname(link?.target ?? path));
-    return {
-      kind,
-      mode: metadata.mode,
-      uid: metadata.uid,
-      mtime: metadata.mtime,
-      ...(link === undefined ? {} : { link }),
-      ...(parent === undefined ? {} : { parent }),
-    };
+    return { kind, mode: metadata.mode, uid: metadata.uid, mtime: metadata.mtime, ...(link === undefined ? {} : { link }) };
   } catch (error) {
     const code = errorCode(error);
     // A dangling symlink is as unusable as a missing path.
@@ -207,6 +233,39 @@ export function readAuditInputs(raw: unknown): AuditInputs {
   };
 }
 
+/**
+ * The directories guarding the audited paths, each with the paths it guards. The secret and data directories
+ * are left out as guards when they exist: their own mode and owner checks already demand they be private.
+ */
+async function guardDirectoryFacts(facts: ReadonlyArray<PathFact>): Promise<GuardDirectory[]> {
+  const selfChecked = new Set(
+    await Promise.all(
+      facts
+        .filter((item) => (item.role === "secret-directory" || item.role === "data-directory") && item.state.kind === "directory")
+        .map((item) => canonicalPath(item.path)),
+    ),
+  );
+  const guarded = new Map<string, Array<{ readonly role: PathRole; readonly path: string }>>();
+  for (const item of facts) {
+    for (const directory of await guardDirectories(item.path)) {
+      if (selfChecked.has(directory)) continue;
+      const entries = guarded.get(directory) ?? [];
+      entries.push({ role: item.role, path: item.path });
+      guarded.set(directory, entries);
+    }
+  }
+  const directories: GuardDirectory[] = [];
+  for (const [path, guards] of [...guarded].sort(([left], [right]) => left.localeCompare(right))) {
+    try {
+      const metadata = await stat(path);
+      directories.push({ path, mode: metadata.mode, uid: metadata.uid, guards });
+    } catch {
+      // A directory the walk just passed through vanished or became unreadable; the paths below it report that.
+    }
+  }
+  return directories;
+}
+
 function errorReason(error: unknown): string {
   return error instanceof Error ? error.message : "unknown error";
 }
@@ -242,7 +301,8 @@ export async function runSecurityAudit(options: SecurityAuditOptions): Promise<S
   const findings: SecurityFinding[] = [];
   const finish = (): SecurityReport => summarizeFindings(findings, now.toISOString());
 
-  findings.push(...checkPathPermissions(await fact(options.configPath, "config"), ownerUid));
+  const configFact = await fact(options.configPath, "config");
+  findings.push(...checkPathPermissions(configFact, ownerUid));
   let rawText: string;
   let raw: unknown;
   try {
@@ -286,6 +346,7 @@ export async function runSecurityAudit(options: SecurityAuditOptions): Promise<S
     (dataDirectory.mode & 0o077) === 0 &&
     (ownerUid === undefined || dataDirectory.uid === ownerUid);
   for (const item of facts) findings.push(...checkPathPermissions(item, ownerUid, { parentPrivate }));
+  findings.push(...checkReplaceableAncestors(await guardDirectoryFacts([configFact, ...facts]), ownerUid));
 
   findings.push(...checkAccess(inputs.access));
   if (inputs.t3BaseUrl !== undefined) findings.push(...checkT3Transport(inputs.t3BaseUrl));

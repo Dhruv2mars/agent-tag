@@ -8,6 +8,7 @@ import {
   checkInlineCredentials,
   checkPathPermissions,
   checkProfiles,
+  checkReplaceableAncestors,
   checkRepositoryRoots,
   checkRetention,
   checkSecretScan,
@@ -19,7 +20,7 @@ import {
   type PathRole,
   type SecurityFinding,
 } from "../src/security/audit.ts";
-import { canonicalPath, readAuditInputs, runSecurityAudit } from "../src/security/audit-run.ts";
+import { canonicalPath, guardDirectories, readAuditInputs, runSecurityAudit } from "../src/security/audit-run.ts";
 import { T3HttpError } from "../src/t3/auth.ts";
 import { parseCliArguments, runSecurityCli } from "../src/security/cli.ts";
 
@@ -85,41 +86,33 @@ describe("file permission checks", () => {
     expect(loose[1]?.remediation).toBe("chmod 600 /real/file");
   });
 
-  test("a path in a directory other users can write is replaceable even when its own mode is private", () => {
-    const inParent = (role: PathRole, parentMode: number, options: { parentUid?: number; link?: boolean } = {}) =>
-      checkPathPermissions(
-        {
-          path: "/shared/item",
-          role,
-          state: {
-            kind: role.endsWith("directory") ? "directory" : "file",
-            mode: role.endsWith("directory") ? 0o700 : 0o600,
-            uid,
-            parent: { path: "/shared", mode: 0o040000 | parentMode, uid: options.parentUid ?? uid },
-            ...(options.link === true ? { link: { target: "/shared/item", replaceableByOthers: false } } : {}),
+  test("a directory on the way to a path that other users can write lets them replace the path", () => {
+    const guarded = (mode: number, options: { owner?: number; roles?: ReadonlyArray<PathRole> } = {}) =>
+      checkReplaceableAncestors(
+        [
+          {
+            path: "/shared",
+            mode: 0o040000 | mode,
+            uid: options.owner ?? uid,
+            guards: (options.roles ?? ["config"]).map((role) => ({ role, path: `/shared/private/${role}` })),
           },
-        },
+        ],
         uid,
       );
-    const config = inParent("config", 0o777);
-    expect(ids(config)).toEqual(["high:config-parent-replaceable"]);
+    const config = guarded(0o777);
+    expect(ids(config)).toEqual(["high:ancestor-replaceable"]);
+    expect(config[0]?.path).toBe("/shared");
     expect(config[0]?.message).toContain("world writable without the sticky bit");
-    expect(config[0]?.message).toContain("change the allowlist");
-    expect(ids(inParent("config", 0o775))).toEqual(["high:config-parent-replaceable"]);
-    expect(ids(inParent("config", 0o755, { parentUid: 777 }))).toEqual(["high:config-parent-replaceable"]);
-    expect(inParent("config", 0o1777)).toEqual([]);
-    expect(inParent("config", 0o755, { parentUid: 0 })).toEqual([]);
-    expect(inParent("config", 0o700)).toEqual([]);
-    expect(ids(inParent("data-directory", 0o777))).toEqual(["high:data-directory-parent-replaceable"]);
-    expect(ids(inParent("secret-directory", 0o777))).toEqual(["high:secret-directory-parent-replaceable"]);
-    expect(ids(inParent("log-directory", 0o777))).toEqual(["medium:log-directory-parent-replaceable"]);
-    // These parents are audited as the secret, data, and log directories, unless a symlink points elsewhere.
-    expect(inParent("secret-file", 0o777)).toEqual([]);
-    expect(inParent("database", 0o777)).toEqual([]);
-    expect(ids(inParent("secret-file", 0o777, { link: true }))).toEqual([
-      "info:secret-file-symlink",
-      "high:secret-file-parent-replaceable",
-    ]);
+    expect(config[0]?.message).toContain("changing the allowlist");
+    expect(ids(guarded(0o775))).toEqual(["high:ancestor-replaceable"]);
+    expect(guarded(0o775)[0]?.message).toContain("group writable");
+    expect(ids(guarded(0o755, { owner: 777 }))).toEqual(["high:ancestor-replaceable"]);
+    expect(guarded(0o1777)).toEqual([]);
+    expect(guarded(0o755, { owner: 0 })).toEqual([]);
+    expect(guarded(0o700)).toEqual([]);
+    expect(ids(guarded(0o777, { roles: ["secret-file", "log"] }))).toEqual(["high:ancestor-replaceable"]);
+    expect(ids(guarded(0o777, { roles: ["log-directory", "log"] }))).toEqual(["medium:ancestor-replaceable"]);
+    expect(guarded(0o777, { roles: [] })).toEqual([]);
   });
 
   test("paths the auditing user cannot stat are reported instead of crashing", () => {
@@ -672,26 +665,60 @@ describe("security audit run", () => {
     });
   });
 
-  test("a private config in a directory other users can write fails the audit", async () => {
+  test("a private deployment under any directory other users can write fails the audit", async () => {
     await withHost(async ({ root, configPath }) => {
       const options = { configPath, now: new Date(now), home: "/nonexistent-home", offline: true, logDirectory: join(root, "logs"), logFiles: [] };
-      expect((await runSecurityAudit(options)).findings.filter((finding) => finding.id.endsWith("-parent-replaceable"))).toEqual([]);
+      const replaceable = async () =>
+        (await runSecurityAudit(options)).findings.filter((finding) => finding.id === "ancestor-replaceable");
+      expect(await replaceable()).toEqual([]);
+      const realRoot = await realpath(root);
       try {
+        // The secrets, data, and log directories stay private (0700); the shared directory above them is enough.
         await chmod(root, 0o777);
         const shared = await runSecurityAudit(options);
         expect(shared.result).toBe("fail");
-        expect(ids(shared.findings).filter((id) => id.endsWith("-parent-replaceable")).sort()).toEqual([
-          "high:config-parent-replaceable",
-          "high:data-directory-parent-replaceable",
-          "high:secret-directory-parent-replaceable",
-          "medium:log-directory-parent-replaceable",
-        ]);
+        const found = shared.findings.filter((finding) => finding.id === "ancestor-replaceable");
+        expect(found.map((finding) => `${finding.severity}:${finding.path}`)).toEqual([`high:${realRoot}`]);
+        expect(found[0]?.message).toContain("config");
+        expect(found[0]?.message).toContain("secret-file");
+        expect(found[0]?.message).toContain("changing the allowlist");
         // Bun's chmod drops the sticky bit (Bun 1.3), so set it with the system tool.
         expect(Bun.spawnSync(["chmod", "1777", root]).exitCode).toBe(0);
-        const sticky = await runSecurityAudit(options);
-        expect(ids(sticky.findings).filter((id) => id.endsWith("-parent-replaceable"))).toEqual([]);
+        expect(await replaceable()).toEqual([]);
       } finally {
         await chmod(root, 0o700);
+      }
+    });
+  });
+
+  test("a symlinked component is followed, and the directory holding the link is checked", async () => {
+    await withHost(async ({ root, configPath, config }) => {
+      const realRoot = await realpath(root);
+      const shared = join(root, "shared");
+      await mkdir(shared, { mode: 0o700 });
+      await symlink(join(root, "secrets"), join(shared, "secrets-link"));
+      const linked = join(shared, "secrets-link", "slack-app-token");
+      expect(await guardDirectories(linked)).toEqual(
+        expect.arrayContaining([realRoot, join(realRoot, "shared"), join(realRoot, "secrets")]),
+      );
+      // `..` after a link climbs from the link target, not lexically (join() would collapse it, so build the string).
+      const climbed = await guardDirectories(`${shared}/secrets-link/../data/agent-tag.sqlite`);
+      expect(climbed).toEqual(expect.arrayContaining([realRoot, join(realRoot, "shared"), join(realRoot, "data")]));
+      expect(climbed).not.toContain(join(realRoot, "shared", "data"));
+
+      const slack = config.slack as Record<string, unknown>;
+      await writeFile(configPath, JSON.stringify({ ...config, slack: { ...slack, appTokenFile: linked } }), { mode: 0o600 });
+      const options = { configPath, now: new Date(now), home: "/nonexistent-home", offline: true, logDirectory: join(root, "logs"), logFiles: [] };
+      expect((await runSecurityAudit(options)).findings.filter((finding) => finding.id === "ancestor-replaceable")).toEqual([]);
+      try {
+        await chmod(shared, 0o777);
+        const report = await runSecurityAudit(options);
+        expect(report.result).toBe("fail");
+        const found = report.findings.filter((finding) => finding.id === "ancestor-replaceable");
+        expect(found.map((finding) => `${finding.severity}:${finding.path}`)).toEqual([`high:${join(realRoot, "shared")}`]);
+        expect(found[0]?.message).toContain("secret-file");
+      } finally {
+        await chmod(shared, 0o700);
       }
     });
   });
