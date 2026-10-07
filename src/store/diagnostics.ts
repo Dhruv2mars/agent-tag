@@ -1,6 +1,7 @@
 // Read-only table counts and operational status for doctor/status.
 import type { Database } from "bun:sqlite";
 
+import { activeOutboxRateLimit } from "./outbox.ts";
 import { isoDateTime } from "./schema.ts";
 import type { OperationalStatus } from "./types.ts";
 
@@ -86,17 +87,24 @@ export function operationalStatus(database: Database, nowInput: string): Operati
     pending: number;
     activeLease: number;
     expiredLease: number;
+    retryBlocked: number;
     outcomeUnknown: number;
-  }, [string, string]>(
+  }, [string, string, string]>(
     `SELECT
        COUNT(*) FILTER (WHERE status = 'pending') AS pending,
        COUNT(*) FILTER (WHERE status = 'inflight' AND lease_expires_at > ?) AS activeLease,
        COUNT(*) FILTER (WHERE status = 'inflight' AND (lease_expires_at IS NULL OR lease_expires_at <= ?)) AS expiredLease,
+       COUNT(*) FILTER (WHERE status = 'pending' AND blocked_until > ?) AS retryBlocked,
        COUNT(*) FILTER (WHERE status = 'failed' AND last_error_code = 'delivery-outcome-unknown') AS outcomeUnknown
      FROM slack_outbox`,
-  ).get(now, now);
+  ).get(now, now, now);
   if (operations === null || interactions === null || outbox === null) {
     throw new Error("operational status query failed");
   }
-  return { asOf: now, operations, interactions, outbox };
+  return {
+    asOf: now,
+    operations,
+    interactions,
+    outbox: { ...outbox, rateLimitedUntil: activeOutboxRateLimit(database, now) },
+  };
 }

@@ -51,14 +51,14 @@ try {
   }); }
   enqueue(deniedMarker);
   const deniedBridge = await SlackSocketBridge.create({ config: { ...config, routes: [] }, store });
-  if (!await deniedBridge.deliverNextOutbox()) throw new Error("denial was not settled");
+  if ((await deniedBridge.deliverNextOutbox()).kind !== "failed") throw new Error("denial was not settled");
   const afterDenial = await replies();
   if (afterDenial.has_more || afterDenial.messages.some((message) => message.text.includes(deniedMarker))) throw new Error("denied delivery found or reply scan incomplete");
   const denialRows = store.listAuditRecords().filter((row) => row.action === "slack.outbox.failed" && row.metadata.errorCode === "ExecutionAuthorityDenied");
   if (denialRows.length !== 1) throw new Error("missing durable denial audit");
   enqueue(allowedMarker);
   const allowedBridge = await SlackSocketBridge.create({ config, store });
-  if (!await allowedBridge.deliverNextOutbox()) throw new Error("allowed send not settled");
+  if ((await allowedBridge.deliverNextOutbox()).kind !== "delivered") throw new Error("allowed send not settled");
   const afterAllow = await replies();
   if (afterAllow.has_more || afterAllow.messages.filter((message) => message.text === allowedMarker).length !== 1) throw new Error("allowed delivery missing, duplicated, or scan incomplete");
   console.log(JSON.stringify({ actorType: "automated-real", deniedDelivery: "absent", denialAuditRows: denialRows.length, allowedDelivery: "one same-thread message", scope: "isolated fixture store; live task and approvals unchanged" }));

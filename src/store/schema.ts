@@ -61,6 +61,7 @@ export const outboxRowSchema = z.object({
   payload_json: nonEmpty,
   attempts: z.number().int().nonnegative(),
   lease_expires_at: isoDateTime,
+  render_mode: z.enum(["rich", "plain"]),
 });
 
 export const deliveryLookupSchema = z.object({
@@ -188,7 +189,10 @@ export const AUDIT_ACTIONS = [
   "slack.outbox.delivered",
   "slack.outbox.enqueued",
   "slack.outbox.failed",
+  "slack.outbox.fallback-scheduled",
   "slack.outbox.quarantined",
+  "slack.outbox.retry-exhausted",
+  "slack.outbox.retry-scheduled",
   "task.cancellation.requested",
   "task.t3-bound",
 ] as const;

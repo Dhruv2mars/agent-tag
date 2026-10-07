@@ -82,7 +82,7 @@ describe("Agent Tag service", () => {
         },
         deliverNextOutbox: async () => {
           calls.delivery += 1;
-          return calls.delivery === 1;
+          return { kind: calls.delivery === 1 ? "delivered" : "idle" };
         },
       };
       const logs: ServiceLogRecord[] = [];
@@ -128,7 +128,7 @@ describe("Agent Tag service", () => {
       const bridge: ServiceSlackBridge = {
         start: async () => {},
         stop: async () => {},
-        deliverNextOutbox: async () => false,
+        deliverNextOutbox: async () => ({ kind: "idle" }),
       };
       const logs: ServiceLogRecord[] = [];
       const service = new AgentTagService({
@@ -212,7 +212,7 @@ describe("Agent Tag service", () => {
       });
       const service = new AgentTagService({
         store,
-        bridge: { start: async () => {}, stop: async () => {}, deliverNextOutbox: async () => false },
+        bridge: { start: async () => {}, stop: async () => {}, deliverNextOutbox: async () => ({ kind: "idle" }) },
         coordinators: [coordinator],
         interactionWorkers: [{ processNext: async () => ({ kind: "idle" }) }],
         idleMs: 1,

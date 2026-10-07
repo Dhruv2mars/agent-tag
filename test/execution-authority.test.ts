@@ -96,14 +96,14 @@ for (const revocation of revocations) {
       expect(store.diagnostics().scheduleRuns).toBe(0);
       expect(store.listSchedules(receipt.taskId).every((schedule) => schedule.state === "cancelled")).toBe(true);
       let sent = 0;
-      while (await deliverNextSlackOutbox({
+      while ((await deliverNextSlackOutbox({
         config: currentConfig, store, workerId: "outbox-worker", now: () => now,
         postMessage: async (message) => {
           sent++;
           expect(message.text).not.toContain("private schedule canary");
           return { ts: "1000.000010" };
         },
-      })) {}
+      })).kind !== "idle") {}
       expect(sent).toBe(revocation.name === "user" ? 2 : 0);
       const audit = store.listAuditRecords({ limit: 100 });
       expect(audit.filter((row) => (row.action === "operation.failed" || row.action === "interaction.response.failed") && JSON.stringify(row.metadata).includes("ExecutionAuthorityDenied"))).toHaveLength(2);

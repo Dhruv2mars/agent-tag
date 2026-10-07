@@ -18,10 +18,16 @@ export interface ServiceWorker {
   readonly processNext: (signal: AbortSignal) => Promise<ServiceWorkerOutcome>;
 }
 
+export interface ServiceOutboxOutcome {
+  /** "idle" when nothing is claimable (empty, or every pending row is waiting out a retry backoff). */
+  readonly kind: string;
+  readonly errorCode?: string;
+}
+
 export interface ServiceSlackBridge {
   readonly start: () => Promise<void>;
   readonly stop: () => Promise<void>;
-  readonly deliverNextOutbox: () => Promise<boolean>;
+  readonly deliverNextOutbox: () => Promise<ServiceOutboxOutcome>;
 }
 
 export interface ServiceLogRecord {
@@ -172,11 +178,17 @@ export class AgentTagService {
   async #runOutboxLoop(signal: AbortSignal): Promise<void> {
     while (!signal.aborted) {
       try {
-        const delivered = await this.#bridge.deliverNextOutbox();
-        if (delivered) {
-          this.#log({ level: "info", event: "worker.outcome", worker: "outbox", outcome: "delivered" });
-        } else {
+        const outcome = await this.#bridge.deliverNextOutbox();
+        if (outcome.kind === "idle") {
           await waitUntilWorkOrStop(this.#idleMs, signal);
+        } else {
+          this.#log({
+            level: outcome.kind === "delivered" ? "info" : "warn",
+            event: "worker.outcome",
+            worker: "outbox",
+            outcome: outcome.kind,
+            ...(outcome.errorCode === undefined ? {} : { errorCode: outcome.errorCode }),
+          });
         }
       } catch (error) {
         this.#log({ level: "warn", event: "worker.failed", worker: "outbox", errorCode: errorCode(error) });

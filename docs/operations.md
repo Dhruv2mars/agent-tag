@@ -80,6 +80,12 @@ Uninstall preserves the Agent Tag data directory and service logs. It is therefo
 - Pending and expired T3 operations replay their original T3 command and message IDs.
 - Pending interaction responses replay their original response command IDs.
 - A Slack send whose process died after claiming it is quarantined as `delivery-outcome-unknown` on startup. It is not automatically resent because the supported Slack API surface has no documented idempotency key.
+- Slack send failures are classified (`src/slack/outbox-policy.ts`):
+  - Known not delivered: 429 / `rate_limited` / `ratelimited`, connection refused or unresolvable host, `service_unavailable`. The row goes back to pending with `blocked_until` set (capped exponential backoff with jitter, never earlier than `Retry-After`). Later messages in the same thread wait behind it. After 10 attempts it fails with a `slack.outbox.retry-exhausted` audit row.
+  - Ambiguous: `internal_error`, `fatal_error`, timeouts, resets after connecting, unknown errors. Quarantined as `delivery-outcome-unknown`, never resent.
+  - Deterministic: `channel_not_found`, `not_in_channel`, `invalid_auth`, and similar. Failed. `invalid_blocks` and `msg_too_long` first get one resend as plain escaped text (`slack.outbox.fallback-scheduled`).
+  - A rate limit (429 / `rate_limited` / `ratelimited`) also starts a cooldown for every outbox send, not just the failed row's thread: Slack may apply the limit to the channel or to `chat.postMessage` across the workspace, and does not say which. No row is claimed until `Retry-After` (or the computed backoff when Slack sent none) has passed.
+  - `status` reports rows waiting out a backoff as `outbox.retryBlocked`, and an active rate-limit cooldown as `outbox.rateLimitedUntil`.
 - Worker exceptions are logged by class only. Exception messages, task text, stored payloads, and credentials are not written to service logs.
 
 The operator must reconcile quarantined Slack sends in SQLite before retrying or replacing them. An automated reconciliation command is still pending.
