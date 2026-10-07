@@ -395,6 +395,8 @@ export interface ReleaseOperationInput {
   readonly operationId: string;
   readonly workerId: string;
   readonly now: string;
+  /** Total active polling time of the turn when released, so short claims still count toward the ceiling. */
+  readonly turnActiveMs?: number | undefined;
 }
 
 /**
@@ -403,14 +405,16 @@ export interface ReleaseOperationInput {
  */
 export function releaseOperation(database: Database, input: ReleaseOperationInput): boolean {
   const now = isoDateTime.parse(input.now);
+  const turnActiveMs = requireTurnActiveMs(input.turnActiveMs);
   const release = database.transaction(() => {
     const result = database
       .query(
         `UPDATE operations SET status = 'pending', attempts = MAX(attempts - 1, 0), blocked_until = NULL,
-           lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+           lease_owner = NULL, lease_expires_at = NULL, updated_at = ?,
+           turn_active_ms = MAX(turn_active_ms, COALESCE(?, 0))
          WHERE operation_id = ? AND status = 'inflight' AND lease_owner = ? AND lease_expires_at > ?`,
       )
-      .run(now, requiredId(input.operationId, "operationId"), requiredId(input.workerId, "workerId"), now);
+      .run(now, turnActiveMs, requiredId(input.operationId, "operationId"), requiredId(input.workerId, "workerId"), now);
     if (result.changes !== 1) return false;
     writeAudit(database, {
       actorType: "worker",
@@ -436,6 +440,8 @@ export interface FailOperationInput {
   readonly retryable: boolean;
   readonly blockedUntil?: string;
   readonly now: string;
+  /** Total active polling time of the turn when it failed, so retries cannot reset the ceiling. */
+  readonly turnActiveMs?: number | undefined;
 }
 
 export function failOperation(database: Database, input: FailOperationInput): void {
@@ -444,11 +450,12 @@ export function failOperation(database: Database, input: FailOperationInput): vo
   const blockedUntil = input.retryable && input.blockedUntil !== undefined
     ? isoDateTime.parse(input.blockedUntil)
     : null;
+  const turnActiveMs = requireTurnActiveMs(input.turnActiveMs);
   const fail = database.transaction(() => {
     const result = database
       .query(
         `UPDATE operations SET status = ?, last_error_code = ?, blocked_until = ?, lease_owner = NULL,
-           lease_expires_at = NULL, updated_at = ?
+           lease_expires_at = NULL, updated_at = ?, turn_active_ms = MAX(turn_active_ms, COALESCE(?, 0))
          WHERE operation_id = ? AND status = 'inflight' AND lease_owner = ? AND lease_expires_at > ?`,
       )
       .run(
@@ -456,6 +463,7 @@ export function failOperation(database: Database, input: FailOperationInput): vo
         requiredId(input.errorCode, "errorCode"),
         blockedUntil,
         now,
+        turnActiveMs,
         requiredId(input.operationId, "operationId"),
         requiredId(input.workerId, "workerId"),
         now,
@@ -486,6 +494,8 @@ export interface FailOperationWithOutboxInput {
   readonly threadTs: string;
   readonly text: string;
   readonly now: string;
+  /** Total active polling time of the turn when it failed. */
+  readonly turnActiveMs?: number | undefined;
 }
 
 export function failOperationWithOutbox(database: Database, input: FailOperationWithOutboxInput): string {
@@ -499,7 +509,7 @@ export function failOperationWithOutbox(database: Database, input: FailOperation
  */
 export function settleFailedOperation(
   database: Database,
-  input: FailOperationWithOutboxInput & { readonly turnActiveMs?: number },
+  input: FailOperationWithOutboxInput,
 ): string {
   const now = isoDateTime.parse(input.now);
   const turnActiveMs = requireTurnActiveMs(input.turnActiveMs);

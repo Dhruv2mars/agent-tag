@@ -387,6 +387,58 @@ describe("progress-based stall policy (B3)", () => {
     });
   });
 
+  test("short stalled attempts that never renew their lease still add up to the ceiling", async () => {
+    await withHarness("turn-ceiling-retries", async (harness) => {
+      const config = configWith({
+        stalledTurn: { timeoutSeconds: 10, retryDelaySeconds: 30, maxAttempts: 10, maxTurnSeconds: 60 },
+      });
+      // Each attempt stalls after ~12 s, before the first lease renewal at 15 s.
+      const coordinator = coordinatorFor(harness, config, () => snapshot({ ...harness.turn }), { pollMs: 6_000 });
+      const receipt = ingest(harness.store, 1);
+
+      const outcomes: string[] = [];
+      for (let attempt = 0; attempt < 10; attempt += 1) {
+        const outcome = await coordinator.processNext();
+        outcomes.push(outcome.kind === "failed" || outcome.kind === "retry-scheduled" ? outcome.errorCode : outcome.kind);
+        if (outcome.kind !== "retry-scheduled") break;
+        expect(readOperation(harness.path, receipt.operationId)?.turn_active_ms).toBe(12_000 * outcomes.length);
+        harness.clock.ms += 30_000;
+      }
+      expect(outcomes.at(-1)).toBe("T3TurnCeiling");
+      expect(outcomes.length).toBeLessThan(10);
+      expect(readOperation(harness.path, receipt.operationId)).toMatchObject({
+        status: "failed",
+        last_error_code: "T3TurnCeiling",
+      });
+    });
+  });
+
+  test("released claims persist their active time, so repeated short shutdowns cannot dodge the ceiling", async () => {
+    await withHarness("turn-ceiling-releases", async (harness) => {
+      const config = configWith({
+        stalledTurn: { timeoutSeconds: 60, retryDelaySeconds: 30, maxAttempts: 5, maxTurnSeconds: 60 },
+      });
+      let activityCount = 0;
+      const advancing = () => snapshot({ ...harness.turn, activityCount: ++activityCount });
+      const receipt = ingest(harness.store, 1);
+
+      for (let restart = 1; restart <= 6; restart += 1) {
+        const controller = new AbortController();
+        const claimStartedAt = harness.clock.ms;
+        const coordinator = coordinatorFor(harness, config, advancing, {
+          workerId: `worker-${restart}`,
+          onSleep: () => {
+            if (harness.clock.ms - claimStartedAt >= 10_000) controller.abort();
+          },
+        });
+        expect(await coordinator.processNext(controller.signal)).toMatchObject({ kind: "released" });
+        expect(readOperation(harness.path, receipt.operationId)?.turn_active_ms).toBe(10_000 * restart);
+      }
+      const last = coordinatorFor(harness, config, advancing, { workerId: "worker-last" });
+      expect(await last.processNext()).toMatchObject({ kind: "failed", errorCode: "T3TurnCeiling" });
+    });
+  });
+
   test("another thread advancing T3's global sequence does not keep a stuck turn alive", async () => {
     await withHarness("turn-global-sequence", async (harness) => {
       const config = configWith({

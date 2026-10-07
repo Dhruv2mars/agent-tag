@@ -38,6 +38,11 @@ export type CoordinatorOutcome =
   | { readonly kind: "released"; readonly operationId: string }
   | { readonly kind: "failed"; readonly operationId: string; readonly outboxId: string; readonly errorCode: string };
 
+/** When this claim started polling its T3 turn; null until the turn has been dispatched. */
+interface TurnPolling {
+  startedAt: number | null;
+}
+
 export interface CoordinatorOptions {
   readonly config: AgentTagConfig;
   readonly store: AgentTagStore;
@@ -405,14 +410,20 @@ export class AgentTagCoordinator {
     });
     if (operation === null) return { kind: "idle" };
 
+    // Active polling time is persisted whenever the claim ends, not only on lease renewal, so short
+    // attempts, retries and shutdowns cannot keep the turn ceiling from accumulating.
+    const polling: TurnPolling = { startedAt: null };
+    const turnActiveMs = () =>
+      polling.startedAt === null ? undefined : operation.turnActiveMs + (this.#now().getTime() - polling.startedAt);
     try {
-      return await this.#run(operation, signal);
+      return await this.#run(operation, signal, polling);
     } catch (error) {
       if (signal?.aborted) {
         this.#store.releaseOperation({
           operationId: operation.operationId,
           workerId: this.#workerId,
           now: this.#now().toISOString(),
+          turnActiveMs: turnActiveMs(),
         });
         return { kind: "released", operationId: operation.operationId };
       }
@@ -426,6 +437,7 @@ export class AgentTagCoordinator {
           retryable: true,
           blockedUntil: new Date(now.getTime() + stalledTurn.retryDelaySeconds * 1_000).toISOString(),
           now: now.toISOString(),
+          turnActiveMs: turnActiveMs(),
         });
         return { kind: "retry-scheduled", operationId: operation.operationId, errorCode: error.name };
       }
@@ -443,6 +455,7 @@ export class AgentTagCoordinator {
           retryable: true,
           blockedUntil: new Date(now.getTime() + 1_000 * 2 ** (operation.attempt - 1)).toISOString(),
           now: now.toISOString(),
+          turnActiveMs: turnActiveMs(),
         });
         return { kind: "retry-scheduled", operationId: operation.operationId, errorCode: errorCode(error) };
       }
@@ -471,12 +484,17 @@ export class AgentTagCoordinator {
         threadTs: operation.payload.threadTs,
         text: failure.userMessage,
         now: this.#now().toISOString(),
+        turnActiveMs: turnActiveMs(),
       });
       return { kind: "failed", operationId: operation.operationId, outboxId, errorCode: failure.name };
     }
   }
 
-  async #run(operation: ClaimedOperation, signal: AbortSignal | undefined): Promise<CoordinatorOutcome> {
+  async #run(
+    operation: ClaimedOperation,
+    signal: AbortSignal | undefined,
+    polling: TurnPolling,
+  ): Promise<CoordinatorOutcome> {
     const task = this.#store.getTaskExecution(operation.taskId);
     const profile = requireExecutionAuthority({
       config: this.#config,
@@ -593,8 +611,10 @@ export class AgentTagCoordinator {
 
     // Stall means "no T3 progress for the stall window", not "not finished yet": a long turn that
     // keeps advancing is polled until it settles, bounded only by the active-time ceiling, which is
-    // summed across claims (restarts, retries, human waits are excluded) and persisted on renewal.
+    // summed across claims (restarts, retries, human waits are excluded) and persisted on renewal and
+    // whenever the claim ends.
     const loopStartedAt = this.#now().getTime();
+    polling.startedAt = loopStartedAt;
     const turnActiveMs = () => operation.turnActiveMs + (this.#now().getTime() - loopStartedAt);
     let progressMarker: string | null = null;
     let progressAt = loopStartedAt;
