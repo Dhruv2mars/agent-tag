@@ -69,6 +69,21 @@ describe("systemd unit rendering", () => {
     expect(unit).toContain("WorkingDirectory=/srv/100%%\n");
   });
 
+  test("keeps literal dollars in the executable path, which systemd never expands", () => {
+    const binary: SystemdUnitDefinition = {
+      program: { kind: "binary", binaryPath: "/tmp/cost$5/agent-tag" },
+      configPath: "/srv/$USER.json",
+      workingDirectory: "/tmp/cost$5",
+    };
+    const unit = renderSystemdUnit(binary);
+    expect(unit).toContain('ExecStart="/tmp/cost$5/agent-tag" "run" "/srv/$$USER.json"\n');
+    expect(unit).toContain("WorkingDirectory=/tmp/cost$5\n");
+    expect(parseSystemdUnitPaths(unit)).toEqual(binary);
+    expect(systemdQuote("/a$b%c", { executable: true })).toBe('"/a$b%%c"');
+    const source = renderSystemdUnit({ ...definition, program: { ...sourceProgram, bunPath: "/opt/$bun/bun" } });
+    expect(source).toMatch(/^ExecStart="\/opt\/\$bun\/bun" "run" /m);
+  });
+
   test("rejects relative paths and control characters", () => {
     expect(() => renderSystemdUnit({ ...definition, program: { ...sourceProgram, bunPath: "bun" } })).toThrow("must be absolute");
     expect(() => renderSystemdUnit({ ...definition, configPath: "/srv/a\nExecStartPre=/bin/sh" })).toThrow(
@@ -102,6 +117,8 @@ class FakeSystemctl {
   failRestart = false;
   failDisable = false;
   failShow = false;
+  /** Starts never reach `running`: the service stays `activating`. */
+  stuckActivating = false;
   linger = "no";
   preflights = 0;
 
@@ -116,8 +133,8 @@ class FakeSystemctl {
       return ok(
         [
           `LoadState=${this.enabled || this.active ? "loaded" : "not-found"}`,
-          `ActiveState=${this.active ? "active" : "inactive"}`,
-          `SubState=${this.active ? "running" : "dead"}`,
+          `ActiveState=${this.active ? (this.stuckActivating ? "activating" : "active") : "inactive"}`,
+          `SubState=${this.active ? (this.stuckActivating ? "start" : "running") : "dead"}`,
           `UnitFileState=${this.enabled ? "enabled" : ""}`,
         ].join("\n"),
       );
@@ -194,6 +211,37 @@ describe("systemd user service lifecycle", () => {
     await expect(service.install("/cfg/a.json")).rejects.toThrow("systemd enable failed");
     expect(await Bun.file(service.unitPath).exists()).toBe(false);
     expect(fake.commands.at(-1)).toBe("systemctl --user daemon-reload");
+  });
+
+  test("install refuses a service that is still running after its unit file was deleted", async () => {
+    await service.install("/cfg/a.json");
+    await rm(service.unitPath);
+    fake.enabled = false;
+    fake.commands.length = 0;
+    await expect(service.install("/cfg/b.json")).rejects.toThrow(
+      `${AGENT_TAG_SYSTEMD_UNIT} is still running without ${service.unitPath}`,
+    );
+    expect(await Bun.file(service.unitPath).exists()).toBe(false);
+    expect(fake.preflights).toBe(1);
+    expect(fake.commands.some((command) => command.includes(" enable "))).toBe(false);
+
+    fake.active = false;
+    expect(await service.install("/cfg/b.json")).toMatchObject({ installed: true, running: true });
+  });
+
+  test("install rollback keeps the unit when it cannot stop a started service", async () => {
+    fake.stuckActivating = true;
+    fake.failDisable = true;
+    await expect(service.install("/cfg/a.json")).rejects.toThrow(
+      `systemd unit did not reach running state; rollback disable --now failed with exit code 1: ` +
+        `Failed to stop unit: Access denied; kept ${service.unitPath}`,
+    );
+    expect(await readFile(service.unitPath, "utf8")).toBe(renderSystemdUnit({ ...definition, configPath: "/cfg/a.json" }));
+    expect(fake.active).toBe(true);
+
+    fake.failDisable = false;
+    fake.stuckActivating = false;
+    expect(await service.uninstall()).toMatchObject({ installed: false, running: false });
   });
 
   test("upgrade rewrites the unit and restores the prior unit when restart fails", async () => {
