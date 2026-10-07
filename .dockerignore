@@ -3,3 +3,6 @@
 !bun.lock
 !tsconfig.json
 !src/
+!config/agent-tag.example.json
+!config/slack-manifest.example.json
+!t3.lock.json

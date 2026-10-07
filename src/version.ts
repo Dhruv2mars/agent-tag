@@ -22,13 +22,18 @@ export interface InstallKindInput {
   readonly env: Readonly<Record<string, string | undefined>>;
 }
 
+/** True when the entrypoint runs from Bun's embedded filesystem, i.e. inside a `bun build --compile` binary. */
+export function isCompiledEntrypoint(mainPath: string): boolean {
+  return mainPath.startsWith("/$bunfs/") || /^[A-Z]:[\\/]~BUN[\\/]/.test(mainPath);
+}
+
 /**
  * A release binary carries an embedded target and runs its entrypoint from Bun's
  * virtual filesystem. Everything else is a source checkout or a container image.
  */
 export function detectInstallKind(input: InstallKindInput): InstallKind {
   if (input.env.AGENT_TAG_INSTALL_KIND === "container") return "container";
-  const embedded = input.mainPath.startsWith("/$bunfs/") || /^[A-Z]:[\\/]~BUN[\\/]/.test(input.mainPath);
+  const embedded = isCompiledEntrypoint(input.mainPath);
   if (input.buildTarget !== undefined && isReleaseTarget(input.buildTarget) && embedded) return "binary";
   return "source";
 }

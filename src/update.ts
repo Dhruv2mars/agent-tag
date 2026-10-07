@@ -78,7 +78,7 @@ export function nonBinaryUpdateGuidance(build: BuildInfo): string {
   return [
     "agent-tag is running from a source checkout, so `agent-tag update` will not replace anything.",
     "Update the checkout instead: git pull && bun install --frozen-lockfile",
-    "Then restart the service (on macOS: bun run service:upgrade -- /absolute/path/to/agent-tag.json).",
+    "Then restart the service: bun run service:upgrade -- /absolute/path/to/agent-tag.json",
   ].join("\n");
 }
 

@@ -1,6 +1,8 @@
 # Operations
 
-Agent Tag runs in the foreground on macOS or Linux. On macOS, the checked-in manager can install it as a per-user LaunchAgent. Linux service-manager automation is not implemented or tested.
+Agent Tag runs in the foreground on macOS or Linux. The same `service` command installs it as a per-user LaunchAgent on macOS or as a `systemd --user` unit on Linux. The LaunchAgent path has been exercised on a live host. The systemd path is covered by fixture tests only; see [Host constraints](#host-constraints).
+
+Commands that take `CONFIG` fall back to `$AGENT_TAG_CONFIG` and then to `~/.agent-tag/agent-tag.json` when the argument is omitted. `bun link` installs the `agent-tag` executable, so `agent-tag doctor` is the same as `bun run doctor`.
 
 Complete the [Slack setup](slack-setup.md) before running live checks.
 
@@ -18,17 +20,52 @@ The verifier refuses a dirty checkout, exports `HEAD` with `git archive`, instal
 
 ## Binary installs and updates
 
-Hosts installed with `install.sh` run a standalone binary from `~/.local/bin/agent-tag`. Its subcommands replace the package scripts: `agent-tag run CONFIG` for `bun run start -- CONFIG`, `agent-tag doctor CONFIG` for `bun run doctor -- CONFIG`, and likewise for `status`, `audit`, `backup`, `restore`, and `schedule-add|list|cancel`; `agent-tag help` lists them. `agent-tag update` verifies and atomically replaces the binary; restart the foreground process afterward. The macOS LaunchAgent manager still runs from a source checkout. See [install](install.md).
+Hosts installed with `install.sh` run a standalone binary from `~/.local/bin/agent-tag`. Its subcommands replace the package scripts: `agent-tag run CONFIG` for `bun run start -- CONFIG`, `agent-tag doctor CONFIG` for `bun run doctor -- CONFIG`, and likewise for `onboard`, `service`, `status`, `audit`, `backup`, `restore`, and `schedule-add|list|cancel`; `agent-tag help` lists them. `agent-tag update` verifies and atomically replaces the binary; restart the foreground process, or run `agent-tag service restart`, afterward. `agent-tag service install` from the binary writes a LaunchAgent or systemd unit that runs the binary itself (`agent-tag run CONFIG`, symlinks resolved to the file `update` replaces) from the config's directory, so the service needs neither Bun nor a checkout. See [install](install.md).
 
-## Start and stop
+## Onboarding
 
-Run a live dependency check first:
+`bun run onboard` (or `agent-tag onboard`) is a plain readline wizard. It walks through these steps, and every answer also has a flag:
+
+1. Acknowledge that agents run as your OS user with access to the configured repositories, so only users you would trust with a shell should be allowed. Non-interactive runs require `--accept-risk`.
+2. Choose the Agent Tag home (`--dir`, default `$AGENT_TAG_HOME` or `~/.agent-tag`). It creates `data/` and `secrets/` at mode `0700`. An existing home directory is left as is, and an existing config is replaced only with `--force` or after an interactive confirmation.
+3. Create the Slack app. The wizard prints `config/slack-manifest.example.json` together with a `https://api.slack.com/apps?new_app=1&manifest_json=...` link that opens Slack's create-from-manifest flow. It then reads the app-level token (`xapp-`) and the bot token (`xoxb-`) from a hidden prompt, from `AGENT_TAG_SLACK_APP_TOKEN` / `AGENT_TAG_SLACK_BOT_TOKEN`, or from token files that already exist. It writes them to `secrets/` at mode `0600` and runs `auth.test` to learn the workspace ID (`--skip-slack-check` skips this check).
+4. Connect T3. The wizard reads `<T3 base dir>/userdata/server-runtime.json` (`--t3-base-dir`, else `$T3CODE_HOME` or `~/.t3`, the same order T3 uses) to find the server URL (`--t3-url` overrides it) and probes it with the same environment check as `doctor`. When that check fails, because T3 is unreachable or does not speak orchestration protocol `1` (for example a nightly or `main` build), the wizard skips token minting and provider discovery and does not install the service. With `--t3-issue-token` or `--t3-admin-token-file` it stops with an error instead. Run the T3 version pinned in `t3.lock.json`. If no restricted token exists yet, it can run `t3 auth session issue --base-dir D --ttl 10m --label agent-tag-onboard --json` (`--t3-issue-token`, `--t3-bin`) or use `--t3-admin-token-file`. It issues a session only when the base dir's running server is the one at the T3 URL. If you pass `--t3-url` for an isolated instance, also pass that instance's `--t3-base-dir`; otherwise the session would come from another instance with different signing keys, so the wizard refuses (or stops, with `--t3-issue-token`). In both cases it mints a restricted token with the same checks as `bun run enroll:t3`. The administrative token is used once and never written. A session the wizard issued is revoked with `t3 auth session revoke` right after enrollment, whether enrollment succeeded or not. If revocation fails, the wizard prints the session ID and the revoke command; the session (administrative scopes, label `agent-tag-onboard`) expires on its own after 10 minutes. A token passed with `--t3-admin-token-file` belongs to you and is not revoked; issue it with a short `--ttl`.
+5. Set the repositories (`--repo`, comma-separated absolute paths), `--base-branch`, `--provider` (by default the first ready T3 provider) and `--model` (by default T3's default model for the selected provider; required when T3 reports none), `--runtime-mode`, and `--profile`.
+6. Set the allowed users (`--users U…`) and channels (`--channels C…`), plus `--max-concurrent-tasks`. Each channel gets a route to the profile. DM routes stay manual; see [DM routes](#dm-routes).
+7. Validate the result with the config schema and write `agent-tag.json` atomically at mode `0600`. Then offer to install the service (`--install-service` / `--no-install-service`).
+
+`--yes`, `--non-interactive`, or a stdin that is not a TTY makes every prompt fall back to its flag or default. A required value with no default stops the run with an error rather than guessing. A fully scripted install looks like this:
 
 ```sh
-bun run doctor -- /absolute/path/to/agent-tag.json
+AGENT_TAG_SLACK_APP_TOKEN=... AGENT_TAG_SLACK_BOT_TOKEN=... \
+bun run onboard -- --yes --accept-risk \
+  --repo /srv/agent/repo --users U0123ABC --channels C0123ABC \
+  --t3-issue-token --install-service
 ```
 
-The check opens and migrates the SQLite store, reads T3's unauthenticated `/.well-known/t3/environment` descriptor, authenticates with the restricted T3 service token, decodes the provider catalog, validates every profile's provider and model, and verifies that the Slack bot belongs to the configured workspace. Missing, disabled, unauthenticated, non-ready, and model-mismatch states fail before Socket Mode or task dispatch. Its JSON output contains aggregate row counts, the T3 orchestration protocol, and provider states, not tokens or message text.
+## Doctor
+
+Run a live dependency check before starting:
+
+```sh
+bun run doctor -- /absolute/path/to/agent-tag.json [--fix] [--json]
+```
+
+Doctor reports each check as `PASS`, `WARN`, `FAIL`, or `SKIP` and exits non-zero only on a failure. It checks, in order:
+
+- Bun against the `package.json` engine minimum and pin.
+- Config schema validity. If the config is invalid, doctor stops after this check.
+- The data directory is owned by this user, private, and writable.
+- Each secret file (Slack app token, Slack bot token, T3 token) is a regular `0600` file in a `0700` directory owned by this user, and each token has its expected prefix.
+- The SQLite store opens and migrates.
+- T3 is reachable, and `/.well-known/t3/environment` reports orchestration protocol `1`. A missing field counts as `1`, and an older server without the endpoint gives a warning.
+- The T3 server version matches `t3.lock.json`. A mismatch is a warning.
+- The restricted T3 session has exactly the orchestration scopes, has not expired, and warns within 7 days of expiry.
+- Every profile's provider and model are ready in T3.
+- Slack `auth.test` belongs to the configured workspace, and the app token can open a Socket Mode connection.
+- The background service is installed, runs this install (the same checkout and Bun, or the same release binary) with the same config, matches the current unit template, and is running. A missing or stopped service is a warning, so doctor still passes before the first install.
+
+`--fix` repairs only safe, local problems. It creates a missing data or secret directory, chmods permissive secret files and directories, regenerates a service unit whose template drifted, and restarts a stopped service. It regenerates a unit only when the installed unit already runs this install: this checkout with the same Bun, or this release binary, and the same config. A unit that runs another checkout (for example the live install, when doctor runs from a worktree or a temporary clone), another Bun, a release binary when doctor runs from a checkout (or the reverse), or another config gets a warning and is left alone. To move the service, run `agent-tag service upgrade CONFIG` from the checkout or binary it should run. A stopped service is restarted with `service restart`, which on macOS bootstraps an installed plist whose job is no longer loaded before starting it. It never writes tokens, changes the config, or touches T3 or Slack. Service repair runs only when no other check failed, because `service upgrade` reruns doctor. `--json` prints the structured report. Output never contains tokens or message text.
 
 This build speaks T3 orchestration protocol 1 (T3 `0.0.42`–`0.0.45`). A descriptor without `orchestrationProtocolVersion` is protocol 1. Any other version makes `doctor` and `start` fail closed with `T3 server speaks orchestration protocol N; this Agent Tag build supports protocol 1 (T3 0.0.42–0.0.45)` before the T3 token is presented. Upgrade Agent Tag before pointing it at a newer protocol.
 
@@ -59,14 +96,22 @@ A terminal stall says only that Agent Tag could not confirm completion; the oper
 
 `limits.interactionExpirySeconds` (default `86400`, 24 h; minimum `60`, maximum 30 days) bounds how long an approval or question waits for a human. While it waits, the operation is deferred until the earliest unanswered request expires, and a Slack response wakes it immediately. If every request T3 still shows as pending already has a response in Agent Tag (queued or delivered), the turn keeps polling instead of deferring, so a response that lands while T3 catches up is never lost. Each request stops accepting responses at its own deadline (posting time plus the expiry), even before the coordinator's next poll closes it, so a late click is never delivered to T3. When the wait expires, Agent Tag closes the requests (late button clicks are ignored), posts a notice, fails the operation with `InteractionExpired`, and queues a durable `thread.turn.interrupt`. The next queued message in the thread starts once that interrupt has been delivered to T3, or has failed terminally.
 
-## macOS background service
+## Background service
 
-Install the current checkout and validated config for the logged-in user:
+One command works on both platforms: `agent-tag service install|upgrade|uninstall|status|restart|logs [CONFIG]`. Each `bun run service:<action>` script runs exactly that command, so the scripts behave the same on macOS (launchd) and Linux (systemd). `logs` accepts `--lines N` (default 200) and `--follow`. `status` prints JSON with `installed`, `loaded`, `running`, the unit path, and hints. Both platforms run `doctor` before installing or upgrading.
+
+### macOS (launchd)
+
+Install the current checkout (or, from a release binary, that binary) and validated config for the logged-in user:
 
 ```sh
 bun run service:install -- /absolute/path/to/agent-tag.json
 bun run service:status
+bun run service:logs -- --follow    # tails ~/Library/Logs/AgentTag/*.log
+bun run service:restart             # launchctl kickstart -k
 ```
+
+`restart` kickstarts a loaded job. If the plist is installed but its job is not loaded in the GUI domain (for example after `launchctl bootout`, a failed bootstrap, or a logout), it bootstraps the plist first and then starts it, instead of failing with "Could not find service".
 
 The installer runs `doctor` before writing anything, installs `~/Library/LaunchAgents/dev.agent-tag.service.plist` at mode `0600`, precreates `~/Library/Logs/AgentTag` and its logs at `0700`/`0600`, bootstraps the GUI launchd domain, and waits until the process is actually running. A job that is merely registered or repeatedly exiting is not reported as healthy. A failed first install removes its generated plist.
 
@@ -85,6 +130,22 @@ bun run service:uninstall
 ```
 
 Uninstall preserves the Agent Tag data directory and service logs. It is therefore reversible with `service:install`. The LaunchAgent needs the user to remain logged in, and the machine must remain awake for local T3 and Socket Mode.
+
+### Linux (systemd --user)
+
+```sh
+bun run service:install -- /absolute/path/to/agent-tag.json
+bun run service:status
+bun run service:logs -- --follow    # journalctl --user --unit agent-tag.service
+```
+
+Install writes `agent-tag.service` at mode `0600` to `$XDG_CONFIG_HOME/systemd/user/` (default `~/.config/systemd/user/`). The unit runs `bun run src/cli.ts run CONFIG` from the checkout, or `agent-tag run CONFIG` from the config's directory when installed from a release binary, with absolute, quoted paths and sets `Restart=always`, `RestartSec=10`, `StartLimitIntervalSec=0`, `UMask=0077`, and `NoNewPrivileges=true`. `agent-tag run` exits when T3 is unreachable at startup, so the unit disables systemd's start rate limit and keeps retrying every 10 seconds while T3 boots or upgrades, like the LaunchAgent's `KeepAlive`. The unit has no `network-online.target` dependency because a `--user` manager cannot order against system targets; the retry loop covers a late network. Install then runs `systemctl --user daemon-reload` and `enable --now` and waits for the unit to report `running`. Install, upgrade, and restart run `systemctl --user reset-failed` first, so a unit left in the failed state still starts. If the first install fails, the unit file is removed. Upgrade rewrites the unit and restarts it, and puts back the prior unit if the restart fails. Uninstall runs `disable --now`, removes the unit, and reloads. The data directory and journal remain.
+
+By default a user manager stops when the user's last session ends. When lingering is off, `status` and `install` print the fix:
+
+```sh
+sudo loginctl enable-linger "$USER"
+```
 
 ## Recovery rules
 
@@ -318,4 +379,4 @@ An overdue `run-once` schedule coalesces missed intervals into one run; `skip` r
 
 ## Host constraints
 
-The verified runtime is macOS arm64 with Bun `1.3.13` and T3 Code `0.0.45` ([live adapter evidence](evidence/2026-10-06-t3-0.0.45.md)). The per-user LaunchAgent install, loaded-service upgrade, uninstall, and reinstall were exercised on macOS against T3 `0.0.42`. A logged-in user and awake host are still required for local T3 and Socket Mode availability. Linux service-manager behavior has not been exercised, so it remains outside the passing claim.
+The verified runtime is macOS arm64 with Bun `1.3.13` and T3 Code `0.0.45` ([live adapter evidence](evidence/2026-10-06-t3-0.0.45.md)). The per-user LaunchAgent install, loaded-service upgrade, uninstall, and reinstall were exercised on macOS against T3 `0.0.42`. A logged-in user and awake host are still required for local T3 and Socket Mode availability. The Linux `systemd --user` manager is implemented and covered by unit tests against a scripted `systemctl`, but it has not been run on a live Linux host, so it remains outside the passing claim.

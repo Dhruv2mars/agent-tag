@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, expect, test } from "bun:test";
-import { mkdtemp, readdir, rm } from "node:fs/promises";
+import { mkdtemp, readdir, realpath, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -63,10 +63,26 @@ test.skipIf(host === undefined)(
     expect((await readdir(outdir)).sort()).toEqual(["SHA256SUMS", `agent-tag-${host}`]);
 
     // An unknown command is a plain usage error, not a Bun crash with an embedded code frame.
-    const unknown = await run([binary, "onboard"]);
+    const unknown = await run([binary, "onbaord"]);
     expect(unknown.exitCode).toBe(1);
-    expect(unknown.stderr).toStartWith("agent-tag: unknown command: onboard\nusage: agent-tag ");
+    expect(unknown.stderr).toStartWith("agent-tag: unknown command: onbaord\nusage: agent-tag onboard");
     expect(unknown.stderr).not.toContain("cli.ts");
+
+    // doctor and onboard load their bundled JSON (T3 pin, package engines, config template, Slack
+    // manifest) from the binary, not from a source tree that does not exist beside it. HOME points
+    // into the temporary directory so neither command can read or write the operator's real home.
+    const isolated = { HOME: join(outdir, "home") };
+    const doctor = await run([binary, "doctor", join(outdir, "missing.json")], isolated);
+    expect(doctor.exitCode).toBe(1);
+    expect(doctor.stdout).toContain("PASS  bun-version");
+    expect(doctor.stdout).toContain(`config not found at ${join(outdir, "missing.json")}`);
+    expect(`${doctor.stdout}${doctor.stderr}`).not.toContain("$bunfs");
+
+    const onboard = await run([binary, "onboard", "--dir", join(outdir, "home", ".agent-tag")], isolated);
+    expect(onboard.exitCode).toBe(1);
+    expect(onboard.stdout).toContain("Agent Tag onboarding");
+    expect(onboard.stderr).toBe("agent-tag onboard: pass --accept-risk to acknowledge trusted same-user execution in non-interactive mode\n");
+    expect((await readdir(outdir)).sort()).toEqual(["SHA256SUMS", `agent-tag-${host}`]);
   },
   120_000,
 );
@@ -129,6 +145,33 @@ test.skipIf(host === undefined)(
     const result = await run([probe]);
     expect(result.stderr).toBe("");
     expect(result.stdout.trim()).toBe("socket-mode-transport-ok");
+  },
+  60_000,
+);
+
+test.skipIf(host === undefined)(
+  "a compiled binary generates service units that run the binary itself",
+  async () => {
+    const probe = join(outdir, "service-unit-probe");
+    const build = await run([
+      process.execPath,
+      "build",
+      "--compile",
+      resolve(import.meta.dir, "fixtures", "compiled-service-unit-probe.ts"),
+      "--outfile",
+      probe,
+    ]);
+    expect(build.exitCode).toBe(0);
+    // Invoked through a symlink, the unit still names the real file that `agent-tag update` replaces.
+    const link = join(outdir, "service-unit-probe-link");
+    await symlink(probe, link);
+    const result = await run([link, "/cfg/agent-tag.json"]);
+    expect(result.stderr).toBe("");
+    expect(JSON.parse(result.stdout)).toEqual({
+      program: { kind: "binary", binaryPath: await realpath(probe) },
+      configPath: "/cfg/agent-tag.json",
+      workingDirectory: "/cfg",
+    });
   },
   60_000,
 );

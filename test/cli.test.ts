@@ -17,7 +17,10 @@ function expectCleanUsageError(result: { exitCode: number; stdout: string; stder
   expect(result.exitCode).toBe(1);
   expect(result.stdout).toBe("");
   expect(result.stderr).toContain(`agent-tag: ${problem}\n`);
-  expect(result.stderr).toContain("usage: agent-tag <run|doctor|status|audit|backup> CONFIG");
+  expect(result.stderr).toContain("usage: agent-tag onboard");
+  expect(result.stderr).toContain("agent-tag doctor [CONFIG] [--fix] [--json]");
+  expect(result.stderr).toContain("agent-tag service <install|upgrade|uninstall|status|restart|logs>");
+  expect(result.stderr).toContain("agent-tag <run|status|audit|backup> CONFIG");
   expect(result.stderr).toContain("agent-tag help");
   // No Bun error banner, code frame, or stack frames.
   expect(result.stderr).not.toContain("cli.ts:");
@@ -25,17 +28,29 @@ function expectCleanUsageError(result: { exitCode: number; stdout: string; stder
   expect(result.stderr).not.toContain("error:");
 }
 
+// onboard, doctor, and service are real commands (doctor's CONFIG is optional), so they never reach usage().
 test("an unknown command prints usage without a stack trace", async () => {
-  expectCleanUsageError(await runCli(["onboard"]), "unknown command: onboard");
+  expectCleanUsageError(await runCli(["onbaord"]), "unknown command: onbaord");
   expectCleanUsageError(await runCli(["bogus", "x"]), "unknown command: bogus");
 });
 
 test("a known command without its argument prints usage without a stack trace", async () => {
-  expectCleanUsageError(await runCli(["doctor"]), "doctor requires an argument");
+  expectCleanUsageError(await runCli(["status"]), "status requires an argument");
+  expectCleanUsageError(await runCli(["run"]), "run requires an argument");
   const restore = await runCli(["restore", "/nonexistent/backup.sqlite"]);
   expect(restore.exitCode).toBe(1);
   expect(restore.stderr.startsWith("usage: agent-tag")).toBe(true);
   expect(restore.stderr).not.toContain("cli.ts:");
+});
+
+test("agent-tag help lists the onboarding, doctor, and service commands", async () => {
+  const result = await runCli(["help"]);
+  expect(result.exitCode).toBe(0);
+  for (const command of ["onboard", "doctor", "service install|upgrade|uninstall|status|restart", "service logs", "run", "update"]) {
+    expect(result.stdout).toContain(`agent-tag ${command}`);
+  }
+  expect(result.stdout).toContain("--fix");
+  expect(result.stdout).toContain("$AGENT_TAG_CONFIG");
 });
 
 test("security and prune argument mistakes print usage without a stack trace", async () => {

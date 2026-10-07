@@ -6,6 +6,7 @@ import { join, resolve } from "node:path";
 import packageJson from "../package.json" with { type: "json" };
 import { HELP_TEXT } from "../src/distribution.ts";
 import { RELEASE_TARGETS } from "../src/release.ts";
+import { SERVICE_ACTIONS } from "../src/service-manager.ts";
 
 const repository = resolve(import.meta.dir, "..");
 const bunVersion = packageJson.packageManager.replace(/^bun@/, "");
@@ -181,4 +182,25 @@ test("install.sh is valid POSIX sh", async () => {
   if (await Bun.file("/bin/dash").exists()) {
     expect((await run(["/bin/dash", "-n", join(repository, "install.sh")], repository)).exitCode).toBe(0);
   }
+});
+
+test("every service:<action> script routes through the unified cross-platform service command", () => {
+  const scripts: Record<string, string> = packageJson.scripts;
+  const serviceScripts = Object.keys(scripts).filter((name) => name.startsWith("service:")).sort();
+  expect(serviceScripts).toEqual(SERVICE_ACTIONS.map((action) => `service:${action}`).sort());
+  for (const action of SERVICE_ACTIONS) expect(scripts[`service:${action}`]).toBe(`bun run src/cli.ts service ${action}`);
+  expect(Object.values(scripts).join("\n")).not.toContain("manage-launchd");
+});
+
+test("operator docs only reference package scripts that exist", async () => {
+  const scripts: Record<string, string> = packageJson.scripts;
+  const missing: string[] = [];
+  for (const file of ["README.md", "docs/install.md", "docs/operations.md"]) {
+    const text = await Bun.file(join(repository, file)).text();
+    // `bun run <name>` where <name> is a script, not a file path such as src/cli.ts.
+    for (const match of text.matchAll(/bun run ([A-Za-z0-9:_-]+)(?![\w./<:-])/g)) {
+      if (!(match[1]! in scripts)) missing.push(`${file}: ${match[0]}`);
+    }
+  }
+  expect(missing).toEqual([]);
 });
