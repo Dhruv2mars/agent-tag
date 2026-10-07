@@ -22,7 +22,7 @@ The installer:
 2. downloads `agent-tag-<os>-<arch>` and `SHA256SUMS` from [GitHub Releases](https://github.com/Dhruv2mars/agent-tag/releases);
 3. refuses to install if the checksum is missing or wrong;
 4. runs the binary once, then moves it atomically to `~/.local/bin/agent-tag`;
-5. prints the next step: create the Slack app and config with [Slack setup](slack-setup.md), then run `agent-tag doctor /absolute/path/to/agent-tag.json`.
+5. prints the next step: run `agent-tag onboard`, which walks through the [Slack app](slack-setup.md), T3, the config, and the background service, then check with `agent-tag doctor`.
 
 On Linux it asks the C library in use (`getconf GNU_LIBC_VERSION`, then `ldd --version`) and refuses only a musl host. A glibc host that also has Debian's `musl` package installed is fine.
 
@@ -63,7 +63,7 @@ agent-tag update             # install the latest release
 agent-tag update --version 0.1.0   # install exactly this release (downgrades allowed)
 ```
 
-`update` downloads the release for this platform together with `SHA256SUMS` and checks the hash. It writes the new binary to a temporary file beside the current one, runs `version --json` on it to confirm it reports the expected version, and only then `rename`s it over the old binary. That rename is atomic. A failed download, checksum, or smoke test leaves the installed binary untouched. A process that is already running keeps the old code until you restart it.
+`update` downloads the release for this platform together with `SHA256SUMS` and checks the hash. It writes the new binary to a temporary file beside the current one, runs `version --json` on it to confirm it reports the expected version, and only then `rename`s it over the old binary. That rename is atomic. A failed download, checksum, or smoke test leaves the installed binary untouched. A process that is already running keeps the old code until you restart it; for the background service, run `agent-tag service restart`. The service unit names the same resolved path `update` replaces, so it needs no reinstall.
 
 `update` only replaces release binaries. From a source checkout it refuses and tells you to `git pull`. Inside the container image it tells you to pull a newer image. `AGENT_TAG_RELEASE_BASE_URL` applies to `update` as well, and must be an http(s) URL.
 
@@ -94,7 +94,7 @@ Inside the container, the config refers to container paths: `"dataDir": "/data"`
 
 ## Source checkout
 
-See the [README](../README.md#development). Follow [operations](operations.md) for the macOS LaunchAgent, which currently runs from a checkout only.
+See the [README](../README.md#development). Follow [operations](operations.md#background-service) for the background service. `agent-tag service install` works from a checkout (the unit runs `bun run src/cli.ts`) or from a release binary (the unit runs the binary itself), on macOS (LaunchAgent) and Linux (`systemd --user`).
 
 ## Cutting a release (maintainers)
 

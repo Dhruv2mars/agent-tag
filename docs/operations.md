@@ -20,7 +20,7 @@ The verifier refuses a dirty checkout, exports `HEAD` with `git archive`, instal
 
 ## Binary installs and updates
 
-Hosts installed with `install.sh` run a standalone binary from `~/.local/bin/agent-tag`. Its subcommands replace the package scripts: `agent-tag run CONFIG` for `bun run start -- CONFIG`, `agent-tag doctor CONFIG` for `bun run doctor -- CONFIG`, and likewise for `onboard`, `service`, `status`, `audit`, `backup`, `restore`, and `schedule-add|list|cancel`; `agent-tag help` lists them. `agent-tag update` verifies and atomically replaces the binary; restart the foreground process afterward. The macOS LaunchAgent manager still runs from a source checkout. See [install](install.md).
+Hosts installed with `install.sh` run a standalone binary from `~/.local/bin/agent-tag`. Its subcommands replace the package scripts: `agent-tag run CONFIG` for `bun run start -- CONFIG`, `agent-tag doctor CONFIG` for `bun run doctor -- CONFIG`, and likewise for `onboard`, `service`, `status`, `audit`, `backup`, `restore`, and `schedule-add|list|cancel`; `agent-tag help` lists them. `agent-tag update` verifies and atomically replaces the binary; restart the foreground process, or run `agent-tag service restart`, afterward. `agent-tag service install` from the binary writes a LaunchAgent or systemd unit that runs the binary itself (`agent-tag run CONFIG`, symlinks resolved to the file `update` replaces) from the config's directory, so the service needs neither Bun nor a checkout. See [install](install.md).
 
 ## Onboarding
 
@@ -63,9 +63,9 @@ Doctor reports each check as `PASS`, `WARN`, `FAIL`, or `SKIP` and exits non-zer
 - The restricted T3 session has exactly the orchestration scopes, has not expired, and warns within 7 days of expiry.
 - Every profile's provider and model are ready in T3.
 - Slack `auth.test` belongs to the configured workspace, and the app token can open a Socket Mode connection.
-- The background service is installed, runs this checkout with the same Bun and config, matches the current unit template, and is running. A missing or stopped service is a warning, so doctor still passes before the first install.
+- The background service is installed, runs this install (the same checkout and Bun, or the same release binary) with the same config, matches the current unit template, and is running. A missing or stopped service is a warning, so doctor still passes before the first install.
 
-`--fix` repairs only safe, local problems. It creates a missing data or secret directory, chmods permissive secret files and directories, regenerates a service unit whose template drifted, and restarts a stopped service. It regenerates a unit only when the installed unit already runs this checkout, with the same Bun and config. A unit that runs another checkout (for example the live install, when doctor runs from a worktree or a temporary clone), another Bun, or another config gets a warning and is left alone. To move the service, run `agent-tag service upgrade CONFIG` from the checkout it should run. It never writes tokens, changes the config, or touches T3 or Slack. Service repair runs only when no other check failed, because `service upgrade` reruns doctor. `--json` prints the structured report. Output never contains tokens or message text.
+`--fix` repairs only safe, local problems. It creates a missing data or secret directory, chmods permissive secret files and directories, regenerates a service unit whose template drifted, and restarts a stopped service. It regenerates a unit only when the installed unit already runs this install: this checkout with the same Bun, or this release binary, and the same config. A unit that runs another checkout (for example the live install, when doctor runs from a worktree or a temporary clone), another Bun, a release binary when doctor runs from a checkout (or the reverse), or another config gets a warning and is left alone. To move the service, run `agent-tag service upgrade CONFIG` from the checkout or binary it should run. A stopped service is restarted with `service restart`, which on macOS bootstraps an installed plist whose job is no longer loaded before starting it. It never writes tokens, changes the config, or touches T3 or Slack. Service repair runs only when no other check failed, because `service upgrade` reruns doctor. `--json` prints the structured report. Output never contains tokens or message text.
 
 This build speaks T3 orchestration protocol 1 (T3 `0.0.42`–`0.0.45`). A descriptor without `orchestrationProtocolVersion` is protocol 1. Any other version makes `doctor` and `start` fail closed with `T3 server speaks orchestration protocol N; this Agent Tag build supports protocol 1 (T3 0.0.42–0.0.45)` before the T3 token is presented. Upgrade Agent Tag before pointing it at a newer protocol.
 
@@ -91,7 +91,7 @@ One command works on both platforms: `agent-tag service install|upgrade|uninstal
 
 ### macOS (launchd)
 
-Install the current checkout and validated config for the logged-in user:
+Install the current checkout (or, from a release binary, that binary) and validated config for the logged-in user:
 
 ```sh
 bun run service:install -- /absolute/path/to/agent-tag.json
@@ -99,6 +99,8 @@ bun run service:status
 bun run service:logs -- --follow    # tails ~/Library/Logs/AgentTag/*.log
 bun run service:restart             # launchctl kickstart -k
 ```
+
+`restart` kickstarts a loaded job. If the plist is installed but its job is not loaded in the GUI domain (for example after `launchctl bootout`, a failed bootstrap, or a logout), it bootstraps the plist first and then starts it, instead of failing with "Could not find service".
 
 The installer runs `doctor` before writing anything, installs `~/Library/LaunchAgents/dev.agent-tag.service.plist` at mode `0600`, precreates `~/Library/Logs/AgentTag` and its logs at `0700`/`0600`, bootstraps the GUI launchd domain, and waits until the process is actually running. A job that is merely registered or repeatedly exiting is not reported as healthy. A failed first install removes its generated plist.
 
@@ -126,7 +128,7 @@ bun run service:status
 bun run service:logs -- --follow    # journalctl --user --unit agent-tag.service
 ```
 
-Install writes `agent-tag.service` at mode `0600` to `$XDG_CONFIG_HOME/systemd/user/` (default `~/.config/systemd/user/`). The unit runs `bun run src/cli.ts run CONFIG` with absolute, quoted paths and sets `Restart=always`, `RestartSec=10`, `StartLimitIntervalSec=0`, `UMask=0077`, and `NoNewPrivileges=true`. `agent-tag run` exits when T3 is unreachable at startup, so the unit disables systemd's start rate limit and keeps retrying every 10 seconds while T3 boots or upgrades, like the LaunchAgent's `KeepAlive`. The unit has no `network-online.target` dependency because a `--user` manager cannot order against system targets; the retry loop covers a late network. Install then runs `systemctl --user daemon-reload` and `enable --now` and waits for the unit to report `running`. Install, upgrade, and restart run `systemctl --user reset-failed` first, so a unit left in the failed state still starts. If the first install fails, the unit file is removed. Upgrade rewrites the unit and restarts it, and puts back the prior unit if the restart fails. Uninstall runs `disable --now`, removes the unit, and reloads. The data directory and journal remain.
+Install writes `agent-tag.service` at mode `0600` to `$XDG_CONFIG_HOME/systemd/user/` (default `~/.config/systemd/user/`). The unit runs `bun run src/cli.ts run CONFIG` from the checkout, or `agent-tag run CONFIG` from the config's directory when installed from a release binary, with absolute, quoted paths and sets `Restart=always`, `RestartSec=10`, `StartLimitIntervalSec=0`, `UMask=0077`, and `NoNewPrivileges=true`. `agent-tag run` exits when T3 is unreachable at startup, so the unit disables systemd's start rate limit and keeps retrying every 10 seconds while T3 boots or upgrades, like the LaunchAgent's `KeepAlive`. The unit has no `network-online.target` dependency because a `--user` manager cannot order against system targets; the retry loop covers a late network. Install then runs `systemctl --user daemon-reload` and `enable --now` and waits for the unit to report `running`. Install, upgrade, and restart run `systemctl --user reset-failed` first, so a unit left in the failed state still starts. If the first install fails, the unit file is removed. Upgrade rewrites the unit and restarts it, and puts back the prior unit if the restart fails. Uninstall runs `disable --now`, removes the unit, and reloads. The data directory and journal remain.
 
 By default a user manager stops when the user's last session ends. When lingering is off, `status` and `install` print the fix:
 

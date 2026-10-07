@@ -17,7 +17,7 @@ agent-tag version
 
 Until GA every release is a prerelease, and the installer's default (`latest`) only finds stable releases, so pin one from [the releases page](https://github.com/Dhruv2mars/agent-tag/releases) with `AGENT_TAG_VERSION`. For the same reason, move between prereleases with `agent-tag update --version X` rather than a bare `agent-tag update`. After the first stable release, drop the pin and use `agent-tag update --check`.
 
-The installer verifies the release's `SHA256SUMS` and installs to `~/.local/bin`. Set `AGENT_TAG_INSTALL_DIR` to change the destination. Then create the Slack app and config with [Slack setup](docs/slack-setup.md) and check them with `agent-tag doctor /absolute/path/to/agent-tag.json`. A Docker image is also available. See [install](docs/install.md) for both, plus self-update and how releases are cut.
+The installer verifies the release's `SHA256SUMS` and installs to `~/.local/bin`. Set `AGENT_TAG_INSTALL_DIR` to change the destination. Then run `agent-tag onboard` (see [Quickstart](#quickstart)): it walks through the [Slack app](docs/slack-setup.md), T3, and the config, and can install the background service, whose unit runs the installed binary directly. Check everything with `agent-tag doctor`. A Docker image is also available. See [install](docs/install.md) for both, plus self-update and how releases are cut.
 
 ## Development
 
@@ -55,7 +55,7 @@ AGENT_TAG_SLACK_APP_TOKEN=... AGENT_TAG_SLACK_BOT_TOKEN=... \
 bun run onboard -- --yes --accept-risk --repo /srv/repo --users U0123 --channels C0123 --t3-issue-token --install-service
 ```
 
-Check the install. `--fix` repairs safe problems: file modes, a missing data directory, a drifted unit template, and a stopped service. It never moves the service to a different checkout or Bun.
+Check the install. `--fix` repairs safe problems: file modes, a missing data directory, a drifted unit template, and a stopped service. It never moves the service to a different checkout, Bun, or binary.
 
 ```sh
 bun run doctor            # or: bun run doctor -- /absolute/path/to/agent-tag.json --fix
@@ -75,7 +75,16 @@ To run it in the foreground instead:
 bun run start -- /absolute/path/to/agent-tag.json
 ```
 
-`bun link` puts the `agent-tag` command on your `PATH`, so `agent-tag onboard|doctor|service ...` work the same way.
+`bun link` puts the `agent-tag` command on your `PATH`, so `agent-tag onboard|doctor|service ...` work the same way. A release binary from `install.sh` takes the same subcommands without Bun or a checkout:
+
+```sh
+agent-tag onboard
+agent-tag doctor --fix
+agent-tag service install      # LaunchAgent on macOS, systemd --user unit on Linux
+agent-tag service logs --follow
+```
+
+A service installed from a checkout runs `bun run src/cli.ts`; one installed from the binary runs the binary itself, so `agent-tag update` followed by `agent-tag service restart` picks up the new version. `doctor --fix` never switches an existing service between the two.
 
 The service validates every configured provider/model against T3 before connecting to Slack, writes structured JSON lifecycle records to stdout/stderr, and shuts down on `SIGINT` or `SIGTERM`. See [operations](docs/operations.md) for upgrade, uninstall, recovery, and host constraints.
 
