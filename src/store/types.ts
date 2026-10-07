@@ -129,6 +129,12 @@ export interface ClaimedInteractionResponse {
   readonly response: unknown;
   readonly attempt: number;
   readonly leaseExpiresAt: string;
+  /** The target operation's status, so a cancel can settle without T3 when nothing is running. */
+  readonly operationStatus: "pending" | "inflight" | "succeeded" | "failed";
+  /** Whether the target operation has dispatched its T3 turn. Only started turns are interrupted. */
+  readonly turnStarted: boolean;
+  /** The T3 turn id once the coordinator has observed it; interrupts pass it when known. */
+  readonly turnId: string | null;
 }
 
 export type UserInputQuestionPrompt = z.infer<typeof userInputQuestionPromptSchema>;

@@ -100,12 +100,14 @@ export type {
   CompleteOperationInput,
   CompleteOperationWithOutboxInput,
   DeferOperationInput,
+  MarkOperationTurnStartedInput,
   ReleaseOperationInput,
   FailOperationInput,
   FailOperationWithOutboxInput,
   CancelOperationWithOutboxInput,
 } from "./operations.ts";
 export type {
+  CancellationDisposition,
   RecordPendingInteractionResult,
   SubmitInteractionResponseResult,
   RequestTaskCancellationResult,
@@ -259,6 +261,11 @@ export class AgentTagStore {
     operations.deferOperation(this.#database, input);
   }
 
+  /** Records that the operation's T3 turn was dispatched (and its turn id once known). */
+  markOperationTurnStarted(input: operations.MarkOperationTurnStartedInput): void {
+    operations.markOperationTurnStarted(this.#database, input);
+  }
+
   /**
    * Returns an in-progress operation to the queue without counting the attempt, e.g. on service
    * shutdown. The stable command and message ids let the next owner resume the same T3 turn.
@@ -319,6 +326,10 @@ export class AgentTagStore {
     return userInput.submitUserInputAnswer(this.#database, input);
   }
 
+  /**
+   * Interrupts the task's current operation only if it started a T3 turn; an operation still queued
+   * with no T3 turn is cancelled in the store and never reaches T3.
+   */
   requestTaskCancellation(
     input: interactions.RequestTaskCancellationInput,
   ): interactions.RequestTaskCancellationResult {

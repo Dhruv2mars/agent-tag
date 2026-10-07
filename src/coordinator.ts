@@ -507,6 +507,14 @@ export class AgentTagCoordinator {
       createdAt: this.#now().toISOString(),
     }, signal), signal);
     this.#store.markT3ThreadStarted({ taskId: task.taskId, now: this.#now().toISOString() });
+    // From here a cancel interrupts this turn in T3 instead of dropping the queued operation.
+    this.#store.markOperationTurnStarted({
+      operationId: operation.operationId,
+      workerId: this.#workerId,
+      turnId: null,
+      now: this.#now().toISOString(),
+    });
+    let turnIdRecorded = false;
     this.#store.enqueueOutbox({
       taskId: operation.taskId,
       correlationId: operation.operationId,
@@ -561,6 +569,16 @@ export class AgentTagCoordinator {
       if (task.threadStarted && !snapshotHasCurrentTurn(snapshot, operation.messageId)) {
         await abortable(this.#sleep(this.#pollMs), signal);
         continue;
+      }
+      if (!turnIdRecorded && snapshot.thread.latestTurn !== null) {
+        // The latest turn is this operation's: either the thread is new or the check above matched.
+        this.#store.markOperationTurnStarted({
+          operationId: operation.operationId,
+          workerId: this.#workerId,
+          turnId: snapshot.thread.latestTurn.turnId,
+          now: this.#now().toISOString(),
+        });
+        turnIdRecorded = true;
       }
       const approvals = pendingT3Approvals(snapshot);
       const userInputs = pendingT3UserInputs(snapshot);

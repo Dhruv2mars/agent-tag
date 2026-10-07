@@ -88,7 +88,7 @@ function seedVersionOne(database: Database): void {
 }
 
 test("upgrades every historical SQLite schema while preserving existing work", async () => {
-  expect(STORE_MIGRATIONS.map((migration) => migration.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+  expect(STORE_MIGRATIONS.map((migration) => migration.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
 
   for (const startingVersion of STORE_MIGRATIONS.map((migration) => migration.version)) {
     const directory = await mkdtemp(join(tmpdir(), `agent-tag-migration-v${startingVersion}-`));
@@ -101,8 +101,10 @@ test("upgrades every historical SQLite schema while preserving existing work", a
       );
       applyMigration(historical, 1);
       seedVersionOne(historical);
-      for (let version = 2; version <= startingVersion; version += 1) {
-        applyMigration(historical, version);
+      for (const migration of STORE_MIGRATIONS) {
+        if (migration.version > 1 && migration.version <= startingVersion) {
+          applyMigration(historical, migration.version);
+        }
       }
       historical.close();
 
@@ -147,6 +149,18 @@ test("upgrades every historical SQLite schema while preserving existing work", a
       expect(
         upgraded.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM slack_rate_limits").get(),
       ).toEqual({ count: 0 });
+      expect(
+        upgraded
+          .query<{ t3_turn_started_at: string | null; t3_turn_id: string | null }, []>(
+            "SELECT t3_turn_started_at, t3_turn_id FROM operations",
+          )
+          .get(),
+      ).toEqual({ t3_turn_started_at: null, t3_turn_id: null });
+      expect(
+        upgraded
+          .query<{ name: string }, []>("SELECT name FROM pragma_table_info('interactions') WHERE name = 'blocked_until'")
+          .get()?.name,
+      ).toBe("blocked_until");
       expect(
         upgraded.query<{ quick_check: string }, []>("PRAGMA quick_check").get()?.quick_check,
       ).toBe("ok");

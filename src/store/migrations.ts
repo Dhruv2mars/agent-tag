@@ -286,4 +286,12 @@ export const STORE_MIGRATIONS: readonly StoreMigration[] = [
       );
     `,
   },
+  {
+    version: 13,
+    sql: `
+      ALTER TABLE interactions ADD COLUMN blocked_until TEXT;
+      ALTER TABLE operations ADD COLUMN t3_turn_started_at TEXT;
+      ALTER TABLE operations ADD COLUMN t3_turn_id TEXT;
+    `,
+  },
 ];

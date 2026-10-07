@@ -115,6 +115,9 @@ export const interactionRowSchema = z.object({
   response_actor_id: nonEmpty,
   attempts: z.number().int().nonnegative(),
   lease_expires_at: isoDateTime,
+  operation_status: z.enum(["pending", "inflight", "succeeded", "failed"]),
+  t3_turn_started_at: isoDateTime.nullable(),
+  t3_turn_id: nonEmpty.nullable(),
 });
 export const userInputQuestionPromptSchema = z.object({
   id: nonEmpty,

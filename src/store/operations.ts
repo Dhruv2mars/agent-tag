@@ -328,6 +328,38 @@ export function completeOperationWithOutbox(
   return complete.immediate();
 }
 
+export interface MarkOperationTurnStartedInput {
+  readonly operationId: string;
+  readonly workerId: string;
+  /** The T3 turn id when known. A later call may fill it in; an existing id is never replaced. */
+  readonly turnId: string | null;
+  readonly now: string;
+}
+
+/**
+ * Records that the operation's `thread.turn.start` reached T3, so cancellation interrupts it instead
+ * of dropping it from the queue. Lease-guarded: only the coordinator running the turn may record it.
+ */
+export function markOperationTurnStarted(database: Database, input: MarkOperationTurnStartedInput): void {
+  const now = isoDateTime.parse(input.now);
+  const turnId = input.turnId === null ? null : requiredId(input.turnId, "turnId");
+  const result = database
+    .query(
+      `UPDATE operations SET t3_turn_started_at = COALESCE(t3_turn_started_at, ?),
+         t3_turn_id = COALESCE(t3_turn_id, ?), updated_at = ?
+       WHERE operation_id = ? AND status = 'inflight' AND lease_owner = ? AND lease_expires_at > ?`,
+    )
+    .run(
+      now,
+      turnId,
+      now,
+      requiredId(input.operationId, "operationId"),
+      requiredId(input.workerId, "workerId"),
+      now,
+    );
+  requireLeaseHeld(result, "operation");
+}
+
 export interface DeferOperationInput {
   readonly operationId: string;
   readonly workerId: string;
