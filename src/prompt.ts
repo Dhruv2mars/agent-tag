@@ -40,7 +40,13 @@ export function createReadlinePrompter(
   output: NodeJS.WriteStream = process.stdout,
 ): Prompter {
   const mutable = new MutableOutput(output);
-  const readline: Interface = createInterface({ input, output: mutable, terminal: input.isTTY === true });
+  // No history: hidden secret answers would otherwise be recallable in plaintext with Up at a later prompt.
+  const readline: Interface = createInterface({
+    input,
+    output: mutable,
+    terminal: input.isTTY === true,
+    historySize: 0,
+  });
   readline.on("SIGINT", () => {
     readline.close();
     output.write("\n");
