@@ -1,6 +1,8 @@
 import { Database } from "bun:sqlite";
 import { isAbsolute } from "node:path";
 
+import { STORE_MIGRATIONS } from "./migrations.ts";
+
 /** Replacement for pruned message bodies. Row identity, status, and timestamps are kept for idempotency and audit. */
 export const PRUNED_TEXT = "[pruned]";
 
@@ -120,7 +122,8 @@ export function pruneRetainedData(
     }
     return { dryRun, cutoffs, auditDeleted, outboxRedacted, eventsRedacted, operationsRedacted };
   });
-  return run.immediate();
+  // A dry run only reads, so it takes no write lock and works on a read-only connection.
+  return dryRun ? run.deferred() : run.immediate();
 }
 
 export function prunedRowCount(result: PruneResult): number {
@@ -131,20 +134,39 @@ export function prunedRowCount(result: PruneResult): number {
  * Opens a short-lived connection beside the service store, prunes, and closes it. After a real prune it
  * checkpoints and truncates the WAL so stale frames holding the old text do not stay on disk. If a reader
  * blocks the truncate past the busy timeout, the frames are left for the next prune or checkpoint.
+ * A dry run opens the file read-only and refuses a store with pending migrations instead of applying them.
  */
 export function pruneDatabaseFile(
   path: string,
   input: { readonly policy: RetentionPolicy; readonly now: string; readonly dryRun?: boolean },
 ): PruneResult {
   if (!isAbsolute(path)) throw new Error("store path must be absolute");
-  const database = new Database(path, { readwrite: true, create: false, strict: true });
+  const dryRun = input.dryRun ?? false;
+  const database = dryRun
+    ? new Database(path, { readonly: true, strict: true })
+    : new Database(path, { readwrite: true, create: false, strict: true });
   try {
     database.exec("PRAGMA busy_timeout = 5000");
+    if (dryRun) requireCurrentSchema(database);
     const result = pruneRetainedData(database, input);
     if (!result.dryRun) database.query("PRAGMA wal_checkpoint(TRUNCATE)").get();
     return result;
   } finally {
     database.close();
+  }
+}
+
+function requireCurrentSchema(database: Database): void {
+  const migrationsTable = database
+    .query<{ name: string }, []>("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'")
+    .get();
+  const applied = new Set(
+    migrationsTable === null
+      ? []
+      : database.query<{ version: number }, []>("SELECT version FROM schema_migrations").all().map((row) => row.version),
+  );
+  if (STORE_MIGRATIONS.some((migration) => !applied.has(migration.version))) {
+    throw new Error("store has pending migrations; start the service or run prune without --dry-run to apply them first");
   }
 }
 

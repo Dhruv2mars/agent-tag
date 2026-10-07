@@ -1,5 +1,6 @@
+import { Database } from "bun:sqlite";
 import { describe, expect, spyOn, test } from "bun:test";
-import { chmod, mkdir, mkdtemp, realpath, rm, symlink, utimes, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, realpath, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -23,6 +24,7 @@ import {
 import { canonicalPath, guardDirectories, readAuditInputs, runSecurityAudit } from "../src/security/audit-run.ts";
 import { T3HttpError } from "../src/t3/auth.ts";
 import { parseCliArguments, runSecurityCli } from "../src/security/cli.ts";
+import { STORE_MIGRATIONS } from "../src/store/migrations.ts";
 
 const uid = 501;
 const now = "2026-09-21T00:00:00.000Z";
@@ -774,6 +776,66 @@ describe("security audit run", () => {
       }
       const report = JSON.parse(printed.join("\n")) as { findings: Array<{ id: string; path?: string }> };
       expect(report.findings.some((finding) => finding.id === "log-world-accessible" && finding.path === join(logs, "agent-tag.log.1"))).toBe(true);
+    });
+  });
+
+  test("prune --dry-run previews without creating, migrating, or tightening the store", async () => {
+    await withHost(async ({ root, configPath }) => {
+      const data = join(root, "data");
+      const store = join(data, "agent-tag.sqlite");
+      const prune = async (...flags: string[]) => {
+        const printed: string[] = [];
+        const log = spyOn(console, "log").mockImplementation((line: string) => {
+          printed.push(line);
+        });
+        try {
+          const code = await runSecurityCli(["prune", configPath, ...flags]);
+          return { code, output: JSON.parse(printed.join("\n")) as Record<string, unknown> };
+        } finally {
+          log.mockRestore();
+        }
+      };
+      const appliedVersions = () => {
+        const database = new Database(store, { readonly: true, strict: true });
+        try {
+          return database.query<{ version: number }, []>("SELECT version FROM schema_migrations ORDER BY version").all().map((row) => row.version);
+        } finally {
+          database.close();
+        }
+      };
+
+      // No store yet: the preview reports nothing to prune and leaves the missing data directory missing.
+      await rm(data, { recursive: true });
+      const missing = await prune("--dry-run");
+      expect(missing.code).toBe(0);
+      expect(missing.output).toMatchObject({ dryRun: true, storeExists: false, auditDeleted: 0, eventsRedacted: 0 });
+      expect(await stat(data).catch(() => undefined)).toBeUndefined();
+
+      // An older store with pending migrations and a loose mode is refused unchanged.
+      await mkdir(data, { mode: 0o700 });
+      const older = new Database(store, { create: true, strict: true });
+      older.exec("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)");
+      const [first] = STORE_MIGRATIONS;
+      if (first === undefined) throw new Error("no store migrations");
+      older.exec(first.sql);
+      older.query("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)").run(first.version, now);
+      older.close();
+      await chmod(store, 0o644);
+      await expect(prune("--dry-run")).rejects.toThrow("pending migrations");
+      expect(appliedVersions()).toEqual([first.version]);
+      expect((await stat(store)).mode & 0o777).toBe(0o644);
+
+      // A real run migrates and tightens it; a later preview of the current store still changes nothing.
+      const real = await prune();
+      expect(real.code).toBe(0);
+      expect(real.output).toMatchObject({ dryRun: false });
+      expect(appliedVersions()).toEqual(STORE_MIGRATIONS.map((migration) => migration.version));
+      expect((await stat(store)).mode & 0o777).toBe(0o600);
+      await chmod(store, 0o640);
+      const preview = await prune("--dry-run");
+      expect(preview.code).toBe(0);
+      expect(preview.output).toMatchObject({ dryRun: true, retentionConfigured: true });
+      expect((await stat(store)).mode & 0o777).toBe(0o640);
     });
   });
 });

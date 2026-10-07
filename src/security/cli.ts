@@ -1,7 +1,7 @@
 import { join, resolve } from "node:path";
 
 import { loadConfig } from "../config.ts";
-import { pruneDatabaseFile, retentionEnabled } from "../store/retention.ts";
+import { pruneDatabaseFile, retentionCutoffs, retentionEnabled } from "../store/retention.ts";
 import { AgentTagStore } from "../store/store.ts";
 import { formatSecurityReport } from "./audit.ts";
 import { runSecurityAudit } from "./audit-run.ts";
@@ -69,14 +69,23 @@ export async function runSecurityCli(argv: ReadonlyArray<string>): Promise<numbe
     if (configPath === undefined || positionals.length !== 1) throw new Error(`usage: ${SECURITY_CLI_USAGE}`);
     const config = await loadConfig(resolve(configPath));
     const databasePath = join(config.dataDir, "agent-tag.sqlite");
-    // Opening through the store applies migrations and enforces the private data directory first.
-    (await AgentTagStore.open(databasePath)).close();
-    const result = pruneDatabaseFile(databasePath, {
-      policy: config.retention,
-      now: new Date().toISOString(),
-      dryRun: flags.has("--dry-run"),
-    });
-    console.log(JSON.stringify({ retentionConfigured: retentionEnabled(config.retention), ...result }, null, 2));
+    const dryRun = flags.has("--dry-run");
+    const now = new Date().toISOString();
+    const retentionConfigured = retentionEnabled(config.retention);
+    if (dryRun) {
+      // A preview must not create, migrate, or chmod anything; a store that does not exist has nothing to prune.
+      if (!(await Bun.file(databasePath).exists())) {
+        const cutoffs = retentionCutoffs(config.retention, now);
+        const empty = { dryRun, cutoffs, auditDeleted: 0, outboxRedacted: 0, eventsRedacted: 0, operationsRedacted: 0 };
+        console.log(JSON.stringify({ retentionConfigured, storeExists: false, ...empty }, null, 2));
+        return 0;
+      }
+    } else {
+      // Opening through the store applies migrations and enforces the private data directory first.
+      (await AgentTagStore.open(databasePath)).close();
+    }
+    const result = pruneDatabaseFile(databasePath, { policy: config.retention, now, dryRun });
+    console.log(JSON.stringify({ retentionConfigured, ...result }, null, 2));
     return 0;
   }
   throw new Error(`usage: ${SECURITY_CLI_USAGE}`);
