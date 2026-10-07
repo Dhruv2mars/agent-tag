@@ -170,6 +170,20 @@ export function classifyT3TurnFailure(lastError: string | null | undefined): {
   };
 }
 
+/**
+ * Failure codes recorded only after T3 itself reported the turn ended: an observed `error` turn
+ * (`classifyT3TurnFailure`) or a cancellation (an observed interrupt, or a turn never sent). Any other
+ * failure is local (settlement timeout, service errors, revoked authority) and leaves the T3 turn's
+ * outcome unknown, so cancellation must still interrupt it.
+ */
+export const T3_TURN_ENDED_FAILURE_CODES: ReadonlySet<string> = new Set([
+  "T3ProviderAuthPolicy",
+  "T3ProviderAuth",
+  "T3ProviderLimit",
+  "T3TurnError",
+  "user-cancelled",
+]);
+
 function t3TurnFailure(snapshot: T3ThreadSnapshot): CoordinatorFailure {
   const failure = classifyT3TurnFailure(snapshot.thread.session?.lastError);
   return new CoordinatorFailure(failure.code, failure.userMessage);

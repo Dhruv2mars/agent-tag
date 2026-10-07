@@ -943,6 +943,49 @@ describe("interaction retries and cancellation", () => {
     });
   });
 
+  test("a cancel still interrupts a started turn whose operation failed locally after the settlement timeout", async () => {
+    await withStore(async ({ store, path }) => {
+      const seeded = seedOperation(store);
+      claimRunningOperation(store, seeded.operationId);
+      store.markOperationTurnStarted({ operationId: seeded.operationId, workerId: "coordinator-a", turnId: "turn-4", now });
+      const cancel = store.requestTaskCancellation({
+        taskId: seeded.taskId,
+        workspaceId: "T1",
+        conversationId: "C1",
+        threadTs: "1000.000001",
+        actorUserId: "U1",
+        sourceActionId: "cancel-after-stall",
+        now,
+      });
+      if (cancel.kind === "denied") throw new Error("cancel was denied");
+      // The coordinator gave up waiting: a local failure that does not prove the T3 turn ended.
+      store.failOperation({
+        operationId: seeded.operationId,
+        workerId: "coordinator-a",
+        errorCode: "T3TurnStalled",
+        retryable: false,
+        now,
+      });
+      const commands: T3Command[] = [];
+      const worker = new InteractionWorker({
+        config,
+        store,
+        t3: {
+          dispatch: async (command) => {
+            commands.push(command);
+            return { sequence: 1 };
+          },
+        },
+        workerId: "interaction-a",
+        now: () => new Date(now),
+      });
+      expect((await worker.processNext()).kind).toBe("resolved");
+      expect(commands).toHaveLength(1);
+      expect(commands[0]).toMatchObject({ type: "thread.turn.interrupt", turnId: "turn-4" });
+      expect(noticesFor(path, cancel.interactionId)).toEqual([]);
+    });
+  });
+
   test("a cancel whose operation already finished settles without T3 and says so once", async () => {
     await withStore(async ({ store, path }) => {
       const seeded = seedOperation(store);

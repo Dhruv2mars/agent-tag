@@ -1,6 +1,7 @@
 import { z } from "zod";
 
 import type { AgentTagConfig } from "./config.ts";
+import { T3_TURN_ENDED_FAILURE_CODES } from "./coordinator.ts";
 import { ExecutionAuthorityDenied, requireExecutionAuthority } from "./policy/execution.ts";
 import type { AgentTagStore, ClaimedInteractionResponse } from "./store/store.ts";
 import { classifyT3DispatchError } from "./t3/dispatch-errors.ts";
@@ -187,12 +188,18 @@ export class InteractionWorker {
 
   /**
    * Interrupts only a turn this operation actually started, naming it when the turn id is known.
-   * A finished operation has nothing left to cancel; one whose turn has not been dispatched yet is
-   * retried with backoff until the coordinator starts (and records) it.
+   * An operation whose T3 turn is confirmed ended has nothing left to cancel. A locally failed one
+   * (for example after the settlement timeout) may still be running in T3, so its started turn is
+   * interrupted anyway. A live operation whose turn has not been dispatched yet is retried with
+   * backoff until the coordinator starts (and records) it.
    */
   #interruptCommand(response: ClaimedInteractionResponse): T3Command {
-    if (response.operationStatus !== "pending" && response.operationStatus !== "inflight") {
-      throw new InteractionSettled("OperationNotRunning", true);
+    const live = response.operationStatus === "pending" || response.operationStatus === "inflight";
+    if (!live) {
+      const remoteEnded = response.operationStatus === "succeeded" ||
+        (response.operationErrorCode !== null && T3_TURN_ENDED_FAILURE_CODES.has(response.operationErrorCode));
+      // A failed operation is never replayed, so an unstarted turn will not be recorded later.
+      if (remoteEnded || !response.turnStarted) throw new InteractionSettled("OperationNotRunning", true);
     }
     if (!response.turnStarted) throw new InteractionSettled("T3TurnNotStarted", false);
     return {

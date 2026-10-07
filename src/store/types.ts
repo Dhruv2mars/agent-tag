@@ -131,6 +131,11 @@ export interface ClaimedInteractionResponse {
   readonly leaseExpiresAt: string;
   /** The target operation's status, so a cancel can settle without T3 when nothing is running. */
   readonly operationStatus: "pending" | "inflight" | "succeeded" | "failed";
+  /**
+   * Why a failed operation failed. A local failure (for example a settlement timeout) does not prove
+   * the T3 turn ended, so a cancel still interrupts unless the code records an observed outcome.
+   */
+  readonly operationErrorCode: string | null;
   /** Whether the target operation has dispatched its T3 turn. Only started turns are interrupted. */
   readonly turnStarted: boolean;
   /** The T3 turn id once the coordinator has observed it; interrupts pass it when known. */
