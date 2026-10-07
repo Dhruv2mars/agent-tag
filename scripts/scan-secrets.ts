@@ -38,4 +38,4 @@ const roots = [...arguments_.map((path) => resolve(path)), ...configuredRoots];
 if (roots.length === 0) usage();
 const result = await scanForSecrets({ roots, canaries, excludedPaths });
 console.log(JSON.stringify(result, null, 2));
-if (result.findings.length > 0 || result.symlinksSkipped > 0) process.exitCode = 1;
+if (result.findings.length > 0 || result.symlinksSkipped > 0 || result.skippedEntries.length > 0) process.exitCode = 1;

@@ -61,5 +61,10 @@
       "maxTurnSeconds": 21600
     },
     "interactionExpirySeconds": 86400
+  },
+  "retention": {
+    "messageDays": 30,
+    "outboxDays": 30,
+    "auditDays": 365
   }
 }

@@ -15,6 +15,8 @@
     "schedule:list": "bun run src/cli.ts schedule-list",
     "schedule:cancel": "bun run src/cli.ts schedule-cancel",
     "scan:secrets": "bun run scripts/scan-secrets.ts",
+    "security:audit": "bun run src/cli.ts security audit",
+    "prune": "bun run src/cli.ts prune",
     "service:install": "bun run scripts/manage-launchd.ts install",
     "service:upgrade": "bun run scripts/manage-launchd.ts upgrade",
     "service:status": "bun run scripts/manage-launchd.ts status",
