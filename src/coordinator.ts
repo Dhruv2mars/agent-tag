@@ -136,22 +136,28 @@ class T3TurnStalled extends Error {
 }
 
 /**
- * Everything in a snapshot that changes while a turn works: the read-model sequence, activity and
- * message counts, the newest activity/message timestamp, streamed text length, and turn/session
- * state. A turn whose marker stops changing for the stall window is stalled.
+ * Everything in a snapshot that changes while this thread's turn works: activity and message
+ * counts, the newest activity sequence and activity/message timestamp, streamed text length, and
+ * turn/session state. A turn whose marker stops changing for the stall window is stalled.
+ * `snapshotSequence` is excluded: T3 reports its global read-model sequence there, which other
+ * threads' events advance while this turn is stuck.
  */
 export function t3ProgressMarker(snapshot: T3ThreadSnapshot): string {
   const thread = snapshot.thread;
   let latestMs = 0;
+  let latestSequence = 0;
   let textLength = 0;
-  for (const activity of thread.activities) latestMs = Math.max(latestMs, Date.parse(activity.createdAt));
+  for (const activity of thread.activities) {
+    latestMs = Math.max(latestMs, Date.parse(activity.createdAt));
+    latestSequence = Math.max(latestSequence, activity.sequence ?? 0);
+  }
   for (const message of thread.messages) {
     latestMs = Math.max(latestMs, Date.parse(message.updatedAt));
     textLength += message.text.length;
   }
   return JSON.stringify([
-    snapshot.snapshotSequence,
     thread.activities.length,
+    latestSequence,
     thread.messages.length,
     latestMs,
     textLength,

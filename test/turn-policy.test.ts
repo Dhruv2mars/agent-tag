@@ -301,14 +301,14 @@ describe("progress-based stall policy (B3)", () => {
       const config = configWith({
         stalledTurn: { timeoutSeconds: 120, retryDelaySeconds: 10, maxAttempts: 1 },
       });
-      let sequence = 0;
+      let activityCount = 0;
       let lastProgressMs = startMs;
       const coordinator = coordinatorFor(harness, config, () => {
         if (harness.clock.ms - startMs < 30 * MINUTE) {
-          sequence += 1;
+          activityCount += 1;
           lastProgressMs = harness.clock.ms;
         }
-        return snapshot({ ...harness.turn, sequence });
+        return snapshot({ ...harness.turn, activityCount });
       });
       const receipt = ingest(harness.store, 1);
 
@@ -348,9 +348,9 @@ describe("progress-based stall policy (B3)", () => {
       const config = configWith({
         stalledTurn: { timeoutSeconds: 300, retryDelaySeconds: 30, maxAttempts: 5, maxTurnSeconds: 3_600 },
       });
-      let sequence = 0;
+      let activityCount = 0;
       const controller = new AbortController();
-      const advancing = () => snapshot({ ...harness.turn, sequence: ++sequence });
+      const advancing = () => snapshot({ ...harness.turn, activityCount: ++activityCount });
       const first = coordinatorFor(harness, config, advancing, {
         onSleep: () => {
           if (harness.clock.ms - startMs >= 40 * MINUTE) controller.abort();
@@ -387,11 +387,27 @@ describe("progress-based stall policy (B3)", () => {
     });
   });
 
-  test("the progress marker moves with sequence, activity, message text and turn state", () => {
+  test("another thread advancing T3's global sequence does not keep a stuck turn alive", async () => {
+    await withHarness("turn-global-sequence", async (harness) => {
+      const config = configWith({
+        stalledTurn: { timeoutSeconds: 120, retryDelaySeconds: 10, maxAttempts: 1 },
+      });
+      // T3 reports its global read-model sequence; a busy neighbour thread bumps it on every poll.
+      let sequence = 0;
+      const coordinator = coordinatorFor(harness, config, () => snapshot({ ...harness.turn, sequence: ++sequence }));
+      const receipt = ingest(harness.store, 1);
+
+      expect(await coordinator.processNext()).toMatchObject({ kind: "failed", errorCode: "T3TurnStalled" });
+      expect(harness.clock.ms - startMs).toBeLessThanOrEqual(120_000 + 10_000);
+      expect(readOperation(harness.path, receipt.operationId)?.last_error_code).toBe("T3TurnStalled");
+    });
+  });
+
+  test("the progress marker moves with this thread's activity, message text and turn state only", () => {
     const base = snapshot({ threadId: "thread-1", messageId: "message-1" });
     const marker = t3ProgressMarker(base);
     expect(t3ProgressMarker(snapshot({ threadId: "thread-1", messageId: "message-1" }))).toBe(marker);
-    expect(t3ProgressMarker({ ...base, snapshotSequence: 2 })).not.toBe(marker);
+    expect(t3ProgressMarker({ ...base, snapshotSequence: 2 })).toBe(marker);
     expect(t3ProgressMarker(snapshot({ threadId: "thread-1", messageId: "message-1", activityCount: 1 }))).not.toBe(marker);
     expect(t3ProgressMarker(snapshot({ threadId: "thread-1", messageId: "message-1", state: "completed" }))).not.toBe(marker);
     const firstMessage = base.thread.messages[0];
