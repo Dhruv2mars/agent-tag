@@ -311,15 +311,19 @@ export const STORE_MIGRATIONS: readonly StoreMigration[] = [
         t3_turn_started_at IS NOT NULL OR attempts > 0 OR EXISTS (
           SELECT 1 FROM audit_log
           WHERE correlation_id = operations.operation_id AND action = 'operation.claimed'));
-    `,
-  },
-  {
-    version: 14,
-    sql: `
+
       -- A response that failed only because transient errors exhausted its retry budget. A fresh
       -- Slack cancel may requeue such a cancellation once T3 recovers; terminal failures stay final.
       ALTER TABLE interactions ADD COLUMN retries_exhausted INTEGER NOT NULL DEFAULT 0
         CHECK (retries_exhausted IN (0, 1));
+      -- Slack action ids a requeue superseded on an interaction's source_action_id, kept so a late
+      -- redelivery of any accepted action stays deduplicated instead of targeting a newer operation.
+      CREATE TABLE interaction_source_actions (
+        source_action_id TEXT PRIMARY KEY,
+        interaction_id TEXT NOT NULL REFERENCES interactions(interaction_id),
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX interaction_source_actions_interaction_idx ON interaction_source_actions(interaction_id);
     `,
   },
 ];

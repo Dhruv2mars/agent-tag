@@ -972,6 +972,62 @@ describe("interaction retries and cancellation", () => {
     });
   });
 
+  test("a redelivered cancel superseded by a requeue does not cancel the next operation", async () => {
+    await withStore(async ({ store, path }) => {
+      const seeded = seedOperation(store);
+      claimRunningOperation(store, seeded.operationId);
+      store.markOperationTurnStarted({
+        operationId: seeded.operationId,
+        workerId: "coordinator-a",
+        turnId: "turn-1",
+        now,
+      });
+      const router = new SlackActionRouter({ config, store, now: () => now });
+      const cancel = (actionTs: string) =>
+        router.ingest(actionBody({ actionId: "agent-tag.turn.cancel", value: seeded.taskId, actionTs }));
+      expect(cancel("1000.000020").kind).toBe("accepted");
+
+      let t3Down = true;
+      let current = new Date(now);
+      const worker = new InteractionWorker({
+        config,
+        store,
+        t3: {
+          fetchThread: unexpectedThreadFetch,
+          dispatch: async () => {
+            if (t3Down) throw new Error("socket closed before the receipt arrived");
+            return { sequence: 1 };
+          },
+        },
+        workerId: "interaction-a",
+        retry: { baseDelayMs: 1_000, maxDelayMs: 1_000, maxAttempts: 1 },
+        now: () => current,
+      });
+      expect((await worker.processNext()).kind).toBe("failed");
+
+      // A fresh click requeues the exhausted cancellation, which then resolves.
+      t3Down = false;
+      expect(cancel("1000.000030").kind).toBe("accepted");
+      expect((await worker.processNext()).kind).toBe("resolved");
+
+      // The interrupted turn finishes and the next request is queued on the same task.
+      store.completeOperation({ operationId: seeded.operationId, workerId: "coordinator-a", resultSequence: 2, now });
+      const next = seedOperation(store);
+      expect(next.taskId).toBe(seeded.taskId);
+      expect(next.operationId).not.toBe(seeded.operationId);
+
+      // Late redeliveries of either accepted click stay duplicates of the original cancellation.
+      expect(cancel("1000.000020").kind).toBe("duplicate");
+      expect(cancel("1000.000030").kind).toBe("duplicate");
+      expect(
+        readRows(path, "SELECT status FROM operations WHERE operation_id = ?", next.operationId),
+      ).toEqual([{ status: "pending" }]);
+      expect(readRows(path, "SELECT COUNT(*) AS count FROM interactions WHERE kind = 'cancel'")).toEqual([
+        { count: 1 },
+      ]);
+    });
+  });
+
   test("a fresh cancel does not requeue a cancellation T3 rejected", async () => {
     await withStore(async ({ store }) => {
       const seeded = seedOperation(store);

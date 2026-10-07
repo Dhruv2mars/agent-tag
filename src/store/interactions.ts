@@ -267,14 +267,17 @@ export function requestTaskCancellation(
       response_command_id: nonEmpty,
       prompt_json: nonEmpty,
     });
-    // A redelivered Slack action must not cancel the next operation in the queue.
+    // A redelivered Slack action must not cancel the next operation in the queue. A requeue moves
+    // source_action_id to the fresh action, so earlier accepted actions are checked as well.
     const replay = priorRowSchema.nullable().parse(
       database
         .query(
           `SELECT interaction_id, response_command_id, prompt_json FROM interactions
-           WHERE source_action_id = ? AND task_id = ? AND kind = 'cancel'`,
+           WHERE task_id = ? AND kind = 'cancel' AND (source_action_id = ? OR interaction_id IN (
+             SELECT interaction_id FROM interaction_source_actions WHERE source_action_id = ?))
+           LIMIT 1`,
         )
-        .get(sourceActionId, taskId),
+        .get(taskId, sourceActionId, sourceActionId),
     );
     if (replay !== null) {
       return {
@@ -303,10 +306,15 @@ export function requestTaskCancellation(
     );
     if (target === null) return { kind: "denied" };
     const requestId = `cancel:${target.operation_id}`;
-    const prior = priorRowSchema.extend({ state: nonEmpty, retries_exhausted: z.number().int() }).nullable().parse(
+    const prior = priorRowSchema.extend({
+      state: nonEmpty,
+      retries_exhausted: z.number().int(),
+      source_action_id: nonEmpty.nullable(),
+    }).nullable().parse(
       database
         .query(
-          `SELECT interaction_id, response_command_id, prompt_json, state, retries_exhausted FROM interactions
+          `SELECT interaction_id, response_command_id, prompt_json, state, retries_exhausted, source_action_id
+           FROM interactions
            WHERE thread_id = ? AND request_id = ? AND kind = 'cancel'`,
         )
         .get(task.thread_id, requestId),
@@ -314,7 +322,16 @@ export function requestTaskCancellation(
     if (prior !== null && prior.state === "failed" && prior.retries_exhausted === 1) {
       // Transient T3 errors exhausted the earlier attempt's retries while the operation still runs.
       // A fresh action (redeliveries were deduplicated above) requeues it with the same command id,
-      // so T3 deduplicates the interrupt if an earlier attempt landed without a receipt.
+      // so T3 deduplicates the interrupt if an earlier attempt landed without a receipt. The
+      // superseded action id stays recorded so its late redelivery is still a duplicate.
+      if (prior.source_action_id !== null) {
+        database
+          .query(
+            `INSERT OR IGNORE INTO interaction_source_actions (source_action_id, interaction_id, created_at)
+             VALUES (?, ?, ?)`,
+          )
+          .run(prior.source_action_id, prior.interaction_id, now);
+      }
       const requeued = database
         .query(
           `UPDATE interactions SET state = 'response-pending', attempts = 0, retries_exhausted = 0,
