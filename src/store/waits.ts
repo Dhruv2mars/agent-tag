@@ -44,9 +44,20 @@ export type AwaitOperationInteractionsResult =
 
 const interactionStateSchema = z.object({
   interaction_id: nonEmpty,
+  operation_id: nonEmpty,
   state: z.enum(["pending", "response-pending", "inflight", "resolved", "failed"]),
   created_at: isoDateTime,
 });
+
+/** An earlier operation's request that expired or failed: it can no longer be answered in Slack. */
+function isClosedForEarlierOperation(
+  row: z.infer<typeof interactionStateSchema>,
+  nowMs: number,
+  expirySeconds: number,
+): boolean {
+  if (row.state === "failed") return true;
+  return row.state === "pending" && nowMs >= new Date(row.created_at).getTime() + expirySeconds * 1_000;
+}
 
 export function awaitOperationInteractions(
   database: Database,
@@ -69,10 +80,15 @@ export function awaitOperationInteractions(
       const row = interactionStateSchema.nullable().parse(
         database
           .query(
-            "SELECT interaction_id, state, created_at FROM interactions WHERE thread_id = ? AND request_id = ? AND kind = ?",
+            "SELECT interaction_id, operation_id, state, created_at FROM interactions WHERE thread_id = ? AND request_id = ? AND kind = ?",
           )
           .get(threadId, requiredId(request.requestId, "requestId"), request.kind),
       );
+      if (row !== null && row.operation_id !== operationId && isClosedForEarlierOperation(row, nowMs, input.expirySeconds)) {
+        // T3 can keep a request (a message-mode question) pending across an interrupt and report it
+        // on later turns. A request an earlier operation already gave up on is not this turn's wait.
+        continue;
+      }
       if (row === null) {
         unanswered.push({ interactionId: null, state: "pending", createdMs: nowMs });
       } else if (row.state === "pending" || row.state === "failed") {

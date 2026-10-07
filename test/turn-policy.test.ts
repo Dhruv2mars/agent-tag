@@ -637,6 +637,94 @@ describe("approval and question expiry (B7)", () => {
     });
   });
 
+  test("a request an earlier turn already expired does not expire the next turn", async () => {
+    await withHarness("turn-carried-request", async (harness) => {
+      const config = configWith({ interactionExpirySeconds: 3_600 });
+      let firstMessageId = "";
+      let secondPolls = 0;
+      // T3 keeps the expired request pending across the interrupt and reports it on the next turn too.
+      const coordinator = coordinatorFor(harness, config, () => {
+        if (harness.turn.messageId === firstMessageId) return snapshot({ ...harness.turn, approvals: ["approval-1"] });
+        secondPolls += 1;
+        return secondPolls === 1
+          ? snapshot({ ...harness.turn, approvals: ["approval-1"] })
+          : snapshot({ ...harness.turn, approvals: ["approval-1"], state: "completed", text: "second-result" });
+      });
+      const first = ingest(harness.store, 1, "first request");
+      firstMessageId = first.messageId;
+      const second = ingest(harness.store, 2, "do Y instead");
+
+      expect(await coordinator.processNext()).toMatchObject({ kind: "waiting-interaction", operationId: first.operationId });
+      harness.clock.ms += 3_600_000;
+      expect(await coordinator.processNext()).toMatchObject({ kind: "expired", operationId: first.operationId });
+      const worker = new InteractionWorker({
+        config,
+        store: harness.store,
+        t3: { dispatch: async () => ({ sequence: 1 }) },
+        now: () => new Date(harness.clock.ms),
+      });
+      expect((await worker.processNext()).kind).toBe("resolved");
+
+      expect(await coordinator.processNext()).toMatchObject({ kind: "completed", operationId: second.operationId });
+      expect(secondPolls).toBe(2);
+      expect(readOperation(harness.path, second.operationId)?.last_error_code ?? null).toBeNull();
+      expect(drainOutboxTexts(harness.store, harness.clock.ms).at(-1)).toBe("second-result");
+    });
+  });
+
+  test("an earlier turn's unanswered request past its deadline does not expire the next turn", async () => {
+    await withHarness("turn-carried-pending", async (harness) => {
+      const { store } = harness;
+      const first = ingest(store, 1, "first request");
+      const second = ingest(store, 2, "do Y instead");
+      const task = store.getTaskExecution(first.taskId);
+      const at = (offsetMs: number) => new Date(startMs + offsetMs).toISOString();
+      const firstClaim = store.claimNextOperation({ workerId: "worker-a", now: at(0), leaseMs: 30_000, maxConcurrentTasks: 1 });
+      expect(firstClaim?.operationId).toBe(first.operationId);
+      store.recordPendingInteraction({
+        taskId: first.taskId,
+        operationId: first.operationId,
+        threadId: task.threadId,
+        requestId: "question-1",
+        kind: "user-input",
+        prompt: {},
+        conversationId: "C1",
+        threadTs: "1000.000001",
+        message: () => ({ text: "which one?" }),
+        now: at(0),
+      });
+      // The first turn ends some other way (here: cancelled) while its question stays pending.
+      store.cancelOperationWithOutbox({
+        operationId: first.operationId,
+        taskId: first.taskId,
+        workerId: "worker-a",
+        conversationId: "C1",
+        threadTs: "1000.000001",
+        now: at(1_000),
+      });
+      const later = at(2 * 3_600_000);
+      const secondClaim = store.claimNextOperation({ workerId: "worker-a", now: later, leaseMs: 30_000, maxConcurrentTasks: 1 });
+      expect(secondClaim?.operationId).toBe(second.operationId);
+      expect(
+        store.awaitOperationInteractions({
+          operationId: second.operationId,
+          taskId: second.taskId,
+          workerId: "worker-a",
+          threadId: task.threadId,
+          actorUserId: "U1",
+          conversationId: "C1",
+          threadTs: "1000.000001",
+          requests: [{ requestId: "question-1", kind: "user-input" }],
+          expirySeconds: 3_600,
+          expiredText: "expired",
+          turnActiveMs: 0,
+          now: later,
+        }),
+      ).toEqual({ kind: "answered" });
+      expect(readOperation(harness.path, second.operationId)?.status).toBe("inflight");
+    });
+  });
+
   test("a question answered before expiry is not expired", async () => {
     await withHarness("turn-answered", async (harness) => {
       const config = configWith({ interactionExpirySeconds: 3_600 });
