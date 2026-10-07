@@ -167,7 +167,10 @@ export class AgentTagService {
         if (outcome.kind !== "idle") {
           this.#log({ level: "info", event: "worker.outcome", worker: name, outcome: outcome.kind });
         }
-        if (outcome.kind === "idle") await waitUntilWorkOrStop(this.#idleMs, signal);
+        // A retry outcome means the worker just backed off a failing item; yield instead of spinning.
+        if (outcome.kind === "idle" || outcome.kind === "retry-scheduled") {
+          await waitUntilWorkOrStop(this.#idleMs, signal);
+        }
       } catch (error) {
         this.#log({ level: "warn", event: "worker.failed", worker: name, errorCode: errorCode(error) });
         await waitUntilWorkOrStop(this.#idleMs, signal);

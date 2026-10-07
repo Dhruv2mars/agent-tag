@@ -151,6 +151,34 @@ describe("Agent Tag service", () => {
     });
   });
 
+  test("yields between retry-scheduled outcomes instead of spinning", async () => {
+    await withStore(async (store) => {
+      let attempts = 0;
+      const retrying: ServiceWorker = {
+        processNext: async () => {
+          attempts += 1;
+          // Yield a macrotask so a non-sleeping loop fails the bound below instead of starving timers.
+          await Bun.sleep(0);
+          return { kind: "retry-scheduled" };
+        },
+      };
+      const service = new AgentTagService({
+        store,
+        bridge: { start: async () => {}, stop: async () => {}, deliverNextOutbox: async () => false },
+        coordinators: [{ processNext: async () => ({ kind: "idle" }) }],
+        interactionWorkers: [retrying],
+        idleMs: 20,
+        logger: () => {},
+      });
+      await service.start();
+      await Bun.sleep(110);
+      await service.stop();
+      // About one attempt per idle interval; a loop that does not sleep would run thousands of times.
+      expect(attempts).toBeGreaterThanOrEqual(2);
+      expect(attempts).toBeLessThanOrEqual(10);
+    });
+  });
+
   test("stop releases a coordinator lease promptly while a T3 turn is still unsettled", async () => {
     await withStore(async (store, path) => {
       const config = agentTagConfigSchema.parse({
