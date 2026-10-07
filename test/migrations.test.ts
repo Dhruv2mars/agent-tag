@@ -179,7 +179,7 @@ test("upgrades every historical SQLite schema while preserving existing work", a
   }
 });
 
-test("backfills started and dispatched turn markers for unfinished operations from persisted evidence", async () => {
+test("backfills started and dispatched turn markers for unfinished and failed operations from persisted evidence", async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-tag-migration-turn-markers-"));
   const path = join(directory, "agent-tag.sqlite");
   try {
@@ -235,6 +235,19 @@ test("backfills started and dispatched turn markers for unfinished operations fr
     insertOperation("queued", "pending", 0);
     // Finished work keeps its markers empty; nothing will cancel it.
     insertOperation("finished", "succeeded", 1);
+    // Failed only locally after its "working" message posted: the T3 turn may still be running.
+    insertOperation("stalled", "failed", 1);
+    historical
+      .query(
+        `INSERT INTO slack_outbox (
+          outbox_id, task_id, correlation_id, conversation_id, thread_ts, client_message_id,
+          payload_json, status, created_at, updated_at
+        ) VALUES ('outbox-stalled', 'task-1', 'stalled', 'C1', '1000.000001', 'stalled:started', '{}',
+          'delivered', ?, ?)`,
+      )
+      .run("2026-09-21T00:07:00.000Z", "2026-09-21T00:07:00.000Z");
+    // Failed after repeated service errors with no start evidence: the claim may have dispatched it.
+    insertOperation("service-failed", "failed", 3);
     historical.close();
 
     const store = await AgentTagStore.open(path);
@@ -255,6 +268,12 @@ test("backfills started and dispatched turn markers for unfinished operations fr
       { operation_id: "finished", t3_turn_started_at: null, t3_turn_dispatched_at: null },
       { operation_id: "queued", t3_turn_started_at: null, t3_turn_dispatched_at: null },
       { operation_id: "retrying", t3_turn_started_at: null, t3_turn_dispatched_at: claimedAt },
+      { operation_id: "service-failed", t3_turn_started_at: null, t3_turn_dispatched_at: claimedAt },
+      {
+        operation_id: "stalled",
+        t3_turn_started_at: "2026-09-21T00:07:00.000Z",
+        t3_turn_dispatched_at: "2026-09-21T00:07:00.000Z",
+      },
     ]);
     upgraded.close();
   } finally {
