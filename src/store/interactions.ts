@@ -457,7 +457,7 @@ export function claimNextInteractionResponse(
           `SELECT i.interaction_id, i.task_id, i.operation_id, i.thread_id, i.request_id, i.kind,
                   i.response_command_id, i.response_json, i.response_actor_id, i.attempts, i.lease_expires_at,
                   o.status AS operation_status, o.last_error_code AS operation_error_code,
-                  o.t3_turn_started_at, o.t3_turn_id
+                  o.message_id AS operation_message_id, o.t3_turn_dispatched_at, o.t3_turn_started_at, o.t3_turn_id
            FROM interactions i JOIN operations o ON o.operation_id = i.operation_id
            WHERE i.interaction_id = ?`,
         )
@@ -489,6 +489,8 @@ export function claimNextInteractionResponse(
       leaseExpiresAt: row.lease_expires_at,
       operationStatus: row.operation_status,
       operationErrorCode: row.operation_error_code,
+      operationMessageId: row.operation_message_id,
+      turnDispatched: row.t3_turn_dispatched_at !== null || row.t3_turn_started_at !== null,
       turnStarted: row.t3_turn_started_at !== null,
       turnId: row.t3_turn_id,
     };

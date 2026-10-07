@@ -84,7 +84,7 @@ for (const revocation of revocations) {
       });
       expect(await coordinator.processNext()).toMatchObject({ kind: "failed", errorCode: "ExecutionAuthorityDenied" });
       expect(await coordinator.processNext()).toEqual({ kind: "idle" });
-      const worker = new InteractionWorker({ config: currentConfig, store, t3: { dispatch }, now: () => new Date(now) });
+      const worker = new InteractionWorker({ config: currentConfig, store, t3: { dispatch, fetchThread: dispatch }, now: () => new Date(now) });
       expect(await worker.processNext()).toMatchObject({ kind: "failed", errorCode: "ExecutionAuthorityDenied" });
       expect(await worker.processNext()).toEqual({ kind: "idle" });
       expect(calls).toBe(0);

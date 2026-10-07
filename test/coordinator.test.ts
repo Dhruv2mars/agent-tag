@@ -719,6 +719,9 @@ describe("Agent Tag coordinator", () => {
           if (command.type === "thread.turn.interrupt") interrupted = true;
           return { sequence: commands.length };
         },
+        fetchThread: async () => {
+          throw new Error("a live operation's cancel must wait for the coordinator, not read T3");
+        },
       },
       workerId: "interaction-a",
       now: () => current,
@@ -794,6 +797,145 @@ describe("Agent Tag coordinator", () => {
       }
       await rm(directory, { recursive: true });
     }
+  });
+
+  async function cancelAfterEveryReceiptLost(
+    prefix: string,
+    snapshotFor: (threadId: string, messageId: string) => T3ThreadSnapshot,
+  ): Promise<{ readonly outcome: unknown; readonly interrupts: ReadonlyArray<T3Command> }> {
+    const directory = await mkdtemp(join(tmpdir(), prefix));
+    const store = await AgentTagStore.open(join(directory, "agent-tag.sqlite"));
+    let current = new Date(now);
+    let threadId = "not-dispatched";
+    let messageId = "not-dispatched";
+    const commands: T3Command[] = [];
+    const worker = new InteractionWorker({
+      config,
+      store,
+      t3: {
+        dispatch: async (command) => {
+          commands.push(command);
+          return { sequence: commands.length };
+        },
+        fetchThread: async () => snapshotFor(threadId, messageId),
+      },
+      workerId: "interaction-a",
+      now: () => current,
+    });
+    const coordinator = new AgentTagCoordinator({
+      config,
+      store,
+      t3: {
+        dispatch: async (command) => {
+          commands.push(command);
+          if (command.type === "thread.turn.start") {
+            threadId = command.threadId;
+            messageId = command.message.messageId;
+            // T3 may have accepted the turn, but no receipt ever reaches Agent Tag.
+            throw new Error("socket closed before the dispatch receipt arrived");
+          }
+          return { sequence: commands.length };
+        },
+        fetchThread: async () => {
+          throw new Error("no turn was confirmed, so the coordinator never polls");
+        },
+      },
+      workerId: "worker-a",
+      now: () => current,
+      sleep: async () => {},
+    });
+    try {
+      const receipt = store.ingestSlackEvent({
+        deliveryId: "delivery-1",
+        eventKey: "C1:1000.000001",
+        workspaceId: "T1",
+        conversationId: "C1",
+        threadTs: "1000.000001",
+        actorUserId: "U1",
+        conversationType: "channel",
+        profileId: "engineering",
+        repositoryRoot: "/srv/repos/example",
+        text: "request",
+        receivedAt: now,
+        sourceOrderKey: "1000.000001",
+      });
+      expect((await coordinator.processNext()).kind).toBe("retry-scheduled");
+      expect(
+        store.requestTaskCancellation({
+          taskId: receipt.taskId,
+          workspaceId: "T1",
+          conversationId: "C1",
+          threadTs: "1000.000001",
+          actorUserId: "U1",
+          sourceActionId: "cancel-after-every-receipt-lost",
+          now: current.toISOString(),
+        }),
+      ).toMatchObject({ kind: "accepted", disposition: "interrupt-requested" });
+      expect(await worker.processNext()).toMatchObject({ kind: "retry-scheduled", errorCode: "T3TurnNotStarted" });
+      let settled = false;
+      for (let attempt = 2; attempt <= 5; attempt++) {
+        current = new Date(current.getTime() + 60_000);
+        const outcome = await coordinator.processNext();
+        settled = outcome.kind === "failed";
+        expect(outcome.kind).toBe(attempt === 5 ? "failed" : "retry-scheduled");
+      }
+      expect(settled).toBe(true);
+      current = new Date(current.getTime() + 60_000);
+      const outcome = await worker.processNext();
+      return { outcome, interrupts: commands.filter((command) => command.type === "thread.turn.interrupt") };
+    } finally {
+      store.close();
+      if (!directory.startsWith(`${tmpdir()}/${prefix}`)) {
+        throw new Error(`refusing to remove unexpected fixture path ${directory}`);
+      }
+      await rm(directory, { recursive: true });
+    }
+  }
+
+  test("a cancel interrupts a turn T3 is still running after every turn.start receipt was lost", async () => {
+    const { outcome, interrupts } = await cancelAfterEveryReceiptLost(
+      "agent-tag-coordinator-receipts-lost-running-",
+      (threadId, messageId) => runningSnapshot(threadId, messageId),
+    );
+    expect(outcome).toMatchObject({ kind: "resolved" });
+    expect(interrupts).toHaveLength(1);
+    expect(interrupts[0]).toMatchObject({ turnId: "turn-1" });
+  });
+
+  test("a cancel settles without interrupting when T3 never received the lost turn.start", async () => {
+    const { outcome, interrupts } = await cancelAfterEveryReceiptLost(
+      "agent-tag-coordinator-receipts-lost-absent-",
+      (threadId) => {
+        const base = runningSnapshot(threadId, "other-message");
+        return { ...base, thread: { ...base.thread, latestTurn: null, messages: [] } };
+      },
+    );
+    expect(outcome).toMatchObject({ kind: "failed", errorCode: "OperationNotRunning" });
+    expect(interrupts).toHaveLength(0);
+  });
+
+  test("a cancel never interrupts a later message's turn when the lost turn.start is no longer current", async () => {
+    const later = new Date(new Date(now).getTime() + 1_000).toISOString();
+    const { outcome, interrupts } = await cancelAfterEveryReceiptLost(
+      "agent-tag-coordinator-receipts-lost-superseded-",
+      (threadId, messageId) => {
+        const base = runningSnapshot(threadId, messageId);
+        const ours = base.thread.messages[0];
+        if (ours === undefined) throw new Error("fixture lacks the user message");
+        return {
+          ...base,
+          thread: {
+            ...base.thread,
+            latestTurn: base.thread.latestTurn === null
+              ? null
+              : { ...base.thread.latestTurn, turnId: "turn-2", requestedAt: later },
+            messages: [ours, { ...ours, id: "later-message", createdAt: later, updatedAt: later }],
+          },
+        };
+      },
+    );
+    expect(outcome).toMatchObject({ kind: "failed", errorCode: "OperationNotRunning" });
+    expect(interrupts).toHaveLength(0);
   });
 
   test("releases the lease without failing when shutdown aborts an unsettled poll", async () => {

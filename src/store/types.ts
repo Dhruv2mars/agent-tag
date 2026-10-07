@@ -136,7 +136,14 @@ export interface ClaimedInteractionResponse {
    * the T3 turn ended, so a cancel still interrupts unless the code records an observed outcome.
    */
   readonly operationErrorCode: string | null;
-  /** Whether the target operation has dispatched its T3 turn. Only started turns are interrupted. */
+  /** The T3 user message id the target operation sends, used to find its turn in a thread snapshot. */
+  readonly operationMessageId: string;
+  /**
+   * Whether `thread.turn.start` may have reached T3. True even when every receipt was lost, so a
+   * failed operation's turn is reconciled against T3 instead of assumed never started.
+   */
+  readonly turnDispatched: boolean;
+  /** Whether a T3 receipt confirmed the target operation's turn start. */
   readonly turnStarted: boolean;
   /** The T3 turn id once the coordinator has observed it; interrupts pass it when known. */
   readonly turnId: string | null;

@@ -7,9 +7,11 @@ import type { AgentTagStore, ClaimedInteractionResponse } from "./store/store.ts
 import { classifyT3DispatchError } from "./t3/dispatch-errors.ts";
 import {
   dispatchT3Command,
+  fetchT3ThreadSnapshot,
   type T3Command,
   type T3ConnectionConfig,
   type T3DispatchResult,
+  type T3ThreadSnapshot,
 } from "./t3/gateway.ts";
 
 const approvalResponseSchema = z.object({
@@ -26,6 +28,8 @@ const userInputResponseSchema = z.discriminatedUnion("kind", [
 
 export interface T3InteractionGateway {
   readonly dispatch: (command: T3Command) => Promise<T3DispatchResult>;
+  /** Reads the thread so a cancel can find a turn whose start receipt was lost. */
+  readonly fetchThread: (threadId: string) => Promise<T3ThreadSnapshot>;
 }
 
 export type InteractionWorkerOutcome =
@@ -113,7 +117,10 @@ export class InteractionWorker {
     } else {
       if (input.t3Config === undefined) throw new Error("InteractionWorker requires t3 or t3Config");
       const t3Config = input.t3Config;
-      this.#t3 = { dispatch: (command) => dispatchT3Command({ config: t3Config, command }) };
+      this.#t3 = {
+        dispatch: (command) => dispatchT3Command({ config: t3Config, command }),
+        fetchThread: (threadId) => fetchT3ThreadSnapshot({ config: t3Config, threadId }),
+      };
     }
     this.#workerId = input.workerId ?? `interaction-worker-${crypto.randomUUID()}`;
     this.#leaseMs = input.leaseMs ?? 30_000;
@@ -172,7 +179,7 @@ export class InteractionWorker {
                 createdAt: this.#now().toISOString(),
               };
       } else {
-        command = this.#interruptCommand(response);
+        command = await this.#interruptCommand(response);
       }
       await this.#t3.dispatch(command);
       this.#store.completeInteractionResponse({
@@ -190,25 +197,62 @@ export class InteractionWorker {
    * Interrupts only a turn this operation actually started, naming it when the turn id is known.
    * An operation whose T3 turn is confirmed ended has nothing left to cancel. A locally failed one
    * (for example after the settlement timeout) may still be running in T3, so its started turn is
-   * interrupted anyway. A live operation whose turn has not been dispatched yet is retried with
-   * backoff until the coordinator starts (and records) it.
+   * interrupted anyway. A failed operation whose `thread.turn.start` was sent but never confirmed
+   * (every receipt lost) is reconciled against the T3 thread. A live operation whose turn has not
+   * been confirmed yet is retried with backoff until the coordinator starts (and records) it.
    */
-  #interruptCommand(response: ClaimedInteractionResponse): T3Command {
+  async #interruptCommand(response: ClaimedInteractionResponse): Promise<T3Command> {
     const live = response.operationStatus === "pending" || response.operationStatus === "inflight";
+    let turnId = response.turnId;
     if (!live) {
       const remoteEnded = response.operationStatus === "succeeded" ||
         (response.operationErrorCode !== null && T3_TURN_ENDED_FAILURE_CODES.has(response.operationErrorCode));
-      // A failed operation is never replayed, so an unstarted turn will not be recorded later.
-      if (remoteEnded || !response.turnStarted) throw new InteractionSettled("OperationNotRunning", true);
+      // A failed operation is never replayed, so an unsent turn will not be recorded later.
+      if (remoteEnded || !response.turnDispatched) throw new InteractionSettled("OperationNotRunning", true);
+      if (!response.turnStarted) turnId = await this.#reconcileUnconfirmedTurn(response);
+    } else if (!response.turnStarted) {
+      throw new InteractionSettled("T3TurnNotStarted", false);
     }
-    if (!response.turnStarted) throw new InteractionSettled("T3TurnNotStarted", false);
     return {
       type: "thread.turn.interrupt",
       commandId: response.commandId,
       threadId: response.threadId,
-      ...(response.turnId === null ? {} : { turnId: response.turnId }),
+      ...(turnId === null ? {} : { turnId }),
       createdAt: this.#now().toISOString(),
     };
+  }
+
+  /**
+   * Finds, in T3, the turn of a failed operation whose start was sent but never confirmed. Returns
+   * its id when it is still running. Settles the cancel when T3 never received the message or the
+   * turn already ended, and retries while T3 holds the message without having started its turn.
+   */
+  async #reconcileUnconfirmedTurn(response: ClaimedInteractionResponse): Promise<string> {
+    const snapshot = await this.#t3.fetchThread(response.threadId);
+    const userMessages = snapshot.thread.messages.filter((message) => message.role === "user");
+    const message = userMessages.find((candidate) => candidate.id === response.operationMessageId);
+    if (message === undefined) throw new InteractionSettled("OperationNotRunning", true);
+    const latest = snapshot.thread.latestTurn;
+    const sentAt = new Date(message.createdAt).getTime();
+    const nextMessageAt = userMessages
+      .map((candidate) => new Date(candidate.createdAt).getTime())
+      .filter((createdAt) => createdAt > sentAt)
+      .reduce((earliest, createdAt) => Math.min(earliest, createdAt), Number.POSITIVE_INFINITY);
+    const requestedAt = latest === null ? null : new Date(latest.requestedAt).getTime();
+    // The latest turn is this operation's when T3 tied the message to it, or when it was requested
+    // after this message and before any later one.
+    const latestIsOurs = latest !== null && (message.turnId !== null
+      ? message.turnId === latest.turnId
+      : requestedAt !== null && requestedAt >= sentAt && requestedAt < nextMessageAt);
+    if (latestIsOurs) {
+      if (latest.state === "running") return latest.turnId;
+      throw new InteractionSettled("OperationNotRunning", true);
+    }
+    // T3 tied the message to an older turn, or a later message's turn is current: ours has ended.
+    if (message.turnId !== null || nextMessageAt !== Number.POSITIVE_INFINITY) {
+      throw new InteractionSettled("OperationNotRunning", true);
+    }
+    throw new InteractionSettled("T3TurnNotStarted", false);
   }
 
   #fail(response: ClaimedInteractionResponse, error: unknown): InteractionWorkerOutcome {

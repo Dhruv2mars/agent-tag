@@ -107,6 +107,10 @@ function viewSubmissionBody(input: {
   };
 }
 
+async function unexpectedThreadFetch(): Promise<never> {
+  throw new Error("unexpected T3 thread fetch");
+}
+
 function seedOperation(store: AgentTagStore): {
   readonly taskId: string;
   readonly operationId: string;
@@ -174,6 +178,7 @@ describe("durable interactions", () => {
       const commands: T3Command[] = [];
       let shouldFail = true;
       const t3: T3InteractionGateway = {
+        fetchThread: unexpectedThreadFetch,
         dispatch: async (command) => {
           commands.push(command);
           if (shouldFail) {
@@ -273,6 +278,7 @@ describe("durable interactions", () => {
       );
       const commands: T3Command[] = [];
       const t3: T3InteractionGateway = {
+        fetchThread: unexpectedThreadFetch,
         dispatch: async (command) => {
           commands.push(command);
           return { sequence: commands.length };
@@ -330,6 +336,7 @@ describe("durable interactions", () => {
       ).toBe("accepted");
       const commands: T3Command[] = [];
       const t3: T3InteractionGateway = {
+        fetchThread: unexpectedThreadFetch,
         dispatch: async (command) => {
           commands.push(command);
           return { sequence: commands.length };
@@ -370,6 +377,7 @@ describe("durable interactions", () => {
         config,
         store,
         t3: {
+          fetchThread: unexpectedThreadFetch,
           dispatch: async () => {
             throw new Error("invalid response must not reach T3");
           },
@@ -466,6 +474,7 @@ describe("durable interactions", () => {
 
       const commands: T3Command[] = [];
       const t3: T3InteractionGateway = {
+        fetchThread: unexpectedThreadFetch,
         dispatch: async (command) => {
           commands.push(command);
           return { sequence: commands.length };
@@ -681,6 +690,7 @@ describe("interaction retries and cancellation", () => {
         config,
         store,
         t3: {
+          fetchThread: unexpectedThreadFetch,
           dispatch: async () => {
             dispatches += 1;
             // The shape T3 0.0.45 sends for a rejected command, decoded as an unknown RPC error.
@@ -723,6 +733,7 @@ describe("interaction retries and cancellation", () => {
         config,
         store,
         t3: {
+          fetchThread: unexpectedThreadFetch,
           dispatch: async () => {
             dispatches += 1;
             throw new Error("socket closed before the receipt arrived");
@@ -773,6 +784,7 @@ describe("interaction retries and cancellation", () => {
         config,
         store,
         t3: {
+          fetchThread: unexpectedThreadFetch,
           dispatch: async (command) => {
             commands.push(command);
             if (commands.length === 1) {
@@ -830,6 +842,7 @@ describe("interaction retries and cancellation", () => {
         config,
         store,
         t3: {
+          fetchThread: unexpectedThreadFetch,
           dispatch: async (command) => {
             commands.push(command);
             return { sequence: 1 };
@@ -873,6 +886,7 @@ describe("interaction retries and cancellation", () => {
         config,
         store,
         t3: {
+          fetchThread: unexpectedThreadFetch,
           dispatch: async (command) => {
             commands.push(command);
             return { sequence: 1 };
@@ -917,6 +931,7 @@ describe("interaction retries and cancellation", () => {
         config,
         store,
         t3: {
+          fetchThread: unexpectedThreadFetch,
           dispatch: async (command) => {
             commands.push(command);
             return { sequence: 1 };
@@ -971,6 +986,7 @@ describe("interaction retries and cancellation", () => {
         config,
         store,
         t3: {
+          fetchThread: unexpectedThreadFetch,
           dispatch: async (command) => {
             commands.push(command);
             return { sequence: 1 };
@@ -1012,6 +1028,7 @@ describe("interaction retries and cancellation", () => {
         config,
         store,
         t3: {
+          fetchThread: unexpectedThreadFetch,
           dispatch: async () => {
             throw new Error("a finished operation must not reach T3");
           },
