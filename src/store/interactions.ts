@@ -193,9 +193,7 @@ export function submitInteractionResponse(
     if (updated.changes !== 1) {
       return { kind: "duplicate" as const, commandId: row.response_command_id };
     }
-    database
-      .query("UPDATE operations SET blocked_until = NULL, updated_at = ? WHERE operation_id = (SELECT operation_id FROM interactions WHERE interaction_id = ?)")
-      .run(now, row.interaction_id);
+    unblockInteractionOperation(database, row.interaction_id, now);
     writeAudit(database, {
       actorType: "slack-user",
       actorId: input.actorUserId,
@@ -609,6 +607,23 @@ export function claimNextInteractionResponse(
   return claim.immediate();
 }
 
+/** Makes the interaction's operation claimable again by clearing its deferral backoff. */
+function unblockInteractionOperation(
+  database: Database,
+  interactionId: string,
+  now: string,
+  filter: { readonly kind?: "cancel" } = {},
+): void {
+  database
+    .query(
+      `UPDATE operations SET blocked_until = NULL, updated_at = ?
+       WHERE operation_id = (
+         SELECT operation_id FROM interactions WHERE interaction_id = ? AND (? IS NULL OR kind = ?)
+       )`,
+    )
+    .run(now, interactionId, filter.kind ?? null, filter.kind ?? null);
+}
+
 export interface CompleteInteractionResponseInput {
   readonly interactionId: string;
   readonly workerId: string;
@@ -634,9 +649,7 @@ export function completeInteractionResponse(
         now,
       );
     requireLeaseHeld(result, "interaction");
-    database
-      .query("UPDATE operations SET blocked_until = NULL, updated_at = ? WHERE operation_id = (SELECT operation_id FROM interactions WHERE interaction_id = ?)")
-      .run(now, input.interactionId);
+    unblockInteractionOperation(database, input.interactionId, now);
     writeAudit(database, {
       actorType: "worker",
       actorId: input.workerId,
@@ -694,6 +707,11 @@ export function failInteractionResponse(database: Database, input: FailInteracti
         now,
       );
     requireLeaseHeld(result, "interaction");
+    // Every cancel settlement unblocks its operation, as successful delivery does: a cancel that found
+    // the turn already ended (or gave up) must not leave the operation deferred, or the coordinator
+    // could not observe and finalize it and later requests in the task would wait out the deferral.
+    // A scheduled retry is not a settlement, so the operation stays blocked until the cancel settles.
+    if (!input.retryable) unblockInteractionOperation(database, interactionId, now, { kind: "cancel" });
     writeAudit(database, {
       actorType: "worker",
       actorId: input.workerId,

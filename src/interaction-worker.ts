@@ -202,7 +202,7 @@ export class InteractionWorker {
   }
 
   // Cancellation invariants. Every path through #interruptCommand, #ownRunningTurn, and #fail must keep
-  // these; the store side (requestTaskCancellation) keeps 5 and 6.
+  // these; the store side (requestTaskCancellation; complete/failInteractionResponse for 7) keeps 5-7.
   //  1. Never interrupt a turn the operation does not own. T3 0.0.45 ignores the interrupt's turn id
   //     and stops whatever the provider session is running, so every interrupt is preceded by a
   //     thread snapshot whose current turn (latestTurn, and session.activeTurnId when set) is this
@@ -217,6 +217,11 @@ export class InteractionWorker {
   //     cancellation and command id, so T3's command-id dedup also covers a lost interrupt receipt.
   //  5. Redeliveries of an accepted click stay duplicates and never target a later operation.
   //  6. An operation that never sent `thread.turn.start` is cancelled in the store, never in T3.
+  //  7. Every cancel settlement unblocks its operation. Delivery, a no-op settle (OperationNotRunning,
+  //     including absence past the bootstrap window), a T3 rejection, invalid input, revoked authority,
+  //     and exhausted retries all clear the operation's blocked_until in the settling transaction, so
+  //     the coordinator can observe and finalize an ended turn instead of waiting out a deferral. A
+  //     scheduled retry is not a settlement and leaves the operation blocked.
 
   /**
    * Builds the interrupt for a cancel, or settles it. An operation whose T3 turn is confirmed ended,

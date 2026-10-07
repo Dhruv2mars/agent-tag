@@ -1366,4 +1366,87 @@ describe("interaction retries and cancellation", () => {
       expect(noticesFor(path, cancel.interactionId)).toEqual([NO_LONGER_PENDING_NOTICE]);
     });
   });
+
+  /** An operation deferred for a day on a pending approval, with a cancel queued against its turn. */
+  function deferredOperationWithCancel(store: AgentTagStore): ReturnType<typeof seedOperation> {
+    const seeded = seedOperation(store);
+    claimRunningOperation(store, seeded.operationId);
+    store.markOperationTurnStarted({ operationId: seeded.operationId, workerId: "coordinator-a", turnId: "turn-1", now });
+    store.deferOperation({
+      operationId: seeded.operationId,
+      workerId: "coordinator-a",
+      blockedUntil: new Date(Date.parse(now) + 24 * 3_600_000).toISOString(),
+      now,
+    });
+    expect(store.claimNextOperation({ workerId: "coordinator-b", now, leaseMs: 10_000, maxConcurrentTasks: 2 }))
+      .toBeNull();
+    expect(
+      store.requestTaskCancellation({
+        taskId: seeded.taskId,
+        workspaceId: "T1",
+        conversationId: "C1",
+        threadTs: "1000.000001",
+        actorUserId: "U1",
+        sourceActionId: "cancel-deferred",
+        now,
+      }),
+    ).toMatchObject({ kind: "accepted", disposition: "interrupt-requested" });
+    return seeded;
+  }
+
+  test("a cancel that finds the deferred operation's turn already ended unblocks the operation", async () => {
+    await withStore(async ({ store }) => {
+      const seeded = deferredOperationWithCancel(store);
+      const worker = new InteractionWorker({
+        config,
+        store,
+        t3: {
+          fetchThread: async (threadId) => threadWithTurn(threadId, "turn-1", { state: "completed" }),
+          dispatch: async () => {
+            throw new Error("an ended turn must not be interrupted");
+          },
+        },
+        workerId: "interaction-a",
+        now: () => new Date(now),
+      });
+      expect(await worker.processNext()).toMatchObject({ kind: "failed", errorCode: "OperationNotRunning" });
+      // The coordinator can claim the operation at once to observe and finalize the ended turn.
+      expect(store.claimNextOperation({ workerId: "coordinator-b", now, leaseMs: 10_000, maxConcurrentTasks: 2 }))
+        .toMatchObject({ operationId: seeded.operationId });
+    });
+  });
+
+  test("a cancel keeps its deferred operation blocked while retrying and unblocks it once retries are exhausted", async () => {
+    await withStore(async ({ store }) => {
+      const seeded = deferredOperationWithCancel(store);
+      let current = new Date(now);
+      const worker = new InteractionWorker({
+        config,
+        store,
+        t3: {
+          fetchThread: async (threadId) => threadWithTurn(threadId, "turn-1"),
+          dispatch: async () => {
+            throw new Error("socket closed before the receipt arrived");
+          },
+        },
+        workerId: "interaction-a",
+        retry: { baseDelayMs: 1_000, maxDelayMs: 1_000, maxAttempts: 2 },
+        now: () => current,
+      });
+      const claimOperation = () =>
+        store.claimNextOperation({
+          workerId: "coordinator-b",
+          now: current.toISOString(),
+          leaseMs: 10_000,
+          maxConcurrentTasks: 2,
+        });
+      const first = await worker.processNext();
+      expect(first.kind).toBe("retry-scheduled");
+      if (first.kind !== "retry-scheduled") throw new Error("expected a retry");
+      current = new Date(first.blockedUntil);
+      expect(claimOperation()).toBeNull();
+      expect(await worker.processNext()).toMatchObject({ kind: "failed", errorCode: "Error" });
+      expect(claimOperation()).toMatchObject({ operationId: seeded.operationId });
+    });
+  });
 });
