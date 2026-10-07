@@ -70,5 +70,7 @@ test("the checked-in Agent Tag config parses without hidden defaults", async () 
     timeoutSeconds: 300,
     retryDelaySeconds: 30,
     maxAttempts: 5,
+    maxTurnSeconds: 21_600,
   });
+  expect(config.limits.interactionExpirySeconds).toBe(86_400);
 });

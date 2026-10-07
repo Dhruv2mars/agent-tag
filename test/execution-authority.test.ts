@@ -61,7 +61,7 @@ for (const revocation of revocations) {
       expect(store.submitInteractionResponse({
         interactionId: interaction.interactionId, workspaceId: "T1", conversationId,
         threadTs: "1000.000001", actorUserId: "U1", sourceActionId: "action-1",
-        response: { decision: "accept" }, now,
+        response: { decision: "accept" }, expirySeconds: 86_400, now,
       }).kind).toBe("accepted");
       const schedules = new AgentTagSchedules({ config: originalConfig, store });
       for (const kind of ["reminder", "agent"] as const) {
@@ -85,7 +85,7 @@ for (const revocation of revocations) {
       expect(await coordinator.processNext()).toMatchObject({ kind: "failed", errorCode: "ExecutionAuthorityDenied" });
       expect(await coordinator.processNext()).toEqual({ kind: "idle" });
       const worker = new InteractionWorker({ config: currentConfig, store, t3: { dispatch }, now: () => new Date(now) });
-      expect(await worker.processNext()).toMatchObject({ kind: "failed", errorCode: "ExecutionAuthorityDenied" });
+      // The operation's terminal failure closed its queued approval in the same transaction.
       expect(await worker.processNext()).toEqual({ kind: "idle" });
       expect(calls).toBe(0);
       const scheduleWorker = new ScheduleWorker({ config: currentConfig, store, now: () => new Date(now) });
@@ -106,7 +106,8 @@ for (const revocation of revocations) {
       })).kind !== "idle") {}
       expect(sent).toBe(revocation.name === "user" ? 2 : 0);
       const audit = store.listAuditRecords({ limit: 100 });
-      expect(audit.filter((row) => (row.action === "operation.failed" || row.action === "interaction.response.failed") && JSON.stringify(row.metadata).includes("ExecutionAuthorityDenied"))).toHaveLength(2);
+      expect(audit.filter((row) => row.action === "operation.failed" && JSON.stringify(row.metadata).includes("ExecutionAuthorityDenied"))).toHaveLength(1);
+      expect(audit.filter((row) => row.action === "interaction.closed" && JSON.stringify(row.metadata).includes("operation-settled"))).toHaveLength(1);
       expect(audit.filter((row) => row.action === "schedule.authority-revoked")).toHaveLength(2);
       expect(JSON.stringify(audit)).not.toContain("private request canary");
       expect(JSON.stringify(audit)).not.toContain("private schedule canary");

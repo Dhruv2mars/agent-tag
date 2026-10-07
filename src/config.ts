@@ -24,13 +24,31 @@ const externalWritesSchema = z.discriminatedUnion("mode", [
   }),
 ]);
 
+/**
+ * A turn is stalled when T3 reports no progress (snapshot sequence, activity, or message updates)
+ * for `timeoutSeconds`. A turn that keeps progressing runs until it settles or its active polling
+ * time reaches the `maxTurnSeconds` backstop.
+ */
 const stalledTurnSchema = z
   .object({
     timeoutSeconds: z.number().int().positive().max(86_400),
     retryDelaySeconds: z.number().int().positive().max(3_600),
     maxAttempts: z.number().int().positive().max(10),
+    maxTurnSeconds: z.number().int().positive().max(604_800).optional(),
   })
-  .default({ timeoutSeconds: 300, retryDelaySeconds: 30, maxAttempts: 5 });
+  // An omitted ceiling defaults to 6h, raised to the stall timeout so older configs stay valid.
+  .transform(({ maxTurnSeconds, ...policy }) => ({
+    ...policy,
+    maxTurnSeconds: maxTurnSeconds ?? Math.max(21_600, policy.timeoutSeconds),
+  }))
+  .refine((policy) => policy.maxTurnSeconds >= policy.timeoutSeconds, {
+    path: ["maxTurnSeconds"],
+    message: "maxTurnSeconds must be at least timeoutSeconds",
+  })
+  .default({ timeoutSeconds: 300, retryDelaySeconds: 30, maxAttempts: 5, maxTurnSeconds: 21_600 });
+
+/** How long an approval or question may wait for a human before the turn is cancelled. */
+const interactionExpirySchema = z.number().int().min(60).max(2_592_000).default(86_400);
 
 const routeBaseSchema = z.object({
   conversationId: slackId,
@@ -102,6 +120,7 @@ export const agentTagConfigSchema = z
       maxConcurrentTasks: z.number().int().positive().max(32),
       maxActiveSchedules: z.number().int().positive().max(10_000).default(100),
       stalledTurn: stalledTurnSchema,
+      interactionExpirySeconds: interactionExpirySchema,
     }),
     retention: retentionSchema,
   })
