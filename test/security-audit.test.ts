@@ -591,6 +591,67 @@ describe("security audit run", () => {
     });
   });
 
+  test("a `..` after a symlinked repository root component climbs from the link target", async () => {
+    await withHost(async ({ root, configPath, config }) => {
+      // safe/link -> private/repo, so safe/link/.. is private, which holds the data directory.
+      const safe = join(root, "safe");
+      const hidden = join(root, "private");
+      await mkdir(safe);
+      await mkdir(join(hidden, "repo"), { recursive: true });
+      await mkdir(join(hidden, "data"), { mode: 0o700 });
+      await symlink(join(hidden, "repo"), join(safe, "link"));
+      const profiles = config.profiles as Array<Record<string, unknown>>;
+      await writeFile(
+        configPath,
+        JSON.stringify({
+          ...config,
+          dataDir: join(hidden, "data"),
+          profiles: profiles.map((profile) => ({ ...profile, repositoryRoots: [`${safe}/link/..`] })),
+        }),
+        { mode: 0o600 },
+      );
+      const report = await runSecurityAudit({ configPath, now: new Date(now), home: "/nonexistent-home", offline: true, logDirectory: join(root, "logs"), logFiles: [] });
+      expect(ids(report.findings)).toContain("high:repo-root-contains-private-path");
+      expect(await canonicalPath(`${safe}/link/../data`)).toBe(join(await realpath(hidden), "data"));
+      expect(await canonicalPath(`${safe}/link/missing/../x`)).toBe(join(await realpath(hidden), "repo", "x"));
+    });
+  });
+
+  test("a secret file that can be inspected but not read fails the audit, since its canary cannot be loaded", async () => {
+    if (process.getuid?.() === 0) return; // root bypasses file permissions
+    await withHost(async ({ root, configPath }) => {
+      const token = join(root, "secrets", "t3-token");
+      await chmod(token, 0o000);
+      try {
+        const report = await runSecurityAudit({ configPath, now: new Date(now), home: "/nonexistent-home", offline: true, logDirectory: join(root, "logs"), logFiles: [] });
+        expect(report.result).toBe("fail");
+        expect(report.findings.filter((finding) => finding.id === "secret-canary-unavailable").map((finding) => finding.path)).toEqual([token]);
+        expect(ids(report.findings)).not.toContain("high:secret-file-mode");
+      } finally {
+        await chmod(token, 0o600);
+      }
+    });
+  });
+
+  test("an unreadable log directory makes the secret scan incomplete and fails the audit", async () => {
+    if (process.getuid?.() === 0) return; // root bypasses directory permissions
+    await withHost(async ({ root, configPath }) => {
+      const locked = join(root, "locked");
+      const logs = join(locked, "logs");
+      await mkdir(logs, { recursive: true, mode: 0o700 });
+      await writeFile(join(logs, "service.stdout.log"), `x xoxb-${"D4".repeat(15)} x`, { mode: 0o600 });
+      await chmod(locked, 0o000);
+      try {
+        const report = await runSecurityAudit({ configPath, now: new Date(now), home: "/nonexistent-home", offline: true, logDirectory: logs });
+        expect(report.result).toBe("fail");
+        expect(ids(report.findings)).toContain("low:log-directory-unreadable");
+        expect(report.findings.filter((finding) => finding.id === "secret-scan-unreadable").map((finding) => finding.path)).toEqual([logs]);
+      } finally {
+        await chmod(locked, 0o700);
+      }
+    });
+  });
+
   test("reports a symlinked secret file that other users can repoint", async () => {
     await withHost(async ({ root, configPath, config }) => {
       const shared = join(root, "shared");
@@ -614,6 +675,7 @@ describe("security audit run", () => {
         expect(report.result).toBe("fail");
         expect(ids(report.findings).filter((id) => id === "high:secret-file-unreadable")).toHaveLength(3);
         expect(ids(report.findings)).not.toContain("high:secret-file-missing");
+        expect(ids(report.findings)).not.toContain("high:secret-canary-unavailable");
       } finally {
         await chmod(join(root, "secrets"), 0o700);
       }

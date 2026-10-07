@@ -1,6 +1,6 @@
 import { lstat, readdir, readlink, realpath, stat } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, sep } from "node:path";
 
 import { z } from "zod";
 
@@ -75,7 +75,7 @@ export async function guardDirectories(path: string): Promise<string[]> {
   const guards = new Set<string>();
   // Components are consumed one at a time so `..` after a symlink climbs from the link target, as the kernel does.
   const components = (from: string) => from.split(sep).filter((part) => part.length > 0 && part !== ".");
-  let pending = components(isAbsolute(path) ? path : join(process.cwd(), path));
+  let pending = components(absoluteUnnormalized(path));
   let current: string = sep;
   let hops = 0;
   while (pending.length > 0) {
@@ -136,19 +136,37 @@ async function fact(path: string, role: PathRole): Promise<PathFact & { readonly
   return { path, role, state: await pathState(path) };
 }
 
+/** `path` made absolute against the working directory without collapsing `..`, which must climb from link targets. */
+function absoluteUnnormalized(path: string): string {
+  return isAbsolute(path) ? path : `${process.cwd()}${sep}${path}`;
+}
+
 /**
- * Resolves every symlink in `path`, including parent components. A missing or unreadable tail is
- * appended to the canonical form of its nearest resolvable ancestor.
+ * Resolves every symlink in `path`, including parent components. Components are resolved one at a time, so a
+ * `..` after a symlink climbs from the link target, as the kernel does. A missing or unreadable component and
+ * everything after it are appended to the canonical form of the nearest resolvable ancestor.
  */
 export async function canonicalPath(path: string): Promise<string> {
-  const absolute = resolve(path);
-  try {
-    return await realpath(absolute);
-  } catch {
-    const parent = dirname(absolute);
-    if (parent === absolute) return absolute;
-    return join(await canonicalPath(parent), basename(absolute));
+  const parts = absoluteUnnormalized(path).split(sep).filter((part) => part.length > 0 && part !== ".");
+  let current: string = sep;
+  let resolvable = true;
+  for (const part of parts) {
+    if (part === "..") {
+      current = dirname(current);
+      continue;
+    }
+    const candidate = join(current, part);
+    if (resolvable) {
+      try {
+        current = await realpath(candidate);
+        continue;
+      } catch {
+        resolvable = false;
+      }
+    }
+    current = candidate;
   }
+  return current;
 }
 
 // The audit reads facts from the raw JSON leniently, so a config that fails validation is still
@@ -407,15 +425,35 @@ export async function runSecurityAudit(options: SecurityAuditOptions): Promise<S
   findings.push(...checkRetention(inputs.retention));
 
   const scanRoots = facts
-    .filter((item) => (item.role === "data-directory" || item.role === "log-directory") && item.state.kind === "directory")
+    // An unreadable root stays in: the scanner reports it as an entry it could not check, which fails the audit.
+    .filter(
+      (item) =>
+        (item.role === "data-directory" || item.role === "log-directory") &&
+        (item.state.kind === "directory" || item.state.kind === "unreadable"),
+    )
     .map((item) => item.path);
   if (scanRoots.length > 0) {
     const canaries: SecretCanary[] = [];
     for (const secretFile of inputs.secretFiles) {
       try {
         canaries.push({ name: secretFile.name, secret: await readSecretFile(secretFile.path) });
-      } catch {
-        // Permission and existence problems are already reported above; scan for known patterns only.
+      } catch (error) {
+        // Without the canary a leaked credential of no known shape goes unnoticed. Problems with the file or its
+        // directory are usually reported above already; one that is not (an owner-only file the auditing user
+        // cannot read, say) must still fail the audit.
+        const covered = findings.some(
+          (finding) =>
+            finding.severity === "high" && (finding.path === secretFile.path || finding.path === dirname(secretFile.path)),
+        );
+        if (!covered) {
+          findings.push({
+            id: "secret-canary-unavailable",
+            severity: "high",
+            message: `the configured ${secretFile.name} credential could not be loaded (${errorReason(error)}), so the secret scan cannot find copies of it`,
+            path: secretFile.path,
+            remediation: "run the audit as the Agent Tag service user and make sure that user can read the secret file",
+          });
+        }
       }
     }
     const excludedPaths = facts
