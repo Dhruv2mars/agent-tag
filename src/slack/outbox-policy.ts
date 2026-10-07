@@ -122,11 +122,30 @@ function stringField(value: unknown, key: string): string | undefined {
   return typeof found === "string" && found !== "" ? found : undefined;
 }
 
-/** Restrict stored codes to a short, secret-free token. */
-function safeCode(code: string): string {
-  const cleaned = code.replace(/[^A-Za-z0-9_.:-]/g, "_").slice(0, 64);
-  return cleaned === "" ? "unknown" : cleaned;
-}
+/**
+ * Platform errors Slack documents as "may or may not have happened". Listed so their codes are
+ * reported verbatim; they classify as ambiguous like any unrecognized error.
+ */
+const AMBIGUOUS_PLATFORM_ERRORS = new Set(["fatal_error", "internal_error"]);
+
+/** Every platform error code that is safe to store and log as-is. */
+const KNOWN_PLATFORM_ERRORS = new Set([
+  ...RETRYABLE_PLATFORM_ERRORS,
+  ...TERMINAL_PLATFORM_ERRORS,
+  ...AMBIGUOUS_PLATFORM_ERRORS,
+]);
+
+/**
+ * Stored and logged in place of any platform error we do not recognize. The WebClient puts a whole
+ * non-JSON response body into `data.error`, so unrecognized text may hold response contents or tokens.
+ */
+const UNRECOGNIZED_PLATFORM_ERROR = "unrecognized_platform_error";
+
+/** Errno-style codes (ECONNRESET, UND_ERR_SOCKET): upper-case letters, digits, underscores only. */
+const ERRNO_CODE = /^[A-Z][A-Z0-9_]{1,63}$/;
+
+/** Exception class names (TypeError, SlackDeliveryError): a plain identifier, nothing else. */
+const CLASS_NAME = /^[A-Za-z][A-Za-z0-9]{0,63}$/;
 
 function secondsToMs(value: unknown): number | undefined {
   const seconds = typeof value === "string" ? Number.parseInt(value, 10) : value;
@@ -154,18 +173,20 @@ function classifyNetworkError(error: unknown): SlackDeliveryFailure | null {
       return { kind: "ambiguous", errorCode: "timeout" };
     }
     if (code === undefined) continue;
-    if (PRE_SEND_NETWORK_CODES.has(code)) return { kind: "retryable", errorCode: safeCode(code) };
+    if (PRE_SEND_NETWORK_CODES.has(code)) return { kind: "retryable", errorCode: code };
     // A reset while connecting means the request was never written; after that it may have been.
     if (code === "ECONNRESET" && stringField(link, "syscall") === "connect") {
       return { kind: "retryable", errorCode: "ECONNRESET" };
     }
-    if (code.startsWith("E") || code.startsWith("UND_ERR")) return { kind: "ambiguous", errorCode: safeCode(code) };
+    if (code.startsWith("E") || code.startsWith("UND_ERR")) {
+      return { kind: "ambiguous", errorCode: ERRNO_CODE.test(code) ? code : "network_error" };
+    }
   }
   return null;
 }
 
 function classifyPlatformError(errorName: string, retryAfterMs: number | undefined): SlackDeliveryFailure {
-  const errorCode = safeCode(errorName);
+  const errorCode = KNOWN_PLATFORM_ERRORS.has(errorName) ? errorName : UNRECOGNIZED_PLATFORM_ERROR;
   if (RETRYABLE_PLATFORM_ERRORS.has(errorName)) {
     return retryAfterMs === undefined ? { kind: "retryable", errorCode } : { kind: "retryable", errorCode, retryAfterMs };
   }
@@ -188,7 +209,7 @@ export function classifySlackDeliveryError(error: unknown): SlackDeliveryFailure
   if (code === "slack_webapi_platform_error") {
     const data = field(error, "data");
     return classifyPlatformError(
-      stringField(data, "error") ?? "unknown_platform_error",
+      stringField(data, "error") ?? UNRECOGNIZED_PLATFORM_ERROR,
       secondsToMs(field(field(data, "response_metadata"), "retryAfter")),
     );
   }
@@ -207,7 +228,8 @@ export function classifySlackDeliveryError(error: unknown): SlackDeliveryFailure
   const network = classifyNetworkError(error);
   if (network !== null) return network;
   if (code === "slack_webapi_request_error") return { kind: "ambiguous", errorCode: "request_error" };
-  return { kind: "ambiguous", errorCode: safeCode(stringField(error, "name") ?? "SlackDeliveryError") };
+  const name = stringField(error, "name");
+  return { kind: "ambiguous", errorCode: name !== undefined && CLASS_NAME.test(name) ? name : "SlackDeliveryError" };
 }
 
 /**

@@ -54,7 +54,13 @@ function enqueue(
   }).outboxId;
 }
 
-type FakeReply = { readonly status: number; readonly headers?: Record<string, string>; readonly body?: unknown };
+type FakeReply = {
+  readonly status: number;
+  readonly headers?: Record<string, string>;
+  readonly body?: unknown;
+  /** A non-JSON response body, sent verbatim as text/plain. */
+  readonly raw?: string;
+};
 
 /** A local stand-in for slack.com/api driven through the real Slack WebClient with production options. */
 async function withFakeSlack(
@@ -73,6 +79,9 @@ async function withFakeSlack(
       requests.push(Object.fromEntries(new URLSearchParams(await request.text())));
       const reply = replies[Math.min(requests.length - 1, replies.length - 1)];
       if (reply === undefined) throw new Error("no fake reply");
+      if (reply.raw !== undefined) {
+        return new Response(reply.raw, { status: reply.status, headers: { "content-type": "text/plain", ...reply.headers } });
+      }
       return new Response(JSON.stringify(reply.body ?? {}), {
         status: reply.status,
         headers: { "content-type": "application/json", ...reply.headers },
@@ -180,6 +189,19 @@ describe("Slack outbox delivery retries", () => {
         expect(store.operationalStatus(at(11)).outbox).toMatchObject({ rateLimitedUntil: null });
         expect(await deliver(store, client, at(11))).toEqual({ kind: "delivered", outboxId: otherThread });
       });
+    });
+  });
+
+  test("a non-JSON response body is quarantined without storing its contents", async () => {
+    await withStore(async (store, taskId, correlationId) => {
+      const outboxId = enqueue(store, taskId, correlationId, { id: "reply-1" });
+      await withFakeSlack([{ status: 200, raw: "private task canary xoxb-secret-canary" }], async ({ client }) => {
+        expect(await deliver(store, client, start))
+          .toEqual({ kind: "quarantined", outboxId, errorCode: "unrecognized_platform_error" });
+      });
+      const audit = JSON.stringify(store.listAuditRecords({ limit: 200 }));
+      expect(audit).not.toContain("canary");
+      expect(audit).toContain("unrecognized_platform_error");
     });
   });
 
@@ -428,9 +450,11 @@ describe("Slack delivery error classification", () => {
   });
 
   test("ambiguous errors are quarantined", () => {
-    for (const error of ["internal_error", "fatal_error", "some_new_error"]) {
+    for (const error of ["internal_error", "fatal_error"]) {
       expect(classifySlackDeliveryError(platform(error))).toEqual({ kind: "ambiguous", errorCode: error });
     }
+    expect(classifySlackDeliveryError(platform("some_new_error")))
+      .toEqual({ kind: "ambiguous", errorCode: "unrecognized_platform_error" });
     expect(classifySlackDeliveryError({ code: "slack_webapi_request_error", original: new DOMException("t", "TimeoutError") }))
       .toEqual({ kind: "ambiguous", errorCode: "timeout" });
     // A reset after connecting may follow a fully written request.
@@ -440,6 +464,18 @@ describe("Slack delivery error classification", () => {
       .toEqual({ kind: "ambiguous", errorCode: "http_503" });
     expect(classifySlackDeliveryError(new Error("boom"))).toEqual({ kind: "ambiguous", errorCode: "Error" });
     expect(classifySlackDeliveryError("not an error")).toEqual({ kind: "ambiguous", errorCode: "SlackDeliveryError" });
+  });
+
+  test("reported error codes never carry response text or secrets", () => {
+    // The WebClient puts a whole non-JSON 200 body into data.error.
+    const leaked = classifySlackDeliveryError(platform("private task canary xoxb-secret-canary"));
+    expect(leaked).toEqual({ kind: "ambiguous", errorCode: "unrecognized_platform_error" });
+    expect(classifySlackDeliveryError({ code: "slack_webapi_platform_error", data: { ok: false } }))
+      .toEqual({ kind: "ambiguous", errorCode: "unrecognized_platform_error" });
+    expect(classifySlackDeliveryError(Object.assign(new Error("x"), { code: "E xoxb-secret-canary" })))
+      .toEqual({ kind: "ambiguous", errorCode: "network_error" });
+    expect(classifySlackDeliveryError(Object.assign(new Error("x"), { name: "private xoxb-secret-canary" })))
+      .toEqual({ kind: "ambiguous", errorCode: "SlackDeliveryError" });
   });
 
   test("deterministic errors are terminal; block and length errors allow a plain-text fallback", () => {
