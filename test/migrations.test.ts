@@ -145,6 +145,9 @@ test("upgrades every historical SQLite schema while preserving existing work", a
           .get(),
       ).toEqual({ status: "pending", blocked_until: null, render_mode: "rich" });
       expect(
+        upgraded.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM slack_rate_limits").get(),
+      ).toEqual({ count: 0 });
+      expect(
         upgraded.query<{ quick_check: string }, []>("PRAGMA quick_check").get()?.quick_check,
       ).toBe("ok");
       upgraded.close();

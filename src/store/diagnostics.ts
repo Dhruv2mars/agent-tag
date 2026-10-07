@@ -1,6 +1,7 @@
 // Read-only table counts and operational status for doctor/status.
 import type { Database } from "bun:sqlite";
 
+import { activeOutboxRateLimit } from "./outbox.ts";
 import { isoDateTime } from "./schema.ts";
 import type { OperationalStatus } from "./types.ts";
 
@@ -100,5 +101,10 @@ export function operationalStatus(database: Database, nowInput: string): Operati
   if (operations === null || interactions === null || outbox === null) {
     throw new Error("operational status query failed");
   }
-  return { asOf: now, operations, interactions, outbox };
+  return {
+    asOf: now,
+    operations,
+    interactions,
+    outbox: { ...outbox, rateLimitedUntil: activeOutboxRateLimit(database, now) },
+  };
 }

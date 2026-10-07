@@ -142,6 +142,47 @@ describe("Slack outbox delivery retries", () => {
     });
   });
 
+  test("a 429 pauses every thread until Retry-After, without spending their attempts", async () => {
+    await withStore(async (store, taskId, correlationId) => {
+      const limited = enqueue(store, taskId, correlationId, { id: "a-1" });
+      const otherThread = enqueue(store, taskId, correlationId, { id: "b-1", threadTs: "2000.000001", createdAt: at(1) });
+      await withFakeSlack(
+        [{ status: 429, headers: { "retry-after": "30" } }, ok("1000.000097"), ok("1000.000098"), ok("1000.000099")],
+        async ({ client, requests }) => {
+          expect(await deliver(store, client, at(10))).toMatchObject({ kind: "retry-scheduled", outboxId: limited });
+          expect(store.operationalStatus(at(11)).outbox).toMatchObject({ pending: 2, retryBlocked: 1, rateLimitedUntil: at(30_010) });
+          // A row queued during the cooldown, in yet another thread, waits too.
+          const queuedLater = enqueue(store, taskId, correlationId, { id: "c-1", threadTs: "3000.000001", createdAt: at(20) });
+          expect(await deliver(store, client, at(20))).toEqual({ kind: "idle" });
+          expect(await deliver(store, client, at(30_009))).toEqual({ kind: "idle" });
+          expect(requests).toHaveLength(1);
+          expect(actionCounts(store, otherThread)).toEqual({});
+          expect(await deliver(store, client, at(30_010))).toEqual({ kind: "delivered", outboxId: limited });
+          expect(await deliver(store, client, at(30_010))).toEqual({ kind: "delivered", outboxId: otherThread });
+          expect(await deliver(store, client, at(30_010))).toEqual({ kind: "delivered", outboxId: queuedLater });
+          expect(requests).toHaveLength(4);
+          expect(store.operationalStatus(at(30_011)).outbox).toMatchObject({ pending: 0, rateLimitedUntil: null });
+          expect(actionCounts(store, otherThread)).toEqual({ "slack.outbox.claimed": 1, "slack.outbox.delivered": 1 });
+          expect(actionCounts(store, queuedLater)).toEqual({ "slack.outbox.claimed": 1, "slack.outbox.delivered": 1 });
+        },
+      );
+      const retry = store.listAuditRecords({ limit: 200 }).find((row) => row.action === "slack.outbox.retry-scheduled");
+      expect(retry?.metadata).toMatchObject({ errorCode: "rate_limited", rateLimitedUntil: at(30_010) });
+    });
+  });
+
+  test("a non-rate-limit retryable error only holds back its own thread", async () => {
+    await withStore(async (store, taskId, correlationId) => {
+      const failed = enqueue(store, taskId, correlationId, { id: "a-1" });
+      const otherThread = enqueue(store, taskId, correlationId, { id: "b-1", threadTs: "2000.000001", createdAt: at(1) });
+      await withFakeSlack([platformError("service_unavailable"), ok("1000.000099")], async ({ client }) => {
+        expect(await deliver(store, client, at(10))).toMatchObject({ kind: "retry-scheduled", outboxId: failed });
+        expect(store.operationalStatus(at(11)).outbox).toMatchObject({ rateLimitedUntil: null });
+        expect(await deliver(store, client, at(11))).toEqual({ kind: "delivered", outboxId: otherThread });
+      });
+    });
+  });
+
   test("an internal_error is quarantined and never resent", async () => {
     await withStore(async (store, taskId, correlationId) => {
       const outboxId = enqueue(store, taskId, correlationId, { id: "reply-1" });
@@ -280,6 +321,27 @@ describe("Slack outbox claim", () => {
       expect(retried).toMatchObject({ outboxId: blocked, attempt: 2, renderMode: "rich" });
       store.markOutboxDelivered({ outboxId: blocked, workerId: "w", slackMessageTs: "1.1", now: at(60_001) });
       expect(store.claimNextOutbox({ workerId: "w", now: at(60_002), leaseMs: 10_000 })?.outboxId).toBe(sameThreadLater);
+    });
+  });
+
+  test("a rate-limit cooldown is never shortened and also follows retry exhaustion", async () => {
+    await withStore(async (store, taskId, correlationId) => {
+      const first = enqueue(store, taskId, correlationId, { id: "a-1" });
+      const second = enqueue(store, taskId, correlationId, { id: "b-1", threadTs: "2000.000001", createdAt: at(1) });
+      enqueue(store, taskId, correlationId, { id: "c-1", threadTs: "3000.000001", createdAt: at(2) });
+      expect(store.claimNextOutbox({ workerId: "w", now: at(10), leaseMs: 10_000 })?.outboxId).toBe(first);
+      expect(store.claimNextOutbox({ workerId: "w", now: at(10), leaseMs: 10_000 })?.outboxId).toBe(second);
+      store.retryOutbox({
+        outboxId: first, workerId: "w", errorCode: "rate_limited", blockedUntil: at(60_000), rateLimitedUntil: at(60_000), now: at(20),
+      });
+      expect(store.claimNextOutbox({ workerId: "w", now: at(30), leaseMs: 10_000 })).toBeNull();
+      // A second in-flight send that hits a shorter limit on its final attempt keeps the longer cooldown.
+      store.exhaustOutboxRetries({
+        outboxId: second, workerId: "w", errorCode: "rate_limited", attempts: 1, rateLimitedUntil: at(5_000), now: at(30),
+      });
+      expect(store.operationalStatus(at(5_000)).outbox).toMatchObject({ rateLimitedUntil: at(60_000) });
+      expect(store.claimNextOutbox({ workerId: "w", now: at(59_999), leaseMs: 10_000 })).toBeNull();
+      expect(store.claimNextOutbox({ workerId: "w", now: at(60_000), leaseMs: 10_000 })?.outboxId).toBe(first);
     });
   });
 

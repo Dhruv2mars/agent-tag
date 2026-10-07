@@ -40,6 +40,14 @@ const RETRYABLE_PLATFORM_ERRORS = new Set([
   "team_added_to_org",
 ]);
 
+/** Retryable error codes that mean Slack rate limited the call, not just this message. */
+const RATE_LIMIT_ERROR_CODES = new Set(["ratelimited", "rate_limited", "http_429"]);
+
+/** True when the failure is a Slack rate limit, which pauses every outbox send, not one row. */
+export function isRateLimitFailure(failure: SlackDeliveryFailure): boolean {
+  return failure.kind === "retryable" && RATE_LIMIT_ERROR_CODES.has(failure.errorCode);
+}
+
 /** Deterministic rejections of the payload shape or size; worth one plain-text fallback. */
 const PLAIN_FALLBACK_PLATFORM_ERRORS = new Set([
   "invalid_blocks",

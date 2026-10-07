@@ -1,5 +1,5 @@
-// Slack outbox queue: enqueue, claim (respecting retry backoff), delivery outcome, retry, fallback,
-// and quarantine of unknown outcomes.
+// Slack outbox queue: enqueue, claim (respecting retry backoff and rate-limit cooldowns), delivery
+// outcome, retry, fallback, and quarantine of unknown outcomes.
 import type { Database } from "bun:sqlite";
 
 import { writeAudit } from "./audit.ts";
@@ -98,6 +98,22 @@ export interface ClaimNextOutboxInput {
   readonly leaseMs: number;
 }
 
+/**
+ * Every outbox row is a chat.postMessage call with the one bot token, so a rate limit on any row
+ * (per channel, or for the method across the workspace; Slack does not say which) pauses them all.
+ */
+export const OUTBOX_RATE_LIMIT_SCOPE = "chat.postMessage";
+
+/** The instant until which the outbox's rate-limit cooldown holds, or null when none is active. */
+export function activeOutboxRateLimit(database: Database, now: string): string | null {
+  const row = database
+    .query<{ blocked_until: string }, [string, string]>(
+      "SELECT blocked_until FROM slack_rate_limits WHERE scope = ? AND blocked_until > ?",
+    )
+    .get(OUTBOX_RATE_LIMIT_SCOPE, now);
+  return row?.blocked_until ?? null;
+}
+
 /** Claim order for a row; also used to keep later rows of a thread behind an earlier blocked row. */
 const CLAIM_ORDER_COLUMNS = (alias: string): string =>
   `${alias}.created_at, ${alias}.correlation_id,
@@ -106,7 +122,8 @@ const CLAIM_ORDER_COLUMNS = (alias: string): string =>
 /**
  * Claims the next deliverable pending row. Rows waiting out a retry backoff (`blocked_until` in the
  * future) are skipped, and so are later rows of the same Slack thread, so a retried message is never
- * overtaken by the replies that were queued after it.
+ * overtaken by the replies that were queued after it. Nothing is claimed while a rate-limit cooldown
+ * is active.
  */
 export function claimNextOutbox(
   context: StoreContext,
@@ -117,6 +134,7 @@ export function claimNextOutbox(
   const now = isoDateTime.parse(input.now);
   const expiresAt = leaseExpiry(now, input.leaseMs);
   const claim = database.transaction((): ClaimedOutboxMessage | null => {
+    if (activeOutboxRateLimit(database, now) !== null) return null;
     const candidate = outboxIdentitySchema.nullable().parse(
       database
         .query(
@@ -248,6 +266,8 @@ interface OutboxSettlement {
     | "slack.outbox.fallback-scheduled";
   readonly result: string;
   readonly metadata: Record<string, string | number | boolean | null>;
+  /** Set when Slack rate limited the send: no row is claimable before this instant. */
+  readonly rateLimitedUntil?: string;
 }
 
 /** Moves a leased inflight row to its next state and writes the matching audit row atomically. */
@@ -273,6 +293,17 @@ function settleLeasedOutbox(database: Database, input: OutboxFailureInput, settl
         now,
       );
     requireLeaseHeld(result, "outbox");
+    if (settlement.rateLimitedUntil !== undefined) {
+      // Never shorten a cooldown another rate-limited send already set.
+      database
+        .query(
+          `INSERT INTO slack_rate_limits (scope, blocked_until, error_code, updated_at) VALUES (?, ?, ?, ?)
+           ON CONFLICT (scope) DO UPDATE SET
+             blocked_until = MAX(blocked_until, excluded.blocked_until),
+             error_code = excluded.error_code, updated_at = excluded.updated_at`,
+        )
+        .run(OUTBOX_RATE_LIMIT_SCOPE, settlement.rateLimitedUntil, errorCode, now);
+    }
     writeAudit(database, {
       actorType: "worker",
       actorId: input.workerId,
@@ -302,14 +333,27 @@ export function failOutbox(database: Database, input: OutboxFailureInput): void 
   });
 }
 
-export interface RetryOutboxInput extends OutboxFailureInput {
+export interface RateLimitCooldownInput {
+  /** Slack rate limited the send: no outbox row is claimable before this instant. */
+  readonly rateLimitedUntil?: string;
+}
+
+function cooldown(input: RateLimitCooldownInput): { rateLimitedUntil?: string } {
+  return input.rateLimitedUntil === undefined ? {} : { rateLimitedUntil: isoDateTime.parse(input.rateLimitedUntil) };
+}
+
+export interface RetryOutboxInput extends OutboxFailureInput, RateLimitCooldownInput {
   /** The row is not claimable before this instant. */
   readonly blockedUntil: string;
 }
 
-/** Known-not-delivered failure: back to pending, but not claimable until `blockedUntil`. */
+/**
+ * Known-not-delivered failure: back to pending, but not claimable until `blockedUntil`. A rate limit
+ * also pauses every other row until `rateLimitedUntil`.
+ */
 export function retryOutbox(database: Database, input: RetryOutboxInput): void {
   const blockedUntil = isoDateTime.parse(input.blockedUntil);
+  const rateLimit = cooldown(input);
   settleLeasedOutbox(database, input, {
     status: "pending",
     lastErrorCode: input.errorCode,
@@ -317,11 +361,12 @@ export function retryOutbox(database: Database, input: RetryOutboxInput): void {
     plainFallback: false,
     action: "slack.outbox.retry-scheduled",
     result: "pending",
-    metadata: { retryable: true, blockedUntil },
+    metadata: { retryable: true, blockedUntil, ...rateLimit },
+    ...rateLimit,
   });
 }
 
-export interface ExhaustOutboxRetriesInput extends OutboxFailureInput {
+export interface ExhaustOutboxRetriesInput extends OutboxFailureInput, RateLimitCooldownInput {
   readonly attempts: number;
 }
 
@@ -335,6 +380,7 @@ export function exhaustOutboxRetries(database: Database, input: ExhaustOutboxRet
     action: "slack.outbox.retry-exhausted",
     result: "failed",
     metadata: { retryable: false, attempts: input.attempts },
+    ...cooldown(input),
   });
 }
 

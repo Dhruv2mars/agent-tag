@@ -6,6 +6,7 @@ import type { AgentTagStore, ClaimedOutboxMessage, SlackOutboxPayload } from "..
 import {
   classifySlackDeliveryError,
   DEFAULT_OUTBOX_RETRY_POLICY,
+  isRateLimitFailure,
   outboxRetryDelayMs,
   plainTextFallback,
   type OutboxRetryPolicy,
@@ -85,18 +86,22 @@ function settleFailure(
   switch (failure.kind) {
     case "retryable": {
       const policy = input.retryPolicy ?? DEFAULT_OUTBOX_RETRY_POLICY;
-      if (claimed.attempt >= policy.maxAttempts) {
-        input.store.exhaustOutboxRetries({ ...settle, attempts: claimed.attempt });
-        return { kind: "retry-exhausted", ...outcome };
-      }
       const delayMs = outboxRetryDelayMs({
         attempt: claimed.attempt,
         policy,
         ...(failure.retryAfterMs === undefined ? {} : { retryAfterMs: failure.retryAfterMs }),
         ...(input.random === undefined ? {} : { random: input.random }),
       });
-      const blockedUntil = new Date(new Date(now).getTime() + delayMs).toISOString();
-      input.store.retryOutbox({ ...settle, blockedUntil });
+      const after = (ms: number): string => new Date(new Date(now).getTime() + ms).toISOString();
+      // A rate limit pauses every row (other threads, other channels) for Slack's Retry-After, or for
+      // this row's backoff when Slack gave none, so queued rows don't burn their attempts meanwhile.
+      const cooldown = isRateLimitFailure(failure) ? { rateLimitedUntil: after(failure.retryAfterMs ?? delayMs) } : {};
+      if (claimed.attempt >= policy.maxAttempts) {
+        input.store.exhaustOutboxRetries({ ...settle, attempts: claimed.attempt, ...cooldown });
+        return { kind: "retry-exhausted", ...outcome };
+      }
+      const blockedUntil = after(delayMs);
+      input.store.retryOutbox({ ...settle, blockedUntil, ...cooldown });
       return { kind: "retry-scheduled", ...outcome, blockedUntil };
     }
     case "terminal":

@@ -99,6 +99,8 @@ export interface OperationalStatus {
     readonly expiredLease: number;
     /** Pending rows waiting out a retry backoff (blocked_until in the future). */
     readonly retryBlocked: number;
+    /** End of the active Slack rate-limit cooldown that pauses every outbox send, or null. */
+    readonly rateLimitedUntil: string | null;
     readonly outcomeUnknown: number;
   };
 }
