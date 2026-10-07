@@ -8,6 +8,7 @@ import { classifyT3DispatchError } from "./t3/dispatch-errors.ts";
 import {
   dispatchT3Command,
   fetchT3ThreadSnapshot,
+  T3ThreadNotFoundError,
   type T3Command,
   type T3ConnectionConfig,
   type T3DispatchResult,
@@ -224,11 +225,19 @@ export class InteractionWorker {
 
   /**
    * Finds, in T3, the turn of a failed operation whose start was sent but never confirmed. Returns
-   * its id when it is still running. Settles the cancel when T3 never received the message or the
+   * its id when it is still running. Settles the cancel when T3 never received the message (or has no
+   * such thread) or the
    * turn already ended, and retries while T3 holds the message without having started its turn.
    */
   async #reconcileUnconfirmedTurn(response: ClaimedInteractionResponse): Promise<string> {
-    const snapshot = await this.#t3.fetchThread(response.threadId);
+    let snapshot: T3ThreadSnapshot;
+    try {
+      snapshot = await this.#t3.fetchThread(response.threadId);
+    } catch (error) {
+      // T3 confirmed the thread does not exist, so it never received this operation's turn.
+      if (error instanceof T3ThreadNotFoundError) throw new InteractionSettled("OperationNotRunning", true);
+      throw error;
+    }
     const userMessages = snapshot.thread.messages.filter((message) => message.role === "user");
     const message = userMessages.find((candidate) => candidate.id === response.operationMessageId);
     if (message === undefined) throw new InteractionSettled("OperationNotRunning", true);

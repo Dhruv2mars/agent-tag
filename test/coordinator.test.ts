@@ -8,7 +8,7 @@ import { AgentTagCoordinator, classifyT3TurnFailure, type T3CoordinatorGateway }
 import { InteractionWorker } from "../src/interaction-worker.ts";
 import { AgentTagMemory } from "../src/memory.ts";
 import { AgentTagStore } from "../src/store/store.ts";
-import type { T3Command, T3ThreadSnapshot } from "../src/t3/gateway.ts";
+import { T3ThreadNotFoundError, type T3Command, type T3ThreadSnapshot } from "../src/t3/gateway.ts";
 
 const now = "2026-09-21T00:00:00.000Z";
 const config = agentTagConfigSchema.parse({
@@ -911,6 +911,28 @@ describe("Agent Tag coordinator", () => {
       },
     );
     expect(outcome).toMatchObject({ kind: "failed", errorCode: "OperationNotRunning" });
+    expect(interrupts).toHaveLength(0);
+  });
+
+  test("a cancel settles without interrupting when T3 confirms the lost turn.start's thread does not exist", async () => {
+    const { outcome, interrupts } = await cancelAfterEveryReceiptLost(
+      "agent-tag-coordinator-receipts-lost-no-thread-",
+      (threadId) => {
+        throw new T3ThreadNotFoundError(threadId);
+      },
+    );
+    expect(outcome).toMatchObject({ kind: "failed", errorCode: "OperationNotRunning" });
+    expect(interrupts).toHaveLength(0);
+  });
+
+  test("a cancel retries when the lost turn.start's thread snapshot fails for another reason", async () => {
+    const { outcome, interrupts } = await cancelAfterEveryReceiptLost(
+      "agent-tag-coordinator-receipts-lost-snapshot-error-",
+      () => {
+        throw new Error("T3 thread snapshot endpoint returned HTTP 503");
+      },
+    );
+    expect(outcome).toMatchObject({ kind: "retry-scheduled" });
     expect(interrupts).toHaveLength(0);
   });
 

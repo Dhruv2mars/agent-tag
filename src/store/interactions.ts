@@ -213,6 +213,20 @@ export function submitInteractionResponse(
   return submit.immediate();
 }
 
+/**
+ * Failure codes recorded only after T3 itself reported the turn ended: an observed `error` turn
+ * (`classifyT3TurnFailure`) or a cancellation (an observed interrupt, or a turn never sent). Any other
+ * failure is local (settlement timeout, service errors, revoked authority) and leaves the T3 turn's
+ * outcome unknown, so cancellation must still interrupt it.
+ */
+export const T3_TURN_ENDED_FAILURE_CODES: ReadonlySet<string> = new Set([
+  "T3ProviderAuthPolicy",
+  "T3ProviderAuth",
+  "T3ProviderLimit",
+  "T3TurnError",
+  "user-cancelled",
+]);
+
 export interface RequestTaskCancellationInput {
   readonly taskId: string;
   readonly workspaceId: string;
@@ -229,6 +243,60 @@ const cancelPromptSchema = z.object({
 
 function cancelDisposition(promptJson: string): CancellationDisposition {
   return cancelPromptSchema.parse(parseStoredJson(promptJson)).disposition ?? "interrupt-requested";
+}
+
+/**
+ * Requeues a cancellation whose transient T3 errors exhausted its retries. It keeps the same command
+ * id, so T3 deduplicates the interrupt if an earlier attempt landed without a receipt. The superseded
+ * action id stays recorded so its late redelivery is still a duplicate.
+ */
+function requeueExhaustedCancellation(
+  database: Database,
+  prior: {
+    readonly interaction_id: string;
+    readonly response_command_id: string;
+    readonly prompt_json: string;
+    readonly source_action_id: string | null;
+    readonly operation_id: string;
+  },
+  input: { readonly actorUserId: string; readonly sourceActionId: string; readonly now: string },
+): RequestTaskCancellationResult {
+  if (prior.source_action_id !== null) {
+    database
+      .query(
+        `INSERT OR IGNORE INTO interaction_source_actions (source_action_id, interaction_id, created_at)
+         VALUES (?, ?, ?)`,
+      )
+      .run(prior.source_action_id, prior.interaction_id, input.now);
+  }
+  const requeued = database
+    .query(
+      `UPDATE interactions SET state = 'response-pending', attempts = 0, retries_exhausted = 0,
+         last_error_code = NULL, blocked_until = NULL, lease_owner = NULL, lease_expires_at = NULL,
+         response_actor_id = ?, source_action_id = ?, updated_at = ?
+       WHERE interaction_id = ? AND state = 'failed' AND retries_exhausted = 1`,
+    )
+    .run(input.actorUserId, input.sourceActionId, input.now, prior.interaction_id);
+  if (requeued.changes !== 1) throw new Error("exhausted cancellation changed during requeue");
+  const disposition = cancelDisposition(prior.prompt_json);
+  writeAudit(database, {
+    actorType: "slack-user",
+    actorId: input.actorUserId,
+    authority: "task-cancel",
+    source: input.sourceActionId,
+    target: prior.operation_id,
+    action: "task.cancellation.requested",
+    result: "requeued",
+    correlationId: prior.operation_id,
+    metadata: { disposition, interactionId: prior.interaction_id },
+    createdAt: input.now,
+  });
+  return {
+    kind: "accepted",
+    interactionId: prior.interaction_id,
+    commandId: prior.response_command_id,
+    disposition,
+  };
 }
 
 /**
@@ -288,6 +356,33 @@ export function requestTaskCancellation(
       };
     }
 
+    const exhaustedSchema = priorRowSchema.extend({
+      operation_id: nonEmpty,
+      source_action_id: nonEmpty.nullable(),
+    });
+    // Delivery failures can exhaust a cancellation's retries while its operation fails locally (for
+    // example on the settlement timeout) with the T3 turn possibly still running. A fresh action
+    // recovers that interrupt before any later operation is targeted. Operations whose T3 turn is
+    // confirmed ended, or was never sent, have nothing left to interrupt.
+    const endedCodes = [...T3_TURN_ENDED_FAILURE_CODES];
+    const stranded = exhaustedSchema.nullable().parse(
+      database
+        .query(
+          `SELECT i.interaction_id, i.response_command_id, i.prompt_json, i.source_action_id, o.operation_id
+           FROM interactions i JOIN operations o ON o.operation_id = i.operation_id
+           WHERE i.task_id = ? AND i.kind = 'cancel' AND i.state = 'failed' AND i.retries_exhausted = 1
+             AND o.status = 'failed'
+             AND (o.t3_turn_started_at IS NOT NULL OR o.t3_turn_dispatched_at IS NOT NULL)
+             AND (o.last_error_code IS NULL OR o.last_error_code NOT IN (${endedCodes.map(() => "?").join(", ")}))
+           ORDER BY o.source_order_key DESC, o.operation_id DESC
+           LIMIT 1`,
+        )
+        .get(taskId, ...endedCodes),
+    );
+    if (stranded !== null) {
+      return requeueExhaustedCancellation(database, stranded, { actorUserId, sourceActionId, now });
+    }
+
     const targetSchema = z.object({
       operation_id: nonEmpty,
       status: z.enum(["pending", "inflight"]),
@@ -320,45 +415,11 @@ export function requestTaskCancellation(
         .get(task.thread_id, requestId),
     );
     if (prior !== null && prior.state === "failed" && prior.retries_exhausted === 1) {
-      // Transient T3 errors exhausted the earlier attempt's retries while the operation still runs.
-      // A fresh action (redeliveries were deduplicated above) requeues it with the same command id,
-      // so T3 deduplicates the interrupt if an earlier attempt landed without a receipt. The
-      // superseded action id stays recorded so its late redelivery is still a duplicate.
-      if (prior.source_action_id !== null) {
-        database
-          .query(
-            `INSERT OR IGNORE INTO interaction_source_actions (source_action_id, interaction_id, created_at)
-             VALUES (?, ?, ?)`,
-          )
-          .run(prior.source_action_id, prior.interaction_id, now);
-      }
-      const requeued = database
-        .query(
-          `UPDATE interactions SET state = 'response-pending', attempts = 0, retries_exhausted = 0,
-             last_error_code = NULL, blocked_until = NULL, lease_owner = NULL, lease_expires_at = NULL,
-             response_actor_id = ?, source_action_id = ?, updated_at = ?
-           WHERE interaction_id = ? AND state = 'failed' AND retries_exhausted = 1`,
-        )
-        .run(actorUserId, sourceActionId, now, prior.interaction_id);
-      if (requeued.changes !== 1) throw new Error("exhausted cancellation changed during requeue");
-      writeAudit(database, {
-        actorType: "slack-user",
-        actorId: actorUserId,
-        authority: "task-cancel",
-        source: sourceActionId,
-        target: target.operation_id,
-        action: "task.cancellation.requested",
-        result: "requeued",
-        correlationId: target.operation_id,
-        metadata: { disposition: cancelDisposition(prior.prompt_json), interactionId: prior.interaction_id },
-        createdAt: now,
-      });
-      return {
-        kind: "accepted",
-        interactionId: prior.interaction_id,
-        commandId: prior.response_command_id,
-        disposition: cancelDisposition(prior.prompt_json),
-      };
+      return requeueExhaustedCancellation(
+        database,
+        { ...prior, operation_id: target.operation_id },
+        { actorUserId, sourceActionId, now },
+      );
     }
     if (prior !== null) {
       return {
