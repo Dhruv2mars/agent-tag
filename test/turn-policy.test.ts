@@ -1044,4 +1044,141 @@ describe("interactions of an abandoned turn (B7)", () => {
       expect(readOperation(harness.path, second.operationId)?.blocked_until).toBeNull();
     });
   });
+
+  function byRequestId(harness: Harness) {
+    return new Map(readInteractions(harness.path).map((row) => [row.request_id, row]));
+  }
+
+  /** Writes directly to the database, bypassing the store, to stage states its API cannot produce. */
+  function rawWrite(harness: Harness, sql: string, ...params: string[]): void {
+    const database = new Database(harness.path, { strict: true });
+    try {
+      database.query(sql).run(...params);
+    } finally {
+      database.close();
+    }
+  }
+
+  test("an answer still queued when stall attempts exhaust is closed with the operation and never sent", async () => {
+    await withHarness("stall-closes-queued", async (harness) => {
+      const config = configWith({
+        interactionExpirySeconds: 86_400,
+        stalledTurn: { timeoutSeconds: 60, retryDelaySeconds: 30, maxAttempts: 1 },
+      });
+      const receipt = ingest(harness.store, 1);
+      const question = record(harness, receipt, "question-1", "user-input", startMs);
+      expect(answer(harness, question, "answer-1").kind).toBe("accepted");
+      expect(byRequestId(harness).get("question-1")?.state).toBe("response-pending");
+
+      // The answer is still queued (no worker has sent it) when the turn exhausts its stall attempts.
+      const coordinator = coordinatorFor(harness, config, () => snapshot(harness.turn));
+      expect(await coordinator.processNext()).toMatchObject({ kind: "failed", errorCode: "T3TurnStalled" });
+      expect(readOperation(harness.path, receipt.operationId)?.status).toBe("failed");
+      expect(byRequestId(harness).get("question-1")).toMatchObject({ state: "failed", last_error_code: "operation-settled" });
+      expect(await deliverAll(harness, config)).toEqual([]);
+    });
+  });
+
+  test("an expiry failure closes the operation's other queued responses, so only the interrupt is sent", async () => {
+    await withHarness("expiry-closes-queued", async (harness) => {
+      const config = configWith({ interactionExpirySeconds: 3_600 });
+      const coordinator = coordinatorFor(harness, config, () =>
+        snapshot({ ...harness.turn, approvals: ["approval-1", "approval-2"] }));
+      const receipt = ingest(harness.store, 1);
+      expect(await coordinator.processNext()).toMatchObject({ kind: "waiting-interaction", approvalCount: 2 });
+      const approved = byRequestId(harness).get("approval-2");
+      if (approved === undefined) throw new Error("approval-2 interaction missing");
+      expect(approve(harness, approved.interaction_id, "click-2").kind).toBe("accepted");
+
+      // approval-1 goes unanswered and expires while approval-2's response is still queued.
+      harness.clock.ms = startMs + 3_600_000;
+      expect(await coordinator.processNext()).toMatchObject({ kind: "expired", operationId: receipt.operationId });
+      const rows = byRequestId(harness);
+      expect(rows.get("approval-1")).toMatchObject({ state: "failed", last_error_code: "expired" });
+      expect(rows.get("approval-2")).toMatchObject({ state: "failed", last_error_code: "operation-settled" });
+      expect(await deliverAll(harness, config)).toEqual([
+        expect.objectContaining({ type: "thread.turn.interrupt", threadId: harness.turn.threadId }),
+      ]);
+    });
+  });
+
+  test("a crashed worker's in-flight answer is never reclaimed after its operation hits the ceiling", async () => {
+    await withHarness("ceiling-inflight", async (harness) => {
+      const config = ceilingConfig();
+      const receipt = ingest(harness.store, 1);
+      const question = record(harness, receipt, "question-1", "user-input", startMs);
+      expect(answer(harness, question, "answer-1").kind).toBe("accepted");
+      // A worker claims the answer and crashes before sending it; its lease outlives the turn.
+      const claimed = harness.store.claimNextInteractionResponse({ workerId: "crashed", now: start, leaseMs: 3 * HOUR });
+      expect(claimed?.interactionId).toBe(question);
+
+      await abandonAtCeiling(harness, config);
+      expect(byRequestId(harness).get("question-1")).toMatchObject({ state: "failed", last_error_code: "abandoned" });
+      // A replacement worker delivers the interrupt; the abandoned answer is not reclaimable, then or later.
+      expect(await deliverAll(harness, config)).toEqual([
+        expect.objectContaining({ type: "thread.turn.interrupt", threadId: harness.turn.threadId }),
+      ]);
+      harness.clock.ms = startMs + 4 * HOUR;
+      expect(await deliverAll(harness, config)).toEqual([]);
+      expect(() =>
+        harness.store.completeInteractionResponse({ interactionId: question, workerId: "crashed", now: start }),
+      ).toThrow("interaction lease");
+    });
+  });
+
+  test("the claim settles, and never hands out, responses whose operation has settled", async () => {
+    await withHarness("claim-refuses-settled", async (harness) => {
+      const receipt = ingest(harness.store, 1);
+      const queued = record(harness, receipt, "question-1", "user-input", startMs);
+      const held = record(harness, receipt, "approval-1", "approval", startMs);
+      expect(answer(harness, queued, "answer-1").kind).toBe("accepted");
+      expect(approve(harness, held, "click-1").kind).toBe("accepted");
+      const claimed = harness.store.claimNextInteractionResponse({ workerId: "crashed", now: start, leaseMs: 1_000 });
+      expect([queued, held]).toContain(claimed?.interactionId ?? "none");
+      // Rows left behind by a settle that did not close them (e.g. written before this invariant):
+      // one queued response, one in flight under an expired lease.
+      rawWrite(harness, "UPDATE operations SET status = 'failed', last_error_code = 'legacy' WHERE operation_id = ?", receipt.operationId);
+
+      const later = new Date(startMs + 5_000).toISOString();
+      expect(harness.store.claimNextInteractionResponse({ workerId: "worker-b", now: later, leaseMs: 30_000 })).toBeNull();
+      const rows = byRequestId(harness);
+      expect(rows.get("question-1")).toMatchObject({ state: "failed", last_error_code: "operation-settled" });
+      expect(rows.get("approval-1")).toMatchObject({ state: "failed", last_error_code: "operation-settled" });
+    });
+  });
+
+  test("the worker refuses a claimed response whose operation settled before dispatch", async () => {
+    await withHarness("worker-refuses-settled", async (harness) => {
+      const config = configWith();
+      const receipt = ingest(harness.store, 1);
+      const approval = record(harness, receipt, "approval-1", "approval", startMs);
+      expect(approve(harness, approval, "click-1").kind).toBe("accepted");
+      // The operation settles between the worker's claim and its dispatch, outside a closing transition.
+      const store = harness.store;
+      const racingStore = new Proxy(store, {
+        get(target, property) {
+          if (property === "claimNextInteractionResponse") {
+            return (input: Parameters<AgentTagStore["claimNextInteractionResponse"]>[0]) => {
+              const claimed = target.claimNextInteractionResponse(input);
+              rawWrite(harness, "UPDATE operations SET status = 'failed' WHERE operation_id = ?", receipt.operationId);
+              return claimed;
+            };
+          }
+          const value: unknown = Reflect.get(target, property, target);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+      const delivered: T3Command[] = [];
+      const worker = new InteractionWorker({
+        config,
+        store: racingStore,
+        t3: { dispatch: async (command) => (delivered.push(command), { sequence: 1 }) },
+        now: () => new Date(harness.clock.ms),
+      });
+      expect(await worker.processNext()).toEqual({ kind: "failed", interactionId: approval, errorCode: "operation-settled" });
+      expect(delivered).toEqual([]);
+      expect(byRequestId(harness).get("approval-1")).toMatchObject({ state: "failed", last_error_code: "operation-settled" });
+      expect(await worker.processNext()).toEqual({ kind: "idle" });
+    });
+  });
 });

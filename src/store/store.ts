@@ -353,6 +353,12 @@ export class AgentTagStore {
     return interactions.claimNextInteractionResponse(this.#database, input);
   }
 
+  checkInteractionDispatch(
+    input: interactions.CheckInteractionDispatchInput,
+  ): interactions.CheckInteractionDispatchResult {
+    return interactions.checkInteractionDispatch(this.#database, input);
+  }
+
   completeInteractionResponse(input: interactions.CompleteInteractionResponseInput): void {
     interactions.completeInteractionResponse(this.#database, input);
   }

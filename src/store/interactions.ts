@@ -326,6 +326,26 @@ export interface ClaimNextInteractionResponseInput {
   readonly leaseMs: number;
 }
 
+/**
+ * INVARIANT: a non-cancel interaction response is dispatched to T3 only while its operation is
+ * `pending` or `inflight`. Once the operation has settled nothing tracks its T3 turn, so a late
+ * approval could approve work after a cancellation and a late answer could start an untracked
+ * message-mode turn. Cancel interactions (turn interrupts) are exempt: they exist to stop the turn
+ * of an operation Agent Tag already settled.
+ *
+ * Every path that can hand a response to T3 upholds it:
+ * - terminal operation transitions close the operation's open responses in the same transaction
+ *   (`closeOperationInteractions`), including in-flight ones, which lose their lease;
+ * - this claim (first claims and reclaims of expired leases alike) only selects dispatchable
+ *   responses, and settles any undispatchable one it would otherwise pick up as `failed`
+ *   (`operation-settled`), so it can never be retried or reclaimed;
+ * - a retryable worker failure returns a response to `response-pending`, i.e. back through this claim;
+ * - the worker re-checks just before dispatching (`checkInteractionDispatch`).
+ */
+const DISPATCHABLE_RESPONSE = `(i.kind = 'cancel' OR EXISTS (
+  SELECT 1 FROM operations o WHERE o.operation_id = i.operation_id AND o.status IN ('pending', 'inflight')))`;
+const CLAIMABLE_RESPONSE = `(i.state = 'response-pending' OR (i.state = 'inflight' AND i.lease_expires_at <= ?))`;
+
 export function claimNextInteractionResponse(
   database: Database,
   input: ClaimNextInteractionResponseInput,
@@ -334,21 +354,41 @@ export function claimNextInteractionResponse(
   const now = isoDateTime.parse(input.now);
   const expiresAt = leaseExpiry(now, input.leaseMs);
   const claim = database.transaction((): ClaimedInteractionResponse | null => {
+    // Settle claimable responses whose operation has already settled, instead of dispatching them.
+    const undispatchable = z
+      .array(z.object({ interaction_id: nonEmpty, operation_id: nonEmpty, state: z.enum(["response-pending", "inflight"]) }))
+      .parse(
+        database
+          .query(
+            `SELECT i.interaction_id, i.operation_id, i.state FROM interactions i
+             WHERE ${CLAIMABLE_RESPONSE} AND NOT ${DISPATCHABLE_RESPONSE}`,
+          )
+          .all(now),
+      );
+    for (const row of undispatchable) {
+      settleInteraction(database, {
+        interactionId: row.interaction_id,
+        fromState: row.state,
+        errorCode: OPERATION_SETTLED,
+        operationId: row.operation_id,
+        now,
+      });
+    }
     const candidate = interactionIdentitySchema.nullable().parse(
       database
         .query(
-          `SELECT interaction_id FROM interactions
-           WHERE state = 'response-pending' OR (state = 'inflight' AND lease_expires_at <= ?)
-           ORDER BY created_at, interaction_id LIMIT 1`,
+          `SELECT i.interaction_id FROM interactions i
+           WHERE ${CLAIMABLE_RESPONSE} AND ${DISPATCHABLE_RESPONSE}
+           ORDER BY i.created_at, i.interaction_id LIMIT 1`,
         )
         .get(now),
     );
     if (candidate === null) return null;
     const updated = database
       .query(
-        `UPDATE interactions SET state = 'inflight', attempts = attempts + 1,
+        `UPDATE interactions AS i SET state = 'inflight', attempts = attempts + 1,
            lease_owner = ?, lease_expires_at = ?, updated_at = ?
-         WHERE interaction_id = ? AND (state = 'response-pending' OR (state = 'inflight' AND lease_expires_at <= ?))`,
+         WHERE i.interaction_id = ? AND ${CLAIMABLE_RESPONSE} AND ${DISPATCHABLE_RESPONSE}`,
       )
       .run(workerId, expiresAt, now, candidate.interaction_id, now);
     if (updated.changes !== 1) return null;
@@ -388,6 +428,63 @@ export function claimNextInteractionResponse(
     };
   });
   return claim.immediate();
+}
+
+export interface CheckInteractionDispatchInput {
+  readonly interactionId: string;
+  readonly workerId: string;
+  readonly now: string;
+}
+
+export type CheckInteractionDispatchResult =
+  | { readonly kind: "dispatch" }
+  | { readonly kind: "refused"; readonly errorCode: string };
+
+/**
+ * The worker's last check before handing a claimed response to T3 (see the invariant at
+ * `claimNextInteractionResponse`): the worker must still hold the response's lease, and a non-cancel
+ * response's operation must still be pending or inflight. A held response whose operation settled
+ * since the claim is closed as `failed` (`operation-settled`) so it is never retried or reclaimed.
+ */
+export function checkInteractionDispatch(
+  database: Database,
+  input: CheckInteractionDispatchInput,
+): CheckInteractionDispatchResult {
+  const interactionId = requiredId(input.interactionId, "interactionId");
+  const workerId = requiredId(input.workerId, "workerId");
+  const now = isoDateTime.parse(input.now);
+  const check = database.transaction((): CheckInteractionDispatchResult => {
+    const row = z
+      .object({
+        operation_id: nonEmpty,
+        held: z.number().int(),
+        dispatchable: z.number().int(),
+        last_error_code: z.string().nullable(),
+      })
+      .nullable()
+      .parse(
+        database
+          .query(
+            `SELECT i.operation_id, i.last_error_code,
+                    (i.state = 'inflight' AND i.lease_owner = ? AND i.lease_expires_at > ?) AS held,
+                    ${DISPATCHABLE_RESPONSE} AS dispatchable
+             FROM interactions i WHERE i.interaction_id = ?`,
+          )
+          .get(workerId, now, interactionId),
+      );
+    if (row === null) return { kind: "refused", errorCode: "interaction-missing" };
+    if (row.held !== 1) return { kind: "refused", errorCode: row.last_error_code ?? "lease-lost" };
+    if (row.dispatchable === 1) return { kind: "dispatch" };
+    settleInteraction(database, {
+      interactionId,
+      fromState: "inflight",
+      errorCode: OPERATION_SETTLED,
+      operationId: row.operation_id,
+      now,
+    });
+    return { kind: "refused", errorCode: OPERATION_SETTLED };
+  });
+  return check.immediate();
 }
 
 export interface CompleteInteractionResponseInput {
@@ -544,52 +641,87 @@ export interface CloseOperationInteractionsInput {
   readonly operationId: string;
   /** Why the operation stopped accepting responses, recorded as each interaction's error code. */
   readonly errorCode: string;
+  /**
+   * Leave requests still awaiting a human (`pending`) open. They cannot be answered or dispatched
+   * while their operation is settled, and a later turn that T3 reports them on can adopt them (see
+   * `awaitOperationInteractions`). Used when a turn ends without Agent Tag giving up on it
+   * (completed, or interrupted in T3).
+   */
+  readonly keepAwaitingHuman?: boolean;
   readonly now: string;
 }
 
+/** The error code an interaction gets when its operation settles before its response reached T3. */
+export const OPERATION_SETTLED = "operation-settled";
+
+const closableStates = ["pending", "response-pending", "inflight"] as const;
+
 /**
- * Closes the approvals and questions an abandoned operation still has open: ones awaiting a human
- * and ones answered but not yet sent to T3. Without this, a late Slack click or reply could still
- * deliver an approval, or answer a message-mode question and start an untracked T3 turn, after the
- * turn was interrupted. A response a worker already holds (`inflight`) is left to finish. Runs inside
- * the caller's transaction; returns how many interactions were closed.
+ * Closes the approvals and questions an operation still has open when it settles: ones awaiting a
+ * human, ones answered but not yet sent to T3, and ones a worker holds (`inflight`). Without this, a
+ * queued or reclaimed response could deliver an approval, or answer a message-mode question and
+ * start an untracked T3 turn, after the operation failed, was interrupted or was abandoned. An
+ * in-flight response loses its lease and becomes `failed`, so it is never retried or reclaimed; a
+ * worker already dispatching it can no longer complete or retry it. Every terminal operation
+ * transition calls this inside its own transaction; returns how many interactions were closed.
  */
 export function closeOperationInteractions(database: Database, input: CloseOperationInteractionsInput): number {
   const operationId = requiredId(input.operationId, "operationId");
   const errorCode = requiredId(input.errorCode, "errorCode");
+  const now = isoDateTime.parse(input.now);
+  const states = input.keepAwaitingHuman === true
+    ? closableStates.filter((state) => state !== "pending")
+    : closableStates;
   const open = z
-    .array(z.object({ interaction_id: nonEmpty, state: z.enum(["pending", "response-pending"]) }))
+    .array(z.object({ interaction_id: nonEmpty, state: z.enum(closableStates) }))
     .parse(
       database
         .query(
           `SELECT interaction_id, state FROM interactions
-           WHERE operation_id = ? AND kind != 'cancel' AND state IN ('pending', 'response-pending')
+           WHERE operation_id = ? AND kind != 'cancel' AND state IN (${states.map(() => "?").join(", ")})
            ORDER BY created_at, interaction_id`,
         )
-        .all(operationId),
+        .all(operationId, ...states),
     );
   let closed = 0;
   for (const row of open) {
-    const result = database
-      .query(
-        `UPDATE interactions SET state = 'failed', last_error_code = ?, updated_at = ?
-         WHERE interaction_id = ? AND state = ?`,
-      )
-      .run(errorCode, input.now, row.interaction_id, row.state);
-    if (result.changes !== 1) continue;
-    closed += 1;
-    writeAudit(database, {
-      actorType: "service",
-      actorId: "agent-tag",
-      authority: "turn-policy",
-      source: row.interaction_id,
-      target: row.interaction_id,
-      action: "interaction.closed",
-      result: "failed",
-      correlationId: operationId,
-      metadata: { errorCode, previousState: row.state },
-      createdAt: input.now,
-    });
+    if (settleInteraction(database, { interactionId: row.interaction_id, fromState: row.state, errorCode, now, operationId })) {
+      closed += 1;
+    }
   }
   return closed;
+}
+
+/** Moves one open interaction to `failed`, dropping any lease, and audits it. Runs in the caller's transaction. */
+function settleInteraction(
+  database: Database,
+  input: {
+    readonly interactionId: string;
+    readonly fromState: (typeof closableStates)[number];
+    readonly errorCode: string;
+    readonly operationId: string;
+    readonly now: string;
+  },
+): boolean {
+  const result = database
+    .query(
+      `UPDATE interactions SET state = 'failed', last_error_code = ?, lease_owner = NULL,
+         lease_expires_at = NULL, updated_at = ?
+       WHERE interaction_id = ? AND state = ? AND kind != 'cancel'`,
+    )
+    .run(input.errorCode, input.now, input.interactionId, input.fromState);
+  if (result.changes !== 1) return false;
+  writeAudit(database, {
+    actorType: "service",
+    actorId: "agent-tag",
+    authority: "turn-policy",
+    source: input.interactionId,
+    target: input.interactionId,
+    action: "interaction.closed",
+    result: "failed",
+    correlationId: input.operationId,
+    metadata: { errorCode: input.errorCode, previousState: input.fromState },
+    createdAt: input.now,
+  });
+  return true;
 }

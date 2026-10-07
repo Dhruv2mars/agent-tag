@@ -3,6 +3,7 @@ import type { Database } from "bun:sqlite";
 
 import { writeAudit } from "./audit.ts";
 import { type StoreContext, requiredId, parseStoredJson } from "./context.ts";
+import { OPERATION_SETTLED, closeOperationInteractions } from "./interactions.ts";
 import { leaseExpiry, requireLeaseHeld } from "./lease.ts";
 import { insertOutboxMessage } from "./outbox.ts";
 import {
@@ -234,6 +235,14 @@ export function completeOperation(database: Database, input: CompleteOperationIn
         now,
       );
     requireLeaseHeld(result, "operation");
+    // The turn ended in T3: no queued or in-flight response may reach it now. Requests still
+    // awaiting a human stay open for a later turn to adopt (they cannot be answered meanwhile).
+    closeOperationInteractions(database, {
+      operationId: input.operationId,
+      errorCode: OPERATION_SETTLED,
+      keepAwaitingHuman: true,
+      now,
+    });
     writeAudit(database, {
       actorType: "worker",
       actorId: input.workerId,
@@ -289,6 +298,14 @@ export function completeOperationWithOutbox(
         now,
       );
     requireLeaseHeld(result, "operation");
+    // The turn ended in T3: no queued or in-flight response may reach it now. Requests still
+    // awaiting a human stay open for a later turn to adopt (they cannot be answered meanwhile).
+    closeOperationInteractions(database, {
+      operationId: input.operationId,
+      errorCode: OPERATION_SETTLED,
+      keepAwaitingHuman: true,
+      now,
+    });
 
     // A single reply keeps the historical `:final` id; chunked replies get stable
     // `:final-1..n` ids. Chunks are spaced 1ms apart so the outbox claim order
@@ -469,6 +486,10 @@ export function failOperation(database: Database, input: FailOperationInput): vo
         now,
       );
     requireLeaseHeld(result, "operation");
+    if (!input.retryable) {
+      // A terminally failed operation tracks no T3 turn, so none of its responses may reach T3.
+      closeOperationInteractions(database, { operationId: input.operationId, errorCode: OPERATION_SETTLED, now });
+    }
     writeAudit(database, {
       actorType: "worker",
       actorId: input.workerId,
@@ -532,6 +553,9 @@ export function settleFailedOperation(
       now,
     );
   requireLeaseHeld(result, "operation");
+  // A failed operation tracks no T3 turn, so none of its responses may reach T3 (stall exhaustion,
+  // expiry, abandonment, unrecoverable errors).
+  closeOperationInteractions(database, { operationId, errorCode: OPERATION_SETTLED, now });
 
   const clientMessageId = `${operationId}:failed`;
   const prior = outboxIdentitySchema.nullable().parse(
@@ -608,6 +632,14 @@ export function cancelOperationWithOutbox(database: Database, input: CancelOpera
         now,
       );
     requireLeaseHeld(result, "operation");
+    // The turn was interrupted in T3: no queued or in-flight response may reach it now. Requests still
+    // awaiting a human stay open for a later turn to adopt (they cannot be answered meanwhile).
+    closeOperationInteractions(database, {
+      operationId: input.operationId,
+      errorCode: OPERATION_SETTLED,
+      keepAwaitingHuman: true,
+      now,
+    });
     const clientMessageId = `${operationId}:cancelled`;
     const outboxId = crypto.randomUUID();
     insertOutboxMessage(database, {
