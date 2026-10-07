@@ -345,7 +345,15 @@ export async function runSecurityAudit(options: SecurityAuditOptions): Promise<S
     dataDirectory.kind === "directory" &&
     (dataDirectory.mode & 0o077) === 0 &&
     (ownerUid === undefined || dataDirectory.uid === ownerUid);
-  for (const item of facts) findings.push(...checkPathPermissions(item, ownerUid, { parentPrivate }));
+  // The private directory shields a store file only when the file it resolves to actually lives inside it;
+  // a symlink out of the data directory leaves the target exposed to its own directory's permissions.
+  const realDataDir = inputs.dataDir === undefined ? undefined : await canonicalPath(inputs.dataDir);
+  const shieldedByDataDir = async (item: PathFact): Promise<boolean> =>
+    parentPrivate && realDataDir !== undefined && (await canonicalPath(item.path)).startsWith(`${realDataDir}${sep}`);
+  for (const item of facts) {
+    const shielded = item.role === "database" && (await shieldedByDataDir(item));
+    findings.push(...checkPathPermissions(item, ownerUid, { parentPrivate: shielded }));
+  }
   findings.push(...checkReplaceableAncestors(await guardDirectoryFacts([configFact, ...facts]), ownerUid));
 
   findings.push(...checkAccess(inputs.access));
@@ -415,7 +423,6 @@ export async function runSecurityAudit(options: SecurityAuditOptions): Promise<S
       .map((item) => item.path);
     try {
       // The scanner reports resolved paths, so match the store files under the resolved data directory.
-      const realDataDir = inputs.dataDir === undefined ? undefined : await canonicalPath(inputs.dataDir);
       const databasePaths =
         realDataDir === undefined ? [] : DATABASE_SUFFIXES.map((suffix) => join(realDataDir, `agent-tag.sqlite${suffix}`));
       findings.push(

@@ -723,6 +723,30 @@ describe("security audit run", () => {
     });
   });
 
+  test("a loose store file is downgraded only while it really sits inside the private data directory", async () => {
+    await withHost(async ({ root, configPath }) => {
+      const options = { configPath, now: new Date(now), home: "/nonexistent-home", offline: true, logDirectory: join(root, "logs"), logFiles: [] };
+      const store = join(root, "data", "agent-tag.sqlite");
+      await writeFile(store, "store\n", { mode: 0o644 });
+      await chmod(store, 0o644);
+      const inside = await runSecurityAudit(options);
+      expect(inside.findings.filter((finding) => finding.id === "database-mode").map((finding) => finding.severity)).toEqual(["low"]);
+      expect(inside.result).toBe("pass");
+
+      // The link stays in the private directory, but the file it opens is readable through a traversable one.
+      await rm(store);
+      const exposed = join(root, "exposed");
+      await mkdir(exposed, { mode: 0o755 });
+      await chmod(exposed, 0o755);
+      await writeFile(join(exposed, "agent-tag.sqlite"), "store\n", { mode: 0o644 });
+      await chmod(join(exposed, "agent-tag.sqlite"), 0o644);
+      await symlink(join(exposed, "agent-tag.sqlite"), store);
+      const outside = await runSecurityAudit(options);
+      expect(outside.findings.filter((finding) => finding.id === "database-mode").map((finding) => finding.severity)).toEqual(["high"]);
+      expect(outside.result).toBe("fail");
+    });
+  });
+
   test("checks every file in a custom log directory and says when no logs were found", async () => {
     await withHost(async ({ root, configPath }) => {
       const missing = await runSecurityAudit({ configPath, now: new Date(now), home: "/nonexistent-home", offline: true });
