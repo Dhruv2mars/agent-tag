@@ -29,8 +29,9 @@ export type SubmitInteractionResponseResult =
   | { readonly kind: "denied" };
 
 /**
- * `interrupt-requested`: the operation started a T3 turn and the interaction worker will interrupt it.
- * `cancelled-queued`: the operation never started a T3 turn and was cancelled in the store directly.
+ * `interrupt-requested`: the operation started (or may have started) a T3 turn and the interaction
+ * worker will interrupt it once the turn is confirmed.
+ * `cancelled-queued`: the operation never sent its T3 turn and was cancelled in the store directly.
  */
 export type CancellationDisposition = "interrupt-requested" | "cancelled-queued";
 
@@ -231,9 +232,9 @@ function cancelDisposition(promptJson: string): CancellationDisposition {
 }
 
 /**
- * Cancels the task's current operation. Only an operation that has dispatched its T3 turn is
- * interrupted (through a queued `cancel` interaction the worker sends to T3). An operation still
- * queued behind nothing, with no T3 turn, is cancelled here in the store and never reaches T3.
+ * Cancels the task's current operation. An operation that has attempted to dispatch its T3 turn is
+ * interrupted (through a queued `cancel` interaction the worker sends to T3), even if the receipt
+ * was lost. Only an operation that never sent `thread.turn.start` is cancelled here in the store.
  */
 export function requestTaskCancellation(
   database: Database,
@@ -288,11 +289,12 @@ export function requestTaskCancellation(
       operation_id: nonEmpty,
       status: z.enum(["pending", "inflight"]),
       t3_turn_started_at: isoDateTime.nullable(),
+      t3_turn_dispatched_at: isoDateTime.nullable(),
     });
     const target = targetSchema.nullable().parse(
       database
         .query(
-          `SELECT o.operation_id, o.status, o.t3_turn_started_at FROM operations o
+          `SELECT o.operation_id, o.status, o.t3_turn_started_at, o.t3_turn_dispatched_at FROM operations o
            WHERE o.task_id = ? AND o.status IN ('pending', 'inflight')
            ORDER BY CASE o.status WHEN 'inflight' THEN 0 ELSE 1 END, o.source_order_key, o.operation_id
            LIMIT 1`,
@@ -318,7 +320,11 @@ export function requestTaskCancellation(
       };
     }
 
-    const queued = target.status === "pending" && target.t3_turn_started_at === null;
+    // A turn whose dispatch was attempted may be running in T3 even if its receipt was lost, so only
+    // an operation that never sent `thread.turn.start` is dropped locally. The rest wait for the
+    // coordinator's idempotent replay to confirm the turn, then interrupt it.
+    const queued = target.status === "pending" && target.t3_turn_started_at === null &&
+      target.t3_turn_dispatched_at === null;
     const disposition: CancellationDisposition = queued ? "cancelled-queued" : "interrupt-requested";
     const interactionId = crypto.randomUUID();
     const commandId = crypto.randomUUID();
@@ -327,7 +333,8 @@ export function requestTaskCancellation(
         .query(
           `UPDATE operations SET status = 'failed', last_error_code = 'user-cancelled', blocked_until = NULL,
              lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
-           WHERE operation_id = ? AND status = 'pending' AND t3_turn_started_at IS NULL`,
+           WHERE operation_id = ? AND status = 'pending' AND t3_turn_started_at IS NULL
+             AND t3_turn_dispatched_at IS NULL`,
         )
         .run(now, target.operation_id);
       if (cancelled.changes !== 1) throw new Error("queued operation changed during cancellation");

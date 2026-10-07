@@ -164,7 +164,7 @@ describe("Agent Tag service", () => {
       };
       const service = new AgentTagService({
         store,
-        bridge: { start: async () => {}, stop: async () => {}, deliverNextOutbox: async () => false },
+        bridge: { start: async () => {}, stop: async () => {}, deliverNextOutbox: async () => ({ kind: "idle" }) },
         coordinators: [{ processNext: async () => ({ kind: "idle" }) }],
         interactionWorkers: [retrying],
         idleMs: 20,

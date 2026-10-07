@@ -5,6 +5,7 @@ import { join } from "node:path";
 
 import { agentTagConfigSchema } from "../src/config.ts";
 import { AgentTagCoordinator, classifyT3TurnFailure, type T3CoordinatorGateway } from "../src/coordinator.ts";
+import { InteractionWorker } from "../src/interaction-worker.ts";
 import { AgentTagMemory } from "../src/memory.ts";
 import { AgentTagStore } from "../src/store/store.ts";
 import type { T3Command, T3ThreadSnapshot } from "../src/t3/gateway.ts";
@@ -694,6 +695,101 @@ describe("Agent Tag coordinator", () => {
     } finally {
       store.close();
       if (!directory.startsWith(`${tmpdir()}/agent-tag-coordinator-cancel-`)) {
+        throw new Error(`refusing to remove unexpected fixture path ${directory}`);
+      }
+      await rm(directory, { recursive: true });
+    }
+  });
+
+  test("a cancel after a lost turn.start receipt interrupts the replayed turn instead of dropping it", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "agent-tag-coordinator-lost-receipt-"));
+    const store = await AgentTagStore.open(join(directory, "agent-tag.sqlite"));
+    let current = new Date(now);
+    let threadId = "not-dispatched";
+    let receiptsLost = 1;
+    let interrupted = false;
+    const commands: T3Command[] = [];
+    const interactionOutcomes: string[] = [];
+    const worker = new InteractionWorker({
+      config,
+      store,
+      t3: {
+        dispatch: async (command) => {
+          commands.push(command);
+          if (command.type === "thread.turn.interrupt") interrupted = true;
+          return { sequence: commands.length };
+        },
+      },
+      workerId: "interaction-a",
+      now: () => current,
+    });
+    const coordinator = new AgentTagCoordinator({
+      config,
+      store,
+      t3: {
+        dispatch: async (command) => {
+          commands.push(command);
+          if (command.type === "thread.turn.start") {
+            threadId = command.threadId;
+            // T3 accepted the turn, but the response never reached Agent Tag.
+            if (receiptsLost > 0) {
+              receiptsLost -= 1;
+              throw new Error("socket closed before the dispatch receipt arrived");
+            }
+          }
+          return { sequence: commands.length };
+        },
+        fetchThread: async () => {
+          if (!interrupted) interactionOutcomes.push((await worker.processNext()).kind);
+          return interrupted ? interruptedSnapshot(threadId) : runningSnapshot(threadId, "unused");
+        },
+      },
+      workerId: "worker-a",
+      now: () => current,
+      sleep: async () => {},
+    });
+    try {
+      const receipt = store.ingestSlackEvent({
+        deliveryId: "delivery-1",
+        eventKey: "C1:1000.000001",
+        workspaceId: "T1",
+        conversationId: "C1",
+        threadTs: "1000.000001",
+        actorUserId: "U1",
+        conversationType: "channel",
+        profileId: "engineering",
+        repositoryRoot: "/srv/repos/example",
+        text: "request",
+        receivedAt: now,
+        sourceOrderKey: "1000.000001",
+      });
+      expect((await coordinator.processNext()).kind).toBe("retry-scheduled");
+      expect(
+        store.requestTaskCancellation({
+          taskId: receipt.taskId,
+          workspaceId: "T1",
+          conversationId: "C1",
+          threadTs: "1000.000001",
+          actorUserId: "U1",
+          sourceActionId: "cancel-after-lost-receipt",
+          now: current.toISOString(),
+        }),
+      ).toMatchObject({ kind: "accepted", disposition: "interrupt-requested" });
+      // The turn's fate is unknown, so the interrupt waits for the replay rather than firing blindly.
+      const waiting = await worker.processNext();
+      expect(waiting).toMatchObject({ kind: "retry-scheduled", errorCode: "T3TurnNotStarted" });
+      if (waiting.kind !== "retry-scheduled") throw new Error("expected a retry");
+
+      current = new Date(Math.max(new Date(waiting.blockedUntil).getTime(), current.getTime() + 60_000));
+      expect((await coordinator.processNext()).kind).toBe("cancelled");
+      expect(interactionOutcomes).toEqual(["resolved"]);
+      const turnStarts = commands.filter((command) => command.type === "thread.turn.start");
+      expect(turnStarts).toHaveLength(2);
+      expect(turnStarts[1]?.commandId).toBe(turnStarts[0]?.commandId);
+      expect(commands.filter((command) => command.type === "thread.turn.interrupt")).toHaveLength(1);
+    } finally {
+      store.close();
+      if (!directory.startsWith(`${tmpdir()}/agent-tag-coordinator-lost-receipt-`)) {
         throw new Error(`refusing to remove unexpected fixture path ${directory}`);
       }
       await rm(directory, { recursive: true });

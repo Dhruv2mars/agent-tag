@@ -468,6 +468,13 @@ export class AgentTagCoordinator {
       createdAt: task.projectCreatedAt,
     }, signal), signal);
 
+    // Recorded first: if the receipt is lost, T3 may still run the turn, so cancellation has to wait
+    // for the replay below to confirm it instead of dropping the operation locally.
+    this.#store.markOperationTurnDispatched({
+      operationId: operation.operationId,
+      workerId: this.#workerId,
+      now: this.#now().toISOString(),
+    });
     const turn = await abortable(this.#t3.dispatch({
       type: "thread.turn.start",
       commandId: operation.commandId,

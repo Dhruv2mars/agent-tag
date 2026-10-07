@@ -292,6 +292,22 @@ export const STORE_MIGRATIONS: readonly StoreMigration[] = [
       ALTER TABLE interactions ADD COLUMN blocked_until TEXT;
       ALTER TABLE operations ADD COLUMN t3_turn_started_at TEXT;
       ALTER TABLE operations ADD COLUMN t3_turn_id TEXT;
+      ALTER TABLE operations ADD COLUMN t3_turn_dispatched_at TEXT;
+
+      -- Unfinished operations from before these markers existed: a posted "working" message or a
+      -- recorded T3 approval/user-input request proves the turn started, and any claim may have
+      -- dispatched it. Cancellation must interrupt these in T3 rather than drop them locally.
+      UPDATE operations SET t3_turn_started_at = COALESCE(
+          (SELECT MIN(created_at) FROM slack_outbox
+           WHERE client_message_id = operations.operation_id || ':started'),
+          (SELECT MIN(created_at) FROM interactions
+           WHERE operation_id = operations.operation_id AND kind IN ('approval', 'user-input')))
+      WHERE status IN ('pending', 'inflight');
+      UPDATE operations SET t3_turn_dispatched_at = COALESCE(t3_turn_started_at, updated_at)
+      WHERE status IN ('pending', 'inflight') AND (
+        t3_turn_started_at IS NOT NULL OR attempts > 0 OR EXISTS (
+          SELECT 1 FROM audit_log
+          WHERE correlation_id = operations.operation_id AND action = 'operation.claimed'));
     `,
   },
 ];

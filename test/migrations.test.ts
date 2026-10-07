@@ -151,11 +151,16 @@ test("upgrades every historical SQLite schema while preserving existing work", a
       ).toEqual({ count: 0 });
       expect(
         upgraded
-          .query<{ t3_turn_started_at: string | null; t3_turn_id: string | null }, []>(
-            "SELECT t3_turn_started_at, t3_turn_id FROM operations",
+          .query<{ t3_turn_started_at: string | null; t3_turn_dispatched_at: string | null; t3_turn_id: string | null }, []>(
+            "SELECT t3_turn_started_at, t3_turn_dispatched_at, t3_turn_id FROM operations",
           )
           .get(),
-      ).toEqual({ t3_turn_started_at: null, t3_turn_id: null });
+      ).toEqual({
+        // The seeded pending operation already posted its "working" message, so its turn started.
+        t3_turn_started_at: createdAt,
+        t3_turn_dispatched_at: createdAt,
+        t3_turn_id: null,
+      });
       expect(
         upgraded
           .query<{ name: string }, []>("SELECT name FROM pragma_table_info('interactions') WHERE name = 'blocked_until'")
@@ -171,5 +176,91 @@ test("upgrades every historical SQLite schema while preserving existing work", a
       }
       await rm(directory, { recursive: true });
     }
+  }
+});
+
+test("backfills started and dispatched turn markers for unfinished operations from persisted evidence", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-tag-migration-turn-markers-"));
+  const path = join(directory, "agent-tag.sqlite");
+  try {
+    const historical = new Database(path, { create: true, strict: true });
+    historical.exec("PRAGMA foreign_keys = ON");
+    historical.exec("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)");
+    for (const migration of STORE_MIGRATIONS) {
+      if (migration.version < 13) applyMigration(historical, migration.version);
+    }
+    historical
+      .query(
+        `INSERT INTO tasks (
+          task_id, workspace_id, conversation_id, thread_ts, profile_id, repository_root,
+          t3_project_id, t3_thread_id, state, created_at, updated_at
+        ) VALUES ('task-1', 'T1', 'C1', '1000.000001', 'engineering', '/srv/repos/example', NULL, NULL, 'active', ?, ?)`,
+      )
+      .run(createdAt, createdAt);
+    const claimedAt = "2026-09-21T00:05:00.000Z";
+    const insertOperation = (operationId: string, status: string, attempts: number): void => {
+      historical
+        .query(
+          `INSERT INTO operations (
+            operation_id, task_id, source_delivery_id, source_event_key, kind, command_id,
+            message_id, payload_json, status, attempts, created_at, updated_at
+          ) VALUES (?, 'task-1', ?, ?, 'user-turn', ?, ?, '{}', ?, ?, ?, ?)`,
+        )
+        .run(
+          operationId,
+          `delivery-${operationId}`,
+          `C1:${operationId}`,
+          `command-${operationId}`,
+          `message-${operationId}`,
+          status,
+          attempts,
+          createdAt,
+          claimedAt,
+        );
+    };
+    // Deferred while T3 waits for an approval: the recorded request proves the turn started.
+    insertOperation("awaiting-approval", "pending", 1);
+    historical
+      .query(
+        `INSERT INTO interactions (
+          interaction_id, task_id, operation_id, thread_id, request_id, kind, prompt_json, state,
+          response_command_id, created_at, updated_at
+        ) VALUES ('interaction-1', 'task-1', 'awaiting-approval', 'thread-1', 'request-1', 'approval', '{}',
+          'pending', 'response-1', ?, ?)`,
+      )
+      .run("2026-09-21T00:06:00.000Z", "2026-09-21T00:06:00.000Z");
+    // Claimed and retried with no evidence of the outcome: the turn may be running in T3.
+    insertOperation("retrying", "pending", 2);
+    // Never claimed: nothing reached T3.
+    insertOperation("queued", "pending", 0);
+    // Finished work keeps its markers empty; nothing will cancel it.
+    insertOperation("finished", "succeeded", 1);
+    historical.close();
+
+    const store = await AgentTagStore.open(path);
+    store.close();
+    const upgraded = new Database(path, { readonly: true, strict: true });
+    expect(
+      upgraded
+        .query<{ operation_id: string; t3_turn_started_at: string | null; t3_turn_dispatched_at: string | null }, []>(
+          "SELECT operation_id, t3_turn_started_at, t3_turn_dispatched_at FROM operations ORDER BY operation_id",
+        )
+        .all(),
+    ).toEqual([
+      {
+        operation_id: "awaiting-approval",
+        t3_turn_started_at: "2026-09-21T00:06:00.000Z",
+        t3_turn_dispatched_at: "2026-09-21T00:06:00.000Z",
+      },
+      { operation_id: "finished", t3_turn_started_at: null, t3_turn_dispatched_at: null },
+      { operation_id: "queued", t3_turn_started_at: null, t3_turn_dispatched_at: null },
+      { operation_id: "retrying", t3_turn_started_at: null, t3_turn_dispatched_at: claimedAt },
+    ]);
+    upgraded.close();
+  } finally {
+    if (!directory.startsWith(`${tmpdir()}/agent-tag-migration-turn-markers-`)) {
+      throw new Error(`refusing to remove unexpected migration fixture path ${directory}`);
+    }
+    await rm(directory, { recursive: true });
   }
 });
