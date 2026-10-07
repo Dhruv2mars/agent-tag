@@ -7,7 +7,7 @@ import { z } from "zod";
 
 import { writeAudit } from "./audit.ts";
 import { requiredId } from "./context.ts";
-import { queueTurnInterrupt } from "./interactions.ts";
+import { closeOperationInteractions, queueTurnInterrupt } from "./interactions.ts";
 import { requireLeaseHeld } from "./lease.ts";
 import { requireTurnActiveMs, settleFailedOperation } from "./operations.ts";
 import { isoDateTime, nonEmpty } from "./schema.ts";
@@ -84,10 +84,29 @@ export function awaitOperationInteractions(
           )
           .get(threadId, requiredId(request.requestId, "requestId"), request.kind),
       );
-      if (row !== null && row.operation_id !== operationId && isClosedForEarlierOperation(row, nowMs, input.expirySeconds)) {
+      if (row !== null && row.operation_id !== operationId) {
         // T3 can keep a request (a message-mode question) pending across an interrupt and report it
         // on later turns. A request an earlier operation already gave up on is not this turn's wait.
-        continue;
+        if (isClosedForEarlierOperation(row, nowMs, input.expirySeconds)) continue;
+        if (row.state === "pending") {
+          // A still-answerable request is adopted by this turn: responses are only accepted for an
+          // active operation, and this turn is the one that will see the answer through.
+          database
+            .query("UPDATE interactions SET operation_id = ?, updated_at = ? WHERE interaction_id = ? AND state = 'pending'")
+            .run(operationId, now, row.interaction_id);
+          writeAudit(database, {
+            actorType: "worker",
+            actorId: workerId,
+            authority: "operation-dispatch",
+            source: row.operation_id,
+            target: row.interaction_id,
+            action: "interaction.adopted",
+            result: "pending",
+            correlationId: operationId,
+            metadata: {},
+            createdAt: now,
+          });
+        }
       }
       if (row === null) {
         unanswered.push({ interactionId: null, state: "pending", createdMs: nowMs });
@@ -188,7 +207,10 @@ export interface AbandonOperationInput {
   readonly now: string;
 }
 
-/** Fails a leased operation with a Slack notice and queues a durable interrupt of its T3 turn. */
+/**
+ * Fails a leased operation with a Slack notice, closes its open interactions, and queues a durable
+ * interrupt of its T3 turn, all in one transaction.
+ */
 export function abandonOperation(database: Database, input: AbandonOperationInput): string {
   const now = isoDateTime.parse(input.now);
   const abandon = database.transaction(() => {
@@ -200,6 +222,8 @@ export function abandonOperation(database: Database, input: AbandonOperationInpu
       reason: input.reason,
       now,
     });
+    // Close the turn's open approvals and questions with it, so a late Slack response cannot reach T3.
+    closeOperationInteractions(database, { operationId: input.operationId, errorCode: "abandoned", now });
     return settleFailedOperation(database, { ...input, now });
   });
   return abandon.immediate();

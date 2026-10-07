@@ -40,6 +40,15 @@ export function interactionResponseExpired(createdAt: string, expirySeconds: num
   return new Date(now).getTime() >= new Date(isoDateTime.parse(createdAt)).getTime() + expirySeconds * 1_000;
 }
 
+/**
+ * Whether an interaction's operation can still take a response. Once the operation has settled
+ * (succeeded, or failed: cancelled, expired, abandoned at its ceiling) nothing tracks its T3 turn, so a late
+ * response could deliver an approval or start an untracked turn; it is refused like an expired one.
+ */
+export function operationAcceptsResponses(status: string): boolean {
+  return status === "pending" || status === "inflight";
+}
+
 export type RequestTaskCancellationResult =
   | { readonly kind: "accepted" | "duplicate"; readonly interactionId: string; readonly commandId: string }
   | { readonly kind: "denied" };
@@ -158,12 +167,15 @@ export function submitInteractionResponse(
       source_action_id: nonEmpty.nullable(),
       state: z.enum(["pending", "response-pending", "inflight", "resolved", "failed"]),
       created_at: isoDateTime,
+      operation_status: nonEmpty,
     });
     const row = rowSchema.nullable().parse(
       database
         .query(
-          `SELECT i.interaction_id, i.response_command_id, i.source_action_id, i.state, i.created_at
+          `SELECT i.interaction_id, i.response_command_id, i.source_action_id, i.state, i.created_at,
+                  o.status AS operation_status
            FROM interactions i JOIN tasks t ON t.task_id = i.task_id
+             JOIN operations o ON o.operation_id = i.operation_id
            WHERE i.interaction_id = ? AND t.workspace_id = ? AND t.conversation_id = ?
              AND t.thread_ts = ? AND t.state = 'active'
              AND (t.conversation_type = 'channel' OR t.owner_user_id = ?)`,
@@ -180,6 +192,7 @@ export function submitInteractionResponse(
     if (row.source_action_id === input.sourceActionId || row.state !== "pending") {
       return { kind: "duplicate" as const, commandId: row.response_command_id };
     }
+    if (!operationAcceptsResponses(row.operation_status)) return { kind: "expired" as const };
     if (interactionResponseExpired(row.created_at, input.expirySeconds, now)) return { kind: "expired" as const };
     const updated = database
       .query(
@@ -525,4 +538,58 @@ export function queueTurnInterrupt(database: Database, input: QueueTurnInterrupt
     createdAt: now,
   });
   return interactionId;
+}
+
+export interface CloseOperationInteractionsInput {
+  readonly operationId: string;
+  /** Why the operation stopped accepting responses, recorded as each interaction's error code. */
+  readonly errorCode: string;
+  readonly now: string;
+}
+
+/**
+ * Closes the approvals and questions an abandoned operation still has open: ones awaiting a human
+ * and ones answered but not yet sent to T3. Without this, a late Slack click or reply could still
+ * deliver an approval, or answer a message-mode question and start an untracked T3 turn, after the
+ * turn was interrupted. A response a worker already holds (`inflight`) is left to finish. Runs inside
+ * the caller's transaction; returns how many interactions were closed.
+ */
+export function closeOperationInteractions(database: Database, input: CloseOperationInteractionsInput): number {
+  const operationId = requiredId(input.operationId, "operationId");
+  const errorCode = requiredId(input.errorCode, "errorCode");
+  const open = z
+    .array(z.object({ interaction_id: nonEmpty, state: z.enum(["pending", "response-pending"]) }))
+    .parse(
+      database
+        .query(
+          `SELECT interaction_id, state FROM interactions
+           WHERE operation_id = ? AND kind != 'cancel' AND state IN ('pending', 'response-pending')
+           ORDER BY created_at, interaction_id`,
+        )
+        .all(operationId),
+    );
+  let closed = 0;
+  for (const row of open) {
+    const result = database
+      .query(
+        `UPDATE interactions SET state = 'failed', last_error_code = ?, updated_at = ?
+         WHERE interaction_id = ? AND state = ?`,
+      )
+      .run(errorCode, input.now, row.interaction_id, row.state);
+    if (result.changes !== 1) continue;
+    closed += 1;
+    writeAudit(database, {
+      actorType: "service",
+      actorId: "agent-tag",
+      authority: "turn-policy",
+      source: row.interaction_id,
+      target: row.interaction_id,
+      action: "interaction.closed",
+      result: "failed",
+      correlationId: operationId,
+      metadata: { errorCode, previousState: row.state },
+      createdAt: input.now,
+    });
+  }
+  return closed;
 }

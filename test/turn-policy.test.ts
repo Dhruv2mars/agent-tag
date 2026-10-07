@@ -848,3 +848,200 @@ describe("approval and question expiry (B7)", () => {
     });
   });
 });
+
+describe("interactions of an abandoned turn (B7)", () => {
+  const question = {
+    questions: [
+      { id: "q1", header: "Target", question: "Which one?", options: [{ label: "A" }, { label: "B" }], multiSelect: false },
+    ],
+  };
+
+  function record(
+    harness: Harness,
+    receipt: { readonly taskId: string; readonly operationId: string },
+    requestId: string,
+    kind: "approval" | "user-input",
+    at: number,
+  ): string {
+    return harness.store.recordPendingInteraction({
+      taskId: receipt.taskId,
+      operationId: receipt.operationId,
+      threadId: harness.store.getTaskExecution(receipt.taskId).threadId,
+      requestId,
+      kind,
+      prompt: kind === "user-input" ? question : {},
+      conversationId: "C1",
+      threadTs: "1000.000001",
+      message: () => ({ text: `${requestId}?` }),
+      now: new Date(at).toISOString(),
+    }).interactionId;
+  }
+
+  function approve(harness: Harness, interactionId: string, sourceActionId: string) {
+    return harness.store.submitInteractionResponse({
+      interactionId,
+      workspaceId: "T1",
+      conversationId: "C1",
+      threadTs: "1000.000001",
+      actorUserId: "U1",
+      sourceActionId,
+      response: { decision: "accept" },
+      expirySeconds: 86_400,
+      now: new Date(harness.clock.ms).toISOString(),
+    });
+  }
+
+  function answer(harness: Harness, interactionId: string, sourceActionId: string) {
+    return harness.store.submitUserInputAnswer({
+      interactionId,
+      questionId: "q1",
+      selection: { optionIndexes: [0] },
+      workspaceId: "T1",
+      conversationId: "C1",
+      threadTs: "1000.000001",
+      actorUserId: "U1",
+      sourceActionId,
+      expirySeconds: 86_400,
+      now: new Date(harness.clock.ms).toISOString(),
+    });
+  }
+
+  async function abandonAtCeiling(harness: Harness, config: AgentTagConfig) {
+    let activityCount = 0;
+    const coordinator = coordinatorFor(harness, config, () => snapshot({ ...harness.turn, activityCount: ++activityCount }));
+    expect(await coordinator.processNext()).toMatchObject({ kind: "failed", errorCode: "T3TurnCeiling" });
+  }
+
+  function deliverAll(harness: Harness, config: AgentTagConfig): Promise<T3Command[]> {
+    const delivered: T3Command[] = [];
+    const worker = new InteractionWorker({
+      config,
+      store: harness.store,
+      t3: { dispatch: async (command) => (delivered.push(command), { sequence: 1 }) },
+      now: () => new Date(harness.clock.ms),
+    });
+    return (async () => {
+      while ((await worker.processNext()).kind !== "idle") {
+        // drain every queued response
+      }
+      return delivered;
+    })();
+  }
+
+  const ceilingConfig = () =>
+    configWith({
+      interactionExpirySeconds: 86_400,
+      stalledTurn: { timeoutSeconds: 300, retryDelaySeconds: 30, maxAttempts: 5, maxTurnSeconds: 3_600 },
+    });
+
+  test("abandoning a turn at its ceiling closes its open approvals and questions in the same transaction", async () => {
+    await withHarness("abandon-closes", async (harness) => {
+      const config = ceilingConfig();
+      const receipt = ingest(harness.store, 1);
+      const pendingApproval = record(harness, receipt, "approval-1", "approval", startMs);
+      const answeredApproval = record(harness, receipt, "approval-2", "approval", startMs);
+      const pendingQuestion = record(harness, receipt, "question-1", "user-input", startMs);
+      expect(approve(harness, answeredApproval, "early-click").kind).toBe("accepted");
+
+      await abandonAtCeiling(harness, config);
+      const byRequest = new Map(readInteractions(harness.path).map((row) => [row.request_id, row]));
+      for (const requestId of ["approval-1", "approval-2", "question-1"]) {
+        expect(byRequest.get(requestId)).toMatchObject({ state: "failed", last_error_code: "abandoned" });
+      }
+      expect(byRequest.get(`interrupt:${receipt.operationId}`)).toMatchObject({ kind: "cancel", state: "response-pending" });
+      expect(harness.store.operationalStatus(new Date(harness.clock.ms).toISOString()).interactions.awaitingHuman).toBe(0);
+
+      // Late Slack clicks cannot revive the closed requests.
+      expect(approve(harness, pendingApproval, "late-click").kind).toBe("duplicate");
+      expect(answer(harness, pendingQuestion, "late-answer").kind).toBe("duplicate");
+      expect(await deliverAll(harness, config)).toEqual([
+        expect.objectContaining({ type: "thread.turn.interrupt", threadId: harness.turn.threadId }),
+      ]);
+    });
+  });
+
+  test("a message-mode question answered after abandonment does not start a turn", async () => {
+    await withHarness("abandon-question", async (harness) => {
+      const config = ceilingConfig();
+      const receipt = ingest(harness.store, 1);
+      const pendingQuestion = record(harness, receipt, "question-1", "user-input", startMs);
+
+      await abandonAtCeiling(harness, config);
+      const turnsBefore = harness.commands.filter((command) => command.type === "thread.turn.start").length;
+      expect(answer(harness, pendingQuestion, "reply-after-interrupt").kind).toBe("duplicate");
+
+      const delivered = await deliverAll(harness, config);
+      expect(delivered.map((command) => command.type)).toEqual(["thread.turn.interrupt"]);
+      expect(harness.commands.filter((command) => command.type === "thread.turn.start")).toHaveLength(turnsBefore);
+      expect(await coordinatorFor(harness, config, () => snapshot(harness.turn)).processNext()).toEqual({ kind: "idle" });
+    });
+  });
+
+  test("responses to a pending interaction of a settled operation are refused", async () => {
+    await withHarness("settled-refused", async (harness) => {
+      const { store } = harness;
+      const receipt = ingest(store, 1);
+      const claim = store.claimNextOperation({ workerId: "worker-a", now: start, leaseMs: 30_000, maxConcurrentTasks: 1 });
+      expect(claim?.operationId).toBe(receipt.operationId);
+      const approval = record(harness, receipt, "approval-1", "approval", startMs);
+      const pendingQuestion = record(harness, receipt, "question-1", "user-input", startMs);
+      // Another terminal path (cancellation) settles the operation without closing its requests.
+      store.cancelOperationWithOutbox({
+        operationId: receipt.operationId,
+        taskId: receipt.taskId,
+        workerId: "worker-a",
+        conversationId: "C1",
+        threadTs: "1000.000001",
+        now: start,
+      });
+
+      expect(approve(harness, approval, "late-click")).toEqual({ kind: "expired" });
+      expect(answer(harness, pendingQuestion, "late-answer")).toEqual({ kind: "expired" });
+      expect(readInteractions(harness.path).map((row) => row.state)).toEqual(["pending", "pending"]);
+      expect(await deliverAll(harness, configWith())).toEqual([]);
+    });
+  });
+
+  test("a later turn adopts an earlier turn's still-answerable request, so it can be answered", async () => {
+    await withHarness("adopt-carried", async (harness) => {
+      const { store } = harness;
+      const first = ingest(store, 1, "first request");
+      const second = ingest(store, 2, "do Y instead");
+      const at = (offsetMs: number) => new Date(startMs + offsetMs).toISOString();
+      store.claimNextOperation({ workerId: "worker-a", now: at(0), leaseMs: 30_000, maxConcurrentTasks: 1 });
+      const carried = record(harness, first, "question-1", "user-input", startMs);
+      store.cancelOperationWithOutbox({
+        operationId: first.operationId,
+        taskId: first.taskId,
+        workerId: "worker-a",
+        conversationId: "C1",
+        threadTs: "1000.000001",
+        now: at(1_000),
+      });
+      expect(
+        store.claimNextOperation({ workerId: "worker-a", now: at(2_000), leaseMs: 30_000, maxConcurrentTasks: 1 })?.operationId,
+      ).toBe(second.operationId);
+      // T3 reports the first turn's question on the second turn, which now waits for it.
+      expect(
+        store.awaitOperationInteractions({
+          operationId: second.operationId,
+          taskId: second.taskId,
+          workerId: "worker-a",
+          threadId: store.getTaskExecution(second.taskId).threadId,
+          actorUserId: "U1",
+          conversationId: "C1",
+          threadTs: "1000.000001",
+          requests: [{ requestId: "question-1", kind: "user-input" }],
+          expirySeconds: 86_400,
+          expiredText: "expired",
+          turnActiveMs: 0,
+          now: at(2_000),
+        }),
+      ).toMatchObject({ kind: "deferred", unanswered: 1 });
+
+      harness.clock.ms = startMs + 3_000;
+      expect(answer(harness, carried, "answer-1").kind).toBe("accepted");
+      expect(readOperation(harness.path, second.operationId)?.blocked_until).toBeNull();
+    });
+  });
+});

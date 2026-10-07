@@ -161,6 +161,8 @@ export const AUDIT_ACTIONS = [
   "interaction.approval.requested",
   "interaction.cancel.requested",
   "interaction.expired",
+  "interaction.closed",
+  "interaction.adopted",
   "interaction.response.claimed",
   "interaction.response.completed",
   "interaction.response.failed",
