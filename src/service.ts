@@ -6,6 +6,7 @@ import { InteractionWorker } from "./interaction-worker.ts";
 import { validateConfiguredProviders } from "./policy/provider.ts";
 import { ScheduleWorker } from "./scheduler.ts";
 import { SlackSocketBridge } from "./slack/bridge.ts";
+import { createRetentionWorker } from "./store/retention.ts";
 import { AgentTagStore } from "./store/store.ts";
 import { inspectT3 } from "./t3/gateway.ts";
 
@@ -18,10 +19,16 @@ export interface ServiceWorker {
   readonly processNext: (signal: AbortSignal) => Promise<ServiceWorkerOutcome>;
 }
 
+export interface ServiceOutboxOutcome {
+  /** "idle" when nothing is claimable (empty, or every pending row is waiting out a retry backoff). */
+  readonly kind: string;
+  readonly errorCode?: string;
+}
+
 export interface ServiceSlackBridge {
   readonly start: () => Promise<void>;
   readonly stop: () => Promise<void>;
-  readonly deliverNextOutbox: () => Promise<boolean>;
+  readonly deliverNextOutbox: () => Promise<ServiceOutboxOutcome>;
 }
 
 export interface ServiceLogRecord {
@@ -172,11 +179,17 @@ export class AgentTagService {
   async #runOutboxLoop(signal: AbortSignal): Promise<void> {
     while (!signal.aborted) {
       try {
-        const delivered = await this.#bridge.deliverNextOutbox();
-        if (delivered) {
-          this.#log({ level: "info", event: "worker.outcome", worker: "outbox", outcome: "delivered" });
-        } else {
+        const outcome = await this.#bridge.deliverNextOutbox();
+        if (outcome.kind === "idle") {
           await waitUntilWorkOrStop(this.#idleMs, signal);
+        } else {
+          this.#log({
+            level: outcome.kind === "delivered" ? "info" : "warn",
+            event: "worker.outcome",
+            worker: "outbox",
+            outcome: outcome.kind,
+            ...(outcome.errorCode === undefined ? {} : { errorCode: outcome.errorCode }),
+          });
         }
       } catch (error) {
         this.#log({ level: "warn", event: "worker.failed", worker: "outbox", errorCode: errorCode(error) });
@@ -197,7 +210,8 @@ export async function createAgentTagService(input: {
 }): Promise<AgentTagService> {
   const now = input.now ?? (() => new Date());
   const logger = input.logger ?? defaultLogger;
-  const store = await AgentTagStore.open(join(input.config.dataDir, "agent-tag.sqlite"));
+  const databasePath = join(input.config.dataDir, "agent-tag.sqlite");
+  const store = await AgentTagStore.open(databasePath);
   const quarantined = store.quarantineExpiredOutbox(now().toISOString());
   try {
     validateConfiguredProviders(input.config, await inspectT3(input.config.t3));
@@ -223,6 +237,7 @@ export async function createAgentTagService(input: {
             return { kind: count === 0 ? "idle" : "memory-expired" };
           },
         },
+        createRetentionWorker({ databasePath, policy: input.config.retention, now }),
       ],
       logger,
       now,

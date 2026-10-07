@@ -270,4 +270,20 @@ export const STORE_MIGRATIONS: readonly StoreMigration[] = [
       ALTER TABLE schedules ADD COLUMN recurrence_json TEXT;
     `,
   },
+  {
+    version: 12,
+    sql: `
+      ALTER TABLE slack_outbox ADD COLUMN blocked_until TEXT;
+      ALTER TABLE slack_outbox ADD COLUMN render_mode TEXT NOT NULL DEFAULT 'rich'
+        CHECK (render_mode IN ('rich', 'plain'));
+      CREATE INDEX slack_outbox_thread_idx
+        ON slack_outbox(conversation_id, thread_ts, status, created_at);
+      CREATE TABLE slack_rate_limits (
+        scope TEXT PRIMARY KEY,
+        blocked_until TEXT NOT NULL,
+        error_code TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+    `,
+  },
 ];

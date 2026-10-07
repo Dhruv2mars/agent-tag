@@ -6,7 +6,7 @@ import { readSecretFile } from "../security/secret-file.ts";
 import type { AgentTagStore } from "../store/store.ts";
 import { SLACK_ACTION_IDS, SlackActionRouter, USER_INPUT_MODAL_CALLBACK_ID } from "./actions.ts";
 import { SlackEventRouter } from "./events.ts";
-import { deliverNextSlackOutbox } from "./outbox.ts";
+import { deliverNextSlackOutbox, type SlackOutboxOutcome } from "./outbox.ts";
 import { installUndiciWebSocketCompat } from "./undici-compat.ts";
 
 const authTestSchema = z.object({
@@ -14,6 +14,19 @@ const authTestSchema = z.object({
   team_id: z.string().min(1),
   user_id: z.string().min(1),
 });
+
+/**
+ * Web API client options. The outbox owns retries: it classifies each failure and requeues
+ * known-not-delivered sends with durable backoff (see outbox-policy.ts). SDK-level retries could
+ * double-post after an ambiguous failure, and the SDK's default 429 handling sleeps inline, so 429s
+ * are surfaced immediately with their Retry-After instead.
+ */
+export const SLACK_CLIENT_OPTIONS = {
+  retryConfig: { retries: 0 },
+  rejectRateLimitedCalls: true,
+  // Abort hung requests well inside the 30s outbox lease so the (ambiguous) outcome is recorded.
+  timeout: 20_000,
+} as const;
 
 export class SlackSocketBridge {
   readonly #app: SlackApp;
@@ -42,7 +55,7 @@ export class SlackSocketBridge {
       appToken: appToken.exposeToBoundary(),
       socketMode: true,
       logLevel: LogLevel.WARN,
-      clientOptions: { retryConfig: { retries: 0 } },
+      clientOptions: SLACK_CLIENT_OPTIONS,
     });
     const auth = authTestSchema.parse(await app.client.auth.test());
     if (auth.team_id !== input.config.slack.workspaceId) {
@@ -91,7 +104,7 @@ export class SlackSocketBridge {
     await this.#app.stop();
   }
 
-  async deliverNextOutbox(): Promise<boolean> {
+  async deliverNextOutbox(): Promise<SlackOutboxOutcome> {
     return deliverNextSlackOutbox({
       config: this.#config,
       store: this.#store,

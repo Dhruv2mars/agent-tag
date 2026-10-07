@@ -121,7 +121,9 @@ export type {
   EnqueueOutboxResult,
   ClaimNextOutboxInput,
   MarkOutboxDeliveredInput,
-  FailOutboxInput,
+  OutboxFailureInput,
+  RetryOutboxInput,
+  ExhaustOutboxRetriesInput,
 } from "./outbox.ts";
 
 export class AgentTagStore {
@@ -349,8 +351,29 @@ export class AgentTagStore {
     outbox.markOutboxDelivered(this.#database, input);
   }
 
-  failOutbox(input: outbox.FailOutboxInput): void {
+  /** Terminal failure (deterministic Slack rejection or revoked authority). */
+  failOutbox(input: outbox.OutboxFailureInput): void {
     outbox.failOutbox(this.#database, input);
+  }
+
+  /** Known-not-delivered failure: requeue, claimable again from `blockedUntil`. */
+  retryOutbox(input: outbox.RetryOutboxInput): void {
+    outbox.retryOutbox(this.#database, input);
+  }
+
+  /** Retryable failure on the last allowed attempt: fail with a retry-exhausted audit row. */
+  exhaustOutboxRetries(input: outbox.ExhaustOutboxRetriesInput): void {
+    outbox.exhaustOutboxRetries(this.#database, input);
+  }
+
+  /** Ambiguous failure: the message may have been posted, so never resend it automatically. */
+  quarantineOutbox(input: outbox.OutboxFailureInput): void {
+    outbox.quarantineOutbox(this.#database, input);
+  }
+
+  /** Requeue once as plain escaped text after Slack rejected the rich payload. */
+  scheduleOutboxFallback(input: outbox.OutboxFailureInput): void {
+    outbox.scheduleOutboxFallback(this.#database, input);
   }
 
   quarantineExpiredOutbox(nowInput: string): number {

@@ -66,6 +66,16 @@ const profileSchema = z.object({
     .default({ enabled: false, keywords: [], cooldownSeconds: 300, maxTurnsPerHour: 4 }),
 });
 
+const retentionDays = z.number().int().positive().max(3650);
+const retentionSchema = z
+  .object({
+    auditDays: retentionDays.optional(),
+    outboxDays: retentionDays.optional(),
+    messageDays: retentionDays.optional(),
+  })
+  .strict()
+  .default({});
+
 export const agentTagConfigSchema = z
   .object({
     version: z.literal(1),
@@ -93,6 +103,7 @@ export const agentTagConfigSchema = z
       maxActiveSchedules: z.number().int().positive().max(10_000).default(100),
       stalledTurn: stalledTurnSchema,
     }),
+    retention: retentionSchema,
   })
   .superRefine((config, context) => {
     const profiles = new Map(config.profiles.map((profile) => [profile.id, profile]));

@@ -100,4 +100,10 @@ AGENT_TAG_T3_TOKEN_FILE=/absolute/path/to/t3-token \
 bun run test:t3
 ```
 
+Read [SECURITY.md](SECURITY.md) before inviting anyone: every allowed Slack user can make the agent run code as the service's OS user. Check a deployment with:
+
+```sh
+bun run security:audit -- /absolute/path/to/agent-tag.json
+```
+
 Agent Tag uses T3 as its only execution backend. It does not contain an independent agent loop or provider manager.

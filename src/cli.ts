@@ -4,6 +4,7 @@ import { resolve } from "node:path";
 import { runDoctorCommand, runOnboardCommand, runServiceCommand } from "./cli-commands.ts";
 import { loadConfig } from "./config.ts";
 import { isDistributionCommand, processDistributionContext, runDistributionCommand } from "./distribution.ts";
+import { runSecurityCli, SECURITY_CLI_USAGE } from "./security/cli.ts";
 import { createAgentTagService } from "./service.ts";
 import { AgentTagSchedules } from "./scheduler.ts";
 import { AgentTagStore } from "./store/store.ts";
@@ -17,6 +18,7 @@ const USAGE = [
   "       agent-tag restore BACKUP NEW_DATA_DIR",
   "       agent-tag schedule-<add|list|cancel> CONFIG TASK ACTOR PROFILE [SPEC_OR_ID]",
   "       agent-tag <version|update|help>",
+  ...SECURITY_CLI_USAGE.split(" | ").map((line) => `       ${line}`),
 ].join("\n");
 
 const KNOWN_COMMANDS = new Set([
@@ -54,6 +56,17 @@ function waitForShutdownSignal(): Promise<void> {
 const command = process.argv[2];
 if (isDistributionCommand(command)) {
   process.exit(await runDistributionCommand(process.argv.slice(2), processDistributionContext()));
+}
+if (command === "security" || command === "prune") {
+  let exitCode: number;
+  try {
+    exitCode = await runSecurityCli(process.argv.slice(2));
+  } catch (error) {
+    // Argument mistakes print usage like other commands; anything else keeps its stack trace.
+    if (!(error instanceof Error && error.message.includes(SECURITY_CLI_USAGE))) throw error;
+    usage(error.message.slice(0, error.message.indexOf("usage:")).replace(/[;:\s]+$/, "") || `invalid ${command} arguments`);
+  }
+  process.exit(exitCode);
 }
 if (command === undefined || !KNOWN_COMMANDS.has(command)) usage(`unknown command: ${String(command)}`);
 const configArgument = process.argv[3];

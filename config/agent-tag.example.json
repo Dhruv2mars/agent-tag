@@ -59,5 +59,10 @@
       "retryDelaySeconds": 30,
       "maxAttempts": 5
     }
+  },
+  "retention": {
+    "messageDays": 30,
+    "outboxDays": 30,
+    "auditDays": 365
   }
 }

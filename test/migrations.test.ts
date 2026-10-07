@@ -88,7 +88,7 @@ function seedVersionOne(database: Database): void {
 }
 
 test("upgrades every historical SQLite schema while preserving existing work", async () => {
-  expect(STORE_MIGRATIONS.map((migration) => migration.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+  expect(STORE_MIGRATIONS.map((migration) => migration.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
 
   for (const startingVersion of STORE_MIGRATIONS.map((migration) => migration.version)) {
     const directory = await mkdtemp(join(tmpdir(), `agent-tag-migration-v${startingVersion}-`));
@@ -137,6 +137,16 @@ test("upgrades every historical SQLite schema while preserving existing work", a
           )
           .get(),
       ).toEqual({ conversation_type: "channel", owner_user_id: null });
+      expect(
+        upgraded
+          .query<{ status: string; blocked_until: string | null; render_mode: string }, []>(
+            "SELECT status, blocked_until, render_mode FROM slack_outbox",
+          )
+          .get(),
+      ).toEqual({ status: "pending", blocked_until: null, render_mode: "rich" });
+      expect(
+        upgraded.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM slack_rate_limits").get(),
+      ).toEqual({ count: 0 });
       expect(
         upgraded.query<{ quick_check: string }, []>("PRAGMA quick_check").get()?.quick_check,
       ).toBe("ok");
