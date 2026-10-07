@@ -4,6 +4,7 @@ import { AgentTagMemory } from "./memory.ts";
 import { escapeSlackText, markdownToMrkdwn, renderCodeBlock, splitForSlack, truncateBlockText } from "./slack/render.ts";
 import type { AgentTagStore, ClaimedOperation, SlackOutboxPayload } from "./store/store.ts";
 import {
+  awaitingT3AnswerContinuation,
   dispatchT3Command,
   fetchT3ThreadSnapshot,
   pendingT3Approvals,
@@ -691,8 +692,9 @@ export class AgentTagCoordinator {
           });
         }
         // Re-read the store before deferring, atomically with the defer: if every request already
-        // has a response (queued or delivered, T3 just has not caught up), keep polling. Otherwise
-        // wait until the earliest request expires; a Slack response clears the block to wake us.
+        // has a response (queued, in flight or delivered, T3 just has not caught up), keep polling.
+        // Otherwise wait until the earliest request expires; a Slack response clears the block to
+        // wake us.
         const expirySeconds = this.#config.limits.interactionExpirySeconds;
         const wait = this.#store.awaitOperationInteractions({
           operationId: operation.operationId,
@@ -723,6 +725,22 @@ export class AgentTagCoordinator {
             questionCount: userInputs.length,
           };
         }
+        if (wait.kind === "answered") {
+          // Every request T3 still awaits has an accepted response that T3 has not reflected yet. This
+          // snapshot predates the answers, so its turn state must not settle the operation: a turn that
+          // completed with a message-mode question pending would otherwise settle and close the answer
+          // before the interaction worker sends it. A delivery that never lands ends via the stall,
+          // ceiling and failure paths, which close the response.
+          await this.#pollAgain(progressAt, signal);
+          continue;
+        }
+        // "stale": every reported request is one an earlier operation gave up on; the turn decides.
+      }
+      if (awaitingT3AnswerContinuation(snapshot)) {
+        // T3 took a message-mode answer but has not started the turn that continues from it; the
+        // latest turn is still the one that asked. Settle only from the continuation turn.
+        await this.#pollAgain(progressAt, signal);
+        continue;
       }
       const latestTurn = snapshot.thread.latestTurn;
       if (latestTurn?.state === "error") throw t3TurnFailure(snapshot);

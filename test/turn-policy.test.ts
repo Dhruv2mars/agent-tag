@@ -10,7 +10,7 @@ import { agentTagConfigSchema, type AgentTagConfig } from "../src/config.ts";
 import { AgentTagCoordinator, t3ProgressMarker } from "../src/coordinator.ts";
 import { InteractionWorker } from "../src/interaction-worker.ts";
 import { AgentTagStore } from "../src/store/store.ts";
-import type { T3Command, T3ThreadSnapshot } from "../src/t3/gateway.ts";
+import { awaitingT3AnswerContinuation, type T3Command, type T3ThreadSnapshot } from "../src/t3/gateway.ts";
 
 const start = "2026-09-21T00:00:00.000Z";
 const startMs = Date.parse(start);
@@ -772,7 +772,7 @@ describe("approval and question expiry (B7)", () => {
           turnActiveMs: 0,
           now: later,
         }),
-      ).toEqual({ kind: "answered" });
+      ).toEqual({ kind: "stale" });
       expect(readOperation(harness.path, second.operationId)?.status).toBe("inflight");
     });
   });
@@ -1180,5 +1180,221 @@ describe("interactions of an abandoned turn (B7)", () => {
       expect(byRequestId(harness).get("approval-1")).toMatchObject({ state: "failed", last_error_code: "operation-settled" });
       expect(await worker.processNext()).toEqual({ kind: "idle" });
     });
+  });
+});
+
+describe("accepted answers outlive the turn that asked (B7)", () => {
+  const askedAt = start;
+  const questionActivity = {
+    id: "requested-question-1",
+    tone: "approval" as const,
+    kind: "user-input.requested",
+    summary: "Input requested",
+    payload: {
+      requestId: "question-1",
+      responseMode: "message",
+      questions: [
+        { id: "q1", header: "Target", question: "Which one?", options: [{ label: "A" }, { label: "B" }], multiSelect: false },
+      ],
+    },
+    turnId: "turn-1",
+    createdAt: askedAt,
+  };
+
+  /** Simulates T3 0.0.45 answering a message-mode question: resolve it and start a continuation turn. */
+  function messageModeThread(harness: Harness) {
+    const t3: { answeredAt: string | null; continuation: "none" | "running" | "completed" } = {
+      answeredAt: null,
+      continuation: "none",
+    };
+    const read = (): T3ThreadSnapshot => {
+      const base = snapshot({ ...harness.turn, state: "completed", text: "Which one?" });
+      if (t3.answeredAt === null) {
+        return { ...base, thread: { ...base.thread, activities: [questionActivity] } };
+      }
+      const answeredAt = t3.answeredAt;
+      const resolved = {
+        id: "async-answer:question-1",
+        tone: "info" as const,
+        kind: "user-input.resolved",
+        summary: "User input submitted",
+        payload: { requestId: "question-1", responseMode: "message", answers: { q1: "A" } },
+        turnId: "turn-1",
+        createdAt: answeredAt,
+      };
+      const reply = {
+        id: "async-answer:question-1",
+        role: "user" as const,
+        text: "Which one?\nA",
+        turnId: null,
+        streaming: false,
+        createdAt: answeredAt,
+        updatedAt: answeredAt,
+      };
+      const thread = { ...base.thread, activities: [questionActivity, resolved], messages: [...base.thread.messages, reply] };
+      if (t3.continuation === "none") return { ...base, thread };
+      const completed = t3.continuation === "completed";
+      return {
+        ...base,
+        thread: {
+          ...thread,
+          latestTurn: {
+            turnId: "turn-2",
+            state: t3.continuation,
+            requestedAt: answeredAt,
+            startedAt: answeredAt,
+            completedAt: completed ? answeredAt : null,
+            assistantMessageId: completed ? "assistant-2" : null,
+          },
+          messages: [
+            ...thread.messages,
+            ...(completed
+              ? [{
+                  id: "assistant-2",
+                  role: "assistant" as const,
+                  text: "continued with A",
+                  turnId: "turn-2",
+                  streaming: false,
+                  createdAt: answeredAt,
+                  updatedAt: answeredAt,
+                }]
+              : []),
+          ],
+        },
+      };
+    };
+    return { t3, read };
+  }
+
+  test("an answer to a message-mode question pending after its turn completed is delivered, and the operation settles after the continuation", async () => {
+    await withHarness("message-mode-continuation", async (harness) => {
+      const config = configWith({ interactionExpirySeconds: 86_400 });
+      const { t3, read } = messageModeThread(harness);
+      const delivered: T3Command[] = [];
+      const worker = new InteractionWorker({
+        config,
+        store: harness.store,
+        t3: {
+          dispatch: async (command) => {
+            delivered.push(command);
+            if (command.type === "thread.user-input.respond") t3.answeredAt = command.createdAt;
+            return { sequence: 1 };
+          },
+        },
+        now: () => new Date(harness.clock.ms),
+      });
+      const seen: string[] = [];
+      let wakeFetches = 0;
+      let woken = false;
+      const coordinator = coordinatorFor(harness, config, async () => {
+        if (woken) {
+          wakeFetches += 1;
+          // 1st: the coordinator wakes before the worker runs and sees the pre-answer snapshot.
+          // 2nd: the worker has sent the answer; T3 resolved it but has not started the new turn.
+          // 3rd: the continuation turn runs. 4th: it completes.
+          if (wakeFetches === 2) expect((await worker.processNext()).kind).toBe("resolved");
+          if (wakeFetches === 3) t3.continuation = "running";
+          if (wakeFetches === 4) t3.continuation = "completed";
+        }
+        const current = read();
+        seen.push(`${current.thread.latestTurn?.turnId}:${current.thread.latestTurn?.state}`);
+        return current;
+      });
+      const receipt = ingest(harness.store, 1);
+
+      // The turn completes with the message-mode question still pending: the operation waits for Slack.
+      expect(await coordinator.processNext()).toMatchObject({ kind: "waiting-interaction", questionCount: 1 });
+      const question = readInteractions(harness.path).find((row) => row.request_id === "question-1");
+      if (question === undefined) throw new Error("question interaction was not recorded");
+      harness.clock.ms += MINUTE;
+      expect(
+        harness.store.submitUserInputAnswer({
+          interactionId: question.interaction_id,
+          questionId: "q1",
+          selection: { optionIndexes: [0] },
+          workspaceId: "T1",
+          conversationId: "C1",
+          threadTs: "1000.000001",
+          actorUserId: "U1",
+          sourceActionId: "answer-1",
+          expirySeconds: 86_400,
+          now: new Date(harness.clock.ms).toISOString(),
+        }).kind,
+      ).toBe("accepted");
+      expect(readInteractions(harness.path).find((row) => row.request_id === "question-1")?.state).toBe("response-pending");
+
+      // The answer wakes the coordinator first; it must not settle from the pre-answer snapshot.
+      woken = true;
+      expect(await coordinator.processNext()).toMatchObject({ kind: "completed", operationId: receipt.operationId });
+      expect(wakeFetches).toBe(4);
+      expect(seen.slice(-4)).toEqual(["turn-1:completed", "turn-1:completed", "turn-2:running", "turn-2:completed"]);
+      expect(delivered).toEqual([
+        expect.objectContaining({ type: "thread.user-input.respond", requestId: "question-1", answers: { q1: "A" } }),
+      ]);
+      expect(readInteractions(harness.path).find((row) => row.request_id === "question-1")).toMatchObject({
+        state: "resolved",
+        last_error_code: null,
+      });
+      expect(readOperation(harness.path, receipt.operationId)).toMatchObject({ status: "succeeded" });
+      expect(drainOutboxTexts(harness.store, harness.clock.ms).at(-1)).toBe("continued with A");
+      expect(await worker.processNext()).toEqual({ kind: "idle" });
+    });
+  });
+
+  test("a delivery that never lands still ends the operation through the stall path, closing the answer", async () => {
+    await withHarness("message-mode-stuck", async (harness) => {
+      const config = configWith({
+        interactionExpirySeconds: 86_400,
+        stalledTurn: { timeoutSeconds: 60, retryDelaySeconds: 30, maxAttempts: 1 },
+      });
+      const { read } = messageModeThread(harness);
+      const coordinator = coordinatorFor(harness, config, read);
+      const receipt = ingest(harness.store, 1);
+      expect(await coordinator.processNext()).toMatchObject({ kind: "waiting-interaction", questionCount: 1 });
+      const question = readInteractions(harness.path).find((row) => row.request_id === "question-1");
+      if (question === undefined) throw new Error("question interaction was not recorded");
+      expect(
+        harness.store.submitUserInputAnswer({
+          interactionId: question.interaction_id,
+          questionId: "q1",
+          selection: { optionIndexes: [0] },
+          workspaceId: "T1",
+          conversationId: "C1",
+          threadTs: "1000.000001",
+          actorUserId: "U1",
+          sourceActionId: "answer-1",
+          expirySeconds: 86_400,
+          now: new Date(harness.clock.ms).toISOString(),
+        }).kind,
+      ).toBe("accepted");
+
+      // No worker ever sends the answer, so T3 never moves: the stall policy fails the operation.
+      expect(await coordinator.processNext()).toMatchObject({ kind: "failed", errorCode: "T3TurnStalled" });
+      expect(readOperation(harness.path, receipt.operationId)?.status).toBe("failed");
+      expect(readInteractions(harness.path).find((row) => row.request_id === "question-1")).toMatchObject({
+        state: "failed",
+        last_error_code: "operation-settled",
+      });
+    });
+  });
+
+  test("a dismissed message-mode question starts no continuation, so the turn that asked settles", () => {
+    const base = snapshot({ threadId: "thread-1", messageId: "message-1", state: "completed" });
+    const dismissed = {
+      ...base,
+      thread: {
+        ...base.thread,
+        activities: [{
+          id: "async-dismiss:question-1",
+          tone: "info" as const,
+          kind: "user-input.resolved",
+          summary: "User input dismissed",
+          payload: { requestId: "question-1", responseMode: "message" },
+          turnId: "turn-1",
+          createdAt: new Date(startMs + MINUTE).toISOString(),
+        }],
+      },
+    };
+    expect(awaitingT3AnswerContinuation(dismissed)).toBe(false);
   });
 });

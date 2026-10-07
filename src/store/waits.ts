@@ -35,8 +35,17 @@ export interface AwaitOperationInteractionsInput {
 }
 
 export type AwaitOperationInteractionsResult =
-  /** Every pending request already has a response (queued, in flight, or delivered): keep polling. */
+  /**
+   * Every pending request already has this operation's response (queued, in flight, or delivered)
+   * that T3 has not reflected yet: keep polling, and do not settle the operation from the snapshot
+   * that reported them.
+   */
   | { readonly kind: "answered" }
+  /**
+   * Every pending request is one an earlier operation already gave up on (T3 can keep reporting it):
+   * nothing to wait for, so the turn's own state decides.
+   */
+  | { readonly kind: "stale" }
   /** Deferred until the earliest unanswered request expires; a response clears the block. */
   | { readonly kind: "deferred"; readonly blockedUntil: string; readonly unanswered: number }
   /** The wait expired: interactions closed, interrupt queued, operation failed with a notice. */
@@ -76,6 +85,7 @@ export function awaitOperationInteractions(
 
   const decide = database.transaction((): AwaitOperationInteractionsResult => {
     const unanswered: Array<{ readonly interactionId: string | null; readonly state: string; readonly createdMs: number }> = [];
+    let answered = 0;
     for (const request of input.requests) {
       const row = interactionStateSchema.nullable().parse(
         database
@@ -113,9 +123,14 @@ export function awaitOperationInteractions(
       } else if (row.state === "pending" || row.state === "failed") {
         // A failed response can never be re-answered in Slack, so it waits for expiry like a pending one.
         unanswered.push({ interactionId: row.interaction_id, state: row.state, createdMs: new Date(row.created_at).getTime() });
+      } else if (row.operation_id === operationId) {
+        // This operation's accepted response, which T3 has not reflected yet. An earlier operation's
+        // response is not this turn's to wait for: that operation settled only once T3 reflected its
+        // responses, or closed them, so T3 still reporting the request is stale.
+        answered += 1;
       }
     }
-    if (unanswered.length === 0) return { kind: "answered" };
+    if (unanswered.length === 0) return answered > 0 ? { kind: "answered" } : { kind: "stale" };
 
     const expiresMs = Math.min(...unanswered.map((entry) => entry.createdMs)) + input.expirySeconds * 1_000;
     if (nowMs < expiresMs) {

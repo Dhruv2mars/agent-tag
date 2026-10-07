@@ -235,8 +235,10 @@ export function completeOperation(database: Database, input: CompleteOperationIn
         now,
       );
     requireLeaseHeld(result, "operation");
-    // The turn ended in T3: no queued or in-flight response may reach it now. Requests still
-    // awaiting a human stay open for a later turn to adopt (they cannot be answered meanwhile).
+    // The turn ended in T3: no queued or in-flight response may reach it now. The coordinator only
+    // completes once T3 reflects every accepted response, so any left are ones T3 no longer awaits
+    // (see the invariant at claimNextInteractionResponse). Requests still awaiting a human stay open
+    // for a later turn to adopt (they cannot be answered meanwhile).
     closeOperationInteractions(database, {
       operationId: input.operationId,
       errorCode: OPERATION_SETTLED,
@@ -298,8 +300,10 @@ export function completeOperationWithOutbox(
         now,
       );
     requireLeaseHeld(result, "operation");
-    // The turn ended in T3: no queued or in-flight response may reach it now. Requests still
-    // awaiting a human stay open for a later turn to adopt (they cannot be answered meanwhile).
+    // The turn ended in T3: no queued or in-flight response may reach it now. The coordinator only
+    // completes once T3 reflects every accepted response, so any left are ones T3 no longer awaits
+    // (see the invariant at claimNextInteractionResponse). Requests still awaiting a human stay open
+    // for a later turn to adopt (they cannot be answered meanwhile).
     closeOperationInteractions(database, {
       operationId: input.operationId,
       errorCode: OPERATION_SETTLED,
@@ -632,8 +636,9 @@ export function cancelOperationWithOutbox(database: Database, input: CancelOpera
         now,
       );
     requireLeaseHeld(result, "operation");
-    // The turn was interrupted in T3: no queued or in-flight response may reach it now. Requests still
-    // awaiting a human stay open for a later turn to adopt (they cannot be answered meanwhile).
+    // The turn was interrupted in T3: no queued or in-flight response may reach it now. As with
+    // completion, any left are ones T3 no longer awaits. Requests still awaiting a human stay open
+    // for a later turn to adopt (they cannot be answered meanwhile).
     closeOperationInteractions(database, {
       operationId: input.operationId,
       errorCode: OPERATION_SETTLED,

@@ -341,6 +341,14 @@ export interface ClaimNextInteractionResponseInput {
  *   (`operation-settled`), so it can never be retried or reclaimed;
  * - a retryable worker failure returns a response to `response-pending`, i.e. back through this claim;
  * - the worker re-checks just before dispatching (`checkInteractionDispatch`).
+ *
+ * The counterpart: an accepted response is never closed while its operation still waits for it. The
+ * coordinator settles an operation only from a T3 snapshot that reflects every accepted response: it
+ * keeps polling while T3 still reports a request that has a response (queued, in flight or delivered),
+ * and while a delivered message-mode answer's continuation turn is not yet T3's latest turn. So when
+ * completion or interruption closes queued and in-flight responses, those are only ones T3 no longer
+ * awaits, which T3 would refuse anyway. A response whose delivery never lands ends with its operation
+ * via the stall, ceiling or failure paths.
  */
 const DISPATCHABLE_RESPONSE = `(i.kind = 'cancel' OR EXISTS (
   SELECT 1 FROM operations o WHERE o.operation_id = i.operation_id AND o.status IN ('pending', 'inflight')))`;

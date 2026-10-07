@@ -367,6 +367,31 @@ export function pendingT3UserInputs(snapshot: T3ThreadSnapshot): ReadonlyArray<T
   return [...pending.values()];
 }
 
+const messageAnswerPayloadSchema = z.object({
+  requestId: id,
+  responseMode: z.literal("message"),
+  answers: z.record(z.string(), z.unknown()),
+});
+
+/**
+ * Whether T3 has accepted an answer to a message-mode question but its continuation turn is not yet
+ * the thread's latest turn. T3 answers such a question in one command: it appends
+ * `user-input.resolved` (with the answers) and starts a new turn carrying them, both stamped with the
+ * answer's `createdAt`. Until that turn shows up, `latestTurn` is still the turn that asked, so its
+ * state (often `completed`) says nothing about the answer. A dismissal has no answers and starts no turn.
+ */
+export function awaitingT3AnswerContinuation(snapshot: T3ThreadSnapshot): boolean {
+  let answeredAt: number | null = null;
+  for (const activity of snapshot.thread.activities) {
+    if (activity.kind !== "user-input.resolved") continue;
+    if (!messageAnswerPayloadSchema.safeParse(activity.payload).success) continue;
+    answeredAt = Math.max(answeredAt ?? 0, Date.parse(activity.createdAt));
+  }
+  if (answeredAt === null) return false;
+  const latestTurn = snapshot.thread.latestTurn;
+  return latestTurn === null || Date.parse(latestTurn.requestedAt) < answeredAt;
+}
+
 const threadStreamItemSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("synchronized") }),
   z.object({ kind: z.literal("snapshot"), snapshot: z.unknown() }),
