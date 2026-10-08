@@ -135,6 +135,37 @@ export interface ClaimedInteractionResponse {
   readonly response: unknown;
   readonly attempt: number;
   readonly leaseExpiresAt: string;
+  /** The target operation's status, so a cancel can settle without T3 when nothing is running. */
+  readonly operationStatus: "pending" | "inflight" | "succeeded" | "failed";
+  /**
+   * Why a failed operation failed. A local failure (for example a settlement timeout) does not prove
+   * the T3 turn ended, so a cancel still interrupts unless the code records an observed outcome.
+   */
+  readonly operationErrorCode: string | null;
+  /** The T3 user message id the target operation sends, used to find its turn in a thread snapshot. */
+  readonly operationMessageId: string;
+  /**
+   * Whether `thread.turn.start` may have reached T3. True even when every receipt was lost, so a
+   * failed operation's turn is reconciled against T3 instead of assumed never started.
+   */
+  readonly turnDispatched: boolean;
+  /** When `thread.turn.start` was last sent (or the start confirmed), or null if it never was. */
+  readonly turnDispatchedAt: string | null;
+  /** Whether a T3 receipt confirmed the target operation's turn start. */
+  readonly turnStarted: boolean;
+  /** The T3 turn id once the coordinator has observed it; interrupts pass it when known. */
+  readonly turnId: string | null;
+  /**
+   * T3 request ids of the target operation's user-input questions. A message-mode answer starts a
+   * continuation turn from user message `async-answer:<requestId>`, which the operation also owns.
+   */
+  readonly userInputRequestIds: ReadonlyArray<string>;
+  /**
+   * Whether any of those questions ever had an answer accepted from Slack (whatever became of its
+   * delivery). Only T3 knows whether such an answer started a continuation turn, so a cancel cannot
+   * settle from the operation's local outcome alone.
+   */
+  readonly userInputAnswered: boolean;
 }
 
 export type UserInputQuestionPrompt = z.infer<typeof userInputQuestionPromptSchema>;

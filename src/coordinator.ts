@@ -221,6 +221,8 @@ export function classifyT3TurnFailure(lastError: string | null | undefined): {
   };
 }
 
+export { T3_TURN_ENDED_FAILURE_CODES } from "./store/interactions.ts";
+
 function t3TurnFailure(snapshot: T3ThreadSnapshot): CoordinatorFailure {
   const failure = classifyT3TurnFailure(snapshot.thread.session?.lastError);
   return new CoordinatorFailure(failure.code, failure.userMessage);
@@ -534,6 +536,13 @@ export class AgentTagCoordinator {
       createdAt: task.projectCreatedAt,
     }, signal), signal);
 
+    // Recorded first: if the receipt is lost, T3 may still run the turn, so cancellation has to wait
+    // for the replay below to confirm it instead of dropping the operation locally.
+    this.#store.markOperationTurnDispatched({
+      operationId: operation.operationId,
+      workerId: this.#workerId,
+      now: this.#now().toISOString(),
+    });
     const turn = await abortable(this.#t3.dispatch({
       type: "thread.turn.start",
       commandId: operation.commandId,
@@ -573,6 +582,14 @@ export class AgentTagCoordinator {
       createdAt: this.#now().toISOString(),
     }, signal), signal);
     this.#store.markT3ThreadStarted({ taskId: task.taskId, now: this.#now().toISOString() });
+    // From here a cancel interrupts this turn in T3 instead of dropping the queued operation.
+    this.#store.markOperationTurnStarted({
+      operationId: operation.operationId,
+      workerId: this.#workerId,
+      turnId: null,
+      now: this.#now().toISOString(),
+    });
+    let turnIdRecorded = false;
     this.#store.enqueueOutbox({
       taskId: operation.taskId,
       correlationId: operation.operationId,
@@ -658,6 +675,16 @@ export class AgentTagCoordinator {
       if (task.threadStarted && !snapshotHasCurrentTurn(snapshot, operation.messageId)) {
         await this.#pollAgain(progressAt, signal);
         continue;
+      }
+      if (!turnIdRecorded && snapshot.thread.latestTurn !== null) {
+        // The latest turn is this operation's: either the thread is new or the check above matched.
+        this.#store.markOperationTurnStarted({
+          operationId: operation.operationId,
+          workerId: this.#workerId,
+          turnId: snapshot.thread.latestTurn.turnId,
+          now: this.#now().toISOString(),
+        });
+        turnIdRecorded = true;
       }
       const approvals = pendingT3Approvals(snapshot);
       const userInputs = pendingT3UserInputs(snapshot);
