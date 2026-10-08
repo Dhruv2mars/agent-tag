@@ -5,6 +5,8 @@ import type {
   AuditAction,
   operationPayloadSchema,
   outboxPayloadSchema,
+  outboxStatusSchema,
+  refreshKindSchema,
   userInputQuestionPromptSchema,
 } from "./schema.ts";
 
@@ -118,6 +120,8 @@ export interface SlackOutboxInput {
 }
 
 export type SlackOutboxPayload = z.infer<typeof outboxPayloadSchema>;
+export type RefreshKind = z.infer<typeof refreshKindSchema>;
+export type OutboxStatus = z.infer<typeof outboxStatusSchema>;
 
 export interface ClaimedInteractionResponse {
   readonly interactionId: string;
@@ -192,6 +196,15 @@ export interface ClaimedOutboxMessage {
   readonly renderMode: "rich" | "plain";
   readonly attempt: number;
   readonly leaseExpiresAt: string;
+  /** "post" is chat.postMessage; "update" edits the message posted by `target` (chat.update). */
+  readonly method: "post" | "update";
+  /**
+   * Set on refresh rows: the payload is rendered at delivery time for (refreshKind, correlationId) and
+   * `payload` is an unsent placeholder. Null on posts and static edits, which send `payload` as-is.
+   */
+  readonly refreshKind: RefreshKind | null;
+  /** The edited message's post row (update rows only): its status and, once delivered, its Slack ts. */
+  readonly target: { readonly status: OutboxStatus; readonly slackMessageTs: string | null } | null;
 }
 
 export interface AuditRecord {

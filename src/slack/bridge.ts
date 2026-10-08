@@ -6,7 +6,7 @@ import { readSecretFile } from "../security/secret-file.ts";
 import type { AgentTagStore } from "../store/store.ts";
 import { SLACK_ACTION_IDS, SlackActionRouter, USER_INPUT_MODAL_CALLBACK_ID } from "./actions.ts";
 import { SlackEventRouter } from "./events.ts";
-import { deliverNextSlackOutbox, type SlackOutboxOutcome } from "./outbox.ts";
+import { deliverNextSlackOutbox, type RefreshRenderers, type SlackOutboxOutcome } from "./outbox.ts";
 import { installUndiciWebSocketCompat } from "./undici-compat.ts";
 
 const authTestSchema = z.object({
@@ -27,6 +27,9 @@ export const SLACK_CLIENT_OPTIONS = {
   // Abort hung requests well inside the 30s outbox lease so the (ambiguous) outcome is recorded.
   timeout: 20_000,
 } as const;
+
+/** Delivery-time renderers for outbox refresh rows. None yet: PR-I I2 and PR-F register theirs here. */
+const REFRESH_RENDERERS: RefreshRenderers = {};
 
 export class SlackSocketBridge {
   readonly #app: SlackApp;
@@ -110,6 +113,9 @@ export class SlackSocketBridge {
       store: this.#store,
       workerId: this.#workerId,
       postMessage: (message) => this.#app.client.chat.postMessage(message),
+      // Needs only chat:write (a bot may edit its own messages), so no scope or manifest change.
+      updateMessage: (message) => this.#app.client.chat.update(message),
+      refreshRenderers: REFRESH_RENDERERS,
     });
   }
 }

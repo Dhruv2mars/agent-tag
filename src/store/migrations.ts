@@ -335,4 +335,16 @@ export const STORE_MIGRATIONS: readonly StoreMigration[] = [
         CHECK (turn_active_ms >= 0);
     `,
   },
+  {
+    // Message edits (chat.update): an 'update' row edits the message its target 'post' row posted.
+    // refresh_kind is validated in zod, not a CHECK, so new kinds need no table rebuild.
+    version: 15,
+    sql: `
+      ALTER TABLE slack_outbox ADD COLUMN method TEXT NOT NULL DEFAULT 'post'
+        CHECK (method IN ('post', 'update'));
+      ALTER TABLE slack_outbox ADD COLUMN target_outbox_id TEXT REFERENCES slack_outbox(outbox_id);
+      ALTER TABLE slack_outbox ADD COLUMN refresh_kind TEXT;
+      CREATE INDEX slack_outbox_refresh_idx ON slack_outbox(target_outbox_id, status) WHERE method = 'update';
+    `,
+  },
 ];
