@@ -8,7 +8,7 @@
  *   schedules.ts    schedules and runs                     memory.ts       memory entries
  *   ambient.ts      ambient trigger decisions              audit.ts        audit log write/export
  *   diagnostics.ts  counts and operational status          lease.ts        shared lease helpers
- *   waits.ts        human waits, expiry, abandoned turns
+ *   waits.ts        human waits, expiry, abandoned turns   schedule-outcomes.ts run outcomes, auto-disable
  *   schema.ts       zod schemas                            types.ts        public types (re-exported)
  */
 import type { Database } from "bun:sqlite";
@@ -37,6 +37,7 @@ import * as files from "./files.ts";
 import * as audit from "./audit.ts";
 import * as memory from "./memory.ts";
 import * as schedules from "./schedules.ts";
+import * as scheduleOutcomes from "./schedule-outcomes.ts";
 import * as ambient from "./ambient.ts";
 import * as diagnostics from "./diagnostics.ts";
 import * as tasks from "./tasks.ts";
@@ -59,6 +60,8 @@ export type {
   IngestReceipt,
   MemoryRecord,
   OperationalStatus,
+  ScheduleEndedReason,
+  ScheduleRunOutcome,
   ScheduleSummary,
   SlackEventInput,
   SlackOutboxInput,
@@ -87,10 +90,18 @@ export type {
   ClaimDueScheduleInput,
   SettleScheduleRunInput,
   RecordScheduleDenialInput,
+  ScheduleSourceInput,
+  ListConversationSchedulesInput,
 } from "./schedules.ts";
+export type {
+  AutoDisabledNoticeInput,
+  ReconcileScheduleRunOutcomesInput,
+  ReconcileScheduleRunOutcomesResult,
+} from "./schedule-outcomes.ts";
 export type { EvaluateAmbientInput } from "./ambient.ts";
 export type {
   TaskBelongsToContextInput,
+  EnsureTaskForThreadInput,
   BindT3TaskInput,
   FindActiveTaskInput,
   MarkT3ThreadStartedInput,
@@ -212,6 +223,30 @@ export class AgentTagStore {
     return schedules.listSchedules(this.#database, taskId);
   }
 
+  getSchedule(scheduleId: string): ScheduleSummary | null {
+    return schedules.getSchedule(this.#database, scheduleId);
+  }
+
+  findScheduleBySourceEvent(input: {
+    readonly workspaceId: string;
+    readonly sourceEventKey: string;
+  }): ScheduleSummary | null {
+    return schedules.findScheduleBySourceEvent(this.#database, input);
+  }
+
+  listActiveSchedulesForConversation(
+    input: schedules.ListConversationSchedulesInput,
+  ): ReadonlyArray<ScheduleSummary> {
+    return schedules.listActiveSchedulesForConversation(this.#database, input);
+  }
+
+  /** Records finished runs' outcomes and auto-disables recurring schedules that keep failing. */
+  reconcileScheduleRunOutcomes(
+    input: scheduleOutcomes.ReconcileScheduleRunOutcomesInput,
+  ): scheduleOutcomes.ReconcileScheduleRunOutcomesResult {
+    return scheduleOutcomes.reconcileScheduleRunOutcomes(this.#context, input);
+  }
+
   cancelSchedule(input: schedules.CancelScheduleInput): boolean {
     return schedules.cancelSchedule(this.#database, input);
   }
@@ -238,6 +273,11 @@ export class AgentTagStore {
 
   evaluateAmbient(input: ambient.EvaluateAmbientInput): AmbientDecision {
     return ambient.evaluateAmbient(this.#database, input);
+  }
+
+  /** The task bound to a Slack thread, created if needed, without creating an operation. */
+  ensureTaskForThread(input: tasks.EnsureTaskForThreadInput): string {
+    return tasks.ensureTaskForThread(this.#database, input);
   }
 
   ingestSlackEvent(input: SlackEventInput): IngestReceipt {

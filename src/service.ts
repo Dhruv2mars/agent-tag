@@ -4,7 +4,7 @@ import type { AgentTagConfig } from "./config.ts";
 import { AgentTagCoordinator } from "./coordinator.ts";
 import { InteractionWorker } from "./interaction-worker.ts";
 import { validateConfiguredProviders } from "./policy/provider.ts";
-import { ScheduleWorker } from "./scheduler.ts";
+import { createScheduleWorkers } from "./scheduler.ts";
 import { SlackSocketBridge } from "./slack/bridge.ts";
 import { createRetentionWorker } from "./store/retention.ts";
 import { AgentTagStore } from "./store/store.ts";
@@ -226,7 +226,7 @@ export async function createAgentTagService(input: {
       bridge,
       coordinators,
       interactionWorkers: [new InteractionWorker({ store, config: input.config, t3Config: input.config.t3 })],
-      scheduleWorkers: [new ScheduleWorker({ config: input.config, store })],
+      scheduleWorkers: createScheduleWorkers({ config: input.config, store }),
       maintenanceWorkers: [
         {
           processNext: async () => {

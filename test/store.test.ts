@@ -275,6 +275,7 @@ describe("Agent Tag durable store", () => {
         memoryEntries: 0,
         schedules: 0,
         scheduleRuns: 0,
+        schedulesAutoDisabled: 0,
         ambientDecisions: 0,
         auditRecords: 2,
       });

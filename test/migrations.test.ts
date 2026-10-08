@@ -90,7 +90,7 @@ function seedVersionOne(database: Database): void {
 test("upgrades every historical SQLite schema while preserving existing work", async () => {
   // 13 belongs to an independent branch; 14 must apply whether or not it is present.
   const versions = STORE_MIGRATIONS.map((migration) => migration.version);
-  expect(versions).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14]);
+  expect(versions).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15]);
 
   for (const startingVersion of versions) {
     const directory = await mkdtemp(join(tmpdir(), `agent-tag-migration-v${startingVersion}-`));
@@ -160,5 +160,81 @@ test("upgrades every historical SQLite schema while preserving existing work", a
       }
       await rm(directory, { recursive: true });
     }
+  }
+});
+
+test("routine migration backfills run outcomes and end reasons from the previous schema", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-tag-migration-routines-"));
+  const path = join(directory, "agent-tag.sqlite");
+  try {
+    const historical = new Database(path, { create: true, strict: true });
+    historical.exec("PRAGMA foreign_keys = ON");
+    historical.exec("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)");
+    applyMigration(historical, 1);
+    seedVersionOne(historical);
+    for (const { version } of STORE_MIGRATIONS) {
+      if (version > 1 && version < 15) applyMigration(historical, version);
+    }
+    const insertSchedule = historical.query(
+      `INSERT INTO schedules (
+        schedule_id, task_id, workspace_id, conversation_id, thread_ts, actor_user_id, profile_id,
+        repository_root, kind, prompt, cadence_seconds, missed_run_policy, misfire_grace_seconds,
+        overlap_policy, state, next_run_at, created_at, updated_at
+      ) VALUES (?, 'task-1', 'T1', 'C1', '1000.000001', 'U1', 'engineering', '/srv/repos/example', 'agent',
+        ?, 3600, 'skip', 60, 'skip', ?, ?, ?, ?)`,
+    );
+    insertSchedule.run("s-active", "hourly check", "active", createdAt, createdAt, createdAt);
+    insertSchedule.run("s-cancelled", "old check", "cancelled", createdAt, createdAt, "2026-09-22T00:00:00.000Z");
+    insertSchedule.run("s-completed", "one check", "completed", createdAt, createdAt, "2026-09-23T00:00:00.000Z");
+    const insertRun = historical.query(
+      `INSERT INTO schedule_runs (run_id, schedule_id, due_at, disposition, operation_id, created_at)
+       VALUES (?, 's-active', ?, ?, ?, ?)`,
+    );
+    insertRun.run("s-active:a", "2026-09-21T01:00:00.000Z", "dispatched", "operation-1", "2026-09-21T01:00:01.000Z");
+    insertRun.run("s-active:b", "2026-09-21T02:00:00.000Z", "missed-skipped", null, "2026-09-21T02:00:01.000Z");
+    insertRun.run("s-active:c", "2026-09-21T03:00:00.000Z", "overlap-skipped", null, "2026-09-21T03:00:01.000Z");
+    historical.close();
+
+    (await AgentTagStore.open(path)).close();
+
+    const upgraded = new Database(path, { strict: true });
+    expect(
+      upgraded
+        .query("SELECT run_id, outcome, outcome_at FROM schedule_runs ORDER BY run_id")
+        .all(),
+    ).toEqual([
+      { run_id: "s-active:a", outcome: null, outcome_at: null },
+      { run_id: "s-active:b", outcome: "skipped", outcome_at: "2026-09-21T02:00:01.000Z" },
+      { run_id: "s-active:c", outcome: "skipped", outcome_at: "2026-09-21T03:00:01.000Z" },
+    ]);
+    expect(
+      upgraded
+        .query(
+          `SELECT schedule_id, prompt, ended_reason, ended_at, consecutive_failures, failure_streak_started_at,
+                  source_event_key FROM schedules ORDER BY schedule_id`,
+        )
+        .all(),
+    ).toEqual([
+      { schedule_id: "s-active", prompt: "hourly check", ended_reason: null, ended_at: null, consecutive_failures: 0, failure_streak_started_at: null, source_event_key: null },
+      { schedule_id: "s-cancelled", prompt: "old check", ended_reason: "user-cancelled", ended_at: "2026-09-22T00:00:00.000Z", consecutive_failures: 0, failure_streak_started_at: null, source_event_key: null },
+      { schedule_id: "s-completed", prompt: "one check", ended_reason: "completed", ended_at: "2026-09-23T00:00:00.000Z", consecutive_failures: 0, failure_streak_started_at: null, source_event_key: null },
+    ]);
+    // The source key is unique per workspace only when set; NULLs (CLI schedules) never collide.
+    upgraded.exec("UPDATE schedules SET source_event_key = 'C1:1.000001' WHERE schedule_id = 's-active'");
+    expect(() =>
+      upgraded.exec("UPDATE schedules SET source_event_key = 'C1:1.000001' WHERE schedule_id = 's-cancelled'"),
+    ).toThrow(/UNIQUE/);
+    expect(() =>
+      upgraded.exec("UPDATE schedules SET ended_reason = 'bogus' WHERE schedule_id = 's-cancelled'"),
+    ).toThrow(/CHECK/);
+    expect(
+      upgraded.query<{ quick_check: string }, []>("PRAGMA quick_check").get()?.quick_check,
+    ).toBe("ok");
+    upgraded.close();
+  } finally {
+    if (!directory.startsWith(`${tmpdir()}/agent-tag-migration-routines-`)) {
+      throw new Error(`refusing to remove unexpected migration fixture path ${directory}`);
+    }
+    await rm(directory, { recursive: true });
   }
 });

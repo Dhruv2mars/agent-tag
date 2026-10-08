@@ -294,4 +294,33 @@ export const STORE_MIGRATIONS: readonly StoreMigration[] = [
         CHECK (turn_active_ms >= 0);
     `,
   },
+  {
+    // Routines (PR-J1): request source and time zone, run outcomes, failure streaks and end reasons.
+    // "Disabled" is state = 'cancelled' with ended_reason = 'auto-disabled', so the state CHECK is unchanged.
+    version: 15,
+    sql: `
+      ALTER TABLE schedules ADD COLUMN time_zone TEXT;
+      ALTER TABLE schedules ADD COLUMN human_readable TEXT;
+      ALTER TABLE schedules ADD COLUMN source_event_key TEXT;
+      ALTER TABLE schedules ADD COLUMN notify_user_id TEXT;
+      ALTER TABLE schedules ADD COLUMN consecutive_failures INTEGER NOT NULL DEFAULT 0
+        CHECK (consecutive_failures >= 0);
+      ALTER TABLE schedules ADD COLUMN failure_streak_started_at TEXT;
+      ALTER TABLE schedules ADD COLUMN ended_reason TEXT CHECK (ended_reason IS NULL OR
+        ended_reason IN ('user-cancelled', 'auto-disabled', 'authority-revoked', 'completed'));
+      ALTER TABLE schedules ADD COLUMN ended_at TEXT;
+      CREATE UNIQUE INDEX schedules_source_event_idx ON schedules(workspace_id, source_event_key)
+        WHERE source_event_key IS NOT NULL;
+      CREATE INDEX schedules_conversation_idx
+        ON schedules(workspace_id, conversation_id, state, created_at);
+      ALTER TABLE schedule_runs ADD COLUMN outcome TEXT CHECK (outcome IS NULL OR
+        outcome IN ('succeeded', 'failed', 'cancelled', 'skipped'));
+      ALTER TABLE schedule_runs ADD COLUMN outcome_at TEXT;
+      ALTER TABLE schedule_runs ADD COLUMN outcome_error_code TEXT;
+      CREATE INDEX schedule_runs_pending_outcome_idx ON schedule_runs(created_at) WHERE outcome IS NULL;
+      UPDATE schedule_runs SET outcome = 'skipped', outcome_at = created_at WHERE disposition <> 'dispatched';
+      UPDATE schedules SET ended_reason = CASE state WHEN 'completed' THEN 'completed' ELSE 'user-cancelled' END,
+        ended_at = updated_at WHERE state <> 'active';
+    `,
+  },
 ];
