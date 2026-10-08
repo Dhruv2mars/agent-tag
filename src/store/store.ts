@@ -199,6 +199,10 @@ export class AgentTagStore {
     memory.recordMemoryDenial(this.#database, input);
   }
 
+  peekResolvedTurnText(input: operations.PeekResolvedTurnTextInput): string | null {
+    return operations.peekResolvedTurnText(this.#database, input);
+  }
+
   resolveOperationTurnText(input: operations.ResolveOperationTurnTextInput): string {
     return operations.resolveOperationTurnText(this.#database, input);
   }

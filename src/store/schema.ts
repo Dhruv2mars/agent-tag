@@ -12,6 +12,10 @@ export const operationPayloadSchema = z.object({
   threadTs: nonEmpty,
   profileId: nonEmpty,
   repositoryRoot: nonEmpty,
+  /** Slack ts of the triggering message. Absent on operations created before it was recorded. */
+  messageTs: nonEmpty.optional(),
+  /** What created the operation. Absent means "slack". */
+  origin: z.enum(["slack", "schedule"]).optional(),
 });
 export const plainTextObjectSchema = z.object({ type: z.literal("plain_text"), text: z.string(), emoji: z.boolean().optional() });
 export const mrkdwnObjectSchema = z.object({ type: z.literal("mrkdwn"), text: z.string() });

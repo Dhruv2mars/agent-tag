@@ -246,6 +246,7 @@ export class ScheduleWorker {
         text: schedule.prompt,
         receivedAt: current.toISOString(),
         sourceOrderKey: slackOrderKey(new Date(schedule.dueAt)),
+        origin: "schedule",
       });
       operationId = receipt.operationId;
     }

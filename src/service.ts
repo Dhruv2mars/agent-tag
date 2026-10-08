@@ -218,11 +218,11 @@ export async function createAgentTagService(input: {
   const quarantined = store.quarantineExpiredOutbox(now().toISOString());
   try {
     validateConfiguredProviders(input.config, await inspectT3(input.config.t3));
-    const bridge = await SlackSocketBridge.create({ config: input.config, store });
+    const bridge = await SlackSocketBridge.create({ config: input.config, store, logger });
     let nextMemoryExpiryAt = 0;
     const coordinators = Array.from(
       { length: input.config.limits.maxConcurrentTasks },
-      () => new AgentTagCoordinator({ config: input.config, store }),
+      () => new AgentTagCoordinator({ config: input.config, store, slackContext: bridge.contextSource }),
     );
     const service = new AgentTagService({
       store,

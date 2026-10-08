@@ -37,6 +37,8 @@ export function ingestSlackEvent(context: StoreContext, input: SlackEventInput):
     text: input.text,
     receivedAt: isoDateTime.parse(input.receivedAt),
     sourceOrderKey: requiredId(input.sourceOrderKey ?? input.receivedAt, "sourceOrderKey"),
+    messageTs: input.messageTs === undefined ? undefined : requiredId(input.messageTs, "messageTs"),
+    origin: input.origin === undefined ? undefined : z.enum(["slack", "schedule"]).parse(input.origin),
   };
   const ingest = database.transaction((): IngestReceipt => {
     const priorDelivery = deliveryLookupSchema.nullable().parse(
@@ -81,6 +83,8 @@ export function ingestSlackEvent(context: StoreContext, input: SlackEventInput):
       threadTs: event.threadTs,
       profileId: event.profileId,
       repositoryRoot: event.repositoryRoot,
+      ...(event.messageTs === undefined ? {} : { messageTs: event.messageTs }),
+      ...(event.origin === undefined ? {} : { origin: event.origin }),
     });
     database
       .query(

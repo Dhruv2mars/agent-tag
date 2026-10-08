@@ -3,16 +3,21 @@ import { z } from "zod";
 
 import type { AgentTagConfig } from "../config.ts";
 import { readSecretFile } from "../security/secret-file.ts";
+import type { ServiceLogger } from "../service.ts";
 import type { AgentTagStore } from "../store/store.ts";
 import { SLACK_ACTION_IDS, SlackActionRouter, USER_INPUT_MODAL_CALLBACK_ID } from "./actions.ts";
+import type { SlackContextSource } from "./context-source.ts";
 import { SlackEventRouter } from "./events.ts";
 import { deliverNextSlackOutbox, type SlackOutboxOutcome } from "./outbox.ts";
 import { installUndiciWebSocketCompat } from "./undici-compat.ts";
+import { SlackUserDirectory } from "./users.ts";
 
 const authTestSchema = z.object({
   ok: z.literal(true),
   team_id: z.string().min(1),
   user_id: z.string().min(1),
+  /** Documented for bot tokens; absent on older or unusual installs. */
+  bot_id: z.string().min(1).optional(),
 });
 
 /**
@@ -33,16 +38,25 @@ export class SlackSocketBridge {
   readonly #store: AgentTagStore;
   readonly #config: AgentTagConfig;
   readonly #workerId = `slack-outbox-${crypto.randomUUID()}`;
+  /** Read-only Slack lookups for turn composition (speaker labels). */
+  readonly contextSource: SlackContextSource;
 
-  private constructor(app: SlackApp, store: AgentTagStore, config: AgentTagConfig) {
+  private constructor(
+    app: SlackApp,
+    store: AgentTagStore,
+    config: AgentTagConfig,
+    contextSource: SlackContextSource,
+  ) {
     this.#app = app;
     this.#store = store;
     this.#config = config;
+    this.contextSource = contextSource;
   }
 
   static async create(input: {
     readonly config: AgentTagConfig;
     readonly store: AgentTagStore;
+    readonly logger?: ServiceLogger;
   }): Promise<SlackSocketBridge> {
     installUndiciWebSocketCompat();
     const { App, LogLevel } = await import("@slack/bolt");
@@ -93,7 +107,16 @@ export class SlackSocketBridge {
         await ack();
       }
     });
-    return new SlackSocketBridge(app, input.store, input.config);
+    const users = new SlackUserDirectory({
+      lookup: (userId) => app.client.users.info({ user: userId }),
+      ...(input.logger === undefined ? {} : { logger: input.logger }),
+    });
+    const contextSource: SlackContextSource = {
+      botUserId: auth.user_id,
+      ...(auth.bot_id === undefined ? {} : { selfBotId: auth.bot_id }),
+      users,
+    };
+    return new SlackSocketBridge(app, input.store, input.config, contextSource);
   }
 
   async start(): Promise<void> {

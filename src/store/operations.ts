@@ -163,11 +163,33 @@ export function renewOperationLease(database: Database, input: RenewOperationLea
   return expiresAt;
 }
 
+export interface PeekResolvedTurnTextInput {
+  readonly operationId: string;
+  readonly workerId: string;
+  readonly now: string;
+}
+
 export interface ResolveOperationTurnTextInput {
   readonly operationId: string;
   readonly workerId: string;
   readonly proposedText: string;
   readonly now: string;
+}
+
+/**
+ * The frozen turn text, or null before it is resolved. Same lease predicate as
+ * `resolveOperationTurnText`, read-only, so a retry can skip every Slack read.
+ */
+export function peekResolvedTurnText(database: Database, input: PeekResolvedTurnTextInput): string | null {
+  const now = isoDateTime.parse(input.now);
+  return resolvedOperationTextSchema.parse(
+    database
+      .query(
+        `SELECT resolved_text FROM operations
+         WHERE operation_id = ? AND status = 'inflight' AND lease_owner = ? AND lease_expires_at > ?`,
+      )
+      .get(requiredId(input.operationId, "operationId"), requiredId(input.workerId, "workerId"), now),
+  ).resolved_text;
 }
 
 export function resolveOperationTurnText(database: Database, input: ResolveOperationTurnTextInput): string {
