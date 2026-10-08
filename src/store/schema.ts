@@ -49,6 +49,7 @@ export const operationRowSchema = z.object({
   payload_json: nonEmpty,
   attempts: z.number().int().nonnegative(),
   lease_expires_at: isoDateTime,
+  turn_active_ms: z.number().int().nonnegative(),
 });
 
 export const outboxRowSchema = z.object({
@@ -165,6 +166,9 @@ export const AUDIT_ACTIONS = [
   "ambient.decided",
   "interaction.approval.requested",
   "interaction.cancel.requested",
+  "interaction.expired",
+  "interaction.closed",
+  "interaction.adopted",
   "interaction.response.claimed",
   "interaction.response.completed",
   "interaction.response.failed",

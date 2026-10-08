@@ -414,6 +414,7 @@ describe("durable interactions", () => {
         actorUserId: "U1",
         sourceActionId: "invalid-fixture",
         response: {},
+        expirySeconds: 86_400,
         now,
       });
       const worker = new InteractionWorker({
@@ -664,6 +665,100 @@ describe("durable interactions", () => {
       expect(store.claimNextInteractionResponse({ workerId: "worker", now, leaseMs: 10_000 })).toBeNull();
     });
   });
+  test("refuses responses at the expiry deadline, before the coordinator closes the wait (B7)", async () => {
+    await withStore(async ({ store, path }) => {
+      const seeded = seedOperation(store);
+      const expiryMs = config.limits.interactionExpirySeconds * 1_000;
+      let clock = Date.parse(now);
+      const router = new SlackActionRouter({ config, store, now: () => new Date(clock).toISOString() });
+      const question = {
+        requestId: "question-late",
+        dismissible: true,
+        questions: [
+          { id: "package", header: "Package", question: "Which package?", options: [{ label: "core" }], multiSelect: false },
+        ],
+      };
+      const record = (requestId: string, kind: "approval" | "user-input", prompt: unknown) =>
+        store.recordPendingInteraction({
+          ...seeded,
+          requestId,
+          kind,
+          prompt,
+          conversationId: "C1",
+          threadTs: "1000.000001",
+          message: () => ({ text: "waiting" }),
+          now,
+        }).interactionId;
+      const onTime = record("approval-on-time", "approval", {});
+      const late = record("approval-late", "approval", {});
+      const lateQuestion = record(question.requestId, "user-input", question);
+
+      // One millisecond before the deadline a response is still accepted...
+      clock = Date.parse(now) + expiryMs - 1;
+      expect(router.ingest(actionBody({ actionId: "agent-tag.approval.accept", value: onTime })).kind).toBe(
+        "accepted",
+      );
+      // ...but from the deadline on, approvals and answers are refused even though the coordinator has
+      // not yet polled and marked the interactions expired.
+      clock = Date.parse(now) + expiryMs;
+      expect(
+        router.ingest(actionBody({ actionId: "agent-tag.approval.accept", value: late, actionTs: "1000.000021" })),
+      ).toEqual({ kind: "ignored", reason: "interaction-expired" });
+      expect(
+        router.ingest(actionBody({ actionId: "agent-tag.user-input.dismiss", value: lateQuestion, actionTs: "1000.000022" })),
+      ).toEqual({ kind: "ignored", reason: "interaction-expired" });
+      expect(
+        router.ingest(
+          actionBody({
+            actionId: "agent-tag.user-input.answer",
+            value: JSON.stringify({ interactionId: lateQuestion, questionId: "package", optionIndex: 0 }),
+            actionTs: "1000.000023",
+          }),
+        ),
+      ).toEqual({ kind: "ignored", reason: "interaction-expired" });
+      expect(
+        router.ingestViewSubmission(
+          viewSubmissionBody({
+            viewId: "view-late",
+            privateMetadata: JSON.stringify({
+              interactionId: lateQuestion,
+              questionId: "package",
+              conversationId: "C1",
+              threadTs: "1000.000001",
+            }),
+            text: "core",
+          }),
+        ),
+      ).toEqual({
+        kind: "invalid-input",
+        errors: { "agent-tag.user-input.text": "This question has expired and can no longer be answered." },
+      });
+
+      const database = new Database(path, { readonly: true });
+      try {
+        const states = Object.fromEntries(
+          database
+            .query("SELECT request_id, state, partial_response_json FROM interactions")
+            .all()
+            .map((row) => {
+              const { request_id, state, partial_response_json } = row as Record<string, string | null>;
+              return [request_id, { state, partial: partial_response_json }];
+            }),
+        );
+        expect(states).toEqual({
+          "approval-on-time": { state: "response-pending", partial: null },
+          "approval-late": { state: "pending", partial: null },
+          "question-late": { state: "pending", partial: null },
+        });
+      } finally {
+        database.close();
+      }
+      // Only the on-time approval reaches the interaction worker.
+      const claimed = store.claimNextInteractionResponse({ workerId: "worker", now: new Date(clock).toISOString(), leaseMs: 10_000 });
+      expect(claimed?.interactionId).toBe(onTime);
+      expect(store.claimNextInteractionResponse({ workerId: "worker", now: new Date(clock).toISOString(), leaseMs: 10_000 })).toBeNull();
+    });
+  });
 });
 
 function readRows<T>(path: string, sql: string, ...params: string[]): T[] {
@@ -698,6 +793,7 @@ function queueApprovalResponse(
     actorUserId: "U1",
     sourceActionId: `accept-${requestId}`,
     response: { decision: "accept" },
+    expirySeconds: 86_400,
     now,
   });
   expect(submitted.kind).toBe("accepted");

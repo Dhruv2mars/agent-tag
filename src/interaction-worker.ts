@@ -197,6 +197,16 @@ export class InteractionWorker {
       } else {
         command = await this.#interruptCommand(response);
       }
+      // Last check before T3: the operation may have settled since the claim (see the invariant at
+      // claimNextInteractionResponse). A refused response is already closed and is never dispatched.
+      const check = this.#store.checkInteractionDispatch({
+        interactionId: response.interactionId,
+        workerId: this.#workerId,
+        now: this.#now().toISOString(),
+      });
+      if (check.kind === "refused") {
+        return { kind: "failed", interactionId: response.interactionId, errorCode: check.errorCode };
+      }
       await this.#t3.dispatch(command);
       this.#store.completeInteractionResponse({
         interactionId: response.interactionId,

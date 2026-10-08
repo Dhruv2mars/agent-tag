@@ -88,10 +88,20 @@ function seedVersionOne(database: Database): void {
 }
 
 test("upgrades every historical SQLite schema while preserving existing work", async () => {
-  expect(STORE_MIGRATIONS.map((migration) => migration.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
+  const versions = STORE_MIGRATIONS.map((migration) => migration.version);
+  expect(versions).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]);
+  // Each historical prefix, plus a store that applied 14 (from main) before 13 existed: applied
+  // versions are tracked as a set, so 13 must still apply on top of it.
+  const startingSets: ReadonlyArray<{ readonly label: string; readonly applied: ReadonlyArray<number> }> = [
+    ...versions.map((startingVersion) => ({
+      label: `v${startingVersion}`,
+      applied: versions.filter((version) => version <= startingVersion),
+    })),
+    { label: "v14-without-13", applied: versions.filter((version) => version !== 13) },
+  ];
 
-  for (const startingVersion of STORE_MIGRATIONS.map((migration) => migration.version)) {
-    const directory = await mkdtemp(join(tmpdir(), `agent-tag-migration-v${startingVersion}-`));
+  for (const { label, applied } of startingSets) {
+    const directory = await mkdtemp(join(tmpdir(), `agent-tag-migration-${label}-`));
     const path = join(directory, "agent-tag.sqlite");
     try {
       const historical = new Database(path, { create: true, strict: true });
@@ -101,10 +111,8 @@ test("upgrades every historical SQLite schema while preserving existing work", a
       );
       applyMigration(historical, 1);
       seedVersionOne(historical);
-      for (const migration of STORE_MIGRATIONS) {
-        if (migration.version > 1 && migration.version <= startingVersion) {
-          applyMigration(historical, migration.version);
-        }
+      for (const version of applied) {
+        if (version > 1) applyMigration(historical, version);
       }
       historical.close();
 
@@ -129,9 +137,10 @@ test("upgrades every historical SQLite schema while preserving existing work", a
             source_order_key: string;
             blocked_until: string | null;
             resolved_text: string | null;
-          }, []>("SELECT source_order_key, blocked_until, resolved_text FROM operations")
+            turn_active_ms: number;
+          }, []>("SELECT source_order_key, blocked_until, resolved_text, turn_active_ms FROM operations")
           .get(),
-      ).toEqual({ source_order_key: createdAt, blocked_until: null, resolved_text: null });
+      ).toEqual({ source_order_key: createdAt, blocked_until: null, resolved_text: null, turn_active_ms: 0 });
       expect(
         upgraded
           .query<{ conversation_type: string; owner_user_id: string | null }, []>(
@@ -171,7 +180,7 @@ test("upgrades every historical SQLite schema while preserving existing work", a
       ).toBe("ok");
       upgraded.close();
     } finally {
-      if (!directory.startsWith(`${tmpdir()}/agent-tag-migration-v${startingVersion}-`)) {
+      if (!directory.startsWith(`${tmpdir()}/agent-tag-migration-${label}-`)) {
         throw new Error(`refusing to remove unexpected migration fixture path ${directory}`);
       }
       await rm(directory, { recursive: true });
