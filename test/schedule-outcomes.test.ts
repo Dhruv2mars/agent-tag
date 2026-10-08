@@ -204,6 +204,22 @@ function autoDisableNotices(store: AgentTagStore, scheduleId: string) {
   return notices;
 }
 
+function disableAudits(store: AgentTagStore, scheduleId: string) {
+  return store
+    .listAuditRecords()
+    .filter((record) => record.action === "schedule.auto-disabled" && record.correlationId === scheduleId);
+}
+
+/** Auto-disable notices ever enqueued for a schedule (read from the audit log, without draining the outbox). */
+function noticeEnqueues(store: AgentTagStore, scheduleId: string) {
+  return store
+    .listAuditRecords()
+    .filter(
+      (record) =>
+        record.action === "slack.outbox.enqueued" && record.metadata.clientMessageId === `${scheduleId}:auto-disabled`,
+    );
+}
+
 describe("schedule run outcomes", () => {
   test("maps operation and reminder outcomes; retry-pending runs stay unsettled", async () => {
     await withHarness(async ({ store, context }) => {
@@ -390,6 +406,112 @@ describe("schedule run outcomes", () => {
         autoDisabled: [routine.scheduleId],
       });
       expect(autoDisableNotices(store, routine.scheduleId)).toHaveLength(1);
+    });
+  });
+
+  test("a success at the end of a backlog larger than one sweep keeps the routine enabled", async () => {
+    await withHarness(async ({ store, context }) => {
+      // A delayed outcome worker finds 50 failed runs followed by a successful one (51 > batch of 50).
+      const routine = createRoutine(store, context(), { cadenceSeconds: 1_800 });
+      const step = 30 * MINUTE;
+      for (let index = 0; index < 50; index += 1) {
+        await dispatch(store, index * step);
+        finishOperation(store, index * step + MINUTE, "failed");
+      }
+      await dispatch(store, 50 * step);
+      finishOperation(store, 50 * step + MINUTE, "succeeded");
+
+      const sweepAt = 50 * step + 2 * MINUTE;
+      // The first sweep sees only the failures; the success is still awaiting reconciliation.
+      expect(await outcomeWorker(store, sweepAt).processNext()).toEqual({
+        kind: "outcomes-recorded",
+        recorded: 50,
+        autoDisabled: [],
+      });
+      expect(store.getSchedule(routine.scheduleId)).toMatchObject({ state: "active", endedReason: null });
+      expect(await outcomeWorker(store, sweepAt + MINUTE).processNext()).toEqual({
+        kind: "outcomes-recorded",
+        recorded: 1,
+        autoDisabled: [],
+      });
+      expect(await outcomeWorker(store, sweepAt + 2 * MINUTE).processNext()).toEqual({ kind: "idle" });
+      expect(store.getSchedule(routine.scheduleId)).toMatchObject({
+        state: "active",
+        endedReason: null,
+        consecutiveFailures: 0,
+        failureStreakStartedAt: null,
+      });
+      expect(disableAudits(store, routine.scheduleId)).toHaveLength(0);
+      expect(noticeEnqueues(store, routine.scheduleId)).toHaveLength(0);
+    });
+  });
+
+  test("an all-failure backlog larger than one sweep disables once, after it is fully reconciled", async () => {
+    await withHarness(async ({ store, context }) => {
+      const routine = createRoutine(store, context(), { cadenceSeconds: 1_800 });
+      const step = 30 * MINUTE;
+      for (let index = 0; index < 52; index += 1) {
+        await dispatch(store, index * step);
+        finishOperation(store, index * step + MINUTE, "failed");
+      }
+      const sweepAt = 52 * step;
+      // 50 of 52 finished runs reconciled: the streak is not final yet, so no decision is made.
+      expect(await outcomeWorker(store, sweepAt).processNext()).toEqual({
+        kind: "outcomes-recorded",
+        recorded: 50,
+        autoDisabled: [],
+      });
+      expect(store.getSchedule(routine.scheduleId)).toMatchObject({ state: "active", endedReason: null });
+      expect(disableAudits(store, routine.scheduleId)).toHaveLength(0);
+
+      expect(await outcomeWorker(store, sweepAt + MINUTE).processNext()).toEqual({
+        kind: "auto-disabled",
+        recorded: 2,
+        autoDisabled: [routine.scheduleId],
+      });
+      expect(await outcomeWorker(store, sweepAt + 2 * MINUTE).processNext()).toEqual({ kind: "idle" });
+      expect(store.getSchedule(routine.scheduleId)).toMatchObject({
+        state: "cancelled",
+        endedReason: "auto-disabled",
+        endedAt: at(sweepAt + MINUTE),
+        consecutiveFailures: 52,
+        failureStreakStartedAt: at(0),
+      });
+      const audits = disableAudits(store, routine.scheduleId);
+      expect(audits).toHaveLength(1);
+      expect(audits[0]?.metadata).toMatchObject({ consecutiveFailures: 52, streakStartedAt: at(0) });
+      expect(noticeEnqueues(store, routine.scheduleId)).toHaveLength(1);
+    });
+  });
+
+  test("a newer run still in flight defers the decision, and its success prevents the disable", async () => {
+    await withHarness(async ({ store, context }) => {
+      const routine = createRoutine(store, context(), { cadenceSeconds: 1_830 });
+      for (const offset of [0, 30.5, 61]) {
+        await dispatch(store, offset * MINUTE);
+        finishOperation(store, (offset + 1) * MINUTE, "failed");
+      }
+      // The next run is dispatched before the outcome worker gets to the third failure.
+      await dispatch(store, 91.5 * MINUTE);
+      expect(await outcomeWorker(store, 92 * MINUTE).processNext()).toEqual({
+        kind: "outcomes-recorded",
+        recorded: 3,
+        autoDisabled: [],
+      });
+      expect(store.getSchedule(routine.scheduleId)).toMatchObject({ state: "active", consecutiveFailures: 3 });
+      finishOperation(store, 93 * MINUTE, "succeeded");
+      expect(await outcomeWorker(store, 94 * MINUTE).processNext()).toEqual({
+        kind: "outcomes-recorded",
+        recorded: 1,
+        autoDisabled: [],
+      });
+      expect(store.getSchedule(routine.scheduleId)).toMatchObject({
+        state: "active",
+        consecutiveFailures: 0,
+        failureStreakStartedAt: null,
+      });
+      expect(disableAudits(store, routine.scheduleId)).toHaveLength(0);
+      expect(noticeEnqueues(store, routine.scheduleId)).toHaveLength(0);
     });
   });
 

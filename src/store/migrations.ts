@@ -318,6 +318,11 @@ export const STORE_MIGRATIONS: readonly StoreMigration[] = [
       ALTER TABLE schedule_runs ADD COLUMN outcome_at TEXT;
       ALTER TABLE schedule_runs ADD COLUMN outcome_error_code TEXT;
       CREATE INDEX schedule_runs_pending_outcome_idx ON schedule_runs(created_at) WHERE outcome IS NULL;
+      -- Runs dispatched before outcome tracking existed still get an outcome for history, but never
+      -- count toward an auto-disable streak: an upgrade must not disable a routine for failures that
+      -- happened before the policy shipped. Only runs recorded from here on start at legacy = 0.
+      ALTER TABLE schedule_runs ADD COLUMN legacy INTEGER NOT NULL DEFAULT 0 CHECK (legacy IN (0, 1));
+      UPDATE schedule_runs SET legacy = 1;
       UPDATE schedule_runs SET outcome = 'skipped', outcome_at = created_at WHERE disposition <> 'dispatched';
       UPDATE schedules SET ended_reason = CASE state WHEN 'completed' THEN 'completed' ELSE 'user-cancelled' END,
         ended_at = updated_at WHERE state <> 'active';

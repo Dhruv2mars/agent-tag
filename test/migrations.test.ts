@@ -238,3 +238,70 @@ test("routine migration backfills run outcomes and end reasons from the previous
     await rm(directory, { recursive: true });
   }
 });
+
+test("runs dispatched before the routine migration never count toward an auto-disable", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-tag-migration-legacy-runs-"));
+  const path = join(directory, "agent-tag.sqlite");
+  try {
+    const historical = new Database(path, { create: true, strict: true });
+    historical.exec("PRAGMA foreign_keys = ON");
+    historical.exec("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)");
+    applyMigration(historical, 1);
+    seedVersionOne(historical);
+    for (const { version } of STORE_MIGRATIONS) {
+      if (version > 1 && version < 15) applyMigration(historical, version);
+    }
+    historical.exec("UPDATE operations SET status = 'failed', last_error_code = 'T3TurnFailed'");
+    historical
+      .query(
+        `INSERT INTO schedules (
+          schedule_id, task_id, workspace_id, conversation_id, thread_ts, actor_user_id, profile_id,
+          repository_root, kind, prompt, cadence_seconds, missed_run_policy, misfire_grace_seconds,
+          overlap_policy, state, next_run_at, created_at, updated_at
+        ) VALUES ('s-legacy', 'task-1', 'T1', 'C1', '1000.000001', 'U1', 'engineering', '/srv/repos/example',
+          'agent', 'hourly check', 3600, 'skip', 60, 'skip', 'active', ?, ?, ?)`,
+      )
+      .run(createdAt, createdAt, createdAt);
+    // Five failed hourly runs from before outcome tracking: well past 3 failures over an hour.
+    for (let hour = 1; hour <= 5; hour += 1) {
+      const dueAt = `2026-09-21T0${hour}:00:00.000Z`;
+      historical
+        .query(
+          `INSERT INTO schedule_runs (run_id, schedule_id, due_at, disposition, operation_id, created_at)
+           VALUES (?, 's-legacy', ?, 'dispatched', 'operation-1', ?)`,
+        )
+        .run(`s-legacy:${dueAt}`, dueAt, dueAt);
+    }
+    historical.close();
+
+    const store = await AgentTagStore.open(path);
+    try {
+      const result = store.reconcileScheduleRunOutcomes({
+        now: "2026-09-21T06:00:00.000Z",
+        consecutiveFailures: 3,
+        minFailureSpanSeconds: 3_600,
+        renderAutoDisabledNotice: () => ({ text: "unexpected" }),
+      });
+      // Outcomes are recorded for history, but the routine stays on with no streak.
+      expect(result).toEqual({ recorded: 5, autoDisabled: [] });
+      expect(store.getSchedule("s-legacy")).toMatchObject({
+        state: "active",
+        endedReason: null,
+        consecutiveFailures: 0,
+        failureStreakStartedAt: null,
+      });
+    } finally {
+      store.close();
+    }
+    const upgraded = new Database(path, { strict: true });
+    expect(
+      upgraded.query("SELECT DISTINCT legacy, outcome FROM schedule_runs WHERE schedule_id = 's-legacy'").all(),
+    ).toEqual([{ legacy: 1, outcome: "failed" }]);
+    upgraded.close();
+  } finally {
+    if (!directory.startsWith(`${tmpdir()}/agent-tag-migration-legacy-runs-`)) {
+      throw new Error(`refusing to remove unexpected migration fixture path ${directory}`);
+    }
+    await rm(directory, { recursive: true });
+  }
+});

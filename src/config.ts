@@ -97,6 +97,8 @@ const retentionSchema = z
 /**
  * Routines. A recurring routine is turned off after `consecutiveFailures` failed runs in a row whose
  * due times span at least `minFailureSpanSeconds` (Claude Tag: 3 failures over at least 1 hour).
+ * The decision waits until every run due since the last success has an outcome, and runs dispatched
+ * before outcome tracking existed never count (see src/store/schedule-outcomes.ts).
  */
 const routinesSchema = z
   .object({
