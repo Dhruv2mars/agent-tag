@@ -5,6 +5,7 @@
  *   files.ts        open + migrations, backup/restore      tasks.ts        Slack ingest, task bindings
  *   operations.ts   operation leases and outcomes          interactions.ts approvals, cancel, responses
  *   user-input.ts   multi-question user-input answers      outbox.ts       Slack outbox queue
+ *   message-edits.ts  chat.update edit/refresh rows (outbox)
  *   schedules.ts    schedules and runs                     memory.ts       memory entries
  *   ambient.ts      ambient trigger decisions              audit.ts        audit log write/export
  *   diagnostics.ts  counts and operational status          lease.ts        shared lease helpers
@@ -44,6 +45,7 @@ import * as operations from "./operations.ts";
 import * as interactions from "./interactions.ts";
 import * as userInput from "./user-input.ts";
 import * as outbox from "./outbox.ts";
+import * as messageEdits from "./message-edits.ts";
 import * as waits from "./waits.ts";
 
 export { AUDIT_ACTIONS, type AuditAction } from "./schema.ts";
@@ -59,6 +61,8 @@ export type {
   IngestReceipt,
   MemoryRecord,
   OperationalStatus,
+  OutboxStatus,
+  RefreshKind,
   ScheduleSummary,
   SlackEventInput,
   SlackOutboxInput,
@@ -137,6 +141,8 @@ export type {
   RetryOutboxInput,
   ExhaustOutboxRetriesInput,
 } from "./outbox.ts";
+export { REFRESH_KINDS } from "./message-edits.ts";
+export type { EnqueueMessageEditInput, EnqueueMessageRefreshInput, MessageEditResult } from "./message-edits.ts";
 
 export class AgentTagStore {
   readonly #database: Database;
@@ -394,6 +400,16 @@ export class AgentTagStore {
 
   enqueueOutbox(input: SlackOutboxInput): outbox.EnqueueOutboxResult {
     return outbox.enqueueOutbox(this.#context, input);
+  }
+
+  /** Ensures one pending delivery-time re-render of a posted message (see message-edits.ts). */
+  enqueueMessageRefresh(input: messageEdits.EnqueueMessageRefreshInput): messageEdits.MessageEditResult {
+    return this.#database.transaction(() => messageEdits.enqueueMessageRefresh(this.#database, input)).immediate();
+  }
+
+  /** Ensures the posted message is edited to `payload`; coalesces with a pending edit of it. */
+  enqueueMessageEdit(input: messageEdits.EnqueueMessageEditInput): messageEdits.MessageEditResult {
+    return this.#database.transaction(() => messageEdits.enqueueMessageEdit(this.#database, input)).immediate();
   }
 
   claimNextOutbox(input: outbox.ClaimNextOutboxInput): ClaimedOutboxMessage | null {

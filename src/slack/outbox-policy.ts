@@ -1,5 +1,5 @@
-// Slack outbox delivery policy: classify chat.postMessage failures, compute retry backoff, and build
-// the plain-text fallback for payloads Slack rejected deterministically.
+// Slack outbox delivery policy: classify chat.postMessage and chat.update failures, compute retry
+// backoff, and build the plain-text fallback for payloads Slack rejected deterministically.
 //
 // Every failure lands in exactly one class:
 // - retryable: Slack definitely did not post the message (rate limited, connection never opened,
@@ -8,7 +8,8 @@
 // - ambiguous: Slack may have posted it (fatal_error, internal_error, timeouts, connection resets
 //   after the request may have been written, anything unknown). Quarantined, never resent.
 // - terminal: Slack deterministically rejected it (invalid_blocks, channel_not_found, invalid_auth,
-//   ...). Failed. invalid_blocks / msg_too_long get one plain-text fallback attempt first.
+//   ...). Failed. invalid_blocks / msg_too_long get one plain-text fallback attempt first (posts only;
+//   an edit that Slack rejects leaves the message as last rendered).
 import type { SlackOutboxPayload } from "../store/store.ts";
 import { escapeSlackText, SLACK_MESSAGE_TEXT_LIMIT, truncateBlockText } from "./render.ts";
 
@@ -56,9 +57,13 @@ const PLAIN_FALLBACK_PLATFORM_ERRORS = new Set([
   "msg_blocks_too_long",
 ]);
 
+/** chat.update rejections: the message is gone or can no longer be edited by this bot. */
+const EDIT_TERMINAL_PLATFORM_ERRORS = new Set(["message_not_found", "cant_update_message", "edit_window_closed"]);
+
 /** Deterministic rejections: resending the same request can never succeed. */
 const TERMINAL_PLATFORM_ERRORS = new Set([
   ...PLAIN_FALLBACK_PLATFORM_ERRORS,
+  ...EDIT_TERMINAL_PLATFORM_ERRORS,
   "account_inactive",
   "as_user_not_supported",
   "cannot_reply_to_message",
@@ -197,7 +202,7 @@ function classifyPlatformError(errorName: string, retryAfterMs: number | undefin
   return { kind: "ambiguous", errorCode };
 }
 
-/** Classify an error thrown by `chat.postMessage` (Slack WebClient errors or raw network errors). */
+/** Classify an error thrown by `chat.postMessage` or `chat.update` (Slack WebClient or network errors). */
 export function classifySlackDeliveryError(error: unknown): SlackDeliveryFailure {
   const code = stringField(error, "code");
   if (code === "slack_webapi_rate_limited_error") {

@@ -103,6 +103,7 @@ for (const revocation of revocations) {
           expect(message.text).not.toContain("private schedule canary");
           return { ts: "1000.000010" };
         },
+        updateMessage: async () => { throw new Error("no edits expected"); },
       })).kind !== "idle") {}
       expect(sent).toBe(revocation.name === "user" ? 2 : 0);
       const audit = store.listAuditRecords({ limit: 100 });

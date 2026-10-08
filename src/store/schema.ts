@@ -56,6 +56,14 @@ export const operationRowSchema = z.object({
   turn_active_ms: z.number().int().nonnegative(),
 });
 
+/**
+ * Kinds of outbox refresh rows, whose message is rendered from current state at delivery time.
+ * Additive: append a kind here and register its renderer in slack/outbox.ts (PR-F adds "status-message").
+ */
+export const REFRESH_KINDS = ["interaction-card"] as const;
+export const refreshKindSchema = z.enum(REFRESH_KINDS);
+export const outboxStatusSchema = z.enum(["pending", "inflight", "delivered", "failed"]);
+
 export const outboxRowSchema = z.object({
   outbox_id: nonEmpty,
   task_id: nonEmpty,
@@ -67,6 +75,10 @@ export const outboxRowSchema = z.object({
   attempts: z.number().int().nonnegative(),
   lease_expires_at: isoDateTime,
   render_mode: z.enum(["rich", "plain"]),
+  method: z.enum(["post", "update"]),
+  refresh_kind: refreshKindSchema.nullable(),
+  target_status: outboxStatusSchema.nullable(),
+  target_slack_message_ts: nonEmpty.nullable(),
 });
 
 export const deliveryLookupSchema = z.object({
