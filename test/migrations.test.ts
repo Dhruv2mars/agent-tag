@@ -88,9 +88,9 @@ function seedVersionOne(database: Database): void {
 }
 
 test("upgrades every historical SQLite schema while preserving existing work", async () => {
-  // 13 belongs to an independent branch; 14 must apply whether or not it is present.
+  // 13 belongs to an independent branch; 14 and 15 must apply whether or not it is present.
   const versions = STORE_MIGRATIONS.map((migration) => migration.version);
-  expect(versions).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14]);
+  expect(versions).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15]);
 
   for (const startingVersion of versions) {
     const directory = await mkdtemp(join(tmpdir(), `agent-tag-migration-v${startingVersion}-`));
@@ -142,11 +142,18 @@ test("upgrades every historical SQLite schema while preserving existing work", a
       ).toEqual({ conversation_type: "channel", owner_user_id: null });
       expect(
         upgraded
-          .query<{ status: string; blocked_until: string | null; render_mode: string }, []>(
-            "SELECT status, blocked_until, render_mode FROM slack_outbox",
-          )
+          .query<{
+            status: string;
+            blocked_until: string | null;
+            render_mode: string;
+            method: string;
+            target_outbox_id: string | null;
+            refresh_kind: string | null;
+          }, []>("SELECT status, blocked_until, render_mode, method, target_outbox_id, refresh_kind FROM slack_outbox")
           .get(),
-      ).toEqual({ status: "pending", blocked_until: null, render_mode: "rich" });
+      ).toEqual({
+        status: "pending", blocked_until: null, render_mode: "rich", method: "post", target_outbox_id: null, refresh_kind: null,
+      });
       expect(
         upgraded.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM slack_rate_limits").get(),
       ).toEqual({ count: 0 });
@@ -160,5 +167,40 @@ test("upgrades every historical SQLite schema while preserving existing work", a
       }
       await rm(directory, { recursive: true });
     }
+  }
+});
+
+test("the message-edit migration enforces the outbox method and target reference", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-tag-migration-edits-"));
+  try {
+    const path = join(directory, "agent-tag.sqlite");
+    const store = await AgentTagStore.open(path);
+    store.close();
+    const database = new Database(path, { strict: true });
+    database.exec("PRAGMA foreign_keys = ON");
+    database
+      .query(
+        `INSERT INTO tasks (
+          task_id, workspace_id, conversation_id, thread_ts, profile_id, repository_root,
+          t3_project_id, t3_thread_id, state, created_at, updated_at
+        ) VALUES ('task-1', 'T1', 'C1', '1.1', 'engineering', '/srv', NULL, NULL, 'active', ?, ?)`,
+      )
+      .run(createdAt, createdAt);
+    const insert = (id: string, method: string, target: string | null) =>
+      database
+        .query(
+          `INSERT INTO slack_outbox (
+            outbox_id, task_id, correlation_id, conversation_id, thread_ts, client_message_id,
+            payload_json, status, created_at, updated_at, method, target_outbox_id
+          ) VALUES (?, 'task-1', 'c', 'C1', '1.1', ?, '{"text":""}', 'pending', ?, ?, ?, ?)`,
+        )
+        .run(id, id, createdAt, createdAt, method, target);
+    insert("post-1", "post", null);
+    insert("edit-1", "update", "post-1");
+    expect(() => insert("edit-2", "delete", "post-1")).toThrow("CHECK constraint failed");
+    expect(() => insert("edit-3", "update", "missing")).toThrow("FOREIGN KEY constraint failed");
+    database.close();
+  } finally {
+    await rm(directory, { recursive: true });
   }
 });
