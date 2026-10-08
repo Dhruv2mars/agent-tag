@@ -5,10 +5,12 @@ import { join } from "node:path";
 
 import {
   dispatchT3Command,
+  fetchT3ThreadSnapshot,
   pendingT3Approvals,
   pendingT3UserInputs,
   t3CommandSchema,
   t3AttachmentSchema,
+  T3ThreadNotFoundError,
   type T3ThreadSnapshot,
 } from "../src/t3/gateway.ts";
 
@@ -252,6 +254,45 @@ describe("T3 gateway command boundary", () => {
     } finally {
       server.stop(true);
       if (!directory.startsWith(`${tmpdir()}/agent-tag-t3-abort-`)) {
+        throw new Error(`refusing to remove unexpected fixture path ${directory}`);
+      }
+      await rm(directory, { recursive: true });
+    }
+  });
+  test("a thread snapshot HTTP 404 is a typed not-found error; other HTTP failures are not", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "agent-tag-t3-snapshot-"));
+    const tokenFile = join(directory, "t3-token");
+    await writeFile(tokenFile, "fixture-token\n");
+    await chmod(tokenFile, 0o600);
+    const server = Bun.serve({
+      port: 0,
+      fetch(request) {
+        const url = new URL(request.url);
+        if (url.pathname === "/api/auth/session") {
+          return Response.json({
+            authenticated: true,
+            scopes: ["orchestration:read", "orchestration:operate"],
+            sessionMethod: "bearer-access-token",
+            expiresAt: "2099-01-01T00:00:00.000Z",
+          });
+        }
+        if (url.pathname === "/api/orchestration/threads/missing-thread") {
+          return new Response("not found", { status: 404 });
+        }
+        return new Response("unavailable", { status: 503 });
+      },
+    });
+    try {
+      const config = { baseUrl: `http://127.0.0.1:${server.port}`, tokenFile };
+      const missing = await fetchT3ThreadSnapshot({ config, threadId: "missing-thread" }).catch((error: unknown) => error);
+      expect(missing).toBeInstanceOf(T3ThreadNotFoundError);
+      const unavailable = await fetchT3ThreadSnapshot({ config, threadId: "other-thread" }).catch((error: unknown) => error);
+      expect(unavailable).toBeInstanceOf(Error);
+      expect(unavailable).not.toBeInstanceOf(T3ThreadNotFoundError);
+      expect((unavailable as Error).message).toContain("HTTP 503");
+    } finally {
+      server.stop(true);
+      if (!directory.startsWith(`${tmpdir()}/agent-tag-t3-snapshot-`)) {
         throw new Error(`refusing to remove unexpected fixture path ${directory}`);
       }
       await rm(directory, { recursive: true });
