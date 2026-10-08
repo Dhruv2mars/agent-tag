@@ -14,6 +14,7 @@ export interface StoreDiagnostics {
   readonly memoryEntries: number;
   readonly schedules: number;
   readonly scheduleRuns: number;
+  readonly schedulesAutoDisabled: number;
   readonly ambientDecisions: number;
   readonly auditRecords: number;
 }
@@ -47,9 +48,18 @@ export function diagnostics(database: Database): StoreDiagnostics {
     memoryEntries: count("memory_entries"),
     schedules: count("schedules"),
     scheduleRuns: count("schedule_runs"),
+    schedulesAutoDisabled: autoDisabledSchedules(database),
     ambientDecisions: count("ambient_decisions"),
     auditRecords: count("audit_log"),
   };
+}
+
+function autoDisabledSchedules(database: Database): number {
+  const value = database
+    .query<{ count: number }, []>("SELECT COUNT(*) AS count FROM schedules WHERE ended_reason = 'auto-disabled'")
+    .get()?.count;
+  if (value === undefined) throw new Error("failed to count auto-disabled schedules");
+  return value;
 }
 
 export function operationalStatus(database: Database, nowInput: string): OperationalStatus {

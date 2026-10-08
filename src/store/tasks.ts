@@ -290,6 +290,35 @@ export function markT3ThreadStarted(database: Database, input: MarkT3ThreadStart
   if (result.changes !== 1) throw new Error("active task not found");
 }
 
+export interface EnsureTaskForThreadInput {
+  readonly workspaceId: string;
+  readonly conversationId: string;
+  readonly threadTs: string;
+  readonly actorUserId: string;
+  readonly conversationType: "channel" | "dm";
+  readonly profileId: string;
+  readonly repositoryRoot: string;
+  readonly now: string;
+}
+
+/**
+ * Returns the task bound to a Slack thread, creating it if needed, without creating an operation
+ * (e.g. so a routine request can bind its schedule to the thread). Idempotent per thread.
+ */
+export function ensureTaskForThread(database: Database, input: EnsureTaskForThreadInput): string {
+  const event = {
+    workspaceId: requiredId(input.workspaceId, "workspaceId"),
+    conversationId: requiredId(input.conversationId, "conversationId"),
+    threadTs: requiredId(input.threadTs, "threadTs"),
+    actorUserId: requiredId(input.actorUserId, "actorUserId"),
+    conversationType: z.enum(["channel", "dm"]).parse(input.conversationType),
+    profileId: requiredId(input.profileId, "profileId"),
+    repositoryRoot: requiredId(input.repositoryRoot, "repositoryRoot"),
+    receivedAt: isoDateTime.parse(input.now),
+  };
+  return database.transaction(() => findOrCreateTask(database, event)).immediate();
+}
+
 function findOrCreateTask(database: Database, event: {
   readonly workspaceId: string;
   readonly conversationId: string;

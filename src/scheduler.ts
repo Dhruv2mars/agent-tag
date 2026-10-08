@@ -3,7 +3,15 @@ import { z } from "zod";
 import { ExecutionAuthorityDenied, requireExecutionAuthority } from "./policy/execution.ts";
 import type { AgentTagConfig } from "./config.ts";
 import { nextRecurrenceRun, scheduleRecurrenceSchema } from "./routines/cron.ts";
-import type { AgentTagStore, ClaimedSchedule, ScheduleSummary } from "./store/store.ts";
+import { escapeSlackText } from "./slack/render.ts";
+import type {
+  AgentTagStore,
+  AutoDisabledNoticeInput,
+  ClaimedSchedule,
+  ScheduleSourceInput,
+  ScheduleSummary,
+  SlackOutboxPayload,
+} from "./store/store.ts";
 
 export interface ScheduleContext {
   readonly workspaceId: string;
@@ -47,12 +55,25 @@ export class AgentTagSchedules {
     readonly context: ScheduleContext;
     readonly spec: unknown;
     readonly now: string;
+    /** Slack request source. A repeated `eventKey` returns the schedule it already created. */
+    readonly source?: ScheduleSourceInput;
   }): ScheduleMutationResult {
     const denial = this.#denial(input.context);
     if (denial !== null) return this.#deny(input.context, input.context.taskId, denial, input.now);
     const parsed = scheduleSpecSchema.safeParse(input.spec);
     if (!parsed.success) {
       return this.#deny(input.context, input.context.taskId, "invalid-schedule", input.now);
+    }
+    if (input.source?.eventKey !== undefined) {
+      const existing = this.#store.findScheduleBySourceEvent({
+        workspaceId: input.context.workspaceId,
+        sourceEventKey: input.source.eventKey,
+      });
+      if (existing !== null) {
+        return existing.taskId === input.context.taskId
+          ? { kind: "accepted", schedule: existing }
+          : this.#deny(input.context, input.context.taskId, "schedule-denied", input.now);
+      }
     }
     if (this.#store.countActiveSchedules(input.context.workspaceId) >= this.#config.limits.maxActiveSchedules) {
       return this.#deny(input.context, input.context.taskId, "schedule-limit", input.now);
@@ -73,6 +94,7 @@ export class AgentTagSchedules {
         misfireGraceSeconds: parsed.data.misfireGraceSeconds,
         overlapPolicy: parsed.data.overlapPolicy,
         now: input.now,
+        ...(input.source === undefined ? {} : { source: input.source }),
       }),
     };
   }
@@ -277,4 +299,94 @@ export class ScheduleWorker {
       now: now.toISOString(),
     });
   }
+}
+
+/** First six hex characters of a schedule id, as shown to users. */
+function shortScheduleId(scheduleId: string): string {
+  return scheduleId.replaceAll("-", "").slice(0, 6).toLowerCase();
+}
+
+/** A Slack date token: rendered in each viewer's own time zone, with the ISO time as fallback text. */
+function slackDateToken(iso: string): string {
+  const epoch = Math.floor(Date.parse(iso) / 1_000);
+  return `<!date^${epoch}^{date_short_pretty} at {time}|${iso}>`;
+}
+
+function oneLine(text: string, limit: number): string {
+  const flat = text.replace(/\s+/g, " ").trim();
+  return flat.length <= limit ? flat : `${flat.slice(0, limit - 1)}…`;
+}
+
+/** The thread notice posted when a recurring routine is turned off after repeated failures. */
+export function renderAutoDisabledNotice(input: AutoDisabledNoticeInput): SlackOutboxPayload {
+  const prompt = escapeSlackText(oneLine(input.prompt, 150)).replaceAll("*", "");
+  const errorCode = input.lastErrorCode === null
+    ? ""
+    : ` Last error: \`${escapeSlackText(oneLine(input.lastErrorCode, 80)).replaceAll("`", "'")}\`.`;
+  return {
+    text:
+      `:pause_button: <@${input.actorUserId}> I turned off routine \`${shortScheduleId(input.scheduleId)}\` ` +
+      `(*${prompt}*) after ${input.consecutiveFailures} failed runs in a row since ` +
+      `${slackDateToken(input.streakStartedAt)}.${errorCode} Ask me again to re-create it once it's fixed.`,
+  };
+}
+
+export type ScheduleOutcomeWorkerOutcome =
+  | { readonly kind: "idle" }
+  | {
+      readonly kind: "outcomes-recorded" | "auto-disabled";
+      readonly recorded: number;
+      readonly autoDisabled: ReadonlyArray<string>;
+    };
+
+/**
+ * Settles the outcome of dispatched schedule runs once their operation or reminder message is final,
+ * and auto-disables recurring routines that keep failing (`routines.autoDisable`).
+ */
+export class ScheduleOutcomeWorker {
+  readonly #config: AgentTagConfig;
+  readonly #store: AgentTagStore;
+  readonly #workerId: string;
+  readonly #now: () => Date;
+  readonly #limit: number;
+
+  constructor(input: {
+    readonly config: AgentTagConfig;
+    readonly store: AgentTagStore;
+    readonly workerId?: string;
+    readonly now?: () => Date;
+    readonly limit?: number;
+  }) {
+    this.#config = input.config;
+    this.#store = input.store;
+    this.#workerId = input.workerId ?? `schedule-outcome-worker-${crypto.randomUUID()}`;
+    this.#now = input.now ?? (() => new Date());
+    this.#limit = input.limit ?? 50;
+  }
+
+  async processNext(): Promise<ScheduleOutcomeWorkerOutcome> {
+    const policy = this.#config.routines.autoDisable;
+    const result = this.#store.reconcileScheduleRunOutcomes({
+      now: this.#now().toISOString(),
+      limit: this.#limit,
+      consecutiveFailures: policy.consecutiveFailures,
+      minFailureSpanSeconds: policy.minFailureSpanSeconds,
+      workerId: this.#workerId,
+      renderAutoDisabledNotice,
+    });
+    if (result.recorded === 0 && result.autoDisabled.length === 0) return { kind: "idle" };
+    return {
+      kind: result.autoDisabled.length > 0 ? "auto-disabled" : "outcomes-recorded",
+      recorded: result.recorded,
+      autoDisabled: result.autoDisabled,
+    };
+  }
+}
+
+/** The service's schedule loops: dispatch due runs, then settle their outcomes. */
+export function createScheduleWorkers(input: {
+  readonly config: AgentTagConfig;
+  readonly store: AgentTagStore;
+}): readonly [ScheduleWorker, ScheduleOutcomeWorker] {
+  return [new ScheduleWorker(input), new ScheduleOutcomeWorker(input)];
 }

@@ -16,7 +16,8 @@ export type StoreFaultPoint =
   | "ingest.after-operation"
   | "operation-claim.after-update"
   | "outbox-enqueue.after-insert"
-  | "outbox-claim.after-update";
+  | "outbox-claim.after-update"
+  | "schedule-outcome.after-record";
 
 export interface StoreOpenOptions {
   readonly faultInjector?: (point: StoreFaultPoint) => void;
@@ -278,7 +279,28 @@ export interface ScheduleSummary {
   readonly recurrence: ScheduleRecurrence | null;
   readonly missedRunPolicy: "run-once" | "skip";
   readonly overlapPolicy: "skip" | "queue";
+  readonly workspaceId: string;
+  readonly conversationId: string;
+  readonly threadTs: string;
+  readonly profileId: string;
+  /** The Slack user who created the routine. */
+  readonly actorUserId: string;
+  /** Zone used to interpret the request; null for CLI-created schedules. */
+  readonly timeZone: string | null;
+  /** The parser's description, e.g. "every weekday at 09:00 (America/New_York)". */
+  readonly humanReadable: string | null;
+  /** Reminders: the user to @mention on delivery. */
+  readonly notifyUserId: string | null;
+  readonly consecutiveFailures: number;
+  readonly failureStreakStartedAt: string | null;
+  readonly endedReason: ScheduleEndedReason | null;
+  readonly endedAt: string | null;
+  readonly createdAt: string;
 }
+
+export type ScheduleEndedReason = "user-cancelled" | "auto-disabled" | "authority-revoked" | "completed";
+
+export type ScheduleRunOutcome = "succeeded" | "failed" | "cancelled" | "skipped";
 
 export type AmbientDecision =
   | { readonly kind: "triggered" }
