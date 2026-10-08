@@ -534,6 +534,14 @@ export async function dispatchT3Command(input: {
   return runRpc(program, input.signal);
 }
 
+/** T3 answered the snapshot request with HTTP 404: the thread does not exist. */
+export class T3ThreadNotFoundError extends Error {
+  constructor(readonly threadId: string) {
+    super("T3 thread snapshot endpoint returned HTTP 404");
+    this.name = "T3ThreadNotFoundError";
+  }
+}
+
 export async function fetchT3ThreadSnapshot(input: {
   readonly config: T3ConnectionConfig;
   readonly threadId: string;
@@ -548,6 +556,7 @@ export async function fetchT3ThreadSnapshot(input: {
     headers: { authorization: `Bearer ${token.exposeToBoundary()}` },
     ...(input.signal === undefined ? {} : { signal: input.signal }),
   });
+  if (response.status === 404) throw new T3ThreadNotFoundError(threadId);
   if (!response.ok) throw new Error(`T3 thread snapshot endpoint returned HTTP ${response.status}`);
   const raw: unknown = await response.json();
   return threadSnapshotSchema.parse(raw);

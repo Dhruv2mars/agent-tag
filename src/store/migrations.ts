@@ -287,7 +287,48 @@ export const STORE_MIGRATIONS: readonly StoreMigration[] = [
     `,
   },
   {
-    // Independent of 13 (another branch): only adds a column, so it applies in any order relative to it.
+    version: 13,
+    sql: `
+      ALTER TABLE interactions ADD COLUMN blocked_until TEXT;
+      ALTER TABLE operations ADD COLUMN t3_turn_started_at TEXT;
+      ALTER TABLE operations ADD COLUMN t3_turn_id TEXT;
+      ALTER TABLE operations ADD COLUMN t3_turn_dispatched_at TEXT;
+
+      -- Unfinished or failed operations from before these markers existed: a posted "working"
+      -- message or a recorded T3 approval/user-input request proves the turn started, and any claim
+      -- may have dispatched it. Cancellation must interrupt these in T3 rather than drop them
+      -- locally. A local failure (settlement timeout, service errors) leaves the T3 turn running,
+      -- so failed operations are backfilled too; the worker settles those whose failure code
+      -- records an observed T3 outcome without contacting T3.
+      UPDATE operations SET t3_turn_started_at = COALESCE(
+          (SELECT MIN(created_at) FROM slack_outbox
+           WHERE client_message_id = operations.operation_id || ':started'),
+          (SELECT MIN(created_at) FROM interactions
+           WHERE operation_id = operations.operation_id AND kind IN ('approval', 'user-input')))
+      WHERE status IN ('pending', 'inflight', 'failed');
+      UPDATE operations SET t3_turn_dispatched_at = COALESCE(t3_turn_started_at, updated_at)
+      WHERE status IN ('pending', 'inflight', 'failed') AND (
+        t3_turn_started_at IS NOT NULL OR attempts > 0 OR EXISTS (
+          SELECT 1 FROM audit_log
+          WHERE correlation_id = operations.operation_id AND action = 'operation.claimed'));
+
+      -- A response that failed only because transient errors exhausted its retry budget. A fresh
+      -- Slack cancel may requeue such a cancellation once T3 recovers; terminal failures stay final.
+      ALTER TABLE interactions ADD COLUMN retries_exhausted INTEGER NOT NULL DEFAULT 0
+        CHECK (retries_exhausted IN (0, 1));
+      -- Slack action ids a requeue superseded on an interaction's source_action_id, kept so a late
+      -- redelivery of any accepted action stays deduplicated instead of targeting a newer operation.
+      CREATE TABLE interaction_source_actions (
+        source_action_id TEXT PRIMARY KEY,
+        interaction_id TEXT NOT NULL REFERENCES interactions(interaction_id),
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX interaction_source_actions_interaction_idx ON interaction_source_actions(interaction_id);
+    `,
+  },
+  {
+    // Independent of 13: only adds a column, so it applies in any order relative to it (a store that
+    // ran 14 before 13 existed still picks up 13, since applied versions are tracked as a set).
     version: 14,
     sql: `
       ALTER TABLE operations ADD COLUMN turn_active_ms INTEGER NOT NULL DEFAULT 0
