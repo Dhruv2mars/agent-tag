@@ -11,7 +11,7 @@ import {
   outboxPayloadSchema,
   outboxRowSchema,
 } from "./schema.ts";
-import type { ClaimedOutboxMessage, SlackOutboxInput, SlackOutboxPayload } from "./types.ts";
+import type { ClaimedOutboxMessage, RefreshKind, SlackOutboxInput, SlackOutboxPayload } from "./types.ts";
 
 export interface OutboxMessageRow {
   readonly outboxId: string;
@@ -23,6 +23,8 @@ export interface OutboxMessageRow {
   readonly payload: SlackOutboxPayload;
   /** Also written as updated_at. */
   readonly createdAt: string;
+  /** Makes the row a chat.update of the message its target post row posted (see message-edits.ts). */
+  readonly edit?: { readonly targetOutboxId: string; readonly refreshKind: RefreshKind | null };
 }
 
 /**
@@ -34,8 +36,9 @@ export function insertOutboxMessage(database: Database, row: OutboxMessageRow): 
     .query(
       `INSERT INTO slack_outbox (
         outbox_id, task_id, correlation_id, conversation_id, thread_ts,
-        client_message_id, payload_json, status, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
+        client_message_id, payload_json, status, created_at, updated_at,
+        method, target_outbox_id, refresh_kind
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)`,
     )
     .run(
       row.outboxId,
@@ -47,6 +50,9 @@ export function insertOutboxMessage(database: Database, row: OutboxMessageRow): 
       JSON.stringify(row.payload),
       row.createdAt,
       row.createdAt,
+      row.edit === undefined ? "post" : "update",
+      row.edit?.targetOutboxId ?? null,
+      row.edit?.refreshKind ?? null,
     );
 }
 
@@ -99,8 +105,9 @@ export interface ClaimNextOutboxInput {
 }
 
 /**
- * Every outbox row is a chat.postMessage call with the one bot token, so a rate limit on any row
- * (per channel, or for the method across the workspace; Slack does not say which) pauses them all.
+ * Every outbox row is a chat.postMessage (or chat.update) call with the one bot token, so a rate limit
+ * on any row (per channel, or for the method across the workspace; Slack does not say which) pauses
+ * them all. The scope keeps its original name so stored cooldowns stay valid.
  */
 export const OUTBOX_RATE_LIMIT_SCOPE = "chat.postMessage";
 
@@ -121,9 +128,23 @@ const CLAIM_ORDER_COLUMNS = (alias: string): string =>
 
 /**
  * Claims the next deliverable pending row. Rows waiting out a retry backoff (`blocked_until` in the
- * future) are skipped, and so are later rows of the same Slack thread, so a retried message is never
+ * future) are skipped, and so are later posts of the same Slack thread, so a retried message is never
  * overtaken by the replies that were queued after it. Nothing is claimed while a rate-limit cooldown
  * is active.
+ *
+ * Invariants (every eligibility predicate below must keep all of them):
+ * 1. Thread order is post-only: an update row never blocks a post, and a post's eligibility never
+ *    depends on an update row. Only posts are ordered within a thread (by claim order); edits create
+ *    no new message, so they neither wait behind nor hold back the thread's posts.
+ * 2. An update row is claimable only once its target post is settled (delivered or failed). It is
+ *    never claimed just to wait for its target, so it never holds a `blocked_until` on its target's
+ *    account, and the edit-to-post relation never involves timestamps (a clock step cannot reorder it).
+ * 3. Edits of one target are claimed one at a time in enqueue (rowid) order, never by timestamp.
+ * 4. With coalescing into the newest pending edit (message-edits.ts), 3 makes the last requested
+ *    edit the last one applied.
+ * Hence the wait-for graph is acyclic: a post waits only on earlier posts (a strict total order);
+ * an update waits only on its target post and on lower-rowid updates of that target; nothing waits
+ * on an update except a later update of the same target.
  */
 export function claimNextOutbox(
   context: StoreContext,
@@ -141,18 +162,37 @@ export function claimNextOutbox(
           `SELECT candidate.outbox_id FROM slack_outbox AS candidate
            WHERE candidate.status = 'pending'
              AND (candidate.blocked_until IS NULL OR candidate.blocked_until <= ?)
-             AND NOT EXISTS (
-               SELECT 1 FROM slack_outbox AS earlier
-               WHERE earlier.conversation_id = candidate.conversation_id
-                 AND earlier.thread_ts = candidate.thread_ts
-                 AND earlier.status = 'pending'
-                 AND earlier.blocked_until > ?
-                 AND (${CLAIM_ORDER_COLUMNS("earlier")}) < (${CLAIM_ORDER_COLUMNS("candidate")})
-             )
+             AND CASE candidate.method
+               -- Invariant 1: a post waits only on earlier blocked posts of its thread.
+               WHEN 'post' THEN NOT EXISTS (
+                 SELECT 1 FROM slack_outbox AS earlier
+                 WHERE earlier.method = 'post'
+                   AND earlier.conversation_id = candidate.conversation_id
+                   AND earlier.thread_ts = candidate.thread_ts
+                   AND earlier.status = 'pending'
+                   AND earlier.blocked_until > ?
+                   AND (${CLAIM_ORDER_COLUMNS("earlier")}) < (${CLAIM_ORDER_COLUMNS("candidate")})
+               )
+               -- Invariant 2: an update waits until its target post is settled.
+               WHEN 'update' THEN NOT EXISTS (
+                 SELECT 1 FROM slack_outbox AS target
+                 WHERE target.outbox_id = candidate.target_outbox_id
+                   AND target.status IN ('pending', 'inflight')
+               )
+               -- Invariant 3: and behind every earlier (rowid) edit of that target still to be sent.
+               AND NOT EXISTS (
+                 SELECT 1 FROM slack_outbox AS prior_edit
+                 WHERE prior_edit.method = 'update'
+                   AND prior_edit.target_outbox_id = candidate.target_outbox_id
+                   AND prior_edit.rowid < candidate.rowid
+                   AND (prior_edit.status = 'pending' OR (prior_edit.status = 'inflight' AND prior_edit.lease_expires_at > ?))
+               )
+               ELSE 0
+             END
            ORDER BY ${CLAIM_ORDER_COLUMNS("candidate")}
            LIMIT 1`,
         )
-        .get(now, now),
+        .get(now, now, now),
     );
     if (candidate === null) return null;
     const updated = database
@@ -170,9 +210,11 @@ export function claimNextOutbox(
     const row = outboxRowSchema.parse(
       database
         .query(
-          `SELECT outbox_id, task_id, correlation_id, conversation_id, thread_ts,
-                  client_message_id, payload_json, attempts, lease_expires_at, render_mode
-           FROM slack_outbox WHERE outbox_id = ?`,
+          `SELECT o.outbox_id, o.task_id, o.correlation_id, o.conversation_id, o.thread_ts,
+                  o.client_message_id, o.payload_json, o.attempts, o.lease_expires_at, o.render_mode,
+                  o.method, o.refresh_kind, t.status AS target_status, t.slack_message_ts AS target_slack_message_ts
+           FROM slack_outbox AS o LEFT JOIN slack_outbox AS t ON t.outbox_id = o.target_outbox_id
+           WHERE o.outbox_id = ?`,
         )
         .get(candidate.outbox_id),
     );
@@ -185,7 +227,7 @@ export function claimNextOutbox(
       action: "slack.outbox.claimed",
       result: "inflight",
       correlationId: row.correlation_id,
-      metadata: { attempt: row.attempts, renderMode: row.render_mode },
+      metadata: { attempt: row.attempts, renderMode: row.render_mode, method: row.method },
       createdAt: now,
     });
     return {
@@ -199,6 +241,12 @@ export function claimNextOutbox(
       renderMode: row.render_mode,
       attempt: row.attempts,
       leaseExpiresAt: row.lease_expires_at,
+      method: row.method,
+      refreshKind: row.refresh_kind,
+      target:
+        row.method === "update" && row.target_status !== null
+          ? { status: row.target_status, slackMessageTs: row.target_slack_message_ts }
+          : null,
     };
   });
   return claim.immediate();

@@ -84,7 +84,7 @@ for (const revocation of revocations) {
       });
       expect(await coordinator.processNext()).toMatchObject({ kind: "failed", errorCode: "ExecutionAuthorityDenied" });
       expect(await coordinator.processNext()).toEqual({ kind: "idle" });
-      const worker = new InteractionWorker({ config: currentConfig, store, t3: { dispatch }, now: () => new Date(now) });
+      const worker = new InteractionWorker({ config: currentConfig, store, t3: { dispatch, fetchThread: dispatch }, now: () => new Date(now) });
       // The operation's terminal failure closed its queued approval in the same transaction.
       expect(await worker.processNext()).toEqual({ kind: "idle" });
       expect(calls).toBe(0);
@@ -103,6 +103,7 @@ for (const revocation of revocations) {
           expect(message.text).not.toContain("private schedule canary");
           return { ts: "1000.000010" };
         },
+        updateMessage: async () => { throw new Error("no edits expected"); },
       })).kind !== "idle") {}
       expect(sent).toBe(revocation.name === "user" ? 2 : 0);
       const audit = store.listAuditRecords({ limit: 100 });

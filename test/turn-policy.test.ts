@@ -377,7 +377,7 @@ describe("progress-based stall policy (B3)", () => {
       const worker = new InteractionWorker({
         config,
         store: harness.store,
-        t3: { dispatch: async (command) => (interrupts.push(command), { sequence: 1 }) },
+        t3: { dispatch: async (command) => (interrupts.push(command), { sequence: 1 }), fetchThread: async () => snapshot({ ...harness.turn }) },
         now: () => new Date(harness.clock.ms),
       });
       expect((await worker.processNext()).kind).toBe("resolved");
@@ -481,7 +481,7 @@ describe("approval wake-up race (B5)", () => {
       const worker = new InteractionWorker({
         config,
         store: harness.store,
-        t3: { dispatch: async (command) => (workerCommands.push(command), { sequence: 1 }) },
+        t3: { dispatch: async (command) => (workerCommands.push(command), { sequence: 1 }), fetchThread: async () => snapshot({ ...harness.turn }) },
         now: () => new Date(harness.clock.ms),
       });
       let phase: "waiting" | "race" | "resolved" = "waiting";
@@ -674,7 +674,7 @@ describe("approval and question expiry (B7)", () => {
       const worker = new InteractionWorker({
         config,
         store: harness.store,
-        t3: { dispatch: async (command) => (workerCommands.push(command), { sequence: 1 }) },
+        t3: { dispatch: async (command) => (workerCommands.push(command), { sequence: 1 }), fetchThread: async () => snapshot({ ...harness.turn }) },
         now: () => new Date(harness.clock.ms),
       });
       expect((await worker.processNext()).kind).toBe("resolved");
@@ -712,7 +712,7 @@ describe("approval and question expiry (B7)", () => {
       const worker = new InteractionWorker({
         config,
         store: harness.store,
-        t3: { dispatch: async () => ({ sequence: 1 }) },
+        t3: { dispatch: async () => ({ sequence: 1 }), fetchThread: async () => snapshot({ ...harness.turn }) },
         now: () => new Date(harness.clock.ms),
       });
       expect((await worker.processNext()).kind).toBe("resolved");
@@ -836,7 +836,7 @@ describe("approval and question expiry (B7)", () => {
       const worker = new InteractionWorker({
         config,
         store: harness.store,
-        t3: { dispatch: async (command) => (workerCommands.push(command), { sequence: 1 }) },
+        t3: { dispatch: async (command) => (workerCommands.push(command), { sequence: 1 }), fetchThread: async () => snapshot({ ...harness.turn }) },
         now: () => new Date(harness.clock.ms),
       });
       expect((await worker.processNext()).kind).toBe("resolved");
@@ -917,7 +917,7 @@ describe("interactions of an abandoned turn (B7)", () => {
     const worker = new InteractionWorker({
       config,
       store: harness.store,
-      t3: { dispatch: async (command) => (delivered.push(command), { sequence: 1 }) },
+      t3: { dispatch: async (command) => (delivered.push(command), { sequence: 1 }), fetchThread: async () => snapshot({ ...harness.turn }) },
       now: () => new Date(harness.clock.ms),
     });
     return (async () => {
@@ -1172,7 +1172,7 @@ describe("interactions of an abandoned turn (B7)", () => {
       const worker = new InteractionWorker({
         config,
         store: racingStore,
-        t3: { dispatch: async (command) => (delivered.push(command), { sequence: 1 }) },
+        t3: { dispatch: async (command) => (delivered.push(command), { sequence: 1 }), fetchThread: async () => snapshot({ ...harness.turn }) },
         now: () => new Date(harness.clock.ms),
       });
       expect(await worker.processNext()).toEqual({ kind: "failed", interactionId: approval, errorCode: "operation-settled" });
@@ -1200,7 +1200,7 @@ describe("accepted answers outlive the turn that asked (B7)", () => {
     createdAt: start,
   };
 
-  type TurnState = "running" | "completed";
+  type TurnState = "running" | "completed" | "interrupted";
 
   /**
    * A thread whose turn-1 asks a message-mode question, modelled on T3 0.0.45's decider: answering
@@ -1242,11 +1242,12 @@ describe("accepted answers outlive the turn that asked (B7)", () => {
         state: t3.turn1,
         requestedAt: start,
         startedAt: start,
-        completedAt: t3.turn1 === "completed" ? t3.turn1EndedAt : null,
+        completedAt: t3.turn1 !== "running" ? t3.turn1EndedAt : null,
         assistantMessageId: t3.turn1 === "completed" ? "assistant-1" : null,
       };
       if (t3.turn2 !== null && answeredAt !== null) {
         const completed = t3.turn2 === "completed";
+        const ended = t3.turn2 !== "running";
         if (completed) {
           messages.push({ id: "assistant-2", role: "assistant", text: "continued with A", turnId: "turn-2", streaming: false, createdAt: answeredAt, updatedAt: answeredAt });
         }
@@ -1255,7 +1256,7 @@ describe("accepted answers outlive the turn that asked (B7)", () => {
           state: t3.turn2,
           requestedAt: answeredAt,
           startedAt: answeredAt,
-          completedAt: completed ? answeredAt : null,
+          completedAt: ended ? answeredAt : null,
           assistantMessageId: completed ? "assistant-2" : null,
         };
       }
@@ -1284,8 +1285,9 @@ describe("accepted answers outlive the turn that asked (B7)", () => {
     expect(readInteractions(harness.path).find((row) => row.request_id === "question-1")?.state).toBe("response-pending");
   }
 
-  function answerWorker(harness: Harness, config: AgentTagConfig, t3: { answeredAt: string | null }) {
+  function answerWorker(harness: Harness, config: AgentTagConfig, sim: ReturnType<typeof messageModeThread>) {
     const delivered: T3Command[] = [];
+    const t3 = sim.t3;
     const worker = new InteractionWorker({
       config,
       store: harness.store,
@@ -1293,8 +1295,14 @@ describe("accepted answers outlive the turn that asked (B7)", () => {
         dispatch: async (command) => {
           delivered.push(command);
           if (command.type === "thread.user-input.respond") t3.answeredAt = command.createdAt;
+          // T3 0.0.45 interrupts whatever the session runs: the continuation if it started, else turn-1.
+          if (command.type === "thread.turn.interrupt") {
+            if (t3.turn2 === "running") t3.turn2 = "interrupted";
+            else if (t3.turn1 === "running") t3.turn1 = "interrupted";
+          }
           return { sequence: 1 };
         },
+        fetchThread: async () => sim.read(),
       },
       now: () => new Date(harness.clock.ms),
     });
@@ -1310,8 +1318,9 @@ describe("accepted answers outlive the turn that asked (B7)", () => {
     config: AgentTagConfig,
     sim: ReturnType<typeof messageModeThread>,
     afterWake: (fetch: number, worker: InteractionWorker) => Promise<void>,
+    onIngest?: (receipt: ReturnType<typeof ingest>) => void,
   ) {
-    const { worker, delivered } = answerWorker(harness, config, sim.t3);
+    const { worker, delivered } = answerWorker(harness, config, sim);
     const seen: string[] = [];
     let woken = false;
     let wakeFetches = 0;
@@ -1325,6 +1334,7 @@ describe("accepted answers outlive the turn that asked (B7)", () => {
       return current;
     });
     const receipt = ingest(harness.store, 1);
+    onIngest?.(receipt);
     expect(await coordinator.processNext()).toMatchObject({ kind: "waiting-interaction", questionCount: 1 });
     harness.clock.ms += MINUTE;
     answerQuestion(harness);
@@ -1363,6 +1373,61 @@ describe("accepted answers outlive the turn that asked (B7)", () => {
       expectAnswerDelivered(harness, run.delivered);
       expect(readOperation(harness.path, run.receipt.operationId)).toMatchObject({ status: "succeeded" });
       expect(drainOutboxTexts(harness.store, harness.clock.ms).at(-1)).toBe("continued with A");
+      expect(await run.worker.processNext()).toEqual({ kind: "idle" });
+    });
+  });
+
+  test("a cancel queued before a message-mode answer's continuation starts interrupts that continuation (r12 P2)", async () => {
+    await withHarness("message-mode-cancel-continuation", async (harness) => {
+      const config = configWith({ interactionExpirySeconds: 86_400 });
+      const sim = messageModeThread(harness);
+      const statusAt: Record<number, string | undefined> = {};
+      const cancelOutcomes: string[] = [];
+      let receiptTaskId = "";
+      let operationId = "";
+      const run = await answerAndWake(harness, config, sim, async (fetch, worker) => {
+        if (fetch === 2) {
+          // The answer is committed and delivered: T3 resolved it but has not started the continuation,
+          // so the latest turn is still the completed turn-1 that asked. Before #11 the coordinator
+          // settled the operation as `succeeded` from this snapshot, and a cancel queued now was then
+          // dropped as OperationNotRunning without reading T3.
+          expect((await worker.processNext()).kind).toBe("resolved");
+          const cancel = harness.store.requestTaskCancellation({
+            taskId: receiptTaskId,
+            workspaceId: "T1",
+            conversationId: "C1",
+            threadTs: "1000.000001",
+            actorUserId: "U1",
+            sourceActionId: "cancel-1",
+            now: new Date(harness.clock.ms).toISOString(),
+          });
+          expect(cancel).toMatchObject({ kind: "accepted", disposition: "interrupt-requested" });
+          // The answer is accepted but its turn has not started: the cancel waits instead of settling.
+          const early = await worker.processNext();
+          cancelOutcomes.push(early.kind === "retry-scheduled" ? `retry:${early.errorCode}` : early.kind);
+        }
+        if (fetch === 3) sim.t3.turn2 = "running";
+        if (fetch === 4) {
+          const late = await worker.processNext();
+          cancelOutcomes.push(late.kind);
+        }
+        statusAt[fetch] = readOperation(harness.path, operationId)?.status;
+      }, (receipt) => {
+        receiptTaskId = receipt.taskId;
+        operationId = receipt.operationId;
+      });
+
+      expect(cancelOutcomes).toEqual(["retry:T3TurnNotStarted", "resolved"]);
+      // Never settled while the continuation was pending or running.
+      expect(statusAt).toEqual({ 1: "inflight", 2: "inflight", 3: "inflight", 4: "inflight" });
+      expect(run.delivered).toEqual([
+        expect.objectContaining({ type: "thread.user-input.respond", requestId: "question-1" }),
+        expect.objectContaining({ type: "thread.turn.interrupt", threadId: harness.turn.threadId, turnId: "turn-2" }),
+      ]);
+      expect(run.seen.slice(-4)).toEqual(["turn-1:completed", "turn-1:completed", "turn-2:running", "turn-2:interrupted"]);
+      expect(run.result).toMatchObject({ kind: "cancelled", operationId: run.receipt.operationId });
+      expect(readOperation(harness.path, run.receipt.operationId)).toMatchObject({ status: "failed", last_error_code: "user-cancelled" });
+      expect(readInteractions(harness.path).find((row) => row.kind === "cancel")).toMatchObject({ state: "resolved" });
       expect(await run.worker.processNext()).toEqual({ kind: "idle" });
     });
   });

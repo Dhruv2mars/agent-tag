@@ -5,6 +5,7 @@
  *   files.ts        open + migrations, backup/restore      tasks.ts        Slack ingest, task bindings
  *   operations.ts   operation leases and outcomes          interactions.ts approvals, cancel, responses
  *   user-input.ts   multi-question user-input answers      outbox.ts       Slack outbox queue
+ *   message-edits.ts  chat.update edit/refresh rows (outbox)
  *   schedules.ts    schedules and runs                     memory.ts       memory entries
  *   ambient.ts      ambient trigger decisions              audit.ts        audit log write/export
  *   diagnostics.ts  counts and operational status          lease.ts        shared lease helpers
@@ -45,6 +46,7 @@ import * as operations from "./operations.ts";
 import * as interactions from "./interactions.ts";
 import * as userInput from "./user-input.ts";
 import * as outbox from "./outbox.ts";
+import * as messageEdits from "./message-edits.ts";
 import * as waits from "./waits.ts";
 
 export { AUDIT_ACTIONS, type AuditAction } from "./schema.ts";
@@ -60,6 +62,8 @@ export type {
   IngestReceipt,
   MemoryRecord,
   OperationalStatus,
+  OutboxStatus,
+  RefreshKind,
   ScheduleEndedReason,
   ScheduleRunOutcome,
   ScheduleSummary,
@@ -113,12 +117,15 @@ export type {
   CompleteOperationInput,
   CompleteOperationWithOutboxInput,
   DeferOperationInput,
+  MarkOperationTurnDispatchedInput,
+  MarkOperationTurnStartedInput,
   ReleaseOperationInput,
   FailOperationInput,
   FailOperationWithOutboxInput,
   CancelOperationWithOutboxInput,
 } from "./operations.ts";
 export type {
+  CancellationDisposition,
   RecordPendingInteractionResult,
   SubmitInteractionResponseResult,
   RequestTaskCancellationResult,
@@ -145,6 +152,8 @@ export type {
   RetryOutboxInput,
   ExhaustOutboxRetriesInput,
 } from "./outbox.ts";
+export { REFRESH_KINDS } from "./message-edits.ts";
+export type { EnqueueMessageEditInput, EnqueueMessageRefreshInput, MessageEditResult } from "./message-edits.ts";
 
 export class AgentTagStore {
   readonly #database: Database;
@@ -308,6 +317,16 @@ export class AgentTagStore {
     operations.deferOperation(this.#database, input);
   }
 
+  /** Records that `thread.turn.start` is about to be sent, before its outcome is known. */
+  markOperationTurnDispatched(input: operations.MarkOperationTurnDispatchedInput): void {
+    operations.markOperationTurnDispatched(this.#database, input);
+  }
+
+  /** Records that the operation's T3 turn was dispatched (and its turn id once known). */
+  markOperationTurnStarted(input: operations.MarkOperationTurnStartedInput): void {
+    operations.markOperationTurnStarted(this.#database, input);
+  }
+
   /**
    * Returns an in-progress operation to the queue without counting the attempt, e.g. on service
    * shutdown. The stable command and message ids let the next owner resume the same T3 turn.
@@ -381,6 +400,10 @@ export class AgentTagStore {
     return userInput.submitUserInputAnswer(this.#database, input);
   }
 
+  /**
+   * Interrupts the task's current operation only if it started a T3 turn; an operation still queued
+   * with no T3 turn is cancelled in the store and never reaches T3.
+   */
   requestTaskCancellation(
     input: interactions.RequestTaskCancellationInput,
   ): interactions.RequestTaskCancellationResult {
@@ -413,6 +436,16 @@ export class AgentTagStore {
 
   enqueueOutbox(input: SlackOutboxInput): outbox.EnqueueOutboxResult {
     return outbox.enqueueOutbox(this.#context, input);
+  }
+
+  /** Ensures one pending delivery-time re-render of a posted message (see message-edits.ts). */
+  enqueueMessageRefresh(input: messageEdits.EnqueueMessageRefreshInput): messageEdits.MessageEditResult {
+    return this.#database.transaction(() => messageEdits.enqueueMessageRefresh(this.#database, input)).immediate();
+  }
+
+  /** Ensures the posted message is edited to `payload`; coalesces with a pending edit of it. */
+  enqueueMessageEdit(input: messageEdits.EnqueueMessageEditInput): messageEdits.MessageEditResult {
+    return this.#database.transaction(() => messageEdits.enqueueMessageEdit(this.#database, input)).immediate();
   }
 
   claimNextOutbox(input: outbox.ClaimNextOutboxInput): ClaimedOutboxMessage | null {

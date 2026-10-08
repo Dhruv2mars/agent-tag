@@ -10,7 +10,7 @@
 //     limit, or still in flight), the schedule is left for a later sweep.
 //  3. So a success after failures always prevents the disable: it is either reconciled before the
 //     decision (resetting the streak) or it blocks the decision until it is.
-//  4. Runs dispatched before outcome tracking existed (`legacy = 1`, set by migration 15) get an
+//  4. Runs dispatched before outcome tracking existed (`legacy = 1`, set by migration 16) get an
 //     outcome for history but never count toward a streak nor block a decision: an upgrade cannot
 //     disable a routine for failures from before the policy shipped.
 //  5. Only active, recurring, unleased schedules are disabled. The state change, its audit row and the

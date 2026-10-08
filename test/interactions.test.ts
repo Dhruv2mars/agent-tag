@@ -4,12 +4,22 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { z } from "zod";
+
 import { agentTagConfigSchema } from "../src/config.ts";
 import { questionMessage } from "../src/coordinator.ts";
-import { InteractionWorker, type T3InteractionGateway } from "../src/interaction-worker.ts";
+import {
+  DEFAULT_INTERACTION_RETRY_POLICY,
+  InteractionWorker,
+  type InteractionWorkerOutcome,
+  NO_LONGER_PENDING_NOTICE,
+  RETRIES_EXHAUSTED_NOTICE,
+  interactionRetryDelayMs,
+  type T3InteractionGateway,
+} from "../src/interaction-worker.ts";
 import { SlackActionRouter } from "../src/slack/actions.ts";
 import { AgentTagStore } from "../src/store/store.ts";
-import type { T3Command } from "../src/t3/gateway.ts";
+import type { T3Command, T3ThreadSnapshot } from "../src/t3/gateway.ts";
 
 const now = "2026-09-21T00:00:00.000Z";
 const config = agentTagConfigSchema.parse({
@@ -98,6 +108,52 @@ function viewSubmissionBody(input: {
   };
 }
 
+async function unexpectedThreadFetch(): Promise<never> {
+  throw new Error("unexpected T3 thread fetch");
+}
+
+/** A T3 thread whose current turn is `turnId` (running unless `state` says otherwise). */
+function threadWithTurn(
+  threadId: string,
+  turnId: string,
+  options: { readonly state?: "running" | "completed" | "interrupted"; readonly activeTurnId?: string | null } = {},
+): T3ThreadSnapshot {
+  const state = options.state ?? "running";
+  return {
+    snapshotSequence: 1,
+    thread: {
+      id: threadId,
+      projectId: "project-1",
+      title: "Fixture",
+      modelSelection: { instanceId: "codex", model: "gpt-5.6-sol" },
+      runtimeMode: "approval-required",
+      interactionMode: "default",
+      branch: null,
+      worktreePath: null,
+      latestTurn: {
+        turnId,
+        state,
+        requestedAt: now,
+        startedAt: now,
+        completedAt: state === "running" ? null : now,
+        assistantMessageId: null,
+      },
+      messages: [],
+      activities: [],
+      session: {
+        threadId,
+        status: state === "running" ? "running" : "ready",
+        providerName: "codex",
+        providerInstanceId: "codex",
+        runtimeMode: "approval-required",
+        activeTurnId: options.activeTurnId !== undefined ? options.activeTurnId : state === "running" ? turnId : null,
+        lastError: null,
+        updatedAt: now,
+      },
+    },
+  };
+}
+
 function seedOperation(store: AgentTagStore): {
   readonly taskId: string;
   readonly operationId: string;
@@ -165,6 +221,7 @@ describe("durable interactions", () => {
       const commands: T3Command[] = [];
       let shouldFail = true;
       const t3: T3InteractionGateway = {
+        fetchThread: unexpectedThreadFetch,
         dispatch: async (command) => {
           commands.push(command);
           if (shouldFail) {
@@ -181,18 +238,22 @@ describe("durable interactions", () => {
         workerId: "interaction-a",
         now: () => new Date(now),
       });
-      expect((await firstWorker.processNext()).kind).toBe("retry-scheduled");
+      const retry = await firstWorker.processNext();
+      if (retry.kind !== "retry-scheduled") throw new Error(`expected a retry, got ${retry.kind}`);
       initialStore.close();
 
       const reopened = await AgentTagStore.open(path);
       try {
+        let current = new Date(now);
         const secondWorker = new InteractionWorker({
           config,
           store: reopened,
           t3,
           workerId: "interaction-b",
-          now: () => new Date(now),
+          now: () => current,
         });
+        expect((await secondWorker.processNext()).kind).toBe("idle");
+        current = new Date(retry.blockedUntil);
         expect((await secondWorker.processNext()).kind).toBe("resolved");
         expect(commands).toHaveLength(2);
         expect(commands[0]).toMatchObject({
@@ -260,6 +321,7 @@ describe("durable interactions", () => {
       );
       const commands: T3Command[] = [];
       const t3: T3InteractionGateway = {
+        fetchThread: unexpectedThreadFetch,
         dispatch: async (command) => {
           commands.push(command);
           return { sequence: commands.length };
@@ -317,6 +379,7 @@ describe("durable interactions", () => {
       ).toBe("accepted");
       const commands: T3Command[] = [];
       const t3: T3InteractionGateway = {
+        fetchThread: unexpectedThreadFetch,
         dispatch: async (command) => {
           commands.push(command);
           return { sequence: commands.length };
@@ -327,35 +390,6 @@ describe("durable interactions", () => {
       expect(commands).toContainEqual(
         expect.objectContaining({ type: "thread.user-input.respond", answers: { pkg: hugeLabel } }),
       );
-    });
-  });
-
-  test("turn cancellation is authorized, durable, and dispatched as an interrupt", async () => {
-    await withStore(async ({ store }) => {
-      const seeded = seedOperation(store);
-      const router = new SlackActionRouter({ config, store, now: () => now });
-      const result = router.ingest(
-        actionBody({ actionId: "agent-tag.turn.cancel", value: seeded.taskId }),
-      );
-      expect(result.kind).toBe("accepted");
-      const commands: T3Command[] = [];
-      const worker = new InteractionWorker({
-        config,
-        store,
-        t3: {
-          dispatch: async (command) => {
-            commands.push(command);
-            return { sequence: 1 };
-          },
-        },
-        workerId: "interaction-a",
-        now: () => new Date(now),
-      });
-      expect((await worker.processNext()).kind).toBe("resolved");
-      expect(commands[0]).toMatchObject({
-        type: "thread.turn.interrupt",
-        threadId: seeded.threadId,
-      });
     });
   });
 
@@ -387,6 +421,7 @@ describe("durable interactions", () => {
         config,
         store,
         t3: {
+          fetchThread: unexpectedThreadFetch,
           dispatch: async () => {
             throw new Error("invalid response must not reach T3");
           },
@@ -483,6 +518,7 @@ describe("durable interactions", () => {
 
       const commands: T3Command[] = [];
       const t3: T3InteractionGateway = {
+        fetchThread: unexpectedThreadFetch,
         dispatch: async (command) => {
           commands.push(command);
           return { sequence: commands.length };
@@ -721,6 +757,1116 @@ describe("durable interactions", () => {
       const claimed = store.claimNextInteractionResponse({ workerId: "worker", now: new Date(clock).toISOString(), leaseMs: 10_000 });
       expect(claimed?.interactionId).toBe(onTime);
       expect(store.claimNextInteractionResponse({ workerId: "worker", now: new Date(clock).toISOString(), leaseMs: 10_000 })).toBeNull();
+    });
+  });
+});
+
+function readRows<T>(path: string, sql: string, ...params: string[]): T[] {
+  const database = new Database(path, { readonly: true, strict: true });
+  try {
+    return database.query<T, string[]>(sql).all(...params);
+  } finally {
+    database.close();
+  }
+}
+
+function queueApprovalResponse(
+  store: AgentTagStore,
+  seeded: ReturnType<typeof seedOperation>,
+  requestId: string,
+): string {
+  const pending = store.recordPendingInteraction({
+    ...seeded,
+    requestId,
+    kind: "approval",
+    prompt: { requestKind: "command" },
+    conversationId: "C1",
+    threadTs: "1000.000001",
+    message: (interactionId) => ({ text: `approve ${interactionId}` }),
+    now,
+  });
+  const submitted = store.submitInteractionResponse({
+    interactionId: pending.interactionId,
+    workspaceId: "T1",
+    conversationId: "C1",
+    threadTs: "1000.000001",
+    actorUserId: "U1",
+    sourceActionId: `accept-${requestId}`,
+    response: { decision: "accept" },
+    expirySeconds: 86_400,
+    now,
+  });
+  expect(submitted.kind).toBe("accepted");
+  return pending.interactionId;
+}
+
+function noticesFor(path: string, interactionId: string): ReadonlyArray<string> {
+  return readRows<{ payload_json: string }>(
+    path,
+    "SELECT payload_json FROM slack_outbox WHERE client_message_id = ?",
+    `${interactionId}:failed`,
+  ).map((row) => z.object({ text: z.string() }).parse(JSON.parse(row.payload_json)).text);
+}
+
+function claimRunningOperation(store: AgentTagStore, operationId: string): void {
+  const claimed = store.claimNextOperation({
+    workerId: "coordinator-a",
+    now,
+    leaseMs: 600_000,
+    maxConcurrentTasks: 2,
+  });
+  expect(claimed?.operationId).toBe(operationId);
+}
+
+describe("interaction retries and cancellation", () => {
+  test("a T3 rejection is terminal: one dispatch, one notice, no hot loop", async () => {
+    await withStore(async ({ store, path }) => {
+      const seeded = seedOperation(store);
+      const interactionId = queueApprovalResponse(store, seeded, "approval-rejected");
+      let dispatches = 0;
+      let current = new Date(now);
+      const worker = new InteractionWorker({
+        config,
+        store,
+        t3: {
+          fetchThread: unexpectedThreadFetch,
+          dispatch: async () => {
+            dispatches += 1;
+            // The shape T3 0.0.45 sends for a rejected command, decoded as an unknown RPC error.
+            throw {
+              _tag: "OrchestrationDispatchCommandError",
+              message: `Orchestration command invariant failed (thread.approval.respond): Thread '${seeded.threadId}' does not exist for command 'thread.approval.respond'.`,
+            };
+          },
+        },
+        workerId: "interaction-a",
+        now: () => current,
+      });
+      const outcomes: string[] = [];
+      for (let iteration = 0; iteration < 50; iteration += 1) {
+        outcomes.push((await worker.processNext()).kind);
+        current = new Date(current.getTime() + 3_600_000);
+      }
+      expect(dispatches).toBe(1);
+      expect(outcomes[0]).toBe("failed");
+      expect(outcomes.slice(1).every((kind) => kind === "idle")).toBe(true);
+      expect(noticesFor(path, interactionId)).toEqual([NO_LONGER_PENDING_NOTICE]);
+      expect(
+        readRows<{ state: string; last_error_code: string }>(
+          path,
+          "SELECT state, last_error_code FROM interactions WHERE interaction_id = ?",
+          interactionId,
+        ),
+      ).toEqual([{ state: "failed", last_error_code: "T3CommandRejected" }]);
+    });
+  });
+
+  test("a T3 that always fails transiently gets at most maxAttempts dispatches with capped backoff", async () => {
+    await withStore(async ({ store, path }) => {
+      const seeded = seedOperation(store);
+      const interactionId = queueApprovalResponse(store, seeded, "approval-flaky");
+      const retry = { baseDelayMs: 1_000, maxDelayMs: 4_000, maxAttempts: 5 };
+      let dispatches = 0;
+      let current = new Date(now);
+      const worker = new InteractionWorker({
+        config,
+        store,
+        t3: {
+          fetchThread: unexpectedThreadFetch,
+          dispatch: async () => {
+            dispatches += 1;
+            throw new Error("socket closed before the receipt arrived");
+          },
+        },
+        workerId: "interaction-a",
+        retry,
+        now: () => current,
+      });
+
+      // A fixed clock models a tight service loop: the backed-off row is not claimable again.
+      const first = await worker.processNext();
+      expect(first.kind).toBe("retry-scheduled");
+      for (let iteration = 0; iteration < 1_000; iteration += 1) {
+        expect((await worker.processNext()).kind).toBe("idle");
+      }
+      expect(dispatches).toBe(1);
+
+      const delays: number[] = [];
+      let last = first;
+      for (let iteration = 0; iteration < 100 && last.kind !== "failed"; iteration += 1) {
+        if (last.kind === "retry-scheduled") {
+          delays.push(new Date(last.blockedUntil).getTime() - current.getTime());
+          current = new Date(last.blockedUntil);
+        } else {
+          current = new Date(current.getTime() + 3_600_000);
+        }
+        last = await worker.processNext();
+      }
+      expect(last).toMatchObject({ kind: "failed", errorCode: "Error" });
+      expect(dispatches).toBe(retry.maxAttempts);
+      expect(delays).toEqual([1_000, 2_000, 4_000, 4_000]);
+      expect(noticesFor(path, interactionId)).toEqual([RETRIES_EXHAUSTED_NOTICE]);
+      // Each attempt writes a claim and a failure audit row, plus one for the notice: bounded by N.
+      const audit = store.listAuditRecords({ limit: 10_000 }).filter((record) => record.source === interactionId);
+      expect(audit).toHaveLength(2 * retry.maxAttempts + 1);
+      expect((await worker.processNext()).kind).toBe("idle");
+    });
+  });
+
+  test("a transient error retries with backoff and then resolves with the same command id", async () => {
+    await withStore(async ({ store }) => {
+      const seeded = seedOperation(store);
+      queueApprovalResponse(store, seeded, "approval-transient");
+      const commands: T3Command[] = [];
+      let current = new Date(now);
+      const worker = new InteractionWorker({
+        config,
+        store,
+        t3: {
+          fetchThread: unexpectedThreadFetch,
+          dispatch: async (command) => {
+            commands.push(command);
+            if (commands.length === 1) {
+              throw { _tag: "OrchestrationDispatchCommandError", message: "Failed to persist orchestration event." };
+            }
+            return { sequence: 7 };
+          },
+        },
+        workerId: "interaction-a",
+        now: () => current,
+      });
+      const retry = await worker.processNext();
+      expect(retry).toMatchObject({ kind: "retry-scheduled", errorCode: "T3DispatchFailed" });
+      if (retry.kind !== "retry-scheduled") throw new Error("expected a retry");
+      expect(new Date(retry.blockedUntil).getTime() - current.getTime()).toBe(
+        interactionRetryDelayMs(DEFAULT_INTERACTION_RETRY_POLICY, 1),
+      );
+      current = new Date(new Date(retry.blockedUntil).getTime() - 1);
+      expect((await worker.processNext()).kind).toBe("idle");
+      current = new Date(retry.blockedUntil);
+      expect((await worker.processNext()).kind).toBe("resolved");
+      expect(commands).toHaveLength(2);
+      expect(commands[1]?.commandId).toBe(commands[0]?.commandId);
+    });
+  });
+
+  test("cancelling a queued operation cancels it in the store and never sends an interrupt", async () => {
+    await withStore(async ({ store, path }) => {
+      const seeded = seedOperation(store);
+      const router = new SlackActionRouter({ config, store, now: () => now });
+      const cancel = actionBody({ actionId: "agent-tag.turn.cancel", value: seeded.taskId });
+      expect(router.ingest(cancel).kind).toBe("accepted");
+      expect(router.ingest(cancel).kind).toBe("duplicate");
+      expect(
+        readRows<{ status: string; last_error_code: string }>(
+          path,
+          "SELECT status, last_error_code FROM operations WHERE operation_id = ?",
+          seeded.operationId,
+        ),
+      ).toEqual([{ status: "failed", last_error_code: "user-cancelled" }]);
+      expect(
+        readRows<{ payload_json: string }>(
+          path,
+          "SELECT payload_json FROM slack_outbox WHERE client_message_id = ?",
+          `${seeded.operationId}:cancelled`,
+        ),
+      ).toEqual([{ payload_json: JSON.stringify({ text: "Cancelled." }) }]);
+      expect(
+        store.claimNextOperation({ workerId: "coordinator-a", now, leaseMs: 10_000, maxConcurrentTasks: 2 }),
+      ).toBeNull();
+
+      const commands: T3Command[] = [];
+      let current = new Date(now);
+      const worker = new InteractionWorker({
+        config,
+        store,
+        t3: {
+          fetchThread: unexpectedThreadFetch,
+          dispatch: async (command) => {
+            commands.push(command);
+            return { sequence: 1 };
+          },
+        },
+        workerId: "interaction-a",
+        now: () => current,
+      });
+      for (let iteration = 0; iteration < 10; iteration += 1) {
+        expect((await worker.processNext()).kind).toBe("idle");
+        current = new Date(current.getTime() + 3_600_000);
+      }
+      expect(commands).toEqual([]);
+    });
+  });
+
+  test("cancelling a running operation sends exactly one interrupt carrying its turn id", async () => {
+    await withStore(async ({ store }) => {
+      const seeded = seedOperation(store);
+      claimRunningOperation(store, seeded.operationId);
+      store.markOperationTurnStarted({ operationId: seeded.operationId, workerId: "coordinator-a", turnId: null, now });
+      store.markOperationTurnStarted({
+        operationId: seeded.operationId,
+        workerId: "coordinator-a",
+        turnId: "turn-1",
+        now,
+      });
+      const router = new SlackActionRouter({ config, store, now: () => now });
+      expect(router.ingest(actionBody({ actionId: "agent-tag.turn.cancel", value: seeded.taskId })).kind).toBe(
+        "accepted",
+      );
+      expect(
+        router.ingest(
+          actionBody({ actionId: "agent-tag.turn.cancel", value: seeded.taskId, actionTs: "1000.000021" }),
+        ).kind,
+      ).toBe("duplicate");
+
+      const commands: T3Command[] = [];
+      let current = new Date(now);
+      const worker = new InteractionWorker({
+        config,
+        store,
+        t3: {
+          fetchThread: async (threadId) => threadWithTurn(threadId, "turn-1"),
+          dispatch: async (command) => {
+            commands.push(command);
+            return { sequence: 1 };
+          },
+        },
+        workerId: "interaction-a",
+        now: () => current,
+      });
+      const outcomes: string[] = [];
+      for (let iteration = 0; iteration < 10; iteration += 1) {
+        outcomes.push((await worker.processNext()).kind);
+        current = new Date(current.getTime() + 3_600_000);
+      }
+      expect(outcomes).toEqual(["resolved", ...Array.from({ length: 9 }, () => "idle")]);
+      expect(commands).toHaveLength(1);
+      expect(commands[0]).toMatchObject({
+        type: "thread.turn.interrupt",
+        threadId: seeded.threadId,
+        turnId: "turn-1",
+      });
+    });
+  });
+
+  test("a fresh cancel requeues a cancellation whose transient retries were exhausted", async () => {
+    await withStore(async ({ store, path }) => {
+      const seeded = seedOperation(store);
+      claimRunningOperation(store, seeded.operationId);
+      store.markOperationTurnStarted({
+        operationId: seeded.operationId,
+        workerId: "coordinator-a",
+        turnId: "turn-1",
+        now,
+      });
+      const router = new SlackActionRouter({ config, store, now: () => now });
+      const cancel = (actionTs: string) =>
+        router.ingest(actionBody({ actionId: "agent-tag.turn.cancel", value: seeded.taskId, actionTs }));
+      const first = cancel("1000.000020");
+      expect(first.kind).toBe("accepted");
+
+      const commands: T3Command[] = [];
+      let t3Down = true;
+      let current = new Date(now);
+      const worker = new InteractionWorker({
+        config,
+        store,
+        t3: {
+          fetchThread: async (threadId) => threadWithTurn(threadId, "turn-1"),
+          dispatch: async (command) => {
+            commands.push(command);
+            if (t3Down) throw new Error("socket closed before the receipt arrived");
+            return { sequence: 1 };
+          },
+        },
+        workerId: "interaction-a",
+        retry: { baseDelayMs: 1_000, maxDelayMs: 1_000, maxAttempts: 2 },
+        now: () => current,
+      });
+      const outcomes: string[] = [];
+      for (let iteration = 0; iteration < 4; iteration += 1) {
+        outcomes.push((await worker.processNext()).kind);
+        current = new Date(current.getTime() + 3_600_000);
+      }
+      expect(outcomes).toEqual(["retry-scheduled", "failed", "idle", "idle"]);
+
+      // A redelivery of the original click stays deduplicated and does not requeue.
+      expect(cancel("1000.000020").kind).toBe("duplicate");
+      expect((await worker.processNext()).kind).toBe("idle");
+
+      // After T3 recovers, a fresh click requeues the same cancellation and command id once.
+      t3Down = false;
+      const fresh = cancel("1000.000030");
+      expect(fresh).toMatchObject({ kind: "accepted", commandId: "commandId" in first ? first.commandId : "" });
+      expect(cancel("1000.000030").kind).toBe("duplicate");
+      expect(cancel("1000.000031").kind).toBe("duplicate");
+      expect((await worker.processNext()).kind).toBe("resolved");
+      expect((await worker.processNext()).kind).toBe("idle");
+      expect(commands).toHaveLength(3);
+      expect(new Set(commands.map((command) => command.commandId)).size).toBe(1);
+      expect(commands[2]).toMatchObject({ type: "thread.turn.interrupt", turnId: "turn-1" });
+      expect(
+        readRows(path, "SELECT state, attempts, retries_exhausted FROM interactions WHERE kind = 'cancel'"),
+      ).toEqual([{ state: "resolved", attempts: 1, retries_exhausted: 0 }]);
+    });
+  });
+
+  test("a redelivered cancel superseded by a requeue does not cancel the next operation", async () => {
+    await withStore(async ({ store, path }) => {
+      const seeded = seedOperation(store);
+      claimRunningOperation(store, seeded.operationId);
+      store.markOperationTurnStarted({
+        operationId: seeded.operationId,
+        workerId: "coordinator-a",
+        turnId: "turn-1",
+        now,
+      });
+      const router = new SlackActionRouter({ config, store, now: () => now });
+      const cancel = (actionTs: string) =>
+        router.ingest(actionBody({ actionId: "agent-tag.turn.cancel", value: seeded.taskId, actionTs }));
+      expect(cancel("1000.000020").kind).toBe("accepted");
+
+      let t3Down = true;
+      let current = new Date(now);
+      const worker = new InteractionWorker({
+        config,
+        store,
+        t3: {
+          fetchThread: async (threadId) => threadWithTurn(threadId, "turn-1"),
+          dispatch: async () => {
+            if (t3Down) throw new Error("socket closed before the receipt arrived");
+            return { sequence: 1 };
+          },
+        },
+        workerId: "interaction-a",
+        retry: { baseDelayMs: 1_000, maxDelayMs: 1_000, maxAttempts: 1 },
+        now: () => current,
+      });
+      expect((await worker.processNext()).kind).toBe("failed");
+
+      // A fresh click requeues the exhausted cancellation, which then resolves.
+      t3Down = false;
+      expect(cancel("1000.000030").kind).toBe("accepted");
+      expect((await worker.processNext()).kind).toBe("resolved");
+
+      // The interrupted turn finishes and the next request is queued on the same task.
+      store.completeOperation({ operationId: seeded.operationId, workerId: "coordinator-a", resultSequence: 2, now });
+      const next = seedOperation(store);
+      expect(next.taskId).toBe(seeded.taskId);
+      expect(next.operationId).not.toBe(seeded.operationId);
+
+      // Late redeliveries of either accepted click stay duplicates of the original cancellation.
+      expect(cancel("1000.000020").kind).toBe("duplicate");
+      expect(cancel("1000.000030").kind).toBe("duplicate");
+      expect(
+        readRows(path, "SELECT status FROM operations WHERE operation_id = ?", next.operationId),
+      ).toEqual([{ status: "pending" }]);
+      expect(readRows(path, "SELECT COUNT(*) AS count FROM interactions WHERE kind = 'cancel'")).toEqual([
+        { count: 1 },
+      ]);
+    });
+  });
+
+  async function exhaustCancelThenFailOperation(
+    errorCode: string,
+    /** The T3 thread after the operation failed; by default its turn-1 is still running. */
+    threadAfterFailure: (threadId: string) => T3ThreadSnapshot = (threadId) => threadWithTurn(threadId, "turn-1"),
+  ) {
+    let result: {
+      readonly first: ReturnType<SlackActionRouter["ingest"]>;
+      readonly fresh: ReturnType<SlackActionRouter["ingest"]>;
+      readonly outcome: string;
+      readonly commands: T3Command[];
+    } | undefined;
+    await withStore(async ({ store }) => {
+      const seeded = seedOperation(store);
+      claimRunningOperation(store, seeded.operationId);
+      store.markOperationTurnStarted({ operationId: seeded.operationId, workerId: "coordinator-a", turnId: "turn-1", now });
+      const router = new SlackActionRouter({ config, store, now: () => now });
+      const cancel = (actionTs: string) =>
+        router.ingest(actionBody({ actionId: "agent-tag.turn.cancel", value: seeded.taskId, actionTs }));
+      const first = cancel("1000.000020");
+      expect(first.kind).toBe("accepted");
+      const commands: T3Command[] = [];
+      let t3Down = true;
+      let operationFailed = false;
+      let current = new Date(now);
+      const worker = new InteractionWorker({
+        config,
+        store,
+        t3: {
+          fetchThread: async (threadId) => (operationFailed ? threadAfterFailure(threadId) : threadWithTurn(threadId, "turn-1")),
+          dispatch: async (command) => {
+            commands.push(command);
+            if (t3Down) throw new Error("socket closed before the receipt arrived");
+            return { sequence: 1 };
+          },
+        },
+        workerId: "interaction-a",
+        retry: { baseDelayMs: 1_000, maxDelayMs: 1_000, maxAttempts: 2 },
+        now: () => current,
+      });
+      expect((await worker.processNext()).kind).toBe("retry-scheduled");
+      current = new Date(current.getTime() + 3_600_000);
+      expect((await worker.processNext()).kind).toBe("failed");
+      // The operation then fails too, while T3 is still unreachable.
+      store.failOperation({ operationId: seeded.operationId, workerId: "coordinator-a", errorCode, retryable: false, now });
+      operationFailed = true;
+      t3Down = false;
+      const fresh = cancel("1000.000030");
+      current = new Date(current.getTime() + 3_600_000);
+      const outcome = (await worker.processNext()).kind;
+      result = { first, fresh, outcome, commands };
+    });
+    if (result === undefined) throw new Error("fixture did not run");
+    return result;
+  }
+
+  test("a fresh cancel requeues an exhausted cancellation whose operation failed locally", async () => {
+    const { first, fresh, outcome, commands } = await exhaustCancelThenFailOperation("T3TurnStalled");
+    expect(fresh).toMatchObject({ kind: "accepted", commandId: "commandId" in first ? first.commandId : "" });
+    expect(outcome).toBe("resolved");
+    expect(commands).toHaveLength(3);
+    expect(new Set(commands.map((command) => command.commandId)).size).toBe(1);
+    expect(commands[2]).toMatchObject({ type: "thread.turn.interrupt", turnId: "turn-1" });
+  });
+
+  test("a requeued cancellation never interrupts a newer turn that replaced its locally failed operation's turn", async () => {
+    // T3 0.0.45 interrupts whatever the session runs and ignores the turn id, so turn-1 must be current.
+    const { fresh, outcome, commands } = await exhaustCancelThenFailOperation(
+      "T3TurnStalled",
+      (threadId) => threadWithTurn(threadId, "turn-2"),
+    );
+    expect(fresh.kind).toBe("accepted");
+    expect(outcome).toBe("failed");
+    expect(commands).toHaveLength(2);
+  });
+
+  test("a requeued cancellation settles without interrupting once its known turn has ended in T3", async () => {
+    const { outcome, commands } = await exhaustCancelThenFailOperation(
+      "T3TurnStalled",
+      (threadId) => threadWithTurn(threadId, "turn-1", { state: "completed" }),
+    );
+    expect(outcome).toBe("failed");
+    expect(commands).toHaveLength(2);
+  });
+
+  test("a cancel never interrupts when the T3 session's active turn is not the operation's", async () => {
+    await withStore(async ({ store, path }) => {
+      const seeded = seedOperation(store);
+      claimRunningOperation(store, seeded.operationId);
+      store.markOperationTurnStarted({ operationId: seeded.operationId, workerId: "coordinator-a", turnId: "turn-1", now });
+      const cancel = store.requestTaskCancellation({
+        taskId: seeded.taskId,
+        workspaceId: "T1",
+        conversationId: "C1",
+        threadTs: "1000.000001",
+        actorUserId: "U1",
+        sourceActionId: "cancel-other-active-turn",
+        now,
+      });
+      if (cancel.kind === "denied") throw new Error("cancel was denied");
+      const commands: T3Command[] = [];
+      const worker = new InteractionWorker({
+        config,
+        store,
+        t3: {
+          // The projection still names turn-1, but the provider session already runs turn-2.
+          fetchThread: async (threadId) => threadWithTurn(threadId, "turn-1", { activeTurnId: "turn-2" }),
+          dispatch: async (command) => {
+            commands.push(command);
+            return { sequence: 1 };
+          },
+        },
+        workerId: "interaction-a",
+        now: () => new Date(now),
+      });
+      expect(await worker.processNext()).toMatchObject({ kind: "failed", errorCode: "OperationNotRunning" });
+      expect(commands).toEqual([]);
+      expect(noticesFor(path, cancel.interactionId)).toEqual([NO_LONGER_PENDING_NOTICE]);
+    });
+  });
+
+  /** A thread snapshot with the given user messages and latest turn. */
+  function threadWithMessages(
+    threadId: string,
+    latest: { readonly turnId: string; readonly requestedAt: string; readonly state?: "running" | "completed" },
+    messages: ReadonlyArray<{ readonly id: string; readonly turnId: string | null; readonly createdAt: string }>,
+  ): T3ThreadSnapshot {
+    const base = threadWithTurn(threadId, latest.turnId, { state: latest.state ?? "running" });
+    return {
+      ...base,
+      thread: {
+        ...base.thread,
+        latestTurn: base.thread.latestTurn === null ? null : { ...base.thread.latestTurn, requestedAt: latest.requestedAt },
+        messages: messages.map((message) => ({
+          ...message,
+          role: "user" as const,
+          text: message.id,
+          streaming: false,
+          updatedAt: message.createdAt,
+        })),
+      },
+    };
+  }
+
+  const minutesAfterNow = (minutes: number): string => new Date(Date.parse(now) + minutes * 60_000).toISOString();
+
+  /** Records a message-mode (dismissible) question for the operation and answers it from Slack. */
+  function answerAsyncQuestion(
+    store: AgentTagStore,
+    seeded: ReturnType<typeof seedOperation>,
+    requestId: string,
+    answerActionTs: string | null,
+  ): void {
+    const prompt = {
+      requestId,
+      dismissible: true,
+      questions: [
+        { id: "package", header: "Package", question: "Which package?", options: [{ label: "core" }], multiSelect: false },
+      ],
+    };
+    const pending = store.recordPendingInteraction({
+      ...seeded,
+      requestId,
+      kind: "user-input",
+      prompt,
+      conversationId: "C1",
+      threadTs: "1000.000001",
+      message: (interactionId) => questionMessage(interactionId, prompt),
+      now,
+    });
+    if (answerActionTs === null) return;
+    const router = new SlackActionRouter({ config, store, now: () => now });
+    expect(
+      router.ingest(
+        actionBody({
+          actionId: "agent-tag.user-input.answer",
+          value: JSON.stringify({ interactionId: pending.interactionId, questionId: "package", answer: "core" }),
+          actionTs: answerActionTs,
+        }),
+      ).kind,
+    ).toBe("accepted");
+  }
+
+  for (const tied of [true, false]) {
+    test(`a cancel after a message-mode answer interrupts the operation's continuation turn (message ${tied ? "tied to" : "untied from"} its turn)`, async () => {
+      await withStore(async ({ store, path }) => {
+        const seeded = seedOperation(store);
+        claimRunningOperation(store, seeded.operationId);
+        store.markOperationTurnStarted({ operationId: seeded.operationId, workerId: "coordinator-a", turnId: "turn-1", now });
+        const messageId = readRows<{ message_id: string }>(
+          path,
+          "SELECT message_id FROM operations WHERE operation_id = ?",
+          seeded.operationId,
+        )[0]?.message_id ?? "";
+        answerAsyncQuestion(store, seeded, "question-1", "1000.000031");
+        store.deferOperation({
+          operationId: seeded.operationId,
+          workerId: "coordinator-a",
+          blockedUntil: new Date(Date.parse(now) + 24 * 3_600_000).toISOString(),
+          now,
+        });
+        // T3 0.0.45 answers a message-mode question with user message `async-answer:<requestId>`
+        // and a continuation turn (turn-2) that replaces the operation's original turn-1.
+        let phase: "original" | "answered" | "continuation" = "original";
+        const fetchThread = async (threadId: string): Promise<T3ThreadSnapshot> => {
+          const original = { id: messageId, turnId: "turn-1", createdAt: now };
+          if (phase === "original") return threadWithMessages(threadId, { turnId: "turn-1", requestedAt: now }, [original]);
+          const answer = { id: "async-answer:question-1", turnId: tied && phase === "continuation" ? "turn-2" : null, createdAt: minutesAfterNow(1) };
+          return phase === "answered"
+            ? threadWithMessages(threadId, { turnId: "turn-1", requestedAt: now, state: "completed" }, [original, answer])
+            : threadWithMessages(threadId, { turnId: "turn-2", requestedAt: minutesAfterNow(1) }, [original, answer]);
+        };
+        const commands: T3Command[] = [];
+        let current = new Date(now);
+        const worker = new InteractionWorker({
+          config,
+          store,
+          t3: {
+            fetchThread,
+            dispatch: async (command) => {
+              commands.push(command);
+              if (command.type === "thread.user-input.respond") phase = "answered";
+              return { sequence: commands.length };
+            },
+          },
+          workerId: "interaction-a",
+          now: () => current,
+        });
+        expect((await worker.processNext()).kind).toBe("resolved");
+        expect(commands[0]).toMatchObject({ type: "thread.user-input.respond", requestId: "question-1" });
+
+        const router = new SlackActionRouter({ config, store, now: () => now });
+        expect(router.ingest(actionBody({ actionId: "agent-tag.turn.cancel", value: seeded.taskId })).kind).toBe(
+          "accepted",
+        );
+        // T3 holds the answer but has not started its turn: wait instead of settling.
+        const waiting = await worker.processNext();
+        expect(waiting).toMatchObject({ kind: "retry-scheduled", errorCode: "T3TurnNotStarted" });
+        if (waiting.kind !== "retry-scheduled") throw new Error("expected a retry");
+        phase = "continuation";
+        current = new Date(waiting.blockedUntil);
+        expect((await worker.processNext()).kind).toBe("resolved");
+        expect(commands.slice(1)).toEqual([
+          expect.objectContaining({ type: "thread.turn.interrupt", threadId: seeded.threadId, turnId: "turn-2" }),
+        ]);
+      });
+    });
+  }
+
+  // r12 P2. Since #11 the coordinator does not settle an operation while a delivered message-mode
+  // answer's continuation is pending (`awaitingT3AnswerContinuation`), so it cannot reach this state;
+  // the worker must still not trust a local `succeeded` (or T3-ended failure) over T3 when the
+  // operation answered a message-mode question, because only T3 knows whether that answer's
+  // continuation turn is running.
+  for (const settled of [
+    { status: "succeeded", errorCode: null },
+    { status: "failed", errorCode: "T3TurnError" },
+  ] as const) {
+    for (const continuation of ["running", "completed"] as const) {
+      test(`a cancel for an operation settled as ${settled.errorCode ?? settled.status} before its answer's continuation started reads T3 (continuation ${continuation})`, async () => {
+        await withStore(async ({ store, path }) => {
+          const seeded = seedOperation(store);
+          claimRunningOperation(store, seeded.operationId);
+          store.markOperationTurnStarted({ operationId: seeded.operationId, workerId: "coordinator-a", turnId: "turn-1", now });
+          const messageId = readRows<{ message_id: string }>(
+            path,
+            "SELECT message_id FROM operations WHERE operation_id = ?",
+            seeded.operationId,
+          )[0]?.message_id ?? "";
+          answerAsyncQuestion(store, seeded, "question-1", "1000.000031");
+          let phase: "answered" | "continuation" = "answered";
+          let fetches = 0;
+          const fetchThread = async (threadId: string): Promise<T3ThreadSnapshot> => {
+            fetches += 1;
+            const original = { id: messageId, turnId: "turn-1", createdAt: now };
+            const answer = { id: "async-answer:question-1", turnId: null, createdAt: minutesAfterNow(1) };
+            return phase === "answered"
+              ? threadWithMessages(threadId, { turnId: "turn-1", requestedAt: now, state: "completed" }, [original, answer])
+              : threadWithMessages(threadId, { turnId: "turn-2", requestedAt: minutesAfterNow(1), state: continuation }, [original, answer]);
+          };
+          const commands: T3Command[] = [];
+          const worker = new InteractionWorker({
+            config,
+            store,
+            t3: { fetchThread, dispatch: async (command) => (commands.push(command), { sequence: commands.length }) },
+            workerId: "interaction-a",
+            now: () => new Date(now),
+          });
+          // The answer is delivered while the operation runs; T3 has not started its continuation yet.
+          expect((await worker.processNext()).kind).toBe("resolved");
+          const router = new SlackActionRouter({ config, store, now: () => now });
+          expect(router.ingest(actionBody({ actionId: "agent-tag.turn.cancel", value: seeded.taskId })).kind).toBe("accepted");
+          // The pre-#11 coordinator settled here, from the completed turn-1 that asked.
+          if (settled.status === "succeeded") {
+            store.completeOperation({ operationId: seeded.operationId, workerId: "coordinator-a", resultSequence: 1, now });
+          } else {
+            store.failOperation({ operationId: seeded.operationId, workerId: "coordinator-a", errorCode: settled.errorCode, retryable: false, now });
+          }
+          expect(readRows<{ status: string }>(path, "SELECT status FROM operations WHERE operation_id = ?", seeded.operationId))
+            .toEqual([{ status: settled.status }]);
+          phase = "continuation";
+          const outcome = await worker.processNext();
+          expect(fetches).toBe(1);
+          if (continuation === "running") {
+            expect(outcome.kind).toBe("resolved");
+            expect(commands.slice(1)).toEqual([
+              expect.objectContaining({ type: "thread.turn.interrupt", threadId: seeded.threadId, turnId: "turn-2" }),
+            ]);
+          } else {
+            expect(outcome).toMatchObject({ kind: "failed", errorCode: "OperationNotRunning" });
+            expect(commands.slice(1)).toEqual([]);
+          }
+        });
+      });
+    }
+  }
+
+  test("a cancel for a settled operation that answered no message-mode question settles without reading T3", async () => {
+    await withStore(async ({ store }) => {
+      const seeded = seedOperation(store);
+      claimRunningOperation(store, seeded.operationId);
+      store.markOperationTurnStarted({ operationId: seeded.operationId, workerId: "coordinator-a", turnId: "turn-1", now });
+      answerAsyncQuestion(store, seeded, "question-1", null);
+      const router = new SlackActionRouter({ config, store, now: () => now });
+      expect(router.ingest(actionBody({ actionId: "agent-tag.turn.cancel", value: seeded.taskId })).kind).toBe("accepted");
+      store.completeOperation({ operationId: seeded.operationId, workerId: "coordinator-a", resultSequence: 1, now });
+      const worker = new InteractionWorker({
+        config,
+        store,
+        t3: {
+          fetchThread: async () => { throw new Error("T3 must not be read"); },
+          dispatch: async () => { throw new Error("T3 must not be called"); },
+        },
+        workerId: "interaction-a",
+        now: () => new Date(now),
+      });
+      expect(await worker.processNext()).toMatchObject({ kind: "failed", errorCode: "OperationNotRunning" });
+    });
+  });
+
+  /**
+   * The older operation answered a message-mode question (continuation turn-2), its cancel exhausted
+   * retries, and it failed locally. A newer operation on the task then runs turn-3, and a fresh click
+   * requeues the older cancellation against a thread whose user messages after the newer one's are
+   * `afterNewer`. Returns the requeued cancel's outcome and the interrupts sent after the requeue.
+   */
+  async function requeueOlderCancelWhileNewerRuns(
+    afterNewer: ReadonlyArray<{ readonly id: string; readonly turnId: string | null; readonly createdAt: string }>,
+  ) {
+    let result: { readonly outcome: InteractionWorkerOutcome; readonly interrupts: T3Command[] } | undefined;
+    await withStore(async ({ store, path }) => {
+      const older = seedOperation(store);
+      claimRunningOperation(store, older.operationId);
+      store.markOperationTurnStarted({ operationId: older.operationId, workerId: "coordinator-a", turnId: "turn-1", now });
+      answerAsyncQuestion(store, older, "question-1", "1000.000031");
+      // Asked by the older operation too; any answer to it arrives only after the newer one started.
+      answerAsyncQuestion(store, older, "question-2", null);
+      const messageIdOf = (operationId: string): string => {
+        const [row] = readRows<{ message_id: string }>(
+          path,
+          "SELECT message_id FROM operations WHERE operation_id = ?",
+          operationId,
+        );
+        if (row === undefined) throw new Error("operation not found");
+        return row.message_id;
+      };
+      const olderMessages = [
+        { id: messageIdOf(older.operationId), turnId: "turn-1", createdAt: now },
+        { id: "async-answer:question-1", turnId: "turn-2", createdAt: minutesAfterNow(1) },
+      ];
+      let snapshot = (threadId: string) =>
+        threadWithMessages(threadId, { turnId: "turn-2", requestedAt: minutesAfterNow(1) }, olderMessages);
+      const commands: T3Command[] = [];
+      let t3Down = false;
+      let current = new Date(now);
+      const worker = new InteractionWorker({
+        config,
+        store,
+        t3: {
+          fetchThread: async (threadId) => snapshot(threadId),
+          dispatch: async (command) => {
+            commands.push(command);
+            if (t3Down) throw new Error("socket closed before the receipt arrived");
+            return { sequence: commands.length };
+          },
+        },
+        workerId: "interaction-a",
+        retry: { baseDelayMs: 1_000, maxDelayMs: 1_000, maxAttempts: 1 },
+        now: () => current,
+      });
+      expect((await worker.processNext()).kind).toBe("resolved");
+
+      const router = new SlackActionRouter({ config, store, now: () => now });
+      const cancel = (actionTs: string) =>
+        router.ingest(actionBody({ actionId: "agent-tag.turn.cancel", value: older.taskId, actionTs }));
+      expect(cancel("1000.000040").kind).toBe("accepted");
+      t3Down = true;
+      expect((await worker.processNext()).kind).toBe("failed");
+      // It did target the continuation while the older operation owned the current turn.
+      expect(commands.at(-1)).toMatchObject({ type: "thread.turn.interrupt", turnId: "turn-2" });
+      store.failOperation({
+        operationId: older.operationId,
+        workerId: "coordinator-a",
+        errorCode: "T3TurnStalled",
+        retryable: false,
+        now,
+      });
+
+      const newer = seedOperation(store);
+      expect(newer.taskId).toBe(older.taskId);
+      claimRunningOperation(store, newer.operationId);
+      store.markOperationTurnStarted({ operationId: newer.operationId, workerId: "coordinator-a", turnId: "turn-3", now });
+      snapshot = (threadId) => threadWithMessages(threadId, { turnId: "turn-3", requestedAt: minutesAfterNow(2) }, [
+        ...olderMessages,
+        { id: messageIdOf(newer.operationId), turnId: "turn-3", createdAt: minutesAfterNow(2) },
+        ...afterNewer,
+      ]);
+      t3Down = false;
+      const dispatched = commands.length;
+      expect(cancel("1000.000050").kind).toBe("accepted");
+      current = new Date(current.getTime() + 3_600_000);
+      const outcome = await worker.processNext();
+      result = { outcome, interrupts: commands.slice(dispatched) };
+    });
+    if (result === undefined) throw new Error("fixture did not run");
+    return result;
+  }
+
+  test("a cancel after a message-mode answer never interrupts a newer operation's turn", async () => {
+    const { outcome, interrupts } = await requeueOlderCancelWhileNewerRuns([]);
+    expect(outcome).toMatchObject({ kind: "failed", errorCode: "OperationNotRunning" });
+    expect(interrupts).toEqual([]);
+  });
+
+  test("a late message-mode answer that steers a newer operation's turn does not make that turn the older operation's", async () => {
+    for (const turnId of ["turn-3", null]) {
+      const { outcome, interrupts } = await requeueOlderCancelWhileNewerRuns([
+        { id: "async-answer:question-2", turnId, createdAt: minutesAfterNow(3) },
+      ]);
+      expect(outcome).toMatchObject({ kind: "failed", errorCode: "OperationNotRunning" });
+      expect(interrupts).toEqual([]);
+    }
+  });
+
+  test("a fresh cancel does not requeue an exhausted cancellation whose T3 turn is confirmed ended", async () => {
+    const { fresh, outcome, commands } = await exhaustCancelThenFailOperation("T3TurnError");
+    expect(fresh).toMatchObject({ kind: "ignored", reason: "interaction-denied" });
+    expect(outcome).toBe("idle");
+    expect(commands).toHaveLength(2);
+  });
+
+  test("a fresh cancel does not requeue a cancellation T3 rejected", async () => {
+    await withStore(async ({ store }) => {
+      const seeded = seedOperation(store);
+      claimRunningOperation(store, seeded.operationId);
+      store.markOperationTurnStarted({
+        operationId: seeded.operationId,
+        workerId: "coordinator-a",
+        turnId: "turn-1",
+        now,
+      });
+      const router = new SlackActionRouter({ config, store, now: () => now });
+      const cancel = (actionTs: string) =>
+        router.ingest(actionBody({ actionId: "agent-tag.turn.cancel", value: seeded.taskId, actionTs }));
+      expect(cancel("1000.000020").kind).toBe("accepted");
+      let dispatches = 0;
+      const worker = new InteractionWorker({
+        config,
+        store,
+        t3: {
+          fetchThread: async (threadId) => threadWithTurn(threadId, "turn-1"),
+          dispatch: async () => {
+            dispatches += 1;
+            throw {
+              _tag: "OrchestrationDispatchCommandError",
+              message: `Orchestration command invariant failed (thread.turn.interrupt): Thread '${seeded.threadId}' does not exist for command 'thread.turn.interrupt'.`,
+            };
+          },
+        },
+        workerId: "interaction-a",
+        now: () => new Date(now),
+      });
+      expect((await worker.processNext()).kind).toBe("failed");
+      expect(cancel("1000.000030").kind).toBe("duplicate");
+      expect((await worker.processNext()).kind).toBe("idle");
+      expect(dispatches).toBe(1);
+    });
+  });
+
+  test("a cancel that races the turn start waits for the turn instead of interrupting blindly", async () => {
+    await withStore(async ({ store }) => {
+      const seeded = seedOperation(store);
+      claimRunningOperation(store, seeded.operationId);
+      expect(
+        store.requestTaskCancellation({
+          taskId: seeded.taskId,
+          workspaceId: "T1",
+          conversationId: "C1",
+          threadTs: "1000.000001",
+          actorUserId: "U1",
+          sourceActionId: "cancel-before-turn",
+          now,
+        }),
+      ).toMatchObject({ kind: "accepted", disposition: "interrupt-requested" });
+      const commands: T3Command[] = [];
+      let current = new Date(now);
+      const worker = new InteractionWorker({
+        config,
+        store,
+        t3: {
+          fetchThread: async (threadId) => threadWithTurn(threadId, "turn-2"),
+          dispatch: async (command) => {
+            commands.push(command);
+            return { sequence: 1 };
+          },
+        },
+        workerId: "interaction-a",
+        now: () => current,
+      });
+      const waiting = await worker.processNext();
+      expect(waiting).toMatchObject({ kind: "retry-scheduled", errorCode: "T3TurnNotStarted" });
+      if (waiting.kind !== "retry-scheduled") throw new Error("expected a retry");
+      expect(commands).toEqual([]);
+
+      store.markOperationTurnStarted({
+        operationId: seeded.operationId,
+        workerId: "coordinator-a",
+        turnId: "turn-2",
+        now,
+      });
+      current = new Date(waiting.blockedUntil);
+      expect((await worker.processNext()).kind).toBe("resolved");
+      expect(commands).toHaveLength(1);
+      expect(commands[0]).toMatchObject({ type: "thread.turn.interrupt", turnId: "turn-2" });
+    });
+  });
+
+  test("a cancel still interrupts a started turn whose operation failed locally after the settlement timeout", async () => {
+    await withStore(async ({ store, path }) => {
+      const seeded = seedOperation(store);
+      claimRunningOperation(store, seeded.operationId);
+      store.markOperationTurnStarted({ operationId: seeded.operationId, workerId: "coordinator-a", turnId: "turn-4", now });
+      const cancel = store.requestTaskCancellation({
+        taskId: seeded.taskId,
+        workspaceId: "T1",
+        conversationId: "C1",
+        threadTs: "1000.000001",
+        actorUserId: "U1",
+        sourceActionId: "cancel-after-stall",
+        now,
+      });
+      if (cancel.kind === "denied") throw new Error("cancel was denied");
+      // The coordinator gave up waiting: a local failure that does not prove the T3 turn ended.
+      store.failOperation({
+        operationId: seeded.operationId,
+        workerId: "coordinator-a",
+        errorCode: "T3TurnStalled",
+        retryable: false,
+        now,
+      });
+      const commands: T3Command[] = [];
+      const worker = new InteractionWorker({
+        config,
+        store,
+        t3: {
+          fetchThread: async (threadId) => threadWithTurn(threadId, "turn-4"),
+          dispatch: async (command) => {
+            commands.push(command);
+            return { sequence: 1 };
+          },
+        },
+        workerId: "interaction-a",
+        now: () => new Date(now),
+      });
+      expect((await worker.processNext()).kind).toBe("resolved");
+      expect(commands).toHaveLength(1);
+      expect(commands[0]).toMatchObject({ type: "thread.turn.interrupt", turnId: "turn-4" });
+      expect(noticesFor(path, cancel.interactionId)).toEqual([]);
+    });
+  });
+
+  test("a cancel whose operation already finished settles without T3 and says so once", async () => {
+    await withStore(async ({ store, path }) => {
+      const seeded = seedOperation(store);
+      claimRunningOperation(store, seeded.operationId);
+      store.markOperationTurnStarted({ operationId: seeded.operationId, workerId: "coordinator-a", turnId: "turn-3", now });
+      const cancel = store.requestTaskCancellation({
+        taskId: seeded.taskId,
+        workspaceId: "T1",
+        conversationId: "C1",
+        threadTs: "1000.000001",
+        actorUserId: "U1",
+        sourceActionId: "cancel-late",
+        now,
+      });
+      if (cancel.kind === "denied") throw new Error("cancel was denied");
+      store.failOperation({
+        operationId: seeded.operationId,
+        workerId: "coordinator-a",
+        errorCode: "T3TurnError",
+        retryable: false,
+        now,
+      });
+      const worker = new InteractionWorker({
+        config,
+        store,
+        t3: {
+          fetchThread: unexpectedThreadFetch,
+          dispatch: async () => {
+            throw new Error("a finished operation must not reach T3");
+          },
+        },
+        workerId: "interaction-a",
+        now: () => new Date(now),
+      });
+      expect(await worker.processNext()).toMatchObject({ kind: "failed", errorCode: "OperationNotRunning" });
+      expect((await worker.processNext()).kind).toBe("idle");
+      expect(noticesFor(path, cancel.interactionId)).toEqual([NO_LONGER_PENDING_NOTICE]);
+    });
+  });
+
+  /** An operation deferred for a day on a pending approval, with a cancel queued against its turn. */
+  function deferredOperationWithCancel(store: AgentTagStore): ReturnType<typeof seedOperation> {
+    const seeded = seedOperation(store);
+    claimRunningOperation(store, seeded.operationId);
+    store.markOperationTurnStarted({ operationId: seeded.operationId, workerId: "coordinator-a", turnId: "turn-1", now });
+    store.deferOperation({
+      operationId: seeded.operationId,
+      workerId: "coordinator-a",
+      blockedUntil: new Date(Date.parse(now) + 24 * 3_600_000).toISOString(),
+      now,
+    });
+    expect(store.claimNextOperation({ workerId: "coordinator-b", now, leaseMs: 10_000, maxConcurrentTasks: 2 }))
+      .toBeNull();
+    expect(
+      store.requestTaskCancellation({
+        taskId: seeded.taskId,
+        workspaceId: "T1",
+        conversationId: "C1",
+        threadTs: "1000.000001",
+        actorUserId: "U1",
+        sourceActionId: "cancel-deferred",
+        now,
+      }),
+    ).toMatchObject({ kind: "accepted", disposition: "interrupt-requested" });
+    return seeded;
+  }
+
+  test("a cancel that finds the deferred operation's turn already ended unblocks the operation", async () => {
+    await withStore(async ({ store }) => {
+      const seeded = deferredOperationWithCancel(store);
+      const worker = new InteractionWorker({
+        config,
+        store,
+        t3: {
+          fetchThread: async (threadId) => threadWithTurn(threadId, "turn-1", { state: "completed" }),
+          dispatch: async () => {
+            throw new Error("an ended turn must not be interrupted");
+          },
+        },
+        workerId: "interaction-a",
+        now: () => new Date(now),
+      });
+      expect(await worker.processNext()).toMatchObject({ kind: "failed", errorCode: "OperationNotRunning" });
+      // The coordinator can claim the operation at once to observe and finalize the ended turn.
+      expect(store.claimNextOperation({ workerId: "coordinator-b", now, leaseMs: 10_000, maxConcurrentTasks: 2 }))
+        .toMatchObject({ operationId: seeded.operationId });
+    });
+  });
+
+  test("a cancel keeps its deferred operation blocked while retrying and unblocks it once retries are exhausted", async () => {
+    await withStore(async ({ store }) => {
+      const seeded = deferredOperationWithCancel(store);
+      let current = new Date(now);
+      const worker = new InteractionWorker({
+        config,
+        store,
+        t3: {
+          fetchThread: async (threadId) => threadWithTurn(threadId, "turn-1"),
+          dispatch: async () => {
+            throw new Error("socket closed before the receipt arrived");
+          },
+        },
+        workerId: "interaction-a",
+        retry: { baseDelayMs: 1_000, maxDelayMs: 1_000, maxAttempts: 2 },
+        now: () => current,
+      });
+      const claimOperation = () =>
+        store.claimNextOperation({
+          workerId: "coordinator-b",
+          now: current.toISOString(),
+          leaseMs: 10_000,
+          maxConcurrentTasks: 2,
+        });
+      const first = await worker.processNext();
+      expect(first.kind).toBe("retry-scheduled");
+      if (first.kind !== "retry-scheduled") throw new Error("expected a retry");
+      current = new Date(first.blockedUntil);
+      expect(claimOperation()).toBeNull();
+      expect(await worker.processNext()).toMatchObject({ kind: "failed", errorCode: "Error" });
+      expect(claimOperation()).toMatchObject({ operationId: seeded.operationId });
     });
   });
 });
