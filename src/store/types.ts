@@ -156,6 +156,12 @@ export interface ClaimedInteractionResponse {
    * continuation turn from user message `async-answer:<requestId>`, which the operation also owns.
    */
   readonly userInputRequestIds: ReadonlyArray<string>;
+  /**
+   * Whether any of those questions ever had an answer accepted from Slack (whatever became of its
+   * delivery). Only T3 knows whether such an answer started a continuation turn, so a cancel cannot
+   * settle from the operation's local outcome alone.
+   */
+  readonly userInputAnswered: boolean;
 }
 
 export type UserInputQuestionPrompt = z.infer<typeof userInputQuestionPromptSchema>;

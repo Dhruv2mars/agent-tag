@@ -1415,6 +1415,97 @@ describe("interaction retries and cancellation", () => {
     });
   }
 
+  // r12 P2. Since #11 the coordinator does not settle an operation while a delivered message-mode
+  // answer's continuation is pending (`awaitingT3AnswerContinuation`), so it cannot reach this state;
+  // the worker must still not trust a local `succeeded` (or T3-ended failure) over T3 when the
+  // operation answered a message-mode question, because only T3 knows whether that answer's
+  // continuation turn is running.
+  for (const settled of [
+    { status: "succeeded", errorCode: null },
+    { status: "failed", errorCode: "T3TurnError" },
+  ] as const) {
+    for (const continuation of ["running", "completed"] as const) {
+      test(`a cancel for an operation settled as ${settled.errorCode ?? settled.status} before its answer's continuation started reads T3 (continuation ${continuation})`, async () => {
+        await withStore(async ({ store, path }) => {
+          const seeded = seedOperation(store);
+          claimRunningOperation(store, seeded.operationId);
+          store.markOperationTurnStarted({ operationId: seeded.operationId, workerId: "coordinator-a", turnId: "turn-1", now });
+          const messageId = readRows<{ message_id: string }>(
+            path,
+            "SELECT message_id FROM operations WHERE operation_id = ?",
+            seeded.operationId,
+          )[0]?.message_id ?? "";
+          answerAsyncQuestion(store, seeded, "question-1", "1000.000031");
+          let phase: "answered" | "continuation" = "answered";
+          let fetches = 0;
+          const fetchThread = async (threadId: string): Promise<T3ThreadSnapshot> => {
+            fetches += 1;
+            const original = { id: messageId, turnId: "turn-1", createdAt: now };
+            const answer = { id: "async-answer:question-1", turnId: null, createdAt: minutesAfterNow(1) };
+            return phase === "answered"
+              ? threadWithMessages(threadId, { turnId: "turn-1", requestedAt: now, state: "completed" }, [original, answer])
+              : threadWithMessages(threadId, { turnId: "turn-2", requestedAt: minutesAfterNow(1), state: continuation }, [original, answer]);
+          };
+          const commands: T3Command[] = [];
+          const worker = new InteractionWorker({
+            config,
+            store,
+            t3: { fetchThread, dispatch: async (command) => (commands.push(command), { sequence: commands.length }) },
+            workerId: "interaction-a",
+            now: () => new Date(now),
+          });
+          // The answer is delivered while the operation runs; T3 has not started its continuation yet.
+          expect((await worker.processNext()).kind).toBe("resolved");
+          const router = new SlackActionRouter({ config, store, now: () => now });
+          expect(router.ingest(actionBody({ actionId: "agent-tag.turn.cancel", value: seeded.taskId })).kind).toBe("accepted");
+          // The pre-#11 coordinator settled here, from the completed turn-1 that asked.
+          if (settled.status === "succeeded") {
+            store.completeOperation({ operationId: seeded.operationId, workerId: "coordinator-a", resultSequence: 1, now });
+          } else {
+            store.failOperation({ operationId: seeded.operationId, workerId: "coordinator-a", errorCode: settled.errorCode, retryable: false, now });
+          }
+          expect(readRows<{ status: string }>(path, "SELECT status FROM operations WHERE operation_id = ?", seeded.operationId))
+            .toEqual([{ status: settled.status }]);
+          phase = "continuation";
+          const outcome = await worker.processNext();
+          expect(fetches).toBe(1);
+          if (continuation === "running") {
+            expect(outcome.kind).toBe("resolved");
+            expect(commands.slice(1)).toEqual([
+              expect.objectContaining({ type: "thread.turn.interrupt", threadId: seeded.threadId, turnId: "turn-2" }),
+            ]);
+          } else {
+            expect(outcome).toMatchObject({ kind: "failed", errorCode: "OperationNotRunning" });
+            expect(commands.slice(1)).toEqual([]);
+          }
+        });
+      });
+    }
+  }
+
+  test("a cancel for a settled operation that answered no message-mode question settles without reading T3", async () => {
+    await withStore(async ({ store }) => {
+      const seeded = seedOperation(store);
+      claimRunningOperation(store, seeded.operationId);
+      store.markOperationTurnStarted({ operationId: seeded.operationId, workerId: "coordinator-a", turnId: "turn-1", now });
+      answerAsyncQuestion(store, seeded, "question-1", null);
+      const router = new SlackActionRouter({ config, store, now: () => now });
+      expect(router.ingest(actionBody({ actionId: "agent-tag.turn.cancel", value: seeded.taskId })).kind).toBe("accepted");
+      store.completeOperation({ operationId: seeded.operationId, workerId: "coordinator-a", resultSequence: 1, now });
+      const worker = new InteractionWorker({
+        config,
+        store,
+        t3: {
+          fetchThread: async () => { throw new Error("T3 must not be read"); },
+          dispatch: async () => { throw new Error("T3 must not be called"); },
+        },
+        workerId: "interaction-a",
+        now: () => new Date(now),
+      });
+      expect(await worker.processNext()).toMatchObject({ kind: "failed", errorCode: "OperationNotRunning" });
+    });
+  });
+
   /**
    * The older operation answered a message-mode question (continuation turn-2), its cancel exhausted
    * retries, and it failed locally. A newer operation on the task then runs turn-3, and a fresh click

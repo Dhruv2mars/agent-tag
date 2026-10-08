@@ -219,8 +219,11 @@ export class InteractionWorker {
     }
   }
 
-  // Cancellation invariants. Every path through #interruptCommand, #ownRunningTurn, and #fail must keep
-  // these; the store side (requestTaskCancellation; complete/failInteractionResponse for 7) keeps 5-7.
+  // Cancellation invariants. Every cancel path (#interruptCommand, #ownRunningTurn, #settleAbsent,
+  // #fail) must keep these, whether the cancel came from a Slack click (`cancel:<op>`) or from the turn
+  // policy (`interrupt:<op>`, an expired wait or the turn ceiling). The store keeps 5, 6 and 9
+  // (requestTaskCancellation, claimNextInteractionResponse, checkInteractionDispatch, every terminal
+  // operation transition) and 7 (complete/failInteractionResponse); the coordinator keeps 8's counterpart.
   //  1. Never interrupt a turn the operation does not own. T3 0.0.45 ignores the interrupt's turn id
   //     and stops whatever the provider session is running, so every interrupt is preceded by a
   //     thread snapshot whose current turn (latestTurn, and session.activeTurnId when set) is this
@@ -232,26 +235,45 @@ export class InteractionWorker {
   //     callback-mode answers resume the same provider turn, so they need no extra tracking. A
   //     continuation counts only if its message precedes every other user message after the
   //     operation's own, so a newer operation's turn (or one it steered) is never the operation's.
-  //  2. Never settle locally while T3 could still start the operation's turn. Terminal settlement
-  //     needs proof: the turn was never sent, T3 reported or shows it ended, a later turn replaced
-  //     it, or T3 shows neither the thread nor the message after the bootstrap window measured from
-  //     the latest `thread.turn.start` (a detached worktree bootstrap may still create both).
-  //  3. A live operation's cancel waits (retryably) for the coordinator to confirm the turn start.
-  //  4. Retries are bounded by maxAttempts; exhaustion is recoverable: a fresh click requeues the same
-  //     cancellation and command id, so T3's command-id dedup also covers a lost interrupt receipt.
+  //  2. Never settle locally while T3 could still start or run a turn the operation owns. Terminal
+  //     settlement without a T3 read needs local proof that nothing owned can run: the turn was never
+  //     sent (6, or a failed operation that never dispatched), or the operation settled from an
+  //     observed T3 end (succeeded, or a T3-ended failure code) and never had a question answered
+  //     (see 8). Otherwise T3 must show the owned turns ended, a newer operation's turn is current, or
+  //     neither the thread nor the message exists after the bootstrap window measured from the latest
+  //     `thread.turn.start` (a detached worktree bootstrap may still create both).
+  //  3. A cancel waits (retryably) while an owned turn may still start: a live operation whose turn
+  //     start the coordinator has not confirmed, T3 holding an owned message (its own, or an
+  //     `async-answer:` continuation) whose turn has not started, or absence within the bootstrap window.
+  //  4. Retries are bounded by maxAttempts; exhaustion is recoverable while the operation is live or
+  //     failed without an observed T3 end: a fresh click requeues the same cancellation and command
+  //     id, so T3's command-id dedup also covers a lost interrupt receipt.
   //  5. Redeliveries of an accepted click stay duplicates and never target a later operation.
-  //  6. An operation that never sent `thread.turn.start` is cancelled in the store, never in T3.
+  //  6. An operation that never sent `thread.turn.start` is cancelled in the store, never in T3, and
+  //     that terminal transition closes its open responses like every other (9).
   //  7. Every cancel settlement unblocks its operation. Delivery, a no-op settle (OperationNotRunning,
   //     including absence past the bootstrap window), a T3 rejection, invalid input, revoked authority,
   //     and exhausted retries all clear the operation's blocked_until in the settling transaction, so
   //     the coordinator can observe and finalize an ended turn instead of waiting out a deferral. A
   //     scheduled retry is not a settlement and leaves the operation blocked.
+  //  8. A settled operation's local outcome never hides an answer's continuation (r12 P2). An accepted
+  //     message-mode answer makes T3 start a continuation turn the operation owns, possibly after the
+  //     turn that asked ended. The coordinator does not settle while T3 still reports an answered
+  //     request or while a delivered answer's continuation has not shown up
+  //     (`awaitingT3AnswerContinuation`), so `succeeded` normally implies every continuation ended.
+  //     This worker does not rely on that: a cancel whose operation ever had a question answered
+  //     (`userInputAnswered`) reads T3 (1, 2) instead of taking the local shortcut.
+  //  9. Answers and approvals (non-cancel responses) reach T3 only while their operation is pending or
+  //     inflight: the claim selects only those, settles the rest as `operation-settled`, and
+  //     checkInteractionDispatch re-checks just before dispatch. Cancels are exempt, since they exist
+  //     to stop turns of operations that already settled; ownership (1) is what bounds them.
 
   /**
-   * Builds the interrupt for a cancel, or settles it. An operation whose T3 turn is confirmed ended,
-   * or was never sent, has nothing left to cancel. A live operation whose turn has not been confirmed
-   * yet is retried until the coordinator starts (and records) it. Everything else, including a locally
-   * failed operation whose turn may still be running, is checked against the T3 thread first.
+   * Builds the interrupt for a cancel, or settles it. An operation whose turn was never sent, or whose
+   * T3 turn is confirmed ended and which answered no question, has nothing left to cancel. A live
+   * operation whose turn has not been confirmed yet is retried until the coordinator starts (and
+   * records) it. Everything else, including a locally failed operation whose turn may still be running
+   * and a settled one whose answer may have started a continuation, is checked against T3 first.
    */
   async #interruptCommand(response: ClaimedInteractionResponse): Promise<T3Command> {
     const live = response.operationStatus === "pending" || response.operationStatus === "inflight";
@@ -259,7 +281,10 @@ export class InteractionWorker {
       const remoteEnded = response.operationStatus === "succeeded" ||
         (response.operationErrorCode !== null && T3_TURN_ENDED_FAILURE_CODES.has(response.operationErrorCode));
       // A failed operation is never replayed, so an unsent turn will not be recorded later.
-      if (remoteEnded || !response.turnDispatched) throw new InteractionSettled("OperationNotRunning", true);
+      if (!response.turnDispatched) throw new InteractionSettled("OperationNotRunning", true);
+      // An answered question may have started a continuation turn after the outcome was recorded
+      // (invariant 8), so only an operation without one can settle from its outcome alone.
+      if (remoteEnded && !response.userInputAnswered) throw new InteractionSettled("OperationNotRunning", true);
     } else if (!response.turnStarted) {
       throw new InteractionSettled("T3TurnNotStarted", false);
     }
