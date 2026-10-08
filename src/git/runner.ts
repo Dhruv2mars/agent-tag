@@ -38,6 +38,7 @@ export interface GitChild {
   readonly stdout: ReadableStream<Uint8Array>;
   readonly stderr: ReadableStream<Uint8Array>;
   readonly exited: Promise<number>;
+  /** Kills the child and everything it started (filters, transport and credential helpers). */
   kill(): void;
 }
 
@@ -51,12 +52,22 @@ export const bunGitSpawn: GitSpawn = (request) => {
     stdin: request.stdin === undefined ? "ignore" : request.stdin,
     stdout: "pipe",
     stderr: "pipe",
+    // Own process group, so a timeout can kill git's descendants too. A filter or helper that outlives
+    // git would otherwise keep running and hold the output pipes open.
+    detached: true,
   });
   return {
     stdout: child.stdout,
     stderr: child.stderr,
     exited: child.exited,
-    kill: () => child.kill("SIGKILL"),
+    kill: () => {
+      try {
+        process.kill(-child.pid, "SIGKILL");
+      } catch {
+        // The group is already gone; fall back to the child itself.
+        child.kill("SIGKILL");
+      }
+    },
   };
 };
 
@@ -73,6 +84,11 @@ export interface GitRunRequest {
   /** Values scrubbed from output and errors, and refused in argv. */
   readonly secrets?: readonly SecretString[];
   readonly signal?: AbortSignal;
+  /**
+   * Throw `git.output-truncated` instead of returning a truncated stdout. Set this whenever stdout feeds
+   * a security decision (secret scans, config allowlists), so a cut never hides anything.
+   */
+  readonly requireCompleteOutput?: boolean;
 }
 
 export interface GitRunResult {
@@ -84,7 +100,13 @@ export interface GitRunResult {
   readonly stderrTruncated: boolean;
 }
 
-export type GitErrorCode = "git.spawn" | "git.timeout" | "git.aborted" | "git.failed" | "git.argv-secret";
+export type GitErrorCode =
+  | "git.spawn"
+  | "git.timeout"
+  | "git.aborted"
+  | "git.failed"
+  | "git.argv-secret"
+  | "git.output-truncated";
 
 export class GitError extends Error {
   readonly code: GitErrorCode;
@@ -151,16 +173,21 @@ function scrubExact(text: string, secrets: readonly SecretString[]): string {
   return scrubbed;
 }
 
+/** Reads `stream` to the end, keeping at most `limit` bytes. `cancel` ends the read early. */
 async function readBounded(
   stream: ReadableStream<Uint8Array>,
   limit: number,
+  cancel: AbortSignal,
 ): Promise<{ readonly bytes: Uint8Array; readonly total: number; readonly truncated: boolean }> {
   const chunks: Uint8Array[] = [];
   let kept = 0;
   let total = 0;
   const reader = stream.getReader();
+  const onCancel = () => void reader.cancel().catch(() => undefined);
+  cancel.addEventListener("abort", onCancel, { once: true });
   for (;;) {
-    const { done, value } = await reader.read();
+    if (cancel.aborted) break;
+    const { done, value } = await reader.read().catch(() => ({ done: true as const, value: undefined }));
     if (done) break;
     total += value.byteLength;
     if (kept < limit) {
@@ -175,6 +202,7 @@ async function readBounded(
     bytes.set(chunk, offset);
     offset += chunk.byteLength;
   }
+  cancel.removeEventListener("abort", onCancel);
   return { bytes, total, truncated: total > kept };
 }
 
@@ -212,23 +240,43 @@ export function createGitRunner(options: GitRunnerOptions = {}): GitRunner {
     const limit = request.maxOutputBytes ?? options.maxOutputBytes ?? DEFAULT_GIT_MAX_OUTPUT_BYTES;
     const timeoutMs = request.timeoutMs ?? options.timeoutMs ?? DEFAULT_GIT_TIMEOUT_MS;
     let stopped: "timeout" | "aborted" | undefined;
+    const reads = new AbortController();
+    let settleStopped: () => void = () => undefined;
+    const stoppedPromise = new Promise<void>((resolve) => {
+      settleStopped = resolve;
+    });
     const stop = (reason: "timeout" | "aborted") => {
       stopped ??= reason;
-      child.kill();
+      try {
+        child.kill();
+      } finally {
+        // Settle now: neither the exit nor a descendant that still holds a pipe may extend the call.
+        reads.abort();
+        settleStopped();
+      }
     };
     const timer = setTimeout(() => stop("timeout"), timeoutMs);
     const onAbort = () => stop("aborted");
     request.signal?.addEventListener("abort", onAbort, { once: true });
     try {
-      const [exitCode, stdout, stderr] = await Promise.all([
+      const work = Promise.all([
         child.exited,
-        readBounded(child.stdout, limit),
-        readBounded(child.stderr, limit),
+        readBounded(child.stdout, limit, reads.signal),
+        readBounded(child.stderr, limit, reads.signal),
       ]);
-      if (stopped === "timeout") {
+      work.catch(() => undefined);
+      const finished = await Promise.race([work, stoppedPromise.then(() => undefined)]);
+      if (stopped === "aborted") throw new GitError({ code: "git.aborted", message: `git ${label} was cancelled` });
+      if (stopped === "timeout" || finished === undefined) {
         throw new GitError({ code: "git.timeout", message: `git ${label} timed out after ${timeoutMs} ms` });
       }
-      if (stopped === "aborted") throw new GitError({ code: "git.aborted", message: `git ${label} was cancelled` });
+      const [exitCode, stdout, stderr] = finished;
+      if (request.requireCompleteOutput === true && stdout.truncated) {
+        throw new GitError({
+          code: "git.output-truncated",
+          message: `git ${label} printed more than ${limit} bytes; refusing to act on partial output`,
+        });
+      }
       const decoder = new TextDecoder();
       return {
         exitCode,
@@ -242,6 +290,7 @@ export function createGitRunner(options: GitRunnerOptions = {}): GitRunner {
       };
     } finally {
       clearTimeout(timer);
+      reads.abort();
       request.signal?.removeEventListener("abort", onAbort);
     }
   };

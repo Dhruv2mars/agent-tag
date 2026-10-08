@@ -188,9 +188,17 @@ function classifyPushFailure(stderr: string): { readonly code: PushErrorCode; re
 }
 
 async function assertMirrorConfig(input: PushInput): Promise<void> {
-  const listed = await input.runner.run({
-    args: ["config", "--file", join(input.mirrorPath, "config"), "--list", "--name-only"],
-  });
+  let listed;
+  try {
+    listed = await input.runner.run({
+      args: ["config", "--file", join(input.mirrorPath, "config"), "--list", "--name-only"],
+      // A cut listing could hide a key past the cap; refuse rather than check a prefix.
+      requireCompleteOutput: true,
+    });
+  } catch (error) {
+    if (error instanceof GitError) throw new PushError("push.mirror-config", `could not read the mirror's config: ${error.message}`);
+    throw error;
+  }
   if (listed.exitCode !== 0) throw new PushError("push.mirror-config", "could not read the mirror's config");
   const unexpected = listed.stdout
     .split("\n")

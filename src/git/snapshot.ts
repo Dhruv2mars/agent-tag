@@ -3,7 +3,7 @@
 //   locate the task worktree -> commit leftovers (hooks off) -> ahead of base? -> size and secret guards
 //   -> fetch the branch into a bare mirror owned by Agent Tag.
 // Every failure is returned as `{ kind: "failed" }` with a short code so a git problem never fails the turn.
-import { chmod, mkdir, stat } from "node:fs/promises";
+import { chmod, mkdir, realpath, stat } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 
 import { GIT_BRANCH_NAME_PATTERN, GITHUB_REPOSITORY_PATTERN } from "../config.ts";
@@ -59,6 +59,11 @@ export interface SizeBlockDetail {
   readonly diffBytes: number;
   readonly maxChangedFiles: number;
   readonly maxDiffBytes: number;
+  /**
+   * Set when the per-commit patches of the new commits (which are all scanned, since the push transfers
+   * every one of them) exceed `maxDiffBytes` even though the net diff does not. Lower bound.
+   */
+  readonly historyBytes?: number;
 }
 
 export type PrSnapshotResult =
@@ -147,43 +152,55 @@ export function parseWorktreeList(output: string): ReadonlyArray<{ readonly path
 }
 
 /**
- * Collects the added lines of a `git diff -U0` and the file each belongs to. Header lines (`+++ b/...`)
- * are not content: added lines are only those inside a hunk.
+ * Collects the added lines of a `git diff -U0` (or `git log -p --cc -U0`) and the file each belongs to.
+ * Header lines (`+++ b/...`) are not content: added lines are only those inside a hunk. In a combined
+ * (merge) hunk, `@@@` has one prefix column per parent and a line is added when any column is `+`.
  */
 export function addedLinesByPath(diff: string): { readonly text: string; readonly paths: readonly string[] } {
   const lines: string[] = [];
   const paths: string[] = [];
   let path = "";
   let inHunk = false;
+  let columns = 1;
   for (const line of diff.split("\n")) {
     if (line.startsWith("diff --git ")) {
       inHunk = false;
       const match = / b\/(.*)$/.exec(line);
       path = match?.[1] ?? "";
+    } else if (line.startsWith("diff --cc ") || line.startsWith("diff --combined ")) {
+      inHunk = false;
+      path = line.slice(line.indexOf(" ", "diff ".length) + 1);
     } else if (!inHunk && line.startsWith("+++ ")) {
       const target = line.slice(4);
       if (target.startsWith("b/")) path = target.slice(2);
     } else if (line.startsWith("@@")) {
       inHunk = true;
-    } else if (inHunk && line.startsWith("+")) {
-      lines.push(line.slice(1));
+      columns = Math.max(1, (/^@+/.exec(line)?.[0].length ?? 2) - 1);
+    } else if (inHunk && line.slice(0, columns).includes("+")) {
+      lines.push(line.slice(columns));
       paths.push(path);
     }
   }
   return { text: lines.join("\n"), paths };
 }
 
-async function tryRun(input: PrSnapshotInput, cwd: string, args: readonly string[]) {
-  return await input.runner.run({ cwd, args, ...(input.signal === undefined ? {} : { signal: input.signal }) });
+interface RunExtra {
+  readonly stdin?: string;
+  readonly maxOutputBytes?: number;
+  /** Fail (`output-truncated`) rather than act on a cut stdout. Set wherever stdout feeds a guard. */
+  readonly requireCompleteOutput?: boolean;
 }
 
-async function mustRun(
-  input: PrSnapshotInput,
-  cwd: string,
-  args: readonly string[],
-  code: string,
-  extra: { readonly stdin?: string; readonly maxOutputBytes?: number } = {},
-) {
+async function tryRun(input: PrSnapshotInput, cwd: string, args: readonly string[], extra: RunExtra = {}) {
+  try {
+    return await input.runner.run({ cwd, args, ...extra, ...(input.signal === undefined ? {} : { signal: input.signal }) });
+  } catch (error) {
+    if (error instanceof GitError && error.code === "git.output-truncated") throw new SnapshotFailure("output-truncated", error.message);
+    throw error;
+  }
+}
+
+async function mustRun(input: PrSnapshotInput, cwd: string, args: readonly string[], code: string, extra: RunExtra = {}) {
   try {
     return await input.runner.runChecked({
       cwd,
@@ -192,7 +209,9 @@ async function mustRun(
       ...(input.signal === undefined ? {} : { signal: input.signal }),
     });
   } catch (error) {
-    if (error instanceof GitError) throw new SnapshotFailure(code, error.message);
+    if (error instanceof GitError) {
+      throw new SnapshotFailure(error.code === "git.output-truncated" ? "output-truncated" : code, error.message);
+    }
     throw error;
   }
 }
@@ -205,16 +224,50 @@ async function isDirectory(path: string): Promise<boolean> {
   }
 }
 
-async function locateWorktree(input: PrSnapshotInput, branch: string): Promise<string | undefined> {
-  const given = input.t3Thread.worktreePath;
-  if (given !== null && given !== undefined && given.length > 0 && (await isDirectory(given))) {
-    const inside = await tryRun(input, given, ["rev-parse", "--is-inside-work-tree"]);
-    if (inside.exitCode === 0 && inside.stdout.trim() === "true") return given;
+async function realpathOrUndefined(path: string): Promise<string | undefined> {
+  try {
+    return await realpath(path);
+  } catch {
+    return undefined;
   }
-  const listed = await tryRun(input, input.repositoryRoot, ["worktree", "list", "--porcelain", "-z"]);
+}
+
+/** Real path of the first line `git rev-parse <flag>` prints in `cwd`, or undefined. */
+async function revParsePath(input: PrSnapshotInput, cwd: string, flag: string): Promise<string | undefined> {
+  const result = await tryRun(input, cwd, ["rev-parse", "--path-format=absolute", flag]);
+  const printed = result.stdout.split("\n")[0]?.trim() ?? "";
+  return result.exitCode === 0 && printed.length > 0 ? await realpathOrUndefined(printed) : undefined;
+}
+
+/**
+ * The task worktree, but only a worktree of the configured repository: it must be in `repositoryRoot`'s
+ * `git worktree list` and share its common git dir. A stale or wrong T3 path is never committed to.
+ */
+async function locateWorktree(input: PrSnapshotInput, branch: string): Promise<string | undefined> {
+  const listed = await tryRun(input, input.repositoryRoot, ["worktree", "list", "--porcelain", "-z"], { requireCompleteOutput: true });
   if (listed.exitCode !== 0) return undefined;
-  const match = parseWorktreeList(listed.stdout).find((entry) => entry.branch === `refs/heads/${branch}`);
-  return match !== undefined && (await isDirectory(match.path)) ? match.path : undefined;
+  const entries = parseWorktreeList(listed.stdout);
+  const rootCommonDir = await revParsePath(input, input.repositoryRoot, "--git-common-dir");
+  if (rootCommonDir === undefined) return undefined;
+  const belongs = async (path: string): Promise<string | undefined> => {
+    if (!(await isDirectory(path))) return undefined;
+    const top = await revParsePath(input, path, "--show-toplevel");
+    if (top === undefined) return undefined;
+    let listedHere = false;
+    for (const entry of entries) {
+      if ((await realpathOrUndefined(entry.path)) === top) listedHere = true;
+    }
+    if (!listedHere) return undefined;
+    return (await revParsePath(input, top, "--git-common-dir")) === rootCommonDir ? top : undefined;
+  };
+
+  const given = input.t3Thread.worktreePath;
+  if (given !== null && given !== undefined && given.length > 0) {
+    const verified = await belongs(given);
+    if (verified !== undefined) return verified;
+  }
+  const match = entries.find((entry) => entry.branch === `refs/heads/${branch}`);
+  return match === undefined ? undefined : await belongs(match.path);
 }
 
 async function commitLeftovers(input: PrSnapshotInput, worktree: string): Promise<boolean> {
@@ -262,6 +315,7 @@ async function scanDelta(
     root,
     ["diff", "--numstat", "-z", "--no-renames", "--no-ext-diff", "--no-textconv", ...range],
     "diff-numstat",
+    { requireCompleteOutput: true },
   );
   // Each `-z` numstat record is `added\tdeleted\tpath\0`.
   const changedFiles = numstat.stdout.split("\0").filter((record) => record.includes("\t")).length;
@@ -289,7 +343,47 @@ async function scanDelta(
     }
   };
   record(scanTextForSecrets(added.text), (line) => added.paths[line - 1] ?? "");
-  const messages = await mustRun(input, root, ["log", "--format=%B", "--no-show-signature", `${from}..${sha}`], "log");
+
+  // The push transfers every new commit, not just the net result: a credential added in one commit and
+  // deleted in the next is still in the pushed history. So each new commit's own patch is scanned too
+  // (`--cc`: a merge shows only what it adds beyond its parents). A cut patch fails closed as a size block.
+  const history = await mustRun(
+    input,
+    root,
+    [
+      "log",
+      "--format=",
+      "--cc",
+      "-U0",
+      "--text",
+      "--no-color",
+      "--no-renames",
+      "--no-ext-diff",
+      "--no-textconv",
+      "--no-show-signature",
+      `${from}..${sha}`,
+    ],
+    "log-patches",
+    { maxOutputBytes: maxDiffBytes + 1 },
+  );
+  if (history.stdoutTruncated || history.stdoutBytes > maxDiffBytes) {
+    return {
+      block: { reason: "size", changedFiles, diffBytes, maxChangedFiles, maxDiffBytes, historyBytes: history.stdoutBytes },
+      changedFiles,
+      diffBytes,
+    };
+  }
+  const historyAdded = addedLinesByPath(history.stdout);
+  record(scanTextForSecrets(historyAdded.text), (line) => historyAdded.paths[line - 1] ?? "");
+
+  // Messages and identities of every new commit; a cut output fails rather than scanning a prefix.
+  const messages = await mustRun(
+    input,
+    root,
+    ["log", "--format=%an%n%ae%n%cn%n%ce%n%B", "--no-show-signature", `${from}..${sha}`],
+    "log",
+    { requireCompleteOutput: true },
+  );
   record(scanTextForSecrets(messages.stdout), () => "commit message");
   if (hitPaths.size === 0) return { changedFiles, diffBytes };
   return {

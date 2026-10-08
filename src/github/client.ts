@@ -188,7 +188,7 @@ export function pullRequestBody(input: {
   ].join("\n");
 }
 
-function retryAfterMs(response: Response, now: number): number {
+function retryAfterMs(response: ApiResponse, now: number): number {
   const retryAfter = response.headers.get("retry-after");
   if (retryAfter !== null) {
     const seconds = Number(retryAfter);
@@ -208,20 +208,22 @@ function scrub(text: string, token: SecretString | undefined): string {
   return redactSecrets(exact);
 }
 
+/** A response whose body was read in full inside the request's timeout. */
+interface ApiResponse {
+  readonly status: number;
+  readonly headers: Headers;
+  /** Parsed JSON, or undefined when the body is empty or not JSON (a payload problem, not transport). */
+  readonly body: unknown;
+}
+
 interface ErrorDetail {
   readonly message: string;
   /** Lowercased message plus every `errors[].message`, for matching. */
   readonly haystack: string;
 }
 
-async function errorDetail(response: Response, token: SecretString | undefined): Promise<ErrorDetail> {
-  let raw: unknown;
-  try {
-    raw = await response.json();
-  } catch {
-    return { message: "", haystack: "" };
-  }
-  const parsed = errorBodySchema.safeParse(raw);
+function errorDetail(response: ApiResponse, token: SecretString | undefined): ErrorDetail {
+  const parsed = errorBodySchema.safeParse(response.body);
   if (!parsed.success) return { message: "", haystack: "" };
   const parts = [
     parsed.data.message ?? "",
@@ -232,9 +234,9 @@ async function errorDetail(response: Response, token: SecretString | undefined):
 }
 
 /** Maps a non-2xx response to a classified, redacted error (outbox-policy style). */
-async function classify(response: Response, token: SecretString | undefined, now: number, what: string): Promise<GitHubApiError> {
+function classify(response: ApiResponse, token: SecretString | undefined, now: number, what: string): GitHubApiError {
   const status = response.status;
-  const detail = await errorDetail(response, token);
+  const detail = errorDetail(response, token);
   const suffix = detail.message.length > 0 ? `: ${detail.message}` : "";
   const rateLimited =
     status === 429 ||
@@ -269,6 +271,25 @@ async function classify(response: Response, token: SecretString | undefined, now
   return new GitHubApiError({ kind: "unexpected", status, message: `unexpected GitHub response for ${what} (HTTP ${status})${suffix}` });
 }
 
+/** Reads the whole body, rejecting as soon as `signal` aborts even if the stream itself never settles. */
+async function readBodyText(response: Response, signal: AbortSignal): Promise<string> {
+  if (signal.aborted) throw signal.reason;
+  let onAbort: () => void = () => undefined;
+  const aborted = new Promise<never>((_, reject) => {
+    onAbort = () => {
+      response.body?.cancel().catch(() => undefined);
+      reject(signal.reason instanceof Error ? signal.reason : new Error("aborted"));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+  aborted.catch(() => undefined);
+  try {
+    return await Promise.race([response.text(), aborted]);
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+  }
+}
+
 export function createGitHubClient(options: GitHubClientOptions): GitHubClient {
   const base = new URL(options.apiBaseUrl);
   if (base.protocol !== "https:" || base.username !== "" || base.password !== "") {
@@ -286,10 +307,14 @@ export function createGitHubClient(options: GitHubClientOptions): GitHubClient {
     readonly what: string;
     readonly body?: unknown;
     readonly signal?: AbortSignal | undefined;
-  }): Promise<{ readonly response: Response; readonly token: SecretString }> => {
+  }): Promise<{ readonly response: ApiResponse; readonly token: SecretString }> => {
     const token = await options.credentials.token(input.repo);
     const timeout = AbortSignal.timeout(timeoutMs);
     const signal = input.signal === undefined ? timeout : AbortSignal.any([timeout, input.signal]);
+    const transportError = (error: unknown) => {
+      const reason = timeout.aborted ? `timed out after ${timeoutMs} ms` : error instanceof Error ? error.message : String(error);
+      return new GitHubApiError({ kind: "transient", message: `GitHub request for ${input.what} failed: ${scrub(reason, token)}` });
+    };
     let response: Response;
     try {
       response = await doFetch(`${apiBaseUrl}${input.path}`, {
@@ -306,14 +331,27 @@ export function createGitHubClient(options: GitHubClientOptions): GitHubClient {
         signal,
       });
     } catch (error) {
-      const reason = timeout.aborted ? `timed out after ${timeoutMs} ms` : error instanceof Error ? error.message : String(error);
-      throw new GitHubApiError({ kind: "transient", message: `GitHub request for ${input.what} failed: ${scrub(reason, token)}` });
+      throw transportError(error);
     }
-    return { response, token };
+    // The body is part of the request: a stall or a dropped connection after the headers is a transport
+    // failure (transient, retryable), and the same timeout covers it.
+    let text: string;
+    try {
+      text = await readBodyText(response, signal);
+    } catch (error) {
+      throw transportError(error);
+    }
+    let body: unknown;
+    try {
+      body = text.length === 0 ? undefined : JSON.parse(text);
+    } catch {
+      body = undefined;
+    }
+    return { response: { status: response.status, headers: response.headers, body }, token };
   };
 
-  const parsePull = async (response: Response, what: string): Promise<GitHubPull> => {
-    const parsed = pullSchema.safeParse(await response.json().catch(() => undefined));
+  const parsePull = (response: ApiResponse, what: string): GitHubPull => {
+    const parsed = pullSchema.safeParse(response.body);
     if (!parsed.success) throw new GitHubApiError({ kind: "unexpected", status: response.status, message: `unexpected GitHub payload for ${what}` });
     return toPull(parsed.data);
   };
@@ -330,8 +368,8 @@ export function createGitHubClient(options: GitHubClientOptions): GitHubClient {
     });
     const what = `pull request lookup on ${repo}`;
     const { response, token } = await request({ repo, method: "GET", path: `/repos/${owner}/${name}/pulls?${query}`, what, signal });
-    if (response.status !== 200) throw await classify(response, token, now(), what);
-    const parsed = z.array(pullSchema).safeParse(await response.json().catch(() => undefined));
+    if (response.status !== 200) throw classify(response, token, now(), what);
+    const parsed = z.array(pullSchema).safeParse(response.body);
     if (!parsed.success) throw new GitHubApiError({ kind: "unexpected", status: 200, message: `unexpected GitHub payload for ${what}` });
     const pulls = parsed.data.map(toPull).filter((pull) => pull.headRef === headBranch);
     pulls.sort((left, right) => right.number - left.number);
@@ -343,8 +381,8 @@ export function createGitHubClient(options: GitHubClientOptions): GitHubClient {
     if (!Number.isSafeInteger(number) || number <= 0) throw new GitHubApiError({ kind: "validation", message: "pull number must be positive" });
     const what = `pull request ${repo}#${number}`;
     const { response, token } = await request({ repo, method: "GET", path: `/repos/${owner}/${name}/pulls/${number}`, what, signal });
-    if (response.status !== 200) throw await classify(response, token, now(), what);
-    return await parsePull(response, what);
+    if (response.status !== 200) throw classify(response, token, now(), what);
+    return parsePull(response, what);
   };
 
   const createDraftPull: GitHubClient["createDraftPull"] = async (repo, input, signal) => {
@@ -366,7 +404,7 @@ export function createGitHubClient(options: GitHubClientOptions): GitHubClient {
     let { response, token } = await attempt(wantDraft, input.title);
     let draftUnavailable = false;
     if (response.status === 422) {
-      const error = await classify(response, token, now(), what);
+      const error = classify(response, token, now(), what);
       const text = error.message.toLowerCase();
       if (text.includes("already exists")) {
         const existing = await findPullByHead(repo, input.head, signal);
@@ -377,26 +415,26 @@ export function createGitHubClient(options: GitHubClientOptions): GitHubClient {
       draftUnavailable = true;
       ({ response, token } = await attempt(false, `${DRAFT_UNAVAILABLE_TITLE_PREFIX}${input.title}`));
       if (response.status === 422) {
-        const retryError = await classify(response, token, now(), what);
+        const retryError = classify(response, token, now(), what);
         if (!retryError.message.toLowerCase().includes("already exists")) throw retryError;
         const existing = await findPullByHead(repo, input.head, signal);
         if (existing === undefined) throw retryError;
         return { pull: existing, created: false, draftUnavailable: false };
       }
     }
-    if (response.status !== 201) throw await classify(response, token, now(), what);
-    return { pull: await parsePull(response, what), created: true, draftUnavailable };
+    if (response.status !== 201) throw classify(response, token, now(), what);
+    return { pull: parsePull(response, what), created: true, draftUnavailable };
   };
 
   const checkPushAccess: GitHubClient["checkPushAccess"] = async (repo, signal) => {
     const { owner, name } = splitRepo(repo);
     const what = `repository ${repo}`;
     const { response, token } = await request({ repo, method: "GET", path: `/repos/${owner}/${name}`, what, signal });
-    if (response.status !== 200) throw await classify(response, token, now(), what);
+    if (response.status !== 200) throw classify(response, token, now(), what);
     const parsed = z
       .object({ permissions: z.object({ push: z.boolean().optional() }).loose().optional() })
       .loose()
-      .safeParse(await response.json().catch(() => undefined));
+      .safeParse(response.body);
     const push = parsed.success ? parsed.data.permissions?.push : undefined;
     return push === undefined ? "unknown" : push ? "yes" : "no";
   };

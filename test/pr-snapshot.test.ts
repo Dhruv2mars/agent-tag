@@ -284,6 +284,120 @@ describe("prSnapshot", () => {
     });
   });
 
+  test("blocks a secret that one new commit adds and a later commit deletes (the push would carry it)", async () => {
+    await withTempDir("pr-snapshot-history-secret", async (directory) => {
+      const repo = await createSourceRepo(directory);
+      await Bun.write(join(repo.worktree, "config.txt"), `token=${slackShapedToken()}\n`);
+      git(repo.worktree, "add", "-A");
+      git(repo.worktree, "commit", "--quiet", "-m", "add config");
+      const first = await prSnapshot(snapshotInput(repo));
+      expect(first).toMatchObject({ kind: "blocked", detail: { reason: "secret", paths: ["config.txt"] } });
+
+      // Deleting the secret without rewriting history must not unblock: the blob is still in the push.
+      await Bun.write(join(repo.worktree, "config.txt"), "token=from-env\n");
+      git(repo.worktree, "commit", "--quiet", "-am", "remove token");
+      git(repo.worktree, "rm", "--quiet", "config.txt");
+      git(repo.worktree, "commit", "--quiet", "-m", "drop config");
+      const second = await prSnapshot(snapshotInput(repo));
+      if (second.kind !== "blocked") throw new Error(`expected blocked, got ${JSON.stringify(second)}`);
+      expect(second.detail).toMatchObject({ reason: "secret", paths: ["config.txt"], patternNames: ["slack-token"] });
+      expect(await exists(join(repo.gitRoot, "octo", "example.git"))).toBe(false);
+    });
+  });
+
+  test("blocks a secret added only by a merge commit's own changes", async () => {
+    await withTempDir("pr-snapshot-evil-merge", async (directory) => {
+      const repo = await createSourceRepo(directory);
+      git(repo.worktree, "checkout", "--quiet", "-b", "side");
+      await Bun.write(join(repo.worktree, "side.txt"), "side\n");
+      git(repo.worktree, "add", "-A");
+      git(repo.worktree, "commit", "--quiet", "-m", "side");
+      git(repo.worktree, "checkout", "--quiet", repo.branch);
+      await Bun.write(join(repo.worktree, "main.txt"), "main\n");
+      git(repo.worktree, "add", "-A");
+      git(repo.worktree, "commit", "--quiet", "-m", "main");
+      git(repo.worktree, "merge", "--quiet", "--no-commit", "side");
+      await Bun.write(join(repo.worktree, "merge.txt"), `${slackShapedToken()}\n`);
+      git(repo.worktree, "add", "-A");
+      git(repo.worktree, "commit", "--quiet", "-m", "merge side");
+      git(repo.worktree, "rm", "--quiet", "merge.txt");
+      git(repo.worktree, "commit", "--quiet", "-m", "drop merge.txt");
+      const result = await prSnapshot(snapshotInput(repo));
+      expect(result).toMatchObject({ kind: "blocked", detail: { reason: "secret", paths: ["merge.txt"] } });
+    });
+  });
+
+  test("history churn beyond maxDiffBytes is a size block even when the net diff is small", async () => {
+    await withTempDir("pr-snapshot-history-size", async (directory) => {
+      const repo = await createSourceRepo(directory);
+      await Bun.write(join(repo.worktree, "big.txt"), "x\n".repeat(5_000));
+      git(repo.worktree, "add", "-A");
+      git(repo.worktree, "commit", "--quiet", "-m", "big");
+      git(repo.worktree, "rm", "--quiet", "big.txt");
+      await Bun.write(join(repo.worktree, "small.txt"), "small\n");
+      git(repo.worktree, "add", "-A");
+      git(repo.worktree, "commit", "--quiet", "-m", "small");
+      const result = await prSnapshot(snapshotInput(repo, { limits: { maxChangedFiles: 300, maxDiffBytes: 2_000, secretScan: "block" } }));
+      if (result.kind !== "blocked" || result.detail.reason !== "size") throw new Error(`expected size block, got ${JSON.stringify(result)}`);
+      expect(result.detail.diffBytes).toBeLessThan(2_000);
+      expect(result.detail.historyBytes).toBeGreaterThan(2_000);
+    });
+  });
+
+  test("fails closed when commit messages exceed the output cap instead of scanning a prefix", async () => {
+    await withTempDir("pr-snapshot-message-truncation", async (directory) => {
+      const repo = await createSourceRepo(directory);
+      await Bun.write(join(repo.worktree, "one.txt"), "1\n");
+      git(repo.worktree, "add", "-A");
+      git(repo.worktree, "commit", "--quiet", "-m", `leaked ${slackShapedToken()}`);
+      await Bun.write(join(repo.worktree, "two.txt"), "2\n");
+      git(repo.worktree, "add", "-A");
+      // The newer message comes first in `git log` and fills the cap, pushing the older one past it.
+      git(repo.worktree, "commit", "--quiet", "-m", `padding\n\n${"p".repeat(8_000)}`);
+      const runner = createGitRunner({ parentEnv: { PATH: process.env.PATH, HOME: "/nonexistent-agent-tag-home" }, maxOutputBytes: 4_096 });
+      const result = await prSnapshot(snapshotInput(repo, { runner }));
+      expect(result).toMatchObject({ kind: "failed", code: "output-truncated" });
+      expect(await exists(join(repo.gitRoot, "octo", "example.git"))).toBe(false);
+    });
+  });
+
+  test("fails closed when the changed-file count output is cut, so maxChangedFiles cannot be undercounted", async () => {
+    await withTempDir("pr-snapshot-numstat-truncation", async (directory) => {
+      const repo = await createSourceRepo(directory);
+      for (let index = 0; index < 400; index += 1) await Bun.write(join(repo.worktree, `file-${index}.txt`), "x\n");
+      const runner = createGitRunner({ parentEnv: { PATH: process.env.PATH, HOME: "/nonexistent-agent-tag-home" }, maxOutputBytes: 4_096 });
+      const result = await prSnapshot(
+        snapshotInput(repo, { runner, limits: { maxChangedFiles: 350, maxDiffBytes: 2_000_000, secretScan: "block" } }),
+      );
+      expect(result).toMatchObject({ kind: "failed", code: "output-truncated" });
+    });
+  });
+
+  test("never commits in a T3-supplied path that is not a worktree of the configured repository", async () => {
+    await withTempDir("pr-snapshot-foreign-worktree", async (directory) => {
+      const repo = await createSourceRepo(directory);
+      const foreign = join(directory, "foreign");
+      await mkdir(foreign);
+      git(foreign, "init", "--quiet", "-b", repo.branch);
+      await Bun.write(join(foreign, "keep.txt"), "kept\n");
+      git(foreign, "add", "-A");
+      git(foreign, "commit", "--quiet", "-m", "foreign initial");
+      await Bun.write(join(foreign, "dirty.txt"), "uncommitted\n");
+
+      const result = await prSnapshot(snapshotInput(repo, { t3Thread: { branch: repo.branch, worktreePath: foreign } }));
+      // Falls back to the real task worktree, which is clean.
+      expect(result.kind).toBe("empty");
+      expect(git(foreign, "rev-list", "--count", "HEAD")).toBe("1");
+      expect(git(foreign, "status", "--porcelain")).toBe("?? dirty.txt");
+
+      // A path inside the real worktree still works.
+      await mkdir(join(repo.worktree, "sub"));
+      await Bun.write(join(repo.worktree, "sub", "file.txt"), "content\n");
+      const inside = await prSnapshot(snapshotInput(repo, { t3Thread: { branch: repo.branch, worktreePath: join(repo.worktree, "sub") } }));
+      expect(inside).toMatchObject({ kind: "ready", committedLeftovers: true });
+    });
+  });
+
   test("returns a failure code instead of throwing", async () => {
     await withTempDir("pr-snapshot-failure", async (directory) => {
       const repo = await createSourceRepo(directory);
@@ -327,5 +441,7 @@ describe("snapshot helpers", () => {
       "+bee",
     ].join("\n");
     expect(addedLinesByPath(diff)).toEqual({ text: "new\n++plus content\nbee", paths: ["a.txt", "a.txt", "b.txt"] });
+    const combined = ["diff --cc f", "--- a/f", "+++ b/f", "@@@ -2,0 -2,1 +2,2 @@@", "+ b", "++evil", "- gone", "  same"].join("\n");
+    expect(addedLinesByPath(combined)).toEqual({ text: "b\nevil", paths: ["f", "f"] });
   });
 });

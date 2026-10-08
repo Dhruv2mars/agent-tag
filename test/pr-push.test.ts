@@ -209,6 +209,19 @@ describe("pushToRemote", () => {
     });
   });
 
+  test("refuses to push when the mirror's config listing is cut, so a key past the cap cannot hide", async () => {
+    await withTempDir("pr-push-mirror-config-truncated", async (directory) => {
+      const prepared = await prepare(directory);
+      git(prepared.mirrorPath, "config", "url.https://evil.example/.insteadOf", "https://github.com/");
+      // The cap ends exactly after the first (allowed) key, so a prefix check would see nothing wrong.
+      const runner = createGitRunner({ parentEnv: { PATH: process.env.PATH, HOME: "/nonexistent-agent-tag-home" }, maxOutputBytes: "core.repositoryformatversion\n".length });
+      const error = await pushToRemote(pushInput(prepared, canaryToken(), { runner })).catch((caught: unknown) => caught);
+      expect(error).toBeInstanceOf(PushError);
+      expect((error as PushError).code).toBe("push.mirror-config");
+      expect(remoteHead(prepared, prepared.repo.branch)).toBeUndefined();
+    });
+  });
+
   test("validates inputs before running git", async () => {
     await withTempDir("pr-push-validate", async (directory) => {
       const prepared = await prepare(directory);

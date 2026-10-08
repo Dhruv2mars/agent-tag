@@ -10,7 +10,13 @@ import {
   type GitSpawn,
 } from "../src/git/runner.ts";
 import { SecretString } from "../src/security/secret-file.ts";
-import { canaryToken, recordingSpawn } from "./fixtures/git-fixture.ts";
+import { join } from "node:path";
+
+import { canaryToken, git, recordingSpawn, withTempDir } from "./fixtures/git-fixture.ts";
+
+function processesMatching(pattern: string): string {
+  return Bun.spawnSync(["pgrep", "-f", pattern], { stdout: "pipe", stderr: "pipe" }).stdout.toString().trim();
+}
 
 function streamOf(chunks: readonly Uint8Array[]): ReadableStream<Uint8Array> {
   return new ReadableStream({
@@ -183,5 +189,51 @@ describe("git runner", () => {
     const runner = createGitRunner({ gitBinary: "/nonexistent/agent-tag-git" });
     const error = (await runner.run({ args: ["--version"] }).catch((caught: unknown) => caught)) as GitError;
     expect(error.code).toBe("git.spawn");
+  });
+
+  test("a timeout kills git's descendants and settles even while a slow clean filter holds the pipes", async () => {
+    await withTempDir("git-runner-slow-filter", async (directory) => {
+      git(directory, "init", "--quiet");
+      // A unique duration so the check below finds only this filter's sleep.
+      const marker = `20.${String(Math.floor(Math.random() * 9_000) + 1_000)}`;
+      git(directory, "config", "filter.slow.clean", `sleep ${marker}; cat`);
+      await Bun.write(join(directory, ".gitattributes"), "* filter=slow\n");
+      await Bun.write(join(directory, "file.txt"), "content\n");
+      const runner = createGitRunner({ parentEnv: { PATH: process.env.PATH, HOME: "/nonexistent-agent-tag-home" } });
+
+      const started = performance.now();
+      const error = await runner.run({ cwd: directory, args: ["add", "-A"], timeoutMs: 300 }).catch((caught: unknown) => caught);
+      const elapsed = performance.now() - started;
+      expect(error).toBeInstanceOf(GitError);
+      expect((error as GitError).code).toBe("git.timeout");
+      expect(elapsed).toBeLessThan(5_000);
+      await Bun.sleep(200);
+      expect(processesMatching(`sleep ${marker}`)).toBe("");
+    });
+  });
+
+  test("abort settles the call even when the child ignores the kill and keeps its pipes open", async () => {
+    const neverEnding = (): GitChild => ({
+      stdout: new ReadableStream<Uint8Array>({ start: () => undefined }),
+      stderr: new ReadableStream<Uint8Array>({ start: () => undefined }),
+      exited: new Promise<number>(() => undefined),
+      kill: () => undefined,
+    });
+    const runner = createGitRunner({ spawn: neverEnding });
+    const timeout = await runner.run({ args: ["fetch"], timeoutMs: 30 }).catch((caught: unknown) => caught);
+    expect((timeout as GitError).code).toBe("git.timeout");
+    const controller = new AbortController();
+    const pending = runner.run({ args: ["fetch"], signal: controller.signal });
+    setTimeout(() => controller.abort(), 10);
+    expect(((await pending.catch((caught: unknown) => caught)) as GitError).code).toBe("git.aborted");
+  });
+
+  test("requireCompleteOutput refuses a truncated stdout", async () => {
+    const big = new Uint8Array(1_000).fill(0x61);
+    const runner = createGitRunner({ spawn: () => fakeChild({ stdout: [big] }), maxOutputBytes: 100 });
+    expect((await runner.run({ args: ["log"] })).stdoutTruncated).toBe(true);
+    const error = await runner.run({ args: ["log"], requireCompleteOutput: true }).catch((caught: unknown) => caught);
+    expect((error as GitError).code).toBe("git.output-truncated");
+    expect((await runner.run({ args: ["log"], requireCompleteOutput: true, maxOutputBytes: 1_000 })).stdout.length).toBe(1_000);
   });
 });

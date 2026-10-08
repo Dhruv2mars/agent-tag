@@ -242,6 +242,60 @@ describe("GitHub client", () => {
     expect(timeout.message).toContain("timed out");
   });
 
+  test("a body that drops or stalls after the headers is a transient, retryable transport error", async () => {
+    const token = canaryToken();
+    const dropping = () =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode('{"number": 1, "html_'));
+            controller.error(new TypeError(`socket hang up (Bearer ${token})`));
+          },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    const { client: github } = client(token, [dropping, dropping, dropping, dropping]);
+    for (const attempt of [
+      github.getPull("octo/example", 1),
+      github.findPullByHead("octo/example", "agent-tag/task-1"),
+      github.checkPushAccess("octo/example"),
+      github.createDraftPull("octo/example", { title: "t", head: "agent-tag/task-1", base: "main", body: "b" }),
+    ]) {
+      const error = await failure(attempt);
+      expect(error.kind).toBe("transient");
+      expect(error.retryable).toBe(true);
+      expect(error.message).not.toContain(token);
+    }
+
+    // Headers arrive, then the body never does: the request timeout still bounds the call.
+    const stalled: FetchLike = async () =>
+      new Response(new ReadableStream<Uint8Array>({ start: () => undefined }), { status: 201, headers: { "content-type": "application/json" } });
+    const slow = createGitHubClient({ apiBaseUrl: "https://api.github.example", credentials: staticCredentials(token), fetch: stalled, timeoutMs: 50 });
+    const started = performance.now();
+    const timeout = await failure(slow.createDraftPull("octo/example", { title: "t", head: "agent-tag/task-1", base: "main", body: "b" }));
+    expect(performance.now() - started).toBeLessThan(2_000);
+    expect(timeout.kind).toBe("transient");
+    expect(timeout.retryable).toBe(true);
+    expect(timeout.message).toContain("timed out");
+
+    // An error status whose body drops is transient too, not a misclassified 4xx.
+    const droppedError = () =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.error(new TypeError("connection reset"));
+          },
+        }),
+        { status: 422 },
+      );
+    const { client: erroring } = client(token, [droppedError]);
+    expect((await failure(erroring.getPull("octo/example", 1))).kind).toBe("transient");
+
+    // A complete body that is not JSON is still a payload problem, not transport.
+    const { client: garbled } = client(token, [() => new Response("<html>", { status: 200 })]);
+    expect((await failure(garbled.getPull("octo/example", 1))).kind).toBe("unexpected");
+  });
+
   test("checkPushAccess reads permissions.push or reports unknown", async () => {
     const { client: github } = client(canaryToken(), [
       () => json(200, { full_name: "octo/example", permissions: { push: true } }),
