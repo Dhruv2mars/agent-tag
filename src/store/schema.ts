@@ -51,6 +51,7 @@ export const operationRowSchema = z.object({
   command_id: nonEmpty,
   message_id: nonEmpty,
   payload_json: nonEmpty,
+  source_event_key: nonEmpty,
   attempts: z.number().int().nonnegative(),
   lease_expires_at: isoDateTime,
   turn_active_ms: z.number().int().nonnegative(),

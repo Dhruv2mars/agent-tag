@@ -394,6 +394,57 @@ describe("coordinator turn envelope", () => {
     });
   });
 
+  test("a routine queued before the upgrade (no payload origin) keeps its plain-text prompt", async () => {
+    await withStore(async (store) => {
+      const clock = () => new Date(start);
+      const slack = countingSlack();
+      const { t3, turnTexts } = recordingT3(clock);
+      const coordinator = new AgentTagCoordinator({
+        config,
+        store,
+        t3,
+        slackContext: slack.source,
+        workerId: "worker-a",
+        now: clock,
+        sleep: async () => {},
+      });
+      // The pre-G1 ScheduleWorker wrote neither `origin` nor `messageTs`.
+      const { messageTs: _messageTs, origin: _origin, ...legacy } = slackEvent({
+        ts: "1000.000001",
+        deliveryId: "schedule:s1:2026-10-01T00:00:00.000Z",
+        eventKey: "schedule:s1:2026-10-01T00:00:00.000Z",
+        text: "Review Array<T> with <@U0B2> &amp; <div>x</div>",
+      });
+      store.ingestSlackEvent(legacy);
+      expect((await coordinator.processNext()).kind).toBe("completed");
+      expect(turnTexts()).toEqual([
+        "Scheduled routine run (created by Alice Chen (U0A1)):\nReview Array<T> with <@U0B2> &amp; <div>x</div>",
+      ]);
+      expect(slack.calls).toEqual(["U0A1"]);
+    });
+  });
+
+  test("a Slack turn queued before the upgrade is still treated as Slack markup", async () => {
+    await withStore(async (store) => {
+      const clock = () => new Date(start);
+      const slack = countingSlack();
+      const { t3, turnTexts } = recordingT3(clock);
+      const coordinator = new AgentTagCoordinator({
+        config,
+        store,
+        t3,
+        slackContext: slack.source,
+        workerId: "worker-a",
+        now: clock,
+        sleep: async () => {},
+      });
+      const { messageTs: _messageTs, origin: _origin, ...legacy } = slackEvent({ ts: "1000.000001", text: "ask <@U0B2>" });
+      store.ingestSlackEvent(legacy);
+      expect((await coordinator.processNext()).kind).toBe("completed");
+      expect(turnTexts()).toEqual(["Slack message from Alice Chen (U0A1):\nask @Bob Lee"]);
+    });
+  });
+
   test("without a Slack context source speakers render as raw IDs", async () => {
     await withStore(async (store) => {
       const clock = () => new Date(start);

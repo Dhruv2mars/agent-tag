@@ -511,7 +511,7 @@ export class AgentTagCoordinator {
       now: this.#now().toISOString(),
     });
     // Schedule prompts are plain text, so only Slack-origin text is scanned for mentions.
-    const mentioned = origin === "schedule" ? [] : collectMentionedUserIds(text);
+    const mentioned = origin === "slack" ? collectMentionedUserIds(text) : [];
     const ids = [...new Set([actorUserId, ...mentioned])]
       .filter((id) => id !== this.#slackContext?.botUserId)
       .slice(0, MAX_TURN_SPEAKER_IDS);
@@ -524,7 +524,8 @@ export class AgentTagCoordinator {
       this.#store.renewOperationLease({ ...lease, now: this.#now().toISOString(), leaseMs: this.#leaseMs });
     }
     const proposedText = composeTurnText({
-      origin: origin ?? "slack",
+      // Claims derive origin for legacy rows; if it is still absent, fail safe to plain text.
+      origin: origin ?? "schedule",
       speaker: names.get(actorUserId) ?? unresolvedSpeaker(actorUserId),
       primaryText: text,
       names,

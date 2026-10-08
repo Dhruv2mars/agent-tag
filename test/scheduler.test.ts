@@ -40,6 +40,44 @@ function acceptedSchedule(result: ReturnType<AgentTagSchedules["create"]>) {
 }
 
 describe("durable scheduler", () => {
+  test("operations queued before origin/messageTs existed get them derived from the event key", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "agent-tag-scheduler-"));
+    const store = await AgentTagStore.open(join(directory, "agent-tag.sqlite"));
+    try {
+      const legacy = {
+        workspaceId: "T1",
+        conversationId: "C1",
+        actorUserId: "U1",
+        conversationType: "channel" as const,
+        profileId: "engineering",
+        repositoryRoot: "/srv/repos/example",
+        receivedAt: createdAt,
+      };
+      store.ingestSlackEvent({ ...legacy, deliveryId: "Ev1", eventKey: "C1:1000.000001", threadTs: "1000.000001", text: "slack" });
+      store.ingestSlackEvent({
+        ...legacy,
+        deliveryId: "schedule:s1:2026-09-21T00:00:00.000Z",
+        eventKey: "schedule:s1:2026-09-21T00:00:00.000Z",
+        threadTs: "2000.000001",
+        text: "routine",
+      });
+      store.ingestSlackEvent({ ...legacy, deliveryId: "x1", eventKey: "mystery-key", threadTs: "3000.000001", text: "unknown" });
+      const claim = () => store.claimNextOperation({ workerId: "w", now: createdAt, leaseMs: 10_000, maxConcurrentTasks: 3 });
+      const payloads = new Map([claim(), claim(), claim()].map((operation) => [operation?.payload.text, operation?.payload]));
+      expect(payloads.get("slack")).toMatchObject({ origin: "slack", messageTs: "1000.000001" });
+      expect(payloads.get("routine")).toMatchObject({ origin: "schedule" });
+      expect(payloads.get("unknown")).toMatchObject({ origin: "schedule" });
+      expect(payloads.get("routine")?.messageTs).toBeUndefined();
+      expect(payloads.get("unknown")?.messageTs).toBeUndefined();
+    } finally {
+      store.close();
+      if (!directory.startsWith(`${tmpdir()}/agent-tag-scheduler-`)) {
+        throw new Error(`refusing to remove unexpected fixture path ${directory}`);
+      }
+      await rm(directory, { recursive: true });
+    }
+  });
+
   test("scheduled agent runs are marked with the schedule origin", async () => {
     const directory = await mkdtemp(join(tmpdir(), "agent-tag-scheduler-"));
     const store = await AgentTagStore.open(join(directory, "agent-tag.sqlite"));

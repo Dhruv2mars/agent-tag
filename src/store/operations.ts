@@ -17,6 +17,24 @@ import {
 } from "./schema.ts";
 import type { ClaimedOperation } from "./types.ts";
 
+type OperationPayload = ClaimedOperation["payload"];
+
+/** Event keys written by SlackEventRouter: `<channel>:<message ts>`. */
+const SLACK_EVENT_KEY = /^[A-Z][A-Z0-9]+:(\d{1,20}\.\d{1,9})$/;
+
+/**
+ * Operations queued before `origin`/`messageTs` were recorded get them from the persisted event key.
+ * Only a key in the Slack router's exact shape counts as Slack; anything else (including
+ * `schedule:…`) is treated as a schedule, whose prompt is plain text and is never parsed as Slack
+ * markup. Failing safe this way can at worst leave Slack markup unrendered, never rewrite a prompt.
+ */
+export function withDerivedOrigin(payload: OperationPayload, sourceEventKey: string): OperationPayload {
+  if (payload.origin !== undefined) return payload;
+  const slackTs = SLACK_EVENT_KEY.exec(sourceEventKey)?.[1];
+  if (slackTs === undefined) return { ...payload, origin: "schedule" };
+  return { ...payload, origin: "slack", messageTs: payload.messageTs ?? slackTs };
+}
+
 export interface ClaimNextOperationInput {
   readonly workerId: string;
   readonly now: string;
@@ -94,7 +112,7 @@ export function claimNextOperation(
     const row = operationRowSchema.parse(
       database
         .query(
-          `SELECT operation_id, task_id, command_id, message_id, payload_json,
+          `SELECT operation_id, task_id, command_id, message_id, payload_json, source_event_key,
                   attempts, lease_expires_at, turn_active_ms
            FROM operations WHERE operation_id = ?`,
         )
@@ -117,7 +135,10 @@ export function claimNextOperation(
       taskId: row.task_id,
       commandId: row.command_id,
       messageId: row.message_id,
-      payload: operationPayloadSchema.parse(parseStoredJson(row.payload_json)),
+      payload: withDerivedOrigin(
+        operationPayloadSchema.parse(parseStoredJson(row.payload_json)),
+        row.source_event_key,
+      ),
       attempt: row.attempts,
       leaseExpiresAt: row.lease_expires_at,
       turnActiveMs: row.turn_active_ms,
