@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 import { resolve } from "node:path";
 
-import { runDoctorCommand, runOnboardCommand, runServiceCommand } from "./cli-commands.ts";
+import { runDoctorCommand, runOnboardCommand, runServiceCommand, runT3Command } from "./cli-commands.ts";
 import { loadConfig } from "./config.ts";
 import { isDistributionCommand, processDistributionContext, runDistributionCommand } from "./distribution.ts";
 import { runSecurityCli, SECURITY_CLI_USAGE } from "./security/cli.ts";
@@ -14,6 +14,7 @@ const USAGE = [
   "usage: agent-tag onboard [--yes --accept-risk ...]",
   "       agent-tag doctor [CONFIG] [--fix] [--json]",
   "       agent-tag service <install|upgrade|uninstall|status|restart|logs> [CONFIG] [--lines N] [--follow]",
+  "       agent-tag t3 <install|status> [CONFIG] [--download-base-url URL]",
   "       agent-tag <run|status|audit|backup> CONFIG [ARG]",
   "       agent-tag restore BACKUP NEW_DATA_DIR",
   "       agent-tag schedule-<add|list|cancel> CONFIG TASK ACTOR PROFILE [SPEC_OR_ID]",
@@ -25,6 +26,7 @@ const KNOWN_COMMANDS = new Set([
   "onboard",
   "doctor",
   "service",
+  "t3",
   "run",
   "status",
   "audit",
@@ -75,6 +77,7 @@ const operatorCommands = new Map<string, (argv: readonly string[]) => Promise<nu
   ["onboard", runOnboardCommand],
   ["doctor", runDoctorCommand],
   ["service", runServiceCommand],
+  ["t3", runT3Command],
 ]);
 const operatorCommand = operatorCommands.get(command);
 

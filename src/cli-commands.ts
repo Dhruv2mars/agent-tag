@@ -7,6 +7,7 @@ import slackManifest from "../config/slack-manifest.example.json" with { type: "
 
 import { parseArguments } from "./cli-args.ts";
 import { runCommand } from "./command.ts";
+import { loadConfig } from "./config.ts";
 import { defaultDoctorDependencies, formatDoctorReport, runDoctor } from "./doctor.ts";
 import { defaultAgentTagHome, type OnboardOptions, runOnboard } from "./onboard.ts";
 import { createReadlinePrompter, nonInteractivePrompter } from "./prompt.ts";
@@ -18,6 +19,8 @@ import {
   mintRestrictedT3Token,
 } from "./t3/auth.ts";
 import { inspectT3 } from "./t3/gateway.ts";
+import { defaultT3RuntimeDir, inspectInstalledT3, installPinnedT3, parseT3DownloadBaseUrl } from "./t3/install.ts";
+import { PINNED_T3 } from "./t3/lock.ts";
 
 /** CONFIG positional, else $AGENT_TAG_CONFIG, else the onboarding default `~/.agent-tag/agent-tag.json`. */
 export function resolveConfigPath(
@@ -73,6 +76,42 @@ export async function runServiceCommand(argv: readonly string[]): Promise<number
           ? await manager.restart()
           : await manager.status();
   console.log(JSON.stringify(status, null, 2));
+  return 0;
+}
+
+export const T3_USAGE = "usage: agent-tag t3 <install|status> [CONFIG] [--download-base-url URL]";
+
+/**
+ * `t3 install` downloads and verifies the pinned T3 runtime into `<dataDir>/t3/runtime`;
+ * `t3 status` reports that install without touching the network or running T3.
+ */
+export async function runT3Command(argv: readonly string[]): Promise<number> {
+  const args = parseArguments(argv, { booleans: [], values: ["download-base-url"] });
+  const action = args.positionals[0];
+  if ((action !== "install" && action !== "status") || args.positionals.length > 2) throw new Error(T3_USAGE);
+  const baseUrlArgument = args.values.get("download-base-url");
+  if (baseUrlArgument !== undefined && action !== "install") throw new Error("--download-base-url only applies to t3 install");
+  const baseUrl = baseUrlArgument === undefined ? undefined : parseT3DownloadBaseUrl(baseUrlArgument);
+  const config = await loadConfig(resolveConfigPath(args.positionals[1]));
+  const runtimeDir = defaultT3RuntimeDir(config.dataDir);
+  if (action === "install") {
+    const installed = await installPinnedT3({
+      pin: PINNED_T3,
+      runtimeDir,
+      ...(baseUrl === undefined ? {} : { downloadBaseUrl: baseUrl }),
+      log: (event, detail) => console.error(`agent-tag: ${event} ${detail}`),
+    });
+    console.log(JSON.stringify({
+      version: installed.version,
+      binary: installed.binary,
+      sha256: installed.binarySha256,
+      downloaded: installed.downloaded,
+    }, null, 2));
+    return 0;
+  }
+  // Managed mode, the supervisor, and token fields arrive with the config union (PR-O O2/O3).
+  const status = await inspectInstalledT3({ pin: PINNED_T3, runtimeDir });
+  console.log(JSON.stringify({ mode: "external", ...status }, null, 2));
   return 0;
 }
 
