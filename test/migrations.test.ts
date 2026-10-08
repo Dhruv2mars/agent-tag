@@ -477,3 +477,59 @@ test("runs dispatched before the routine migration never count toward an auto-di
     await rm(directory, { recursive: true });
   }
 });
+
+test("routine migration recovers authority revocations from the audit log", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-tag-migration-revoked-"));
+  const path = join(directory, "agent-tag.sqlite");
+  try {
+    const historical = new Database(path, { create: true, strict: true });
+    historical.exec("PRAGMA foreign_keys = ON");
+    historical.exec("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)");
+    applyMigration(historical, 1);
+    seedVersionOne(historical);
+    for (const { version } of STORE_MIGRATIONS) {
+      if (version > 1 && version < 16) applyMigration(historical, version);
+    }
+    const insertSchedule = historical.query(
+      `INSERT INTO schedules (
+        schedule_id, task_id, workspace_id, conversation_id, thread_ts, actor_user_id, profile_id,
+        repository_root, kind, prompt, cadence_seconds, missed_run_policy, misfire_grace_seconds,
+        overlap_policy, state, next_run_at, created_at, updated_at
+      ) VALUES (?, 'task-1', 'T1', 'C1', '1000.000001', 'U1', 'engineering', '/srv/repos/example', 'agent',
+        'hourly check', 3600, 'skip', 60, 'skip', 'cancelled', ?, ?, ?)`,
+    );
+    const insertAudit = historical.query(
+      `INSERT INTO audit_log (
+        audit_id, actor_type, actor_id, authority, source, target, action, result,
+        correlation_id, metadata_json, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, 'cancelled', ?, '{}', ?)`,
+    );
+    // Exactly the rows the previous revokeClaimedSchedule and cancelSchedule wrote.
+    insertSchedule.run("s-revoked", createdAt, createdAt, "2026-09-22T00:00:00.000Z");
+    insertAudit.run("audit-revoked", "worker", "schedule-worker", "schedule-dispatch", "s-revoked", "s-revoked",
+      "schedule.authority-revoked", "s-revoked", "2026-09-22T00:00:00.000Z");
+    insertSchedule.run("s-user", createdAt, createdAt, "2026-09-23T00:00:00.000Z");
+    insertAudit.run("audit-user", "slack-user", "U1", "schedule-cancel", "s-user", "s-user",
+      "schedule.cancelled", "s-user", "2026-09-23T00:00:00.000Z");
+    // Audit rows pruned by retention: nothing to recover, so it stays attributed to the user.
+    insertSchedule.run("s-pruned", createdAt, createdAt, "2026-09-24T00:00:00.000Z");
+    historical.close();
+
+    (await AgentTagStore.open(path)).close();
+
+    const upgraded = new Database(path, { strict: true });
+    expect(
+      upgraded.query("SELECT schedule_id, ended_reason, ended_at FROM schedules ORDER BY schedule_id").all(),
+    ).toEqual([
+      { schedule_id: "s-pruned", ended_reason: "user-cancelled", ended_at: "2026-09-24T00:00:00.000Z" },
+      { schedule_id: "s-revoked", ended_reason: "authority-revoked", ended_at: "2026-09-22T00:00:00.000Z" },
+      { schedule_id: "s-user", ended_reason: "user-cancelled", ended_at: "2026-09-23T00:00:00.000Z" },
+    ]);
+    upgraded.close();
+  } finally {
+    if (!directory.startsWith(`${tmpdir()}/agent-tag-migration-revoked-`)) {
+      throw new Error(`refusing to remove unexpected migration fixture path ${directory}`);
+    }
+    await rm(directory, { recursive: true });
+  }
+});

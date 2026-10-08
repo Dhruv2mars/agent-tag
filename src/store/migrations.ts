@@ -377,7 +377,21 @@ export const STORE_MIGRATIONS: readonly StoreMigration[] = [
       ALTER TABLE schedule_runs ADD COLUMN legacy INTEGER NOT NULL DEFAULT 0 CHECK (legacy IN (0, 1));
       UPDATE schedule_runs SET legacy = 1;
       UPDATE schedule_runs SET outcome = 'skipped', outcome_at = created_at WHERE disposition <> 'dispatched';
-      UPDATE schedules SET ended_reason = CASE state WHEN 'completed' THEN 'completed' ELSE 'user-cancelled' END,
+      -- End reasons for schedules that ended before this migration. Before it, only three paths ended a
+      -- schedule: settling a one-shot's run ('completed', the only writer of that state), a user cancel
+      -- (audit 'schedule.cancelled') and a claimed run losing execution authority (audit
+      -- 'schedule.authority-revoked'); both cancel paths set state 'cancelled' and only from 'active',
+      -- so a schedule has at most one of those rows. The earliest such row decides. Where retention
+      -- pruned it, the reason is unrecoverable and defaults to 'user-cancelled'. updated_at is the end
+      -- time: nothing touched an ended schedule after that transition.
+      UPDATE schedules SET ended_reason = CASE
+          WHEN state = 'completed' THEN 'completed'
+          WHEN (SELECT a.action FROM audit_log a
+                WHERE a.correlation_id = schedules.schedule_id AND a.target = schedules.schedule_id
+                  AND a.action IN ('schedule.cancelled', 'schedule.authority-revoked')
+                ORDER BY a.created_at, a.audit_id LIMIT 1) = 'schedule.authority-revoked'
+            THEN 'authority-revoked'
+          ELSE 'user-cancelled' END,
         ended_at = updated_at WHERE state <> 'active';
     `,
   },
