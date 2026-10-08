@@ -19,6 +19,8 @@ Usage:
                                        Manage the per-user service (launchd on macOS, systemd on Linux)
   agent-tag service logs [--lines N] [--follow]
                                        Show the service logs
+  agent-tag t3 install|status [CONFIG] Install the T3 runtime pinned in t3.lock.json (sha256-verified)
+                                       into DATA_DIR/t3/runtime, or report that install
   agent-tag run CONFIG                 Start the Slack service in the foreground
   agent-tag status CONFIG              Print operational status from the local store
   agent-tag audit CONFIG               Export audit records as JSON lines
@@ -35,7 +37,7 @@ Usage:
                                        Download, verify, and replace this release binary
   agent-tag help                       Show this help
 
-For doctor and service, CONFIG defaults to $AGENT_TAG_CONFIG, then agent-tag.json in $AGENT_TAG_HOME
+For doctor, service, and t3, CONFIG defaults to $AGENT_TAG_CONFIG, then agent-tag.json in $AGENT_TAG_HOME
 (default ~/.agent-tag), where onboard writes it.
 
 Docs: https://github.com/Dhruv2mars/agent-tag#readme
