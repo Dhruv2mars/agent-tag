@@ -13,7 +13,10 @@ export type TurnNote = never;
 export interface ComposeTurnInput {
   readonly origin: "slack" | "schedule";
   readonly speaker: SpeakerIdentity;
-  /** `payload.text`, raw Slack markup, with the agent's own mention already stripped. */
+  /**
+   * `payload.text`. For "slack" origin it is Slack markup with the agent's own mention stripped;
+   * for "schedule" origin it is plain text and is sent verbatim (envelope lines still escaped).
+   */
   readonly primaryText: string;
   /** Resolved labels for user IDs mentioned in any rendered text. Missing IDs render raw. */
   readonly names: ReadonlyMap<string, SpeakerIdentity>;
@@ -53,9 +56,11 @@ function speakerSection(input: ComposeTurnInput): string {
   const header = input.origin === "schedule"
     ? `Scheduled routine run (created by ${speaker}):`
     : `Slack message from ${speaker}:`;
-  const body = escapeEnvelopeLines(
-    resolveSlackMarkup(input.primaryText, input.names, input.botUserId === undefined ? {} : { botUserId: input.botUserId }),
-  );
+  // Schedule prompts are stored plain text, not Slack-encoded: never resolve markup or entities.
+  const text = input.origin === "schedule"
+    ? input.primaryText
+    : resolveSlackMarkup(input.primaryText, input.names, input.botUserId === undefined ? {} : { botUserId: input.botUserId });
+  const body = escapeEnvelopeLines(text);
   return body === "" ? header : `${header}\n${body}`;
 }
 

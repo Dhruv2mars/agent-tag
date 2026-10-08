@@ -191,6 +191,30 @@ describe("SlackUserDirectory", () => {
     await expect(directory.labels(["U1"], preAborted.signal)).rejects.toThrow();
   });
 
+  test("a turn deadline returns raw-ID fallbacks, starts no new lookups and still fills the cache", async () => {
+    const calls: string[] = [];
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const { directory } = fixture({
+      lookup: async (id) => {
+        calls.push(id);
+        await gate;
+        return userResponse(id, { profile: { display_name: `Name ${id}` } });
+      },
+    });
+    const ids = Array.from({ length: 10 }, (_, index) => `U${index}`);
+    const labels = await directory.labels(ids, undefined, AbortSignal.timeout(10));
+    expect([...labels.keys()]).toEqual(ids);
+    expect([...labels.values()].every((identity) => !identity.resolved && identity.label === identity.userId)).toBe(true);
+    expect(calls).toEqual(["U0", "U1", "U2", "U3"]);
+    release();
+    await Bun.sleep(0);
+    expect(await directory.label("U0")).toEqual({ userId: "U0", label: "Name U0", resolved: true });
+    expect(calls).toHaveLength(4);
+  });
+
   test("evicts the least recently used entry beyond maxEntries", async () => {
     let calls = 0;
     const directory = new SlackUserDirectory({

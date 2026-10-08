@@ -176,23 +176,37 @@ export class SlackUserDirectory {
     return raceAbort(pending, signal);
   }
 
-  async labels(ids: Iterable<string>, signal?: AbortSignal): Promise<Map<string, SpeakerIdentity>> {
+  /**
+   * Resolves many IDs at bounded concurrency. When `deadline` aborts, returns at once: IDs not yet
+   * resolved fall back to raw IDs, no new lookups start, and in-flight ones finish into the cache.
+   */
+  async labels(
+    ids: Iterable<string>,
+    signal?: AbortSignal,
+    deadline?: AbortSignal,
+  ): Promise<Map<string, SpeakerIdentity>> {
     const unique = [...new Set(ids)];
     const result = new Map<string, SpeakerIdentity>();
     let next = 0;
     const worker = async () => {
-      while (next < unique.length) {
+      while (next < unique.length && deadline?.aborted !== true) {
         const userId = unique[next++];
         if (userId === undefined) break;
         result.set(userId, await this.label(userId, signal));
       }
     };
-    await Promise.all(Array.from({ length: Math.min(LABEL_CONCURRENCY, unique.length) }, worker));
-    // Preserve caller order regardless of completion order.
-    return new Map(unique.flatMap((id) => {
-      const identity = result.get(id);
-      return identity === undefined ? [] : [[id, identity] as const];
-    }));
+    const all = Promise.all(Array.from({ length: Math.min(LABEL_CONCURRENCY, unique.length) }, worker));
+    if (deadline === undefined) {
+      await all;
+    } else {
+      all.catch(() => {});
+      await raceAbort(all, deadline).catch((error: unknown) => {
+        if (!deadline.aborted || signal?.aborted === true) throw error;
+      });
+    }
+    if (signal?.aborted) throw abortError(signal);
+    // Caller order; anything unresolved by the deadline renders as its raw ID.
+    return new Map(unique.map((id) => [id, result.get(id) ?? unresolvedSpeaker(id)] as const));
   }
 
   async #fetch(userId: string): Promise<SpeakerIdentity> {

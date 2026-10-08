@@ -55,6 +55,8 @@ export interface CoordinatorOptions {
   readonly memory?: AgentTagMemory;
   /** Slack reads for speaker labels. Absent (tests, legacy) means speakers render as raw IDs. */
   readonly slackContext?: SlackContextSource;
+  /** Turn-wide wall-clock budget for speaker lookups. Defaults to min(5s, lease / 4). */
+  readonly speakerLookupBudgetMs?: number;
   readonly workerId?: string;
   readonly leaseMs?: number;
   readonly pollMs?: number;
@@ -66,8 +68,8 @@ export interface CoordinatorOptions {
   readonly sleep?: (milliseconds: number) => Promise<void>;
 }
 
-/** Upper bound on distinct users resolved for one turn. */
-const MAX_TURN_SPEAKER_IDS = 100;
+/** Upper bound on distinct users resolved for one turn; the rest render as raw IDs. */
+const MAX_TURN_SPEAKER_IDS = 50;
 
 function defaultT3Gateway(config: T3ConnectionConfig): T3CoordinatorGateway {
   return {
@@ -366,6 +368,7 @@ export class AgentTagCoordinator {
   readonly #t3: T3CoordinatorGateway;
   readonly #memory: AgentTagMemory;
   readonly #slackContext: SlackContextSource | undefined;
+  readonly #speakerLookupBudgetMs: number;
   readonly #workerId: string;
   readonly #leaseMs: number;
   readonly #pollMs: number;
@@ -382,6 +385,7 @@ export class AgentTagCoordinator {
     this.#slackContext = options.slackContext;
     this.#workerId = options.workerId ?? `t3-worker-${crypto.randomUUID()}`;
     this.#leaseMs = options.leaseMs ?? 30_000;
+    this.#speakerLookupBudgetMs = options.speakerLookupBudgetMs ?? Math.min(5_000, Math.floor(this.#leaseMs / 4));
     this.#pollMs = options.pollMs ?? 500;
     this.#stallMs = options.stallMs ?? options.config.limits.stalledTurn.timeoutSeconds * 1_000;
     this.#maxTurnMs = options.maxTurnMs ?? options.config.limits.stalledTurn.maxTurnSeconds * 1_000;
@@ -506,12 +510,19 @@ export class AgentTagCoordinator {
       },
       now: this.#now().toISOString(),
     });
-    const ids = [...new Set([actorUserId, ...collectMentionedUserIds(text)])]
+    // Schedule prompts are plain text, so only Slack-origin text is scanned for mentions.
+    const mentioned = origin === "schedule" ? [] : collectMentionedUserIds(text);
+    const ids = [...new Set([actorUserId, ...mentioned])]
       .filter((id) => id !== this.#slackContext?.botUserId)
       .slice(0, MAX_TURN_SPEAKER_IDS);
-    const names: ReadonlyMap<string, SpeakerIdentity> = this.#slackContext === undefined
-      ? new Map()
-      : await abortable(this.#slackContext.users.labels(ids, signal), signal);
+    let names: ReadonlyMap<string, SpeakerIdentity> = new Map();
+    if (this.#slackContext !== undefined) {
+      // A hard deadline well inside the lease: unresolved users fall back to raw IDs, then the lease
+      // is renewed so dispatch starts with a full lease.
+      const deadline = AbortSignal.timeout(this.#speakerLookupBudgetMs);
+      names = await abortable(this.#slackContext.users.labels(ids, signal, deadline), signal);
+      this.#store.renewOperationLease({ ...lease, now: this.#now().toISOString(), leaseMs: this.#leaseMs });
+    }
     const proposedText = composeTurnText({
       origin: origin ?? "slack",
       speaker: names.get(actorUserId) ?? unresolvedSpeaker(actorUserId),

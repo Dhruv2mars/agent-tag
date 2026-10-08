@@ -325,6 +325,75 @@ describe("coordinator turn envelope", () => {
     });
   });
 
+  test("slow speaker lookups are bounded well inside the lease and fall back to raw IDs", async () => {
+    await withStore(async (store) => {
+      let current = new Date(start).getTime();
+      const clock = () => new Date(current);
+      const calls: string[] = [];
+      // Every users.info call costs 5s of lease time and never answers; 28 mentioned users
+      // would otherwise hold the claim for ~35s+ against a 30s lease before dispatch.
+      const users = new SlackUserDirectory({
+        lookup: (userId) => {
+          calls.push(userId);
+          current += 5_000;
+          return new Promise(() => {});
+        },
+        lookupTimeoutMs: 5_000,
+        logger: () => {},
+      });
+      const { t3, turnTexts } = recordingT3(clock);
+      const coordinator = new AgentTagCoordinator({
+        config,
+        store,
+        t3,
+        slackContext: { botUserId: "UBOT", users },
+        workerId: "worker-a",
+        leaseMs: 30_000,
+        speakerLookupBudgetMs: 20,
+        now: clock,
+        sleep: async () => {},
+      });
+      const mentioned = Array.from({ length: 27 }, (_, index) => `U${String(index + 10).padStart(3, "0")}`);
+      store.ingestSlackEvent(
+        slackEvent({ ts: "1000.000001", text: mentioned.map((id) => `<@${id}>`).join(" ") }),
+      );
+      const outcome = await coordinator.processNext();
+      expect(outcome.kind).toBe("completed");
+      const [text] = turnTexts();
+      expect(text).toBe(`Slack message from U0A1 (U0A1):\n${mentioned.map((id) => `@${id}`).join(" ")}`);
+      // Only the first concurrent batch started before the turn-wide deadline.
+      expect(calls.length).toBeLessThanOrEqual(4);
+    });
+  }, 2_000);
+
+  test("scheduled prompts are not scanned for Slack mentions", async () => {
+    await withStore(async (store) => {
+      const clock = () => new Date(start);
+      const slack = countingSlack();
+      const { t3, turnTexts } = recordingT3(clock);
+      const coordinator = new AgentTagCoordinator({
+        config,
+        store,
+        t3,
+        slackContext: slack.source,
+        workerId: "worker-a",
+        now: clock,
+        sleep: async () => {},
+      });
+      const { messageTs: _messageTs, ...scheduled } = slackEvent({
+        ts: "1000.000001",
+        text: "Review Array<T> with <@U0B2> &amp; <div>x</div>",
+        origin: "schedule",
+      });
+      store.ingestSlackEvent(scheduled);
+      expect((await coordinator.processNext()).kind).toBe("completed");
+      expect(turnTexts()).toEqual([
+        "Scheduled routine run (created by Alice Chen (U0A1)):\nReview Array<T> with <@U0B2> &amp; <div>x</div>",
+      ]);
+      expect(slack.calls).toEqual(["U0A1"]);
+    });
+  });
+
   test("without a Slack context source speakers render as raw IDs", async () => {
     await withStore(async (store) => {
       const clock = () => new Date(start);
