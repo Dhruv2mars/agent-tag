@@ -2,7 +2,7 @@ import { Database } from "bun:sqlite";
 import { randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { chmod, mkdir, open, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { createGunzip } from "node:zlib";
 import { z } from "zod";
 
@@ -16,7 +16,6 @@ export const MAX_T3_ARCHIVE_BYTES = 256 * 1024 * 1024;
 const MAX_T3_ENTRY_BYTES = 256 * 1024 * 1024;
 const MAX_T3_EXPANDED_BYTES = 1024 * 1024 * 1024;
 const DOWNLOAD_TIMEOUT_MS = 10 * 60 * 1000;
-const STALE_DOWNLOAD_MS = 60 * 60 * 1000;
 const INSTALL_RECORD = "agent-tag-install.json";
 const INSTALL_LOCK = "install.lock";
 const LOCK_POLL_MS = 100;
@@ -142,9 +141,21 @@ async function readInstallRecord(root: string): Promise<InstallRecord | undefine
 }
 
 /**
- * sha256 over every entry under `root` except the install record: kind, relative path, exec bit,
- * and content sha256, in sorted order. Anything but regular files and directories is rejected,
- * because extraction only ever creates those.
+ * Metadata files the OS writes into any directory a user merely browses: Finder's `.DS_Store`,
+ * macOS AppleDouble `._<name>` companions (copies to non-HFS volumes, archive tools), and Windows
+ * Explorer's `Thumbs.db`. Counting them as tampering would make opening the runtime in Finder
+ * trigger a full re-download, so the tree hash skips them. Only these exact names, and only as
+ * regular files, are skipped: nothing loads them as code, while any other extra file (a script,
+ * a module, a directory named `._x`) still changes the hash and counts as tampering.
+ */
+function isBenignOsMetadata(name: string, isFile: boolean): boolean {
+  return isFile && (name === ".DS_Store" || name === "Thumbs.db" || name.startsWith("._"));
+}
+
+/**
+ * sha256 over every entry under `root` except the install record and {@link isBenignOsMetadata}
+ * files: kind, relative path, exec bit, and content sha256, in sorted order. Anything but regular
+ * files and directories is rejected, because extraction only ever creates those.
  */
 async function treeSha256(root: string): Promise<string> {
   const lines: string[] = [];
@@ -153,7 +164,7 @@ async function treeSha256(root: string): Promise<string> {
       .sort((left, right) => (left.name < right.name ? -1 : left.name > right.name ? 1 : 0));
     for (const entry of entries) {
       const relative = prefix === "" ? entry.name : `${prefix}/${entry.name}`;
-      if (relative === INSTALL_RECORD) continue;
+      if (relative === INSTALL_RECORD || isBenignOsMetadata(entry.name, entry.isFile())) continue;
       const path = join(dir, entry.name);
       if (entry.isDirectory()) {
         lines.push(`d ${JSON.stringify(relative)}`);
@@ -250,14 +261,51 @@ async function assertNoDowngrade(runtimeDir: string, pin: T3Pin): Promise<void> 
   }
 }
 
-async function removeStaleDownloads(downloads: string, now: Date): Promise<void> {
+/** `versions/.<version>.previous-<uuid>`: where a runtime waits while its replacement is renamed in. */
+const PREVIOUS_RUNTIME = /^\.(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)\.previous-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+/**
+ * Clears what a crashed earlier install left behind. Only called under the install lock, so every
+ * `downloads/` entry belongs to a dead run. A set-aside runtime whose version directory is missing
+ * means that run died between its two swap renames: it is moved back, and the normal checks then
+ * decide whether it is reused or replaced. Any other set-aside runtime is removed. The leading dot
+ * keeps set-aside directories out of {@link prune} and away from `versions/<version>` lookups.
+ */
+async function clearCrashedInstalls(downloads: string, versionsDir: string): Promise<void> {
   for (const name of await readdir(downloads).catch(() => [])) {
-    const path = join(downloads, name);
-    const metadata = await stat(path).catch(() => undefined);
-    if (metadata !== undefined && now.getTime() - metadata.mtimeMs > STALE_DOWNLOAD_MS) {
-      await rm(path, { recursive: true, force: true });
-    }
+    await rm(join(downloads, name), { recursive: true, force: true });
   }
+  for (const name of await readdir(versionsDir).catch(() => [])) {
+    const version = PREVIOUS_RUNTIME.exec(name)?.[1];
+    if (version === undefined) continue;
+    const path = join(versionsDir, name);
+    const original = join(versionsDir, version);
+    if (!(await exists(original))) await rename(path, original);
+    else await rm(path, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Replaces `root` with the fully verified `staged` tree using only same-filesystem renames: the old
+ * tree is set aside, the new one renamed in, and only then is the old one deleted. If the second
+ * rename fails, the old tree is renamed back, so `root` is never left missing by a failed swap.
+ */
+async function swapIntoPlace(staged: string, root: string): Promise<void> {
+  if (!(await exists(root))) {
+    await rename(staged, root);
+    return;
+  }
+  const previous = join(dirname(root), `.${basename(root)}.previous-${randomUUID()}`);
+  await rename(root, previous);
+  try {
+    await rename(staged, root);
+  } catch (error) {
+    // If even this fails, `previous` survives and the next run's clearCrashedInstalls restores it.
+    await rename(previous, root);
+    throw error;
+  }
+  // The swap has committed; a leftover `previous` is harmless and the next run removes it.
+  await rm(previous, { recursive: true, force: true }).catch(() => undefined);
 }
 
 async function download(input: {
@@ -483,8 +531,9 @@ function installed(root: string, target: string, record: InstallRecord, download
 /**
  * Installs the pinned T3 release under `<runtimeDir>/versions/<version>`: download, sha256 check
  * against t3.lock.json, listing check, extract into `downloads/<nonce>`, `t3 --version` check, then
- * one atomic rename. An existing install is reused only when its record, file tree, and
- * `t3 --version` all check out; otherwise it is replaced. The whole sequence runs under the
+ * rename into place. An existing install is reused only when its record, file tree, and
+ * `t3 --version` all check out; otherwise it is replaced, but only after the replacement has fully
+ * verified, so a failed repair never removes a runtime. The whole sequence runs under the
  * runtime's install lock, so concurrent installs and repairs converge on one verified tree.
  */
 export async function installPinnedT3(options: InstallPinnedT3Options): Promise<InstalledT3> {
@@ -500,7 +549,11 @@ async function installLocked(options: InstallPinnedT3Options, artifact: T3Artifa
   await assertNoDowngrade(runtimeDir, pin);
 
   const versionsDir = join(runtimeDir, "versions");
+  const downloads = join(runtimeDir, "downloads");
   const root = join(versionsDir, pin.version);
+  await mkdir(downloads, { recursive: true, mode: 0o700 });
+  await mkdir(versionsDir, { recursive: true, mode: 0o700 });
+  await clearCrashedInstalls(downloads, versionsDir);
   let existing = await checkInstalled(root, pin, artifact);
   if (existing.kind === "verified") {
     const failure = await verifyT3Binary({ pin, binary: join(root, "t3") }).then(
@@ -511,14 +564,11 @@ async function installLocked(options: InstallPinnedT3Options, artifact: T3Artifa
     existing = { kind: "tampered", reason: `t3 --version check failed: ${failure}`, binaryVerified: true };
   }
   if (existing.kind === "tampered") {
-    options.log?.("t3.install.tampered", `${root}: ${existing.reason}; reinstalling`);
-    await rm(root, { recursive: true, force: true });
+    // The existing tree stays in place until a replacement has fully verified (see swapIntoPlace),
+    // so a failed download, checksum, or extraction leaves the runtime exactly as it was.
+    options.log?.("t3.install.tampered", `${root}: ${existing.reason}; replacing it once a verified copy is staged`);
   }
 
-  const downloads = join(runtimeDir, "downloads");
-  await mkdir(downloads, { recursive: true, mode: 0o700 });
-  await mkdir(versionsDir, { recursive: true, mode: 0o700 });
-  await removeStaleDownloads(downloads, now());
   const staging = join(downloads, randomUUID());
   await mkdir(staging, { mode: 0o700 });
   try {
@@ -560,7 +610,7 @@ async function installLocked(options: InstallPinnedT3Options, artifact: T3Artifa
     };
     await writeFile(join(stagedRoot, INSTALL_RECORD), `${JSON.stringify(record, null, 2)}\n`, { mode: 0o644 });
     // The install lock guarantees nobody else is creating or replacing `root` right now.
-    await rename(stagedRoot, root);
+    await swapIntoPlace(stagedRoot, root);
     options.log?.("t3.install.installed", `${pin.version} at ${root}`);
     await prune(versionsDir, pin.version, options.log);
     return installed(root, artifact.target, record, true);

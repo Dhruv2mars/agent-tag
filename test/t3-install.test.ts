@@ -1,12 +1,14 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { chmod, mkdir, mkdtemp, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
+import { runCommand } from "../src/command.ts";
 import {
   defaultT3RuntimeDir,
   inspectInstalledT3,
   installPinnedT3,
+  type InstallPinnedT3Options,
   parseT3DownloadBaseUrl,
   T3ArchiveRejectedError,
   T3ArtifactVerificationError,
@@ -46,6 +48,19 @@ function mirrorFor(pin: T3Pin, tarball: FakeTarball): FakeT3Mirror {
 
 async function listing(path: string): Promise<string[]> {
   return (await readdir(path).catch(() => [])).sort();
+}
+
+/** Every file and directory under `root` with its mode and content, to prove a tree was not touched. */
+async function snapshot(root: string): Promise<string[]> {
+  const entries: string[] = [];
+  for (const relative of (await readdir(root, { recursive: true })).sort()) {
+    const path = join(root, relative);
+    const metadata = await stat(path);
+    entries.push(metadata.isDirectory()
+      ? `d ${relative} ${metadata.mode}`
+      : `f ${relative} ${metadata.mode} ${await Bun.file(path).text()}`);
+  }
+  return entries;
 }
 
 describe("embedded T3 lock", () => {
@@ -294,6 +309,105 @@ describe("installPinnedT3", () => {
       holder.kill("SIGKILL");
     }
     expect(await inspectInstalledT3({ pin, runtimeDir: dir })).toMatchObject({ filesVerified: true, problem: null });
+  });
+
+  const failedReplacements: ReadonlyArray<readonly [string, (pin: T3Pin, good: FakeTarball) => Promise<Partial<InstallPinnedT3Options>>, string]> = [
+    ["an HTTP 503", async () => ({ fetch: async () => new Response("unavailable", { status: 503 }) }), "failed: HTTP 503"],
+    [
+      "a checksum mismatch",
+      async (pin) => ({ downloadBaseUrl: mirrorFor(pin, await buildFakeT3Tarball({ reportedVersion: "9.9.9" })).baseUrl }),
+      "sha256 mismatch",
+    ],
+    [
+      "an extraction failure",
+      async (pin, good) => ({
+        downloadBaseUrl: mirrorFor(pin, good).baseUrl,
+        runCommand: async (command) =>
+          command[0] === "tar" ? { exitCode: 1, stdout: "", stderr: "tar: disk full" } : runCommand(command),
+      }),
+      "tar: disk full",
+    ],
+  ];
+  for (const [label, replacement, message] of failedReplacements) {
+    test(`keeps the existing runtime untouched when its replacement fails with ${label}`, async () => {
+      const tarball = await buildFakeT3Tarball();
+      const pin = fixturePin({ sha256: tarball.sha256 });
+      const dir = await runtimeDir();
+      const first = await installPinnedT3({ pin, runtimeDir: dir, downloadBaseUrl: mirrorFor(pin, tarball).baseUrl });
+      // A non-benign extra file marks the runtime tampered, so the next install tries to replace it.
+      await writeFile(join(first.root, "extra.js"), "require('child_process');\n");
+      const before = await snapshot(first.root);
+      expect((await inspectInstalledT3({ pin, runtimeDir: dir })).filesVerified).toBe(false);
+
+      const events: string[] = [];
+      await expect(
+        installPinnedT3({ pin, runtimeDir: dir, ...(await replacement(pin, tarball)), log: (event) => events.push(event) }),
+      ).rejects.toThrow(message);
+
+      expect(events).toContain("t3.install.tampered");
+      expect(await snapshot(first.root)).toEqual(before);
+      expect(Bun.spawnSync([first.binary, "--version"]).stdout.toString().trim()).toBe(`t3 v${pin.version}`);
+      expect(await listing(join(dir, "versions"))).toEqual([pin.version]);
+      expect(await listing(join(dir, "downloads"))).toEqual([]);
+    });
+  }
+
+  test("treats .DS_Store, AppleDouble ._* and Thumbs.db files as benign but other extra files as tampering", async () => {
+    const tarball = await buildFakeT3Tarball();
+    const pin = fixturePin({ sha256: tarball.sha256 });
+    const mirror = mirrorFor(pin, tarball);
+    const dir = await runtimeDir();
+    const first = await installPinnedT3({ pin, runtimeDir: dir, downloadBaseUrl: mirror.baseUrl });
+    await writeFile(join(first.root, ".DS_Store"), "finder");
+    await writeFile(join(first.root, "client", ".DS_Store"), "finder");
+    await writeFile(join(first.root, "._t3"), "appledouble");
+    await writeFile(join(first.root, "client", "Thumbs.db"), "explorer");
+
+    expect(await inspectInstalledT3({ pin, runtimeDir: dir })).toMatchObject({ filesVerified: true, problem: null });
+    const second = await installPinnedT3({ pin, runtimeDir: dir, downloadBaseUrl: mirror.baseUrl });
+    expect(second).toEqual({ ...first, downloaded: false });
+    expect(mirror.requests).toHaveLength(1);
+
+    // Only those exact names are benign: an extra script, or a directory named like one, is not.
+    for (const extra of [join(first.root, "client", "evil.js"), join(first.root, "._evil")]) {
+      if (extra.endsWith("._evil")) await mkdir(extra);
+      else await writeFile(extra, "x");
+      expect((await inspectInstalledT3({ pin, runtimeDir: dir })).problem).toContain("runtime files differ");
+      await rm(extra, { recursive: true });
+    }
+  });
+
+  test("a successful replacement swaps cleanly and clears staging left by a crashed run", async () => {
+    const tarball = await buildFakeT3Tarball();
+    const pin = fixturePin({ sha256: tarball.sha256 });
+    const mirror = mirrorFor(pin, tarball);
+    const dir = await runtimeDir();
+    const first = await installPinnedT3({ pin, runtimeDir: dir, downloadBaseUrl: mirror.baseUrl });
+    await writeFile(join(first.root, "extra.js"), "x");
+    // A run that crashed mid-download and one that crashed after its swap committed.
+    await mkdir(join(dir, "downloads", crypto.randomUUID(), "x"), { recursive: true });
+    await mkdir(join(dir, "versions", `.${pin.version}.previous-${crypto.randomUUID()}`, "client"), { recursive: true });
+
+    const second = await installPinnedT3({ pin, runtimeDir: dir, downloadBaseUrl: mirror.baseUrl });
+    expect(second.downloaded).toBe(true);
+    expect(await listing(second.root)).toEqual(["agent-tag-install.json", "client", "node_modules", "t3"]);
+    expect(await listing(join(dir, "versions"))).toEqual([pin.version]);
+    expect(await listing(join(dir, "downloads"))).toEqual([]);
+    expect(await inspectInstalledT3({ pin, runtimeDir: dir })).toMatchObject({ filesVerified: true, problem: null });
+  });
+
+  test("restores a runtime set aside by a run that crashed mid-swap instead of downloading again", async () => {
+    const tarball = await buildFakeT3Tarball();
+    const pin = fixturePin({ sha256: tarball.sha256 });
+    const mirror = mirrorFor(pin, tarball);
+    const dir = await runtimeDir();
+    const first = await installPinnedT3({ pin, runtimeDir: dir, downloadBaseUrl: mirror.baseUrl });
+    await rename(first.root, join(dir, "versions", `.${pin.version}.previous-${crypto.randomUUID()}`));
+
+    const second = await installPinnedT3({ pin, runtimeDir: dir, downloadBaseUrl: mirror.baseUrl });
+    expect(second).toEqual({ ...first, downloaded: false });
+    expect(mirror.requests).toHaveLength(1);
+    expect(await listing(join(dir, "versions"))).toEqual([pin.version]);
   });
 
   test("rejects an archive whose sha256 differs from the lock and leaves nothing behind", async () => {
