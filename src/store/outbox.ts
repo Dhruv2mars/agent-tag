@@ -128,10 +128,23 @@ const CLAIM_ORDER_COLUMNS = (alias: string): string =>
 
 /**
  * Claims the next deliverable pending row. Rows waiting out a retry backoff (`blocked_until` in the
- * future) are skipped, and so are later rows of the same Slack thread, so a retried message is never
- * overtaken by the replies that were queued after it. Edits of one message are claimed strictly in
- * enqueue (rowid) order, one at a time, so an older edit can never land after a newer one. Nothing is
- * claimed while a rate-limit cooldown is active.
+ * future) are skipped, and so are later posts of the same Slack thread, so a retried message is never
+ * overtaken by the replies that were queued after it. Nothing is claimed while a rate-limit cooldown
+ * is active.
+ *
+ * Invariants (every eligibility predicate below must keep all of them):
+ * 1. Thread order is post-only: an update row never blocks a post, and a post's eligibility never
+ *    depends on an update row. Only posts are ordered within a thread (by claim order); edits create
+ *    no new message, so they neither wait behind nor hold back the thread's posts.
+ * 2. An update row is claimable only once its target post is settled (delivered or failed). It is
+ *    never claimed just to wait for its target, so it never holds a `blocked_until` on its target's
+ *    account, and the edit-to-post relation never involves timestamps (a clock step cannot reorder it).
+ * 3. Edits of one target are claimed one at a time in enqueue (rowid) order, never by timestamp.
+ * 4. With coalescing into the newest pending edit (message-edits.ts), 3 makes the last requested
+ *    edit the last one applied.
+ * Hence the wait-for graph is acyclic: a post waits only on earlier posts (a strict total order);
+ * an update waits only on its target post and on lower-rowid updates of that target; nothing waits
+ * on an update except a later update of the same target.
  */
 export function claimNextOutbox(
   context: StoreContext,
@@ -149,21 +162,33 @@ export function claimNextOutbox(
           `SELECT candidate.outbox_id FROM slack_outbox AS candidate
            WHERE candidate.status = 'pending'
              AND (candidate.blocked_until IS NULL OR candidate.blocked_until <= ?)
-             AND NOT EXISTS (
-               SELECT 1 FROM slack_outbox AS earlier
-               WHERE earlier.conversation_id = candidate.conversation_id
-                 AND earlier.thread_ts = candidate.thread_ts
-                 AND earlier.status = 'pending'
-                 AND earlier.blocked_until > ?
-                 AND (${CLAIM_ORDER_COLUMNS("earlier")}) < (${CLAIM_ORDER_COLUMNS("candidate")})
-             )
-             AND NOT EXISTS (
-               SELECT 1 FROM slack_outbox AS prior_edit
-               WHERE candidate.method = 'update' AND prior_edit.method = 'update'
-                 AND prior_edit.target_outbox_id = candidate.target_outbox_id
-                 AND prior_edit.rowid < candidate.rowid
-                 AND (prior_edit.status = 'pending' OR (prior_edit.status = 'inflight' AND prior_edit.lease_expires_at > ?))
-             )
+             AND CASE candidate.method
+               -- Invariant 1: a post waits only on earlier blocked posts of its thread.
+               WHEN 'post' THEN NOT EXISTS (
+                 SELECT 1 FROM slack_outbox AS earlier
+                 WHERE earlier.method = 'post'
+                   AND earlier.conversation_id = candidate.conversation_id
+                   AND earlier.thread_ts = candidate.thread_ts
+                   AND earlier.status = 'pending'
+                   AND earlier.blocked_until > ?
+                   AND (${CLAIM_ORDER_COLUMNS("earlier")}) < (${CLAIM_ORDER_COLUMNS("candidate")})
+               )
+               -- Invariant 2: an update waits until its target post is settled.
+               WHEN 'update' THEN NOT EXISTS (
+                 SELECT 1 FROM slack_outbox AS target
+                 WHERE target.outbox_id = candidate.target_outbox_id
+                   AND target.status IN ('pending', 'inflight')
+               )
+               -- Invariant 3: and behind every earlier (rowid) edit of that target still to be sent.
+               AND NOT EXISTS (
+                 SELECT 1 FROM slack_outbox AS prior_edit
+                 WHERE prior_edit.method = 'update'
+                   AND prior_edit.target_outbox_id = candidate.target_outbox_id
+                   AND prior_edit.rowid < candidate.rowid
+                   AND (prior_edit.status = 'pending' OR (prior_edit.status = 'inflight' AND prior_edit.lease_expires_at > ?))
+               )
+               ELSE 0
+             END
            ORDER BY ${CLAIM_ORDER_COLUMNS("candidate")}
            LIMIT 1`,
         )
@@ -281,8 +306,6 @@ interface OutboxSettlement {
   readonly lastErrorCode: string;
   readonly blockedUntil: string | null;
   readonly plainFallback: boolean;
-  /** Give back the attempt the claim counted (the row was never sent). */
-  readonly refundAttempt?: boolean;
   readonly action:
     | "slack.outbox.failed"
     | "slack.outbox.quarantined"
@@ -304,7 +327,6 @@ function settleLeasedOutbox(database: Database, input: OutboxFailureInput, settl
       .query(
         `UPDATE slack_outbox SET status = ?, last_error_code = ?, blocked_until = ?,
            render_mode = CASE WHEN ? THEN 'plain' ELSE render_mode END,
-           attempts = attempts - CASE WHEN ? THEN 1 ELSE 0 END,
            lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
          WHERE outbox_id = ? AND status = 'inflight' AND lease_owner = ? AND lease_expires_at > ?`,
       )
@@ -313,7 +335,6 @@ function settleLeasedOutbox(database: Database, input: OutboxFailureInput, settl
         requiredId(settlement.lastErrorCode, "lastErrorCode"),
         settlement.blockedUntil,
         settlement.plainFallback ? 1 : 0,
-        settlement.refundAttempt === true ? 1 : 0,
         now,
         requiredId(input.outboxId, "outboxId"),
         requiredId(input.workerId, "workerId"),
@@ -372,11 +393,6 @@ function cooldown(input: RateLimitCooldownInput): { rateLimitedUntil?: string } 
 export interface RetryOutboxInput extends OutboxFailureInput, RateLimitCooldownInput {
   /** The row is not claimable before this instant. */
   readonly blockedUntil: string;
-  /**
-   * False when nothing was sent (an edit waiting for its target's post), so the wait does not spend
-   * the row's retry budget. Defaults to true.
-   */
-  readonly countAttempt?: boolean;
 }
 
 /**
@@ -391,10 +407,9 @@ export function retryOutbox(database: Database, input: RetryOutboxInput): void {
     lastErrorCode: input.errorCode,
     blockedUntil,
     plainFallback: false,
-    refundAttempt: input.countAttempt === false,
     action: "slack.outbox.retry-scheduled",
     result: "pending",
-    metadata: { retryable: true, blockedUntil, ...rateLimit, ...(input.countAttempt === false ? { countAttempt: false } : {}) },
+    metadata: { retryable: true, blockedUntil, ...rateLimit },
     ...rateLimit,
   });
 }

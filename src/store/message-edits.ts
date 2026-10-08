@@ -4,8 +4,9 @@
 //
 // Coalescing (latest wins): a new edit request rewrites the target's newest pending (unclaimed) edit
 // row in place. A new row is added only when no edit is pending, for example while the previous one
-// is in flight. Edits of one target are claimed strictly in rowid order (see claimNextOutbox), which
-// is the monotonic revision: the last requested edit is always the last one applied, and none is lost.
+// is in flight. Edits of one target are claimed strictly in rowid order, and only once the target
+// post is settled (see the invariants on claimNextOutbox). Rowid order is the monotonic revision: the
+// last requested edit is always the last one applied, and none is lost.
 import type { Database } from "bun:sqlite";
 import { z } from "zod";
 

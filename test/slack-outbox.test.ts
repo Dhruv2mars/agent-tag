@@ -484,24 +484,21 @@ describe("Slack message edits (chat.update)", () => {
     });
   });
 
-  test("an edit whose post is still in flight waits without spending attempts", async () => {
+  test("an edit whose post is still in flight is not claimed until the post is delivered", async () => {
     await withStore(async (store, taskId, correlationId) => {
       const post = enqueue(store, taskId, correlationId, { id: "card-1" });
       expect(store.claimNextOutbox({ workerId: "other", now: at(1), leaseMs: 60_000 })?.outboxId).toBe(post);
       const edited = edit(store, "Approved", at(2));
       await withFakeSlack([ok("1000.000052")], async ({ client, requests }) => {
         for (const offset of [10, 2_010, 4_010]) {
-          expect(await deliver(store, client, at(offset), { maxAttempts: 1 })).toEqual({
-            kind: "retry-scheduled", outboxId: edited, errorCode: "TargetPending", blockedUntil: at(offset + 2_000),
-          });
-          expect(await deliver(store, client, at(offset + 1_999))).toEqual({ kind: "idle" });
+          expect(await deliver(store, client, at(offset), { maxAttempts: 1 })).toEqual({ kind: "idle" });
         }
         store.markOutboxDelivered({ outboxId: post, workerId: "other", slackMessageTs: "1000.000052", now: at(5_000) });
-        expect(await deliver(store, client, at(6_010), { maxAttempts: 1 })).toEqual({ kind: "delivered", outboxId: edited });
+        expect(await deliver(store, client, at(5_001), { maxAttempts: 1 })).toEqual({ kind: "delivered", outboxId: edited });
         expect(requests).toMatchObject([{ apiMethod: "chat.update", ts: "1000.000052" }]);
       });
       const claims = store.listAuditRecords({ limit: 200 }).filter((row) => row.action === "slack.outbox.claimed" && row.source === edited);
-      expect(claims.map((row) => row.metadata.attempt)).toEqual([1, 1, 1, 1]);
+      expect(claims.map((row) => row.metadata.attempt)).toEqual([1]);
     });
   });
 
@@ -642,6 +639,114 @@ describe("Slack message edits (chat.update)", () => {
       expect(() => store.enqueueMessageRefresh({
         targetClientMessageId: "card-1", refreshKind: "no-such-kind" as "interaction-card", refreshKey: "k", now: at(30),
       })).toThrow();
+    });
+  });
+
+  /** Runs the outbox like the service loop, 2.001s apart, until idle or `maxSteps`; returns the outcomes. */
+  async function drain(
+    store: AgentTagStore,
+    client: InstanceType<typeof webApi.WebClient>,
+    from: number,
+    extra: { readonly refreshRenderers?: RefreshRenderers } = {},
+    maxSteps = 12,
+  ): Promise<SlackOutboxOutcome[]> {
+    const outcomes: SlackOutboxOutcome[] = [];
+    for (let step = 0; step < maxSteps; step += 1) {
+      const outcome = await deliver(store, client, at(from + step * 2_001), extra);
+      if (outcome.kind === "idle") break;
+      outcomes.push(outcome);
+    }
+    return outcomes;
+  }
+  const renderers: RefreshRenderers = { "interaction-card": (key) => card(`${key} rendered`) };
+
+  test("an edit that sorts before its pending post by correlation id never blocks that post", async () => {
+    await withStore(async (store, taskId) => {
+      // Same created_at; the refresh's correlation id ("a-…") sorts before the post's ("z-…").
+      const post = enqueue(store, taskId, "z-post", { id: "card-1", payload: card("Approval needed"), createdAt: at(5) });
+      const refreshed = store.enqueueMessageRefresh({
+        targetClientMessageId: "card-1", refreshKind: "interaction-card", refreshKey: "a-interaction", now: at(5),
+      });
+      await withFakeSlack([ok("1000.000060")], async ({ client, requests }) => {
+        expect(await drain(store, client, 10, { refreshRenderers: renderers })).toEqual([
+          { kind: "delivered", outboxId: post },
+          { kind: "delivered", outboxId: z.string().parse(refreshed?.outboxId) },
+        ]);
+        expect(requests.map((request) => [request.apiMethod, request.ts])).toEqual([
+          ["chat.postMessage", undefined], ["chat.update", "1000.000060"],
+        ]);
+      });
+    });
+  });
+
+  test("an edit that ties its pending post and sorts first by outbox id never blocks that post", async () => {
+    await withStore(async (store, taskId, correlationId) => {
+      // Static edits share the post's correlation id and created_at, so outbox_id (random) decides
+      // claim order. 32 pairs make an edit-first pair certain in practice.
+      const pairs = Array.from({ length: 32 }, (_, index) => {
+        const post = enqueue(store, taskId, correlationId, { id: `card-${index}`, threadTs: `3000.${index}`, createdAt: at(5) });
+        const edited = store.enqueueMessageEdit({ targetClientMessageId: `card-${index}`, payload: { text: `edit ${index}` }, now: at(5) });
+        return { post, edited: z.string().parse(edited?.outboxId) };
+      });
+      expect(pairs.some((pair) => pair.edited < pair.post)).toBe(true);
+      await withFakeSlack([ok("3000.000001")], async ({ client, requests }) => {
+        const outcomes = await drain(store, client, 10, {}, 80);
+        expect(outcomes.every((outcome) => outcome.kind === "delivered")).toBe(true);
+        expect(outcomes).toHaveLength(64);
+        expect(requests.filter((request) => request.apiMethod === "chat.update")).toHaveLength(32);
+      });
+    });
+  });
+
+  test("an edit stamped before its post by a backward clock step still lands after the post", async () => {
+    await withStore(async (store, taskId, correlationId) => {
+      const post = enqueue(store, taskId, correlationId, { id: "card-1", createdAt: at(100) });
+      const edited = edit(store, "Approved", at(50));
+      await withFakeSlack([ok("1000.000061")], async ({ client, requests }) => {
+        expect(await drain(store, client, 110)).toEqual([
+          { kind: "delivered", outboxId: post },
+          { kind: "delivered", outboxId: edited },
+        ]);
+        expect(requests.map((request) => [request.apiMethod, request.text])).toEqual([
+          ["chat.postMessage", "message card-1"], ["chat.update", "Approved"],
+        ]);
+      });
+    });
+  });
+
+  test("an edit of a later post never blocks an earlier, unrelated post it sorts before", async () => {
+    await withStore(async (store, taskId) => {
+      // Thread order: edit(card-2) < card-1 < card-2. card-2 waits on card-1; the edit waits on card-2.
+      const first = enqueue(store, taskId, "z-1", { id: "card-1", createdAt: at(5) });
+      const second = enqueue(store, taskId, "z-2", { id: "card-2", createdAt: at(5) });
+      const refreshed = store.enqueueMessageRefresh({
+        targetClientMessageId: "card-2", refreshKind: "interaction-card", refreshKey: "a-interaction", now: at(5),
+      });
+      await withFakeSlack([ok("1000.000062"), ok("1000.000063"), ok("1000.000063")], async ({ client, requests }) => {
+        expect(await drain(store, client, 10, { refreshRenderers: renderers })).toEqual([
+          { kind: "delivered", outboxId: first },
+          { kind: "delivered", outboxId: second },
+          { kind: "delivered", outboxId: z.string().parse(refreshed?.outboxId) },
+        ]);
+        expect(requests.at(-1)).toMatchObject({ apiMethod: "chat.update", ts: "1000.000063" });
+      });
+    });
+  });
+
+  test("an edit waiting on an in-flight post never delays later posts in its thread", async () => {
+    await withStore(async (store, taskId, correlationId) => {
+      const target = enqueue(store, taskId, correlationId, { id: "card-1", createdAt: at(1) });
+      expect(store.claimNextOutbox({ workerId: "other", now: at(2), leaseMs: 60_000 })?.outboxId).toBe(target);
+      const edited = edit(store, "Approved", at(3));
+      const later = enqueue(store, taskId, correlationId, { id: "reply-1", createdAt: at(4) });
+      await withFakeSlack([ok("1000.000064"), ok("1000.000065")], async ({ client, requests }) => {
+        expect(await drain(store, client, 10)).toEqual([{ kind: "delivered", outboxId: later }]);
+        store.markOutboxDelivered({ outboxId: target, workerId: "other", slackMessageTs: "1000.000065", now: at(30_000) });
+        expect(await drain(store, client, 30_001)).toEqual([{ kind: "delivered", outboxId: edited }]);
+        expect(requests.map((request) => [request.apiMethod, request.ts])).toEqual([
+          ["chat.postMessage", undefined], ["chat.update", "1000.000065"],
+        ]);
+      });
     });
   });
 

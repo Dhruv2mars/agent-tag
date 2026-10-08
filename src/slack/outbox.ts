@@ -40,8 +40,6 @@ export type RefreshRenderer = (refreshKey: string) => SlackOutboxPayload | null;
 export type RefreshRenderers = Partial<Readonly<Record<RefreshKind, RefreshRenderer>>>;
 
 const OUTBOX_LEASE_MS = 30_000;
-/** How long an edit waits before checking again whether its target post has been delivered. */
-const EDIT_TARGET_WAIT_MS = 2_000;
 const slackPostResponseSchema = z.object({ ts: z.string().min(1) });
 
 interface DeliverInput {
@@ -96,8 +94,9 @@ export async function deliverNextSlackOutbox(input: DeliverInput): Promise<Slack
 }
 
 /**
- * chat.update of the target post's message. Waits (without spending attempts) while the post is
- * undelivered; refresh rows render the current state now, so a retry never regresses the message.
+ * chat.update of the target post's message. The claim only hands out an edit once its target post is
+ * settled (see claimNextOutbox), so the target is delivered or failed here. Refresh rows render the
+ * current state now, so a retry never regresses the message.
  */
 async function deliverEdit(input: DeliverInput, claimed: ClaimedOutboxMessage, now: () => string): Promise<SlackOutboxOutcome> {
   const settle = { outboxId: claimed.outboxId, workerId: input.workerId };
@@ -106,13 +105,6 @@ async function deliverEdit(input: DeliverInput, claimed: ClaimedOutboxMessage, n
     return { kind: "failed", outboxId: claimed.outboxId, errorCode };
   };
   const target = claimed.target;
-  if (target?.status === "pending" || target?.status === "inflight") {
-    const errorCode = "TargetPending";
-    const at = now();
-    const blockedUntil = new Date(new Date(at).getTime() + EDIT_TARGET_WAIT_MS).toISOString();
-    input.store.retryOutbox({ ...settle, errorCode, blockedUntil, countAttempt: false, now: at });
-    return { kind: "retry-scheduled", outboxId: claimed.outboxId, errorCode, blockedUntil };
-  }
   // A failed or quarantined post has no message to edit.
   if (target?.status !== "delivered" || target.slackMessageTs === null) return fail("TargetNotDelivered");
 
