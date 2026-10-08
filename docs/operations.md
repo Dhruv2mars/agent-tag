@@ -212,7 +212,7 @@ Store migrations are append-only and run inside SQLite transactions when Agent T
 
 ## Secret scan
 
-Scan the Agent Tag checkout for common Slack, GitHub, AWS, Anthropic, and OpenAI credential shapes:
+Scan the Agent Tag checkout for common Slack, GitHub (classic and fine-grained `github_pat_`), AWS, Anthropic, and OpenAI credential shapes and PEM private key headers:
 
 ```sh
 bun run scan:secrets -- /absolute/path/to/agent-tag
@@ -376,6 +376,50 @@ bun run schedule:cancel -- CONFIG TASK_ID USER_ID PROFILE_ID SCHEDULE_ID
 `kind: "agent"` adds a normal durable T3 operation when due. `kind: "reminder"` sends `Reminder: ...` through the durable Slack outbox without running a provider. Cadence is optional for a one-shot schedule and must be at least 60 seconds when present. Workspace active schedules are capped by `limits.maxActiveSchedules`.
 
 An overdue `run-once` schedule coalesces missed intervals into one run; `skip` records the miss without dispatch. `overlapPolicy: skip` suppresses a recurring agent run while an earlier run from the same schedule is pending or in flight. `queue` preserves every due run behind normal per-task serialization.
+
+## GitHub pull requests (preview: config only)
+
+This release adds the config keys and the git and GitHub libraries for the draft PR workflow. Nothing acts on them yet: the coordinator does not commit, push, or open PRs until the worker lands in a later release. Configs without these keys stay valid, and `pullRequests` defaults to `{ "mode": "off" }`.
+
+```jsonc
+"github": {                                   // top-level, optional
+  "apiBaseUrl": "https://api.github.com",     // GHES: https://ghe.example/api/v3
+  "webBaseUrl": "https://github.com",         // GHES: https://ghe.example
+  "auth": { "type": "token", "tokenFile": "/abs/secrets/github-token" }
+},
+"profiles": [{
+  "pullRequests": {
+    "mode": "auto",                           // "off" (default) | "auto" | "button"
+    "repositories": [{ "root": "/abs/repo", "repo": "owner/name", "baseBranch": "main" }],
+    "draft": true,
+    "commitAuthor": { "name": "Agent Tag", "email": "agent-tag@users.noreply.github.com" },
+    "maxChangedFiles": 300,
+    "maxDiffBytes": 2000000,
+    "secretScan": "block"                     // "block" (default) | "off"
+  }
+}]
+```
+
+Validation rules:
+
+- A mode other than `off` requires the top-level `github` block.
+- Every `repositories[].root` must be in the profile's `repositoryRoots`, and each root can appear only once.
+- `repo` must be `owner/name`. `baseBranch` defaults to the profile's `baseBranch`.
+- A profile with `externalWrites.mode: "deny"` must keep `pullRequests.mode` set to `off`.
+- `apiBaseUrl` and `webBaseUrl` must be `https` URLs without credentials. Only `auth.type: "token"` is supported for now. GitHub App auth comes in a later release.
+
+### Creating the token
+
+Use a fine-grained personal access token limited to the repositories you configure, with **Contents: read and write**, **Pull requests: read and write**, and **Metadata: read**. Store it the same way as the Slack and T3 tokens: one line in a file with mode `0600`, inside a directory with mode `0700`, both owned by the Agent Tag user. The file is re-read for every job, so you can rotate the token without a restart. Protect the base branch with branch protection and required reviews. Agent Tag only opens drafts and never force-pushes, but the token can push to any unprotected branch of the granted repositories.
+
+### How the credential is handled
+
+- The token is read by Agent Tag only. It never goes into the agent's worktree, a git config file, a remote URL, a process's argv, or a log line. Errors from git and GitHub are redacted before they are returned.
+- Git runs without a shell. Each call has a timeout and a cap on captured output, and its environment is limited to `PATH`, `HOME`, and `LANG` plus `GIT_TERMINAL_PROMPT=0`, `GIT_CONFIG_NOSYSTEM=1`, and `GIT_CONFIG_GLOBAL=/dev/null`. Each call also passes `-c core.hooksPath=/dev/null -c core.fsmonitor=false -c commit.gpgSign=false`. Diffs use `--no-ext-diff --no-textconv`. As a result, hooks, fsmonitor, diff drivers, and `url.*.insteadOf` rules in the repository's `.git/config` or the user's `~/.gitconfig` do not run or take effect.
+- Leftover changes are committed in the worktree, with no credential present, and fetched into a bare mirror owned by Agent Tag at `<dataDir>/git/<owner>/<repo>.git` (mode `0700`). The push runs from that mirror to `{webBaseUrl}/{owner}/{repo}.git`. Git gets the token through `GIT_ASKPASS=<dataDir>/git/askpass.sh`, a fixed script with no secret in it, and `AGENT_TAG_GIT_TOKEN`, which is set only in the environment of that one `git push` child. `-c credential.helper=` stops git from asking or writing to the keychain or `gh` helpers. If the mirror's config has a key Agent Tag did not write, the push is refused.
+- Before anything is pushed, the added lines and commit messages are scanned with the same credential patterns as `scan:secrets`, which also cover `github_pat_` tokens and private key headers. A hit blocks the push. Changes over `maxChangedFiles` or `maxDiffBytes` are blocked too. Rejected (non-fast-forward) pushes are reported and never forced.
+
+In `trusted-same-user` isolation the agent runs as the same OS user and could read `tokenFile` directly. These measures make sure the token is never handed to the agent; they do not make the file unreadable to it. Use `os-account` or `container` isolation for that.
 
 ## Host constraints
 
