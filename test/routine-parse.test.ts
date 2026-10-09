@@ -303,6 +303,34 @@ describe("splitRoutineRequest", () => {
   });
 });
 
+describe("reminder notify target", () => {
+  test.each<[string, string | undefined]>([
+    ["remind me tomorrow at 3pm to deploy", "U1"],
+    ["set a reminder: tomorrow at 3pm deploy", "U1"],
+    ["reminder: tomorrow at 3pm deploy", "U1"],
+    ["remind <@U2> tomorrow at 3pm to deploy", "U2"],
+    ["remind <@u2|alice> tomorrow at 3pm to deploy", "U2"],
+    ["remind the team tomorrow at 3pm to deploy", undefined],
+    ["remind us tomorrow at 3pm to deploy", undefined],
+    ["remind everyone tomorrow at 3pm to deploy", undefined],
+    ["remind <!channel> tomorrow at 3pm to deploy", undefined],
+    ["remind <#C1> tomorrow at 3pm to deploy", undefined],
+    ["every day at 9am remind me to deploy", undefined],
+  ])("%s", (text, notifyUserId) => {
+    const split = splitRoutineRequest(text, { actorUserId: "U1" });
+    expect(split.kind).toBe("ok");
+    if (notifyUserId === undefined) expect(split).not.toHaveProperty("notifyUserId");
+    else expect(split).toMatchObject({ notifyUserId });
+    const parsed = parseRoutineRequest(text, { ...ny, actorUserId: "U1" });
+    if (notifyUserId === undefined) expect(parsed).not.toHaveProperty("notifyUserId");
+    else expect(parsed).toMatchObject({ kind: "ok", notifyUserId });
+  });
+
+  test("remind me without a known requester has no target", () => {
+    expect(splitRoutineRequest("remind me tomorrow at 3pm to deploy")).not.toHaveProperty("notifyUserId");
+  });
+});
+
 describe("scheduler spec conversion", () => {
   test("parseRoutineRequest produces a spec the scheduler accepts", () => {
     const recurring = parseRoutineRequest("every weekday at 9am summarize open PRs", ist);

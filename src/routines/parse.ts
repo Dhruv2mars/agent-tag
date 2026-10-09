@@ -47,6 +47,8 @@ export interface ParseScheduleOptions {
   readonly timeZone: string;
 }
 
+const TOO_FREQUENT_ERROR = `That's too frequent. Routines can repeat at most every ${MIN_INTERVAL_SECONDS / 60} minutes.`;
+
 /** Timing portion of a schedule spec; feed it to {@link toScheduleSpec}. */
 export interface ParsedSchedule {
   readonly runAt: string;
@@ -253,12 +255,7 @@ function intervalResult(amount: number, unit: Unit): TimingResult {
         };
   }
   const seconds = amount * (unit === "minute" ? 60 : 3_600);
-  if (seconds < MIN_INTERVAL_SECONDS) {
-    return {
-      kind: "invalid",
-      message: `That's too frequent. Routines can repeat at most every ${MIN_INTERVAL_SECONDS / 60} minutes.`,
-    };
-  }
+  if (seconds < MIN_INTERVAL_SECONDS) return { kind: "invalid", message: TOO_FREQUENT_ERROR };
   if (seconds > MAX_CADENCE_SECONDS) {
     return { kind: "invalid", message: "That interval is too long. Try a calendar schedule like 'every month on the 1st'." };
   }
@@ -476,7 +473,8 @@ function formatTime(hour: number, minute: number): string {
   return `${display}:${pad(minute)} ${suffix}`;
 }
 
-function formatInstant(instant: Date, timeZone: string): string {
+/** "Wed, Oct 7, 2026 at 9:00 AM" in the given zone. */
+export function formatInstant(instant: Date, timeZone: string): string {
   const local = toLocal(instant, timeZone);
   const weekday = WEEKDAY_NAMES[weekdayOf(local)]?.slice(0, 3) ?? "";
   return `${weekday}, ${MONTH_NAMES[local.month - 1] ?? ""} ${local.day}, ${local.year} at ${formatTime(local.hour, local.minute)}`;
@@ -517,7 +515,8 @@ function describeCalendar(pattern: CalendarPattern, weekday: number): string {
   }
 }
 
-function describeInterval(seconds: number): string {
+/** "every hour", "every 2 hours", "every 15 minutes" for a fixed cadence. */
+export function describeInterval(seconds: number): string {
   if (seconds % 3_600 === 0) {
     const hours = seconds / 3_600;
     return hours === 1 ? "every hour" : `every ${hours} hours`;
@@ -618,12 +617,7 @@ function resolveTiming(timing: Timing, options: ParseScheduleOptions): ScheduleP
           nextRunAt: instant.toISOString(),
         };
   const cronSchedule = (expression: string, description: string): ScheduleParseResult => {
-    if (!minimumCronGapOk(expression, timeZone, now)) {
-      return {
-        kind: "error",
-        message: `That's too frequent. Routines can repeat at most every ${MIN_INTERVAL_SECONDS / 60} minutes.`,
-      };
-    }
+    if (!minimumCronGapOk(expression, timeZone, now)) return { kind: "error", message: TOO_FREQUENT_ERROR };
     const parsed = parseCron(expression);
     const next = parsed.kind === "ok" ? nextCronOccurrence(parsed.cron, timeZone, now) : null;
     if (next === null) return { kind: "error", message: "That schedule never runs. Check the date and try again." };
@@ -738,10 +732,47 @@ export type RoutineSplitResult =
       readonly scheduleKind: ScheduleSpec["kind"];
       readonly timing: string;
       readonly task: string;
+      /** Reminders: the Slack user to @mention on delivery (absent for agent runs and team reminders). */
+      readonly notifyUserId?: string;
     }
   | { readonly kind: "error"; readonly message: string };
 
-const REMINDER_LEAD = /^(?:please\s+)?(?:set\s+(?:a\s+)?reminder\s*:?|reminder\s*:|remind\s+(?:me|us|everyone|the\s+team|<[@#!][^>]+>))\s*/i;
+/**
+ * Trim and drop leading bot mentions and "please". Inner whitespace is kept (multi-line prompts, code). Create requests must be
+ * parsed from this same text, so detection and parsing never disagree about the lead.
+ */
+export function normalizeRoutineRequest(text: string): string {
+  return text
+    .trim()
+    .replace(/^(?:<@[^>]+>\s*)+/, "")
+    .replace(/^please[\s,]+/i, "")
+    // "routine:every day…" and "cron:0 9 * * *" parse like their spaced forms.
+    .replace(/^(routine|cron)\s*:\s*/i, (_match, lead: string) => `${lead}: `)
+    .trim();
+}
+
+export interface SplitRoutineOptions {
+  /** The requester: `remind me ...` and `set a reminder ...` notify them. */
+  readonly actorUserId?: string;
+}
+
+/**
+ * Reminder leads. Group 1 is who to remind ("me", "us", "the team", `<@U123>`); it is absent for
+ * "set a reminder" / "reminder:", which remind the requester.
+ */
+export const REMINDER_LEAD =
+  /^(?:please\s+)?(?:set\s+(?:a\s+)?reminder\s*:?|reminder\s*:|remind\s+(me|us|everyone|the\s+team|<[@#!][^>]+>))\s*/i;
+
+const USER_MENTION = /^<@([UW][A-Z0-9]+)(?:\|[^>]*)?>$/i;
+
+/**
+ * Who a reminder @mentions: the requester for "remind me", the named user for "remind <@U2>", and
+ * nobody for "remind us / everyone / the team" (never `@here` or `@channel`).
+ */
+function reminderNotifyUserId(target: string | undefined, actorUserId: string | undefined): string | undefined {
+  if (target === undefined || target.toLowerCase() === "me") return actorUserId;
+  return USER_MENTION.exec(target)?.[1]?.toUpperCase();
+}
 const AGENT_LEAD = /^(?:(?:please|can\s+you|could\s+you|schedule|routine\s*:)\s+)+/i;
 const TASK_LEAD = /^(?:(?:to|that|about|and)\s+|[:,\-–—]+\s*)+/i;
 
@@ -910,12 +941,14 @@ function mergeTrailingTime(found: TimingSplit): TimingSplit | { readonly kind: "
  * "remind me tomorrow at 3pm to deploy"      -> reminder, "tomorrow at 3pm", "deploy"
  * The timing may also trail the task: "remind me to deploy tomorrow at 3pm".
  */
-export function splitRoutineRequest(text: string): RoutineSplitResult {
+export function splitRoutineRequest(text: string, options: SplitRoutineOptions = {}): RoutineSplitResult {
   let rest = text.trim().replace(/^(?:<@[^>]+>\s*)+/, "");
   let scheduleKind: ScheduleSpec["kind"] = "agent";
+  let notifyUserId: string | undefined;
   const reminder = REMINDER_LEAD.exec(rest);
   if (reminder !== null) {
     scheduleKind = "reminder";
+    notifyUserId = reminderNotifyUserId(reminder[1], options.actorUserId);
     rest = rest.slice(reminder[0].length);
   } else {
     rest = rest.replace(AGENT_LEAD, "");
@@ -949,7 +982,13 @@ export function splitRoutineRequest(text: string): RoutineSplitResult {
           : "What should I do then? Try 'every weekday at 9am summarize open PRs'.",
     };
   }
-  return { kind: "ok", scheduleKind, timing: timing.replace(/[\s,:;\-–—]+$/, ""), task };
+  return {
+    kind: "ok",
+    scheduleKind,
+    timing: timing.replace(/[\s,:;\-–—]+$/, ""),
+    task,
+    ...(notifyUserId === undefined ? {} : { notifyUserId }),
+  };
 }
 
 export type RoutineParseResult =
@@ -960,12 +999,17 @@ export type RoutineParseResult =
       readonly recurring: boolean;
       readonly humanReadable: string;
       readonly nextRunAt: string;
+      /** Reminders: the Slack user to @mention on delivery. */
+      readonly notifyUserId?: string;
     }
   | { readonly kind: "error"; readonly message: string };
 
 /** Split + parse + convert in one step: Slack text -> scheduler spec. */
-export function parseRoutineRequest(text: string, options: ParseScheduleOptions): RoutineParseResult {
-  const split = splitRoutineRequest(text);
+export function parseRoutineRequest(
+  text: string,
+  options: ParseScheduleOptions & SplitRoutineOptions,
+): RoutineParseResult {
+  const split = splitRoutineRequest(text, options);
   if (split.kind === "error") return split;
   const parsed = parseSchedule(split.timing, options);
   if (parsed.kind === "error") return parsed;
@@ -976,5 +1020,6 @@ export function parseRoutineRequest(text: string, options: ParseScheduleOptions)
     recurring: parsed.recurring,
     humanReadable: parsed.humanReadable,
     nextRunAt: parsed.nextRunAt,
+    ...(split.notifyUserId === undefined ? {} : { notifyUserId: split.notifyUserId }),
   };
 }
