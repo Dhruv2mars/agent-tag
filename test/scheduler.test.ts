@@ -304,4 +304,141 @@ describe("durable scheduler", () => {
       await rm(directory, { recursive: true });
     }
   });
+
+  test("tracks end reasons, settles across a concurrent cancel, and dedupes Slack-sourced creates", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "agent-tag-scheduler-"));
+    const path = join(directory, "agent-tag.sqlite");
+    const store = await AgentTagStore.open(path);
+    try {
+      const thread = {
+        workspaceId: "T1",
+        conversationId: "C1",
+        threadTs: "3000.000001",
+        actorUserId: "U1",
+        conversationType: "channel",
+        profileId: "engineering",
+        repositoryRoot: "/srv/repos/example",
+        now: createdAt,
+      } as const;
+      const taskId = store.ensureTaskForThread(thread);
+      expect(store.ensureTaskForThread({ ...thread, now: "2026-09-21T00:00:05.000Z" })).toBe(taskId);
+      expect(store.diagnostics()).toMatchObject({ tasks: 1, operations: 0 });
+      const otherTaskId = store.ensureTaskForThread({ ...thread, threadTs: "3000.000002" });
+      expect(otherTaskId).not.toBe(taskId);
+
+      const context: ScheduleContext = { workspaceId: "T1", actorUserId: "U1", profileId: "engineering", taskId };
+      const schedules = new AgentTagSchedules({ config, store });
+      const spec = {
+        kind: "reminder",
+        prompt: "check the deploy",
+        runAt: "2026-09-21T00:01:00.000Z",
+        cadenceSeconds: 60,
+        missedRunPolicy: "run-once",
+        misfireGraceSeconds: 30,
+        overlapPolicy: "skip",
+      } as const;
+      const source = { eventKey: "C1:3000.000009", timeZone: "Asia/Kolkata", humanReadable: "every minute", notifyUserId: "U1" };
+      const sourced = acceptedSchedule(schedules.create({ context, spec, source, now: createdAt }));
+      expect(sourced).toMatchObject({
+        workspaceId: "T1",
+        conversationId: "C1",
+        threadTs: "3000.000001",
+        timeZone: "Asia/Kolkata",
+        humanReadable: "every minute",
+        notifyUserId: "U1",
+        consecutiveFailures: 0,
+        endedReason: null,
+      });
+      // A redelivered Slack request returns the same schedule instead of creating a second one.
+      expect(schedules.create({ context, spec, source, now: "2026-09-21T00:00:02.000Z" })).toEqual({
+        kind: "accepted",
+        schedule: sourced,
+      });
+      expect(
+        schedules.create({
+          context: { ...context, taskId: otherTaskId },
+          spec,
+          source,
+          now: "2026-09-21T00:00:03.000Z",
+        }),
+      ).toEqual({ kind: "denied", reason: "schedule-denied" });
+      expect(store.findScheduleBySourceEvent({ workspaceId: "T1", sourceEventKey: source.eventKey })?.scheduleId).toBe(
+        sourced.scheduleId,
+      );
+      expect(store.listSchedules(taskId)).toHaveLength(1);
+      expect(
+        store.listAuditRecords().filter((record) => record.action === "schedule.created").map((record) => record.metadata.source),
+      ).toEqual(["slack"]);
+
+      // The user cancels while a worker holds the run's lease: settling records the run and keeps the cancel.
+      const claimed = store.claimDueSchedule({ workerId: "worker-a", now: "2026-09-21T00:01:00.000Z", leaseMs: 30_000 });
+      expect(claimed?.scheduleId).toBe(sourced.scheduleId);
+      expect(schedules.cancel({ context, scheduleId: sourced.scheduleId, now: "2026-09-21T00:01:01.000Z" })).toEqual({
+        kind: "accepted",
+      });
+      expect(() =>
+        store.settleScheduleRun({
+          scheduleId: sourced.scheduleId,
+          workerId: "worker-a",
+          dueAt: "2026-09-21T00:01:00.000Z",
+          disposition: "dispatched",
+          nextRunAt: "2026-09-21T00:02:00.000Z",
+          now: "2026-09-21T00:01:02.000Z",
+        }),
+      ).not.toThrow();
+      expect(store.diagnostics().scheduleRuns).toBe(1);
+      expect(store.getSchedule(sourced.scheduleId)).toMatchObject({
+        state: "cancelled",
+        endedReason: "user-cancelled",
+        endedAt: "2026-09-21T00:01:01.000Z",
+        nextRunAt: "2026-09-21T00:01:00.000Z",
+      });
+      expect(
+        store.listAuditRecords().find((record) => record.action === "schedule.run.settled")?.metadata.cancelledDuringRun,
+      ).toBe(true);
+      const once = acceptedSchedule(
+        schedules.create({ context, spec: { ...spec, cadenceSeconds: undefined, runAt: "2026-09-21T00:05:00.000Z" }, now: createdAt }),
+      );
+      const revoked = acceptedSchedule(
+        schedules.create({ context, spec: { ...spec, runAt: "2026-09-21T00:06:00.000Z" }, now: createdAt }),
+      );
+      const kept = acceptedSchedule(
+        schedules.create({ context, spec: { ...spec, runAt: "2026-09-21T01:00:00.000Z" }, now: createdAt }),
+      );
+      const worker = (now: string) => new ScheduleWorker({ config, store, workerId: "worker-c", now: () => new Date(now) });
+      expect(await worker("2026-09-21T00:05:00.000Z").processNext()).toMatchObject({ scheduleId: once.scheduleId });
+      expect(store.getSchedule(once.scheduleId)).toMatchObject({ state: "completed", endedReason: "completed" });
+      const revokedClaim = store.claimDueSchedule({ workerId: "worker-d", now: "2026-09-21T00:06:00.000Z", leaseMs: 30_000 });
+      expect(revokedClaim?.scheduleId).toBe(revoked.scheduleId);
+      store.revokeClaimedSchedule({ scheduleId: revoked.scheduleId, workerId: "worker-d", now: "2026-09-21T00:06:01.000Z" });
+      expect(store.getSchedule(revoked.scheduleId)).toMatchObject({
+        state: "cancelled",
+        endedReason: "authority-revoked",
+        endedAt: "2026-09-21T00:06:01.000Z",
+      });
+
+      // Any other settle without the lease on a live schedule still fails closed.
+      expect(() =>
+        store.settleScheduleRun({
+          scheduleId: kept.scheduleId,
+          workerId: "worker-x",
+          dueAt: "2026-09-21T01:00:00.000Z",
+          disposition: "dispatched",
+          now: "2026-09-21T00:07:00.000Z",
+        }),
+      ).toThrow();
+
+      expect(
+        store.listActiveSchedulesForConversation({ workspaceId: "T1", conversationId: "C1" }).map((row) => row.scheduleId),
+      ).toEqual([kept.scheduleId]);
+      expect(store.listActiveSchedulesForConversation({ workspaceId: "T1", conversationId: "C2" })).toEqual([]);
+      expect(() => store.listActiveSchedulesForConversation({ workspaceId: "T1", conversationId: "C1", limit: 0 })).toThrow();
+    } finally {
+      store.close();
+      if (!directory.startsWith(`${tmpdir()}/agent-tag-scheduler-`)) {
+        throw new Error(`refusing to remove unexpected fixture path ${directory}`);
+      }
+      await rm(directory, { recursive: true });
+    }
+  });
 });

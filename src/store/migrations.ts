@@ -347,4 +347,52 @@ export const STORE_MIGRATIONS: readonly StoreMigration[] = [
       CREATE INDEX slack_outbox_refresh_idx ON slack_outbox(target_outbox_id, status) WHERE method = 'update';
     `,
   },
+  {
+    // Routines (PR-J1): request source and time zone, run outcomes, failure streaks and end reasons.
+    // "Disabled" is state = 'cancelled' with ended_reason = 'auto-disabled', so the state CHECK is unchanged.
+    version: 16,
+    sql: `
+      ALTER TABLE schedules ADD COLUMN time_zone TEXT;
+      ALTER TABLE schedules ADD COLUMN human_readable TEXT;
+      ALTER TABLE schedules ADD COLUMN source_event_key TEXT;
+      ALTER TABLE schedules ADD COLUMN notify_user_id TEXT;
+      ALTER TABLE schedules ADD COLUMN consecutive_failures INTEGER NOT NULL DEFAULT 0
+        CHECK (consecutive_failures >= 0);
+      ALTER TABLE schedules ADD COLUMN failure_streak_started_at TEXT;
+      ALTER TABLE schedules ADD COLUMN ended_reason TEXT CHECK (ended_reason IS NULL OR
+        ended_reason IN ('user-cancelled', 'auto-disabled', 'authority-revoked', 'completed'));
+      ALTER TABLE schedules ADD COLUMN ended_at TEXT;
+      CREATE UNIQUE INDEX schedules_source_event_idx ON schedules(workspace_id, source_event_key)
+        WHERE source_event_key IS NOT NULL;
+      CREATE INDEX schedules_conversation_idx
+        ON schedules(workspace_id, conversation_id, state, created_at);
+      ALTER TABLE schedule_runs ADD COLUMN outcome TEXT CHECK (outcome IS NULL OR
+        outcome IN ('succeeded', 'failed', 'cancelled', 'skipped'));
+      ALTER TABLE schedule_runs ADD COLUMN outcome_at TEXT;
+      ALTER TABLE schedule_runs ADD COLUMN outcome_error_code TEXT;
+      CREATE INDEX schedule_runs_pending_outcome_idx ON schedule_runs(created_at) WHERE outcome IS NULL;
+      -- Runs dispatched before outcome tracking existed still get an outcome for history, but never
+      -- count toward an auto-disable streak: an upgrade must not disable a routine for failures that
+      -- happened before the policy shipped. Only runs recorded from here on start at legacy = 0.
+      ALTER TABLE schedule_runs ADD COLUMN legacy INTEGER NOT NULL DEFAULT 0 CHECK (legacy IN (0, 1));
+      UPDATE schedule_runs SET legacy = 1;
+      UPDATE schedule_runs SET outcome = 'skipped', outcome_at = created_at WHERE disposition <> 'dispatched';
+      -- End reasons for schedules that ended before this migration. Before it, only three paths ended a
+      -- schedule: settling a one-shot's run ('completed', the only writer of that state), a user cancel
+      -- (audit 'schedule.cancelled') and a claimed run losing execution authority (audit
+      -- 'schedule.authority-revoked'); both cancel paths set state 'cancelled' and only from 'active',
+      -- so a schedule has at most one of those rows. The earliest such row decides. Where retention
+      -- pruned it, the reason is unrecoverable and defaults to 'user-cancelled'. updated_at is the end
+      -- time: nothing touched an ended schedule after that transition.
+      UPDATE schedules SET ended_reason = CASE
+          WHEN state = 'completed' THEN 'completed'
+          WHEN (SELECT a.action FROM audit_log a
+                WHERE a.correlation_id = schedules.schedule_id AND a.target = schedules.schedule_id
+                  AND a.action IN ('schedule.cancelled', 'schedule.authority-revoked')
+                ORDER BY a.created_at, a.audit_id LIMIT 1) = 'schedule.authority-revoked'
+            THEN 'authority-revoked'
+          ELSE 'user-cancelled' END,
+        ended_at = updated_at WHERE state <> 'active';
+    `,
+  },
 ];

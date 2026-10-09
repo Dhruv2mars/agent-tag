@@ -77,5 +77,11 @@
     "messageDays": 30,
     "outboxDays": 30,
     "auditDays": 365
+  },
+  "routines": {
+    "autoDisable": {
+      "consecutiveFailures": 3,
+      "minFailureSpanSeconds": 3600
+    }
   }
 }
