@@ -210,8 +210,10 @@ export interface OnboardAnswers {
 /** Builds a config from the example template plus answers; throws with readable issues when invalid. */
 export function buildOnboardConfig(template: unknown, answers: OnboardAnswers): { readonly config: AgentTagConfig; readonly json: string } {
   const base = agentTagConfigSchema.parse(template);
-  const baseProfile = base.profiles[0];
-  if (baseProfile === undefined) throw new Error("config template has no profile");
+  const templateProfile = base.profiles[0];
+  if (templateProfile === undefined) throw new Error("config template has no profile");
+  // Model policy keys keep their schema defaults rather than being written out; the wizard does not ask about them.
+  const { allowedModels: _allowedModels, modelSwitch: _modelSwitch, ...baseProfile } = templateProfile;
   const candidate = {
     version: 1,
     dataDir: answers.paths.dataDir,
