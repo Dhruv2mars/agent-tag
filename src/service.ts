@@ -8,10 +8,12 @@ import { createScheduleWorkers } from "./scheduler.ts";
 import { SlackSocketBridge } from "./slack/bridge.ts";
 import { createRetentionWorker } from "./store/retention.ts";
 import { AgentTagStore } from "./store/store.ts";
+import { T3Connection } from "./t3/connection.ts";
 import { createT3GateWorker, T3RuntimeGate } from "./t3/gate.ts";
 import { inspectT3, type T3ServerInfo } from "./t3/gateway.ts";
 import { PINNED_T3 } from "./t3/lock.ts";
 import { prepareManagedT3Binary, T3ManagedRuntime } from "./t3/supervisor.ts";
+import { protocolV1Source, ThreadWatcher } from "./t3/watcher.ts";
 
 interface ServiceWorkerOutcome {
   readonly kind: string;
@@ -58,6 +60,7 @@ export interface ServiceLogRecord {
   readonly outcome?: string;
   readonly errorCode?: string;
   readonly count?: number;
+  readonly stats?: Readonly<Record<string, number>>;
   /** Redacted, human-readable context (T3 runtime and gate events). */
   readonly detail?: string;
   readonly profileId?: string;
@@ -74,6 +77,8 @@ export interface AgentTagServiceOptions {
   readonly interactionWorkers: ReadonlyArray<ServiceWorker>;
   readonly scheduleWorkers?: ReadonlyArray<ServiceWorker>;
   readonly maintenanceWorkers?: ReadonlyArray<ServiceWorker>;
+  /** Closed after every loop has stopped, before the store (e.g. the shared T3 connection). */
+  readonly resources?: ReadonlyArray<{ readonly close: () => Promise<void> }>;
   readonly idleMs?: number;
   readonly logger?: ServiceLogger;
   readonly now?: () => Date;
@@ -112,6 +117,7 @@ export class AgentTagService {
   readonly #interactionWorkers: ReadonlyArray<ServiceWorker>;
   readonly #scheduleWorkers: ReadonlyArray<ServiceWorker>;
   readonly #maintenanceWorkers: ReadonlyArray<ServiceWorker>;
+  readonly #resources: ReadonlyArray<{ readonly close: () => Promise<void> }>;
   readonly #idleMs: number;
   readonly #logger: ServiceLogger;
   readonly #now: () => Date;
@@ -132,6 +138,7 @@ export class AgentTagService {
     this.#interactionWorkers = options.interactionWorkers;
     this.#scheduleWorkers = options.scheduleWorkers ?? [];
     this.#maintenanceWorkers = options.maintenanceWorkers ?? [];
+    this.#resources = options.resources ?? [];
     this.#idleMs = idleMs;
     this.#logger = options.logger ?? defaultLogger;
     this.#now = options.now ?? (() => new Date());
@@ -150,6 +157,7 @@ export class AgentTagService {
       await this.#bridge.start();
     } catch (error) {
       this.#state = "stopped";
+      await this.#closeResources();
       await this.#stopRuntime();
       this.#store.close();
       throw error;
@@ -179,6 +187,7 @@ export class AgentTagService {
     if (this.#state === "stopped") return;
     if (this.#state === "created") {
       this.#state = "stopped";
+      await this.#closeResources();
       await this.#stopRuntime();
       this.#store.close();
       return;
@@ -195,6 +204,7 @@ export class AgentTagService {
         this.#log({ level: "warn", event: "service.stop.failed", errorCode: errorCode(result.reason) });
       }
     }
+    await this.#closeResources();
     // Workers are stopped, so no T3 call is in flight when the managed runtime goes down.
     await this.#stopRuntime();
     this.#store.close();
@@ -255,6 +265,14 @@ export class AgentTagService {
     }
   }
 
+  async #closeResources(): Promise<void> {
+    for (const result of await Promise.allSettled(this.#resources.map((resource) => resource.close()))) {
+      if (result.status === "rejected") {
+        this.#log({ level: "warn", event: "service.stop.failed", errorCode: errorCode(result.reason) });
+      }
+    }
+  }
+
   #log(input: Omit<ServiceLogRecord, "at">): void {
     this.#logger({ ...input, at: this.#now().toISOString() });
   }
@@ -292,39 +310,58 @@ export async function createAgentTagService(input: {
   const databasePath = join(input.config.dataDir, "agent-tag.sqlite");
   const store = await AgentTagStore.open(databasePath);
   const quarantined = store.quarantineExpiredOutbox(now().toISOString());
+  // One T3 session and WebSocket for the whole service, and one subscription per watched thread.
+  // The connection is lazy, so building it before a managed runtime starts makes no request.
+  const t3 = new T3Connection({ config: input.config.t3, logger, now });
+  const watch = input.config.t3.watch;
+  const watcher = watch.enabled
+    ? new ThreadWatcher({ source: protocolV1Source(t3), logger, now, lingerMs: watch.lingerMs })
+    : undefined;
+  const closeT3 = async () => {
+    await watcher?.close();
+    await t3.close();
+  };
   let runtime: T3ManagedRuntime | undefined;
   try {
-    const t3 = input.config.t3;
-    if (t3.mode === "managed") {
-      const installed = await prepareManagedT3Binary({ settings: t3.managed, pin: PINNED_T3, logger, now });
-      runtime = new T3ManagedRuntime({ settings: t3.managed, installed, logger, now });
+    const t3Config = input.config.t3;
+    if (t3Config.mode === "managed") {
+      const installed = await prepareManagedT3Binary({ settings: t3Config.managed, pin: PINNED_T3, logger, now });
+      runtime = new T3ManagedRuntime({ settings: t3Config.managed, installed, logger, now });
       await runtime.start();
     }
-    const server = await inspectT3(t3);
+    const server = await inspectT3(t3Config);
     validateConfiguredProviders(input.config, server);
     for (const record of allowedModelLogRecords(input.config, server, now().toISOString())) logger(record);
     const gate = new T3RuntimeGate({
-      baseUrl: t3.baseUrl,
+      baseUrl: t3Config.baseUrl,
       ...(runtime === undefined ? {} : { pinnedVersion: PINNED_T3.version }),
       logger,
       now,
     });
-    if (!(await gate.check())) throw new Error(`refusing to run against T3 at ${t3.baseUrl}: ${gate.reason}`);
+    if (!(await gate.check())) throw new Error(`refusing to run against T3 at ${t3Config.baseUrl}: ${gate.reason}`);
     // Every supervisor ready (start or restart) re-checks the gate; a restart closes it as unreachable first.
     runtime?.onStateChange((state) => {
       if (state === "ready" || state === "restarting") void gate.check();
     });
     const bridge = await SlackSocketBridge.create({ config: input.config, store, logger });
     let nextMemoryExpiryAt = 0;
+    let nextT3StatsAt = now().getTime() + 60_000;
     const coordinators = Array.from(
       { length: input.config.limits.maxConcurrentTasks },
-      () => new AgentTagCoordinator({ config: input.config, store, slackContext: bridge.contextSource }),
+      () =>
+        new AgentTagCoordinator({
+          config: input.config,
+          store,
+          slackContext: bridge.contextSource,
+          t3,
+          ...(watcher === undefined ? {} : { watcher }),
+        }),
     );
     const service = new AgentTagService({
       store,
       bridge,
       coordinators,
-      interactionWorkers: [new InteractionWorker({ store, config: input.config, t3Config: input.config.t3 })],
+      interactionWorkers: [new InteractionWorker({ store, config: input.config, t3 })],
       scheduleWorkers: createScheduleWorkers({ config: input.config, store }),
       maintenanceWorkers: [
         {
@@ -337,8 +374,23 @@ export async function createAgentTagService(input: {
           },
         },
         createRetentionWorker({ databasePath, policy: input.config.retention, now }),
+        {
+          processNext: async () => {
+            const current = now();
+            if (current.getTime() < nextT3StatsAt) return { kind: "idle" };
+            nextT3StatsAt = current.getTime() + 60_000;
+            logger({
+              level: "info",
+              event: "t3.connection.stats",
+              at: current.toISOString(),
+              stats: { ...t3.stats, watchedThreads: watcher?.subscriptionCount ?? 0 },
+            });
+            return { kind: "idle" };
+          },
+        },
         createT3GateWorker({ gate, now }),
       ],
+      resources: [{ close: closeT3 }],
       logger,
       now,
       gate,
@@ -354,6 +406,7 @@ export async function createAgentTagService(input: {
     }
     return service;
   } catch (error) {
+    await closeT3();
     await runtime?.stop().catch(() => undefined);
     store.close();
     throw error;

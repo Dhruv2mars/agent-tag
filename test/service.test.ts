@@ -278,6 +278,65 @@ describe("Agent Tag service", () => {
       }
     });
   });
+
+  test("closes shared resources after its loops stop, before a stop that never started, and when start fails", async () => {
+    const bridge = (start: () => Promise<void> = async () => {}): ServiceSlackBridge => ({
+      start,
+      stop: async () => {},
+      deliverNextOutbox: async () => ({ kind: "idle" }),
+    });
+    const idle: ServiceWorker = { processNext: async () => ({ kind: "idle" }) };
+    await withStore(async (store) => {
+      const events: string[] = [];
+      const service = new AgentTagService({
+        store,
+        bridge: bridge(),
+        coordinators: [
+          {
+            processNext: async (signal) => {
+              await new Promise((resolve) => signal?.addEventListener("abort", resolve, { once: true }));
+              events.push("loop-stopped");
+              return { kind: "idle" };
+            },
+          },
+        ],
+        interactionWorkers: [idle],
+        resources: [
+          { close: async () => void events.push("closed") },
+          { close: async () => Promise.reject(new Error("close-canary")) },
+        ],
+        idleMs: 1,
+        logger: () => undefined,
+      });
+      await service.start();
+      await service.stop();
+      expect(events).toEqual(["loop-stopped", "closed"]);
+    });
+    await withStore(async (store) => {
+      let closed = 0;
+      const service = new AgentTagService({
+        store,
+        bridge: bridge(),
+        coordinators: [idle],
+        interactionWorkers: [idle],
+        resources: [{ close: async () => void (closed += 1) }] });
+      await service.stop();
+      await service.stop();
+      expect(closed).toBe(1);
+    });
+    await withStore(async (store) => {
+      let closed = 0;
+      const service = new AgentTagService({
+        store,
+        bridge: bridge(async () => Promise.reject(new Error("slack down"))),
+        coordinators: [idle],
+        interactionWorkers: [idle],
+        resources: [{ close: async () => void (closed += 1) }],
+      });
+      await expect(service.start()).rejects.toThrow("slack down");
+      expect(closed).toBe(1);
+    });
+  });
 });
 
 describe("startup model report", () => {
