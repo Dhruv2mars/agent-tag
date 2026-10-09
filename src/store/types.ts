@@ -309,3 +309,20 @@ export type ScheduleRunOutcome = "succeeded" | "failed" | "cancelled" | "skipped
 export type AmbientDecision =
   | { readonly kind: "triggered" }
   | { readonly kind: "quiet"; readonly reason: "unchanged" | "cooldown" | "hourly-limit" };
+
+/** A bot, non-allowlisted or edit update in a bound thread, shown on the next human turn. */
+export interface ThreadNote {
+  readonly noteId: string;
+  readonly kind: "message" | "edit";
+  readonly speakerKind: "human" | "bot";
+  /** A user ID for humans, a bot ID for bots. */
+  readonly speakerId: string;
+  /** Bots only: `bot_profile.name ?? username`, unsanitized. */
+  readonly speakerLabel: string | null;
+  readonly steeringAllowed: boolean;
+  readonly messageTs: string;
+  /** Raw Slack markup, capped on insert. For edits, the text after the edit. */
+  readonly text: string;
+  /** Edits only: the text before the edit; null when it is unknown. */
+  readonly previousText: string | null;
+}

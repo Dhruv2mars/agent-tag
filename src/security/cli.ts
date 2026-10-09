@@ -77,7 +77,7 @@ export async function runSecurityCli(argv: ReadonlyArray<string>): Promise<numbe
       if (!(await Bun.file(databasePath).exists())) {
         const cutoffs = retentionCutoffs(config.retention, now);
         const empty = { dryRun, cutoffs, auditDeleted: 0, outboxRedacted: 0, eventsRedacted: 0, operationsRedacted: 0,
-          schedulesRedacted: 0 };
+          schedulesRedacted: 0, notesRedacted: 0, notesDeleted: 0 };
         console.log(JSON.stringify({ retentionConfigured, storeExists: false, ...empty }, null, 2));
         return 0;
       }

@@ -21,6 +21,28 @@ const authTestSchema = z.object({
   bot_id: z.string().min(1).optional(),
 });
 
+const usersInfoBotSchema = z.object({
+  user: z.object({ profile: z.object({ bot_id: z.string().min(1).optional() }).optional() }),
+});
+
+/**
+ * Agent Tag's own bot ID, used to drop its own posts and edits. `auth.test` documents `bot_id`
+ * for bot tokens; when it is absent, `users.info` on the bot user carries it in `profile.bot_id`.
+ * A failed lookup (for example a token without `users:read`) leaves only the user-ID filter.
+ */
+export async function resolveSelfBotId(
+  auth: { readonly user_id: string; readonly bot_id?: string | undefined },
+  usersInfo: (user: string) => Promise<unknown>,
+): Promise<string | undefined> {
+  if (auth.bot_id !== undefined) return auth.bot_id;
+  try {
+    const parsed = usersInfoBotSchema.safeParse(await usersInfo(auth.user_id));
+    return parsed.success ? parsed.data.user.profile?.bot_id : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /**
  * Web API client options. The outbox owns retries: it classifies each failure and requeues
  * known-not-delivered sends with durable backoff (see outbox-policy.ts). SDK-level retries could
@@ -145,10 +167,12 @@ export class SlackSocketBridge {
         `Slack bot belongs to workspace ${auth.team_id}, expected ${input.config.slack.workspaceId}`,
       );
     }
+    const selfBotId = await resolveSelfBotId(auth, (user) => app.client.users.info({ user }));
     const router = new SlackEventRouter({
       config: input.config,
       store: input.store,
       botUserId: auth.user_id,
+      ...(selfBotId === undefined ? {} : { selfBotId }),
     });
     const actions = new SlackActionRouter({ config: input.config, store: input.store });
     app.event("app_mention", async ({ body }) => {
@@ -182,7 +206,7 @@ export class SlackSocketBridge {
     const replies = await createSlackRepliesReader({ botToken: botToken.exposeToBoundary() });
     const contextSource: SlackContextSource = {
       botUserId: auth.user_id,
-      ...(auth.bot_id === undefined ? {} : { selfBotId: auth.bot_id }),
+      ...(selfBotId === undefined ? {} : { selfBotId }),
       users,
       replies,
     };

@@ -521,6 +521,8 @@ export class AgentTagCoordinator {
     if (frozen !== null) return frozen;
     const { actorUserId, text, origin } = operation.payload;
     const window = await this.#readThreadWindow(operation, profile, signal);
+    // Updates since the last turn are context for the next human turn; schedule runs leave them pending.
+    const notes = origin === "slack" ? this.#store.listPendingThreadNotes(operation.taskId) : [];
     const memories = this.#memory.list({
       context: {
         workspaceId: this.#config.slack.workspaceId,
@@ -539,7 +541,12 @@ export class AgentTagCoordinator {
         ...(message.speakerKind === "human" ? [message.speakerId] : []),
         ...collectMentionedUserIds(message.text),
       ]);
-    const ids = [...new Set([actorUserId, ...mentioned, ...windowIds])]
+    const noteIds = notes.flatMap((note) => [
+      ...(note.speakerKind === "human" ? [note.speakerId] : []),
+      ...collectMentionedUserIds(note.text),
+      ...collectMentionedUserIds(note.previousText ?? ""),
+    ]);
+    const ids = [...new Set([actorUserId, ...mentioned, ...windowIds, ...noteIds])]
       .filter((id) => id !== this.#slackContext?.botUserId)
       .slice(0, MAX_TURN_SPEAKER_IDS);
     let names: ReadonlyMap<string, SpeakerIdentity> = new Map();
@@ -558,10 +565,20 @@ export class AgentTagCoordinator {
       names,
       ...(this.#slackContext === undefined ? {} : { botUserId: this.#slackContext.botUserId }),
       window,
-      notes: [],
+      notes: notes.length === 0
+        ? null
+        : {
+          items: notes,
+          limits: { maxChars: profile.threadContext.maxChars, maxMessageChars: profile.threadContext.maxMessageChars },
+        },
       memories,
     });
-    return this.#store.resolveOperationTurnText({ ...lease, proposedText, now: this.#now().toISOString() });
+    return this.#store.resolveOperationTurnText({
+      ...lease,
+      proposedText,
+      consumeNoteIds: notes.map((note) => note.noteId),
+      now: this.#now().toISOString(),
+    });
   }
 
   /**
