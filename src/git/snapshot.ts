@@ -378,10 +378,12 @@ async function scanDelta(
   record(scanTextForSecrets(historyAdded.text), (line) => historyAdded.paths[line - 1] ?? "");
 
   // Messages and identities of every new commit; a cut output fails rather than scanning a prefix.
+  // `--encoding=none`: repository config (`i18n.logOutputEncoding`) must not re-encode them past the
+  // scanner, so the stored bytes are scanned.
   const messages = await mustRun(
     input,
     root,
-    ["log", "--format=%an%n%ae%n%cn%n%ce%n%B", "--no-show-signature", `${from}..${sha}`],
+    ["log", "--encoding=none", "--format=%an%n%ae%n%cn%n%ce%n%B", "--no-show-signature", `${from}..${sha}`],
     "log",
     { requireCompleteOutput: true },
   );

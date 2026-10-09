@@ -372,6 +372,20 @@ describe("prSnapshot", () => {
     });
   });
 
+  test("repository log encoding config cannot re-encode a commit message past the scan", async () => {
+    await withTempDir("pr-snapshot-log-encoding", async (directory) => {
+      const repo = await createSourceRepo(directory);
+      await Bun.write(join(repo.worktree, "notes.txt"), "notes\n");
+      git(repo.worktree, "add", "-A");
+      git(repo.worktree, "commit", "--quiet", "-m", `notes\n\n${slackShapedToken()}`);
+      git(repo.worktree, "config", "i18n.logOutputEncoding", "UTF-16");
+
+      const result = await prSnapshot(snapshotInput(repo));
+      expect(result).toMatchObject({ kind: "blocked", detail: { reason: "secret", paths: ["commit message"] } });
+      expect(await exists(mirrorPathFor(repo.gitRoot, "octo/example"))).toBe(false);
+    });
+  });
+
   test("scans history the fetch transfers even when info/grafts hides a commit", async () => {
     await withTempDir("pr-snapshot-grafts", async (directory) => {
       const repo = await createSourceRepo(directory);
