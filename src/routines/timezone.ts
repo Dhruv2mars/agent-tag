@@ -171,10 +171,12 @@ function timingSpan(stripped: string): TimingSpan | null {
   if (split.kind !== "ok") return null;
   const all = words(stripped);
   const timing = words(split.timing);
-  // The parser takes the timing from the start ("every day at 9am …") or the end ("… every day at 9am").
-  const matches = (at: number): boolean => timing.every((word, offset) => all[at + offset] === word);
-  const start = matches(0) ? 0 : all.length - timing.length;
-  if (start < 0 || !matches(start)) return null;
+  // The parser takes the timing from the start ("every day at 9am …"), the end ("… every day at
+  // 9am"), or right after a lead it strips ("remind me every day at 9am …", "routine: daily …").
+  const matches = (at: number): boolean => at >= 0 && timing.every((word, offset) => all[at + offset] === word);
+  const last = all.length - timing.length;
+  const start = matches(0) ? 0 : matches(last) ? last : all.findIndex((_, at) => matches(at));
+  if (start < 0) return null;
   return { start, end: start + timing.length, words: all };
 }
 

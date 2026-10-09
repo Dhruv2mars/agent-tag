@@ -40,6 +40,8 @@ describe("extractTimeZone", () => {
     // Zones in the task text stay there; only the timing's zone counts.
     ["every day at 9am ET check the 10am PT incident", "every day at 9am check the 10am PT incident", "America/New_York"],
     ["check the 10am PT incident every day at 9am ET", "check the 10am PT incident every day at 9am", "America/New_York"],
+    ["remind me every day at 9am ET to check the 10am PT incident", "remind me every day at 9am to check the 10am PT incident", "America/New_York"],
+    ["schedule tomorrow at 9am PT: review the noon UTC report", "schedule tomorrow at 9am: review the noon UTC report", "America/Los_Angeles"],
   ])("%s", (input, text, explicit) => {
     expect(extractTimeZone(input)).toEqual({ kind: "ok", text, explicit });
   });
@@ -58,6 +60,9 @@ describe("extractTimeZone", () => {
     "every day at 9am check the 9am PT incident",
     "every day at 9am review the noon UTC report",
     "every day at 9am compare 9am ET with 9am PT",
+    "remind me every day at 9am to check the 10am PT incident",
+    "routine: every day at 9am check the 10am PT incident",
+    "schedule tomorrow at 9am: review the noon UTC report",
   ])("keeps %j as task text", (input) => {
     expect(extractTimeZone(input)).toEqual({ kind: "ok", text: input });
   });
@@ -198,6 +203,14 @@ describe("resolveRoutineSchedule", () => {
     ).toMatchObject({ kind: "ok", task: "check the 10am PT incident", timeZone: "America/New_York", timeZoneSource: "explicit" });
     expect(
       resolveRoutineSchedule({ text: "every day at 9am check the 10am PT incident", now: NOW, profileTimeZone: "Asia/Tokyo" }),
+    ).toMatchObject({ kind: "ok", task: "check the 10am PT incident", timeZone: "Asia/Tokyo", timeZoneSource: "profile" });
+    expect(
+      resolveRoutineSchedule({
+        text: "remind me every day at 9am to check the 10am PT incident",
+        now: NOW,
+        actorUserId: "U1",
+        profileTimeZone: "Asia/Tokyo",
+      }),
     ).toMatchObject({ kind: "ok", task: "check the 10am PT incident", timeZone: "Asia/Tokyo", timeZoneSource: "profile" });
   });
 
