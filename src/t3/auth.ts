@@ -58,6 +58,18 @@ export class T3HttpError extends Error {
   }
 }
 
+/**
+ * `GET /api/auth/session` answers HTTP 200 `{authenticated:false}` for a revoked or expired bearer
+ * (confirmed live on 0.0.45), so that answer is a credential rejection like a 401.
+ */
+export class T3UnauthenticatedSessionError extends T3HttpError {
+  constructor() {
+    super("session", 401);
+    this.name = "T3UnauthenticatedSessionError";
+    this.message = "T3 session endpoint reports the token is not authenticated (revoked or expired)";
+  }
+}
+
 /** True when T3 answered and refused the credential itself (as opposed to being unreachable). */
 export function isT3CredentialRejection(error: unknown): error is T3HttpError {
   return error instanceof T3HttpError && (error.status === 401 || error.status === 403);
@@ -82,7 +94,11 @@ export async function inspectT3Session(input: {
     ...(input.signal === undefined ? {} : { signal: input.signal }),
   });
   if (!response.ok) throw new T3HttpError("session", response.status);
-  return sessionSchema.parse(await parseJson(response));
+  const body = await parseJson(response);
+  if (typeof body === "object" && body !== null && (body as { authenticated?: unknown }).authenticated === false) {
+    throw new T3UnauthenticatedSessionError();
+  }
+  return sessionSchema.parse(body);
 }
 
 export function assertRestrictedOrchestrationSession(session: T3Session): void {
@@ -172,4 +188,53 @@ export async function expectAdministrativeAccessDenied(input: {
   if (response.status !== 403) {
     throw new Error(`expected T3 administrative endpoint to deny access, received ${response.status}`);
   }
+}
+
+const authClientSchema = z
+  .object({
+    sessionId: z.string().min(1),
+    scopes: z.array(z.string()).optional(),
+    expiresAt: z.string().optional(),
+    current: z.boolean().optional(),
+    client: z.object({ label: z.string().optional() }).loose().optional(),
+  })
+  .loose();
+
+export type T3AuthClient = z.infer<typeof authClientSchema>;
+
+/**
+ * `GET /api/auth/clients` with an administrative bearer. Live 0.0.45 returns a JSON array of
+ * `{sessionId, subject, scopes, client: {label, …}, issuedAt, expiresAt, current, …}`; any other
+ * shape is reported as `undefined` so callers can skip revocation instead of guessing.
+ */
+export async function listT3AuthClients(input: {
+  readonly baseUrl: string;
+  readonly administrativeToken: SecretString;
+  readonly signal?: AbortSignal;
+}): Promise<ReadonlyArray<T3AuthClient> | undefined> {
+  const response = await fetch(new URL("/api/auth/clients", input.baseUrl), {
+    headers: bearerHeaders(input.administrativeToken),
+    ...(input.signal === undefined ? {} : { signal: input.signal }),
+  });
+  if (!response.ok) throw new T3HttpError("clients", response.status);
+  const parsed = z.array(authClientSchema).safeParse(await parseJson(response).catch(() => undefined));
+  return parsed.success ? parsed.data : undefined;
+}
+
+/** `POST /api/auth/clients/revoke {sessionId}`; live 0.0.45 answers `{revoked: true}`. */
+export async function revokeT3AuthClient(input: {
+  readonly baseUrl: string;
+  readonly administrativeToken: SecretString;
+  readonly sessionId: string;
+  readonly signal?: AbortSignal;
+}): Promise<boolean> {
+  const response = await fetch(new URL("/api/auth/clients/revoke", input.baseUrl), {
+    method: "POST",
+    headers: { ...bearerHeaders(input.administrativeToken), "content-type": "application/json" },
+    body: JSON.stringify({ sessionId: input.sessionId }),
+    ...(input.signal === undefined ? {} : { signal: input.signal }),
+  });
+  if (!response.ok) throw new T3HttpError("clients/revoke", response.status);
+  const body: unknown = await parseJson(response).catch(() => undefined);
+  return z.object({ revoked: z.literal(true) }).loose().safeParse(body).success;
 }

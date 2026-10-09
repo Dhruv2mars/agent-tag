@@ -1,5 +1,6 @@
-import { open, stat } from "node:fs/promises";
-import { dirname } from "node:path";
+import { randomBytes } from "node:crypto";
+import { open, rename, rm, stat } from "node:fs/promises";
+import { basename, dirname, join } from "node:path";
 
 export class SecretString {
   readonly #value: string;
@@ -59,5 +60,38 @@ export async function createSecretFile(input: {
     await file.sync();
   } finally {
     await file.close();
+  }
+}
+
+/**
+ * Atomically replaces (or creates) a secret file: a 0600 temp file in the same private directory is
+ * written and fsynced, then renamed over `path`, so a concurrent reader sees the old or the new full
+ * secret, never a partial one.
+ */
+export async function replaceSecretFile(input: {
+  readonly path: string;
+  readonly secret: SecretString;
+}): Promise<void> {
+  const directory = dirname(input.path);
+  await assertPrivateDirectory(directory);
+  const temporary = join(directory, `.${basename(input.path)}.${randomBytes(6).toString("hex")}.tmp`);
+  const file = await open(temporary, "wx", 0o600);
+  try {
+    try {
+      await file.writeFile(`${input.secret.exposeToBoundary()}\n`, { encoding: "utf8" });
+      await file.sync();
+    } finally {
+      await file.close();
+    }
+    await rename(temporary, input.path);
+  } catch (error) {
+    await rm(temporary, { force: true });
+    throw error;
+  }
+  const handle = await open(directory, "r");
+  try {
+    await handle.sync();
+  } finally {
+    await handle.close();
   }
 }

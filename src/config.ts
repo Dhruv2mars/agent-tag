@@ -250,6 +250,17 @@ const managedT3Schema = z.object({
   runtimeDir: absolutePath.optional(),
   autoInstall: z.boolean().default(true),
   watch: t3WatchSchema,
+  /**
+   * Restricted-token rotation: rotate when fewer than `rotateBeforeDays` remain (tokens live 30 days),
+   * and revoke the replaced token `revokeGraceMinutes` later so in-flight turns finish on it.
+   */
+  rotation: z
+    .object({
+      rotateBeforeDays: z.number().int().min(1).max(25).default(7),
+      revokeGraceMinutes: z.number().int().min(1).max(1_440).default(15),
+    })
+    .strict()
+    .default({ rotateBeforeDays: 7, revokeGraceMinutes: 15 }),
   /** Mirror for the pinned release assets; https only (http only on loopback). */
   downloadBaseUrl: z
     .string()
@@ -273,6 +284,12 @@ export interface ResolvedManagedT3 {
   readonly runtimeDir: string;
   readonly autoInstall: boolean;
   readonly downloadBaseUrl?: string;
+  readonly rotation: T3RotationConfig;
+}
+
+export interface T3RotationConfig {
+  readonly rotateBeforeDays: number;
+  readonly revokeGraceMinutes: number;
 }
 
 /**
@@ -303,6 +320,7 @@ function resolveManagedT3(t3: z.infer<typeof managedT3Schema>, dataDir: string):
     homeDir: t3.homeDir ?? join(dataDir, "t3", "home"),
     runtimeDir: t3.runtimeDir ?? join(dataDir, "t3", "runtime"),
     autoInstall: t3.autoInstall,
+    rotation: t3.rotation,
     ...(t3.downloadBaseUrl === undefined ? {} : { downloadBaseUrl: t3.downloadBaseUrl }),
   };
 }

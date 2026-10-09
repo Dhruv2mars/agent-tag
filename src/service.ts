@@ -53,7 +53,7 @@ export interface ServiceSlackBridge {
 }
 
 export interface ServiceLogRecord {
-  readonly level: "info" | "warn";
+  readonly level: "info" | "warn" | "error";
   readonly event: string;
   readonly at: string;
   readonly worker?: string;
@@ -106,7 +106,7 @@ function waitUntilWorkOrStop(milliseconds: number, signal: AbortSignal): Promise
 }
 
 function defaultLogger(record: ServiceLogRecord): void {
-  const target = record.level === "warn" ? console.error : console.log;
+  const target = record.level === "info" ? console.log : console.error;
   target(JSON.stringify(record));
 }
 

@@ -372,6 +372,7 @@ describe("t3 config", () => {
         homeDir: "/var/lib/agent-tag/t3/home",
         runtimeDir: "/var/lib/agent-tag/t3/runtime",
         autoInstall: true,
+        rotation: { rotateBeforeDays: 7, revokeGraceMinutes: 15 },
       },
     });
     expect(managedOf(t3)).not.toHaveProperty("downloadBaseUrl");
@@ -392,6 +393,7 @@ describe("t3 config", () => {
       homeDir: "/srv/t3/home",
       runtimeDir: "/srv/t3/runtime",
       autoInstall: true,
+      rotation: { rotateBeforeDays: 7, revokeGraceMinutes: 15 },
     });
   });
 
