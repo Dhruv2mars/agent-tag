@@ -9,7 +9,7 @@ import packageJson from "../package.json" with { type: "json" };
 import t3Lock from "../t3.lock.json" with { type: "json" };
 
 import { type AgentTagConfig, agentTagConfigSchema } from "./config.ts";
-import { validateConfiguredProviders } from "./policy/provider.ts";
+import { type AllowedModelReport, reportAllowedModels, validateConfiguredProviders } from "./policy/provider.ts";
 import { SecretString } from "./security/secret-file.ts";
 import type { ServiceManager } from "./service-manager.ts";
 import { describeInstalledProgram } from "./service-unit.ts";
@@ -43,6 +43,8 @@ export interface DoctorReport {
   readonly ok: boolean;
   readonly configPath: string;
   readonly checks: readonly DoctorCheck[];
+  /** Every model each profile may run, with whether T3 can run it (`unchecked` when T3 was not inspected). */
+  readonly models: readonly AllowedModelReport[];
 }
 
 export interface DoctorDependencies {
@@ -464,17 +466,50 @@ export async function checkT3Providers(
   config: AgentTagConfig,
   dependencies: Pick<DoctorDependencies, "inspectT3">,
 ): Promise<DoctorCheck> {
+  return (await inspectT3Providers(config, dependencies)).check;
+}
+
+/** Validates profile and route defaults strictly, and returns the catalog for the allowed-model report. */
+async function inspectT3Providers(
+  config: AgentTagConfig,
+  dependencies: Pick<DoctorDependencies, "inspectT3">,
+): Promise<{ readonly check: DoctorCheck; readonly server: T3ServerInfo | null }> {
+  let server: T3ServerInfo;
   try {
-    const server = await dependencies.inspectT3(config.t3);
+    server = await dependencies.inspectT3(config.t3);
+  } catch (error) {
+    return { check: { id: "t3-providers", status: "fail", summary: errorMessage(error), hint: PROVIDER_HINT }, server: null };
+  }
+  try {
     const selections = validateConfiguredProviders(config, server);
     return {
-      id: "t3-providers",
-      status: "pass",
-      summary: selections.map((selection) => `${selection.profileId}: ${selection.instanceId}/${selection.model}`).join(", "),
+      check: {
+        id: "t3-providers",
+        status: "pass",
+        summary: selections.map((selection) => `${selection.profileId}: ${selection.instanceId}/${selection.model}`).join(", "),
+      },
+      server,
     };
   } catch (error) {
-    return { id: "t3-providers", status: "fail", summary: errorMessage(error), hint: "authenticate the provider in T3 or change the profile's provider/model" };
+    return { check: { id: "t3-providers", status: "fail", summary: errorMessage(error), hint: PROVIDER_HINT }, server };
   }
+}
+
+const PROVIDER_HINT = "authenticate the provider in T3 or change the profile's provider/model";
+
+/** Allowed models T3 cannot run only warn: a request for one is refused, and defaults are checked by t3-providers. */
+export function checkAllowedModels(models: readonly AllowedModelReport[]): DoctorCheck {
+  const unavailable = models.filter((entry) => entry.status !== "available");
+  const name = (entry: AllowedModelReport): string => `${entry.profileId}: ${entry.instanceId}/${entry.model}`;
+  if (unavailable.length === 0) {
+    return { id: "t3-models", status: "pass", summary: `${models.length} model(s) available` };
+  }
+  return {
+    id: "t3-models",
+    status: "warn",
+    summary: unavailable.map((entry) => `${name(entry)} (${entry.status})`).join(", "),
+    hint: "switching a thread to these models is refused until T3 can run them; fix the provider in T3 or remove the allowedModels entry",
+  };
 }
 
 async function slackCall(
@@ -613,10 +648,12 @@ export async function runDoctor(input: {
   const configPath = resolve(input.configPath);
   const { dependencies, fix } = input;
   const checks: DoctorCheck[] = [];
+  let models: readonly AllowedModelReport[] = [];
   const finish = (): DoctorReport => ({
     ok: checks.every((check) => check.status !== "fail"),
     configPath,
     checks,
+    models,
   });
 
   checks.push(checkBunVersion(dependencies));
@@ -648,21 +685,32 @@ export async function runDoctor(input: {
   // Authenticated checks send the T3 token, so they run only against a server whose environment check
   // passed (or warned that it predates the endpoint, which implies protocol 1). A server speaking another
   // protocol or publishing an unrecognized descriptor is reachable but must never receive the token.
+  const skipT3 = (reason: string, session = true): void => {
+    if (session) checks.push(skipped("t3-session", reason));
+    checks.push(skipped("t3-providers", reason), skipped("t3-models", reason));
+  };
+  models = reportAllowedModels(config, null);
   if (!environment.reachable) {
-    checks.push(skipped("t3-session", "T3 is not reachable"), skipped("t3-providers", "T3 is not reachable"));
+    skipT3("T3 is not reachable");
   } else if (environment.check.status === "fail") {
-    const reason = "T3 environment check failed; the token is not sent to an incompatible server";
-    checks.push(skipped("t3-session", reason), skipped("t3-providers", reason));
+    skipT3("T3 environment check failed; the token is not sent to an incompatible server");
   } else if (t3Token === undefined) {
-    checks.push(skipped("t3-session", "T3 token is not usable"), skipped("t3-providers", "T3 token is not usable"));
+    skipT3("T3 token is not usable");
   } else {
     const session = await checkT3Session(config, t3Token, dependencies);
     checks.push(session);
-    checks.push(
-      session.status === "fail"
-        ? skipped("t3-providers", "T3 token was rejected")
-        : await checkT3Providers(config, dependencies),
-    );
+    if (session.status === "fail") {
+      skipT3("T3 token was rejected", false);
+    } else {
+      const providers = await inspectT3Providers(config, dependencies);
+      checks.push(providers.check);
+      if (providers.server === null) {
+        checks.push(skipped("t3-models", "T3 provider catalog is not readable"));
+      } else {
+        models = reportAllowedModels(config, providers.server);
+        checks.push(checkAllowedModels(models));
+      }
+    }
   }
 
   const botToken = secrets.get("secret:slack-bot-token");

@@ -278,6 +278,8 @@ describe("Slack event ingress", () => {
       });
       expect(claimed?.payload).toMatchObject({
         text: "investigate this",
+        messageTs: "1000.000001",
+        origin: "slack",
         actorUserId: "U1",
         profileId: "engineering",
         repositoryRoot: "/srv/repos/example",

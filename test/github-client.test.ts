@@ -379,7 +379,7 @@ describe("GitHub PAT credentials", () => {
   });
 
   test("builds PAT credentials from config", async () => {
-    const config = agentTagConfigSchema.shape.github.unwrap().parse({ auth: { type: "token", tokenFile: "/secrets/github-token" } });
+    const config = agentTagConfigSchema.in.shape.github.unwrap().parse({ auth: { type: "token", tokenFile: "/secrets/github-token" } });
     const read: string[] = [];
     const credentials = githubCredentialsFromConfig(config, async (path) => {
       read.push(path);

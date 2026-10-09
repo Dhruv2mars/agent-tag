@@ -40,7 +40,10 @@ test("the checked-in Slack manifest is the least-privilege runtime contract", as
     "chat:write",
     "groups:history",
     "im:history",
+    "users:read",
   ]);
+  // Least privilege: names only, never email addresses.
+  expect(manifest.oauth_config.scopes.bot).not.toContain("users:read.email");
   expect(manifest.settings.event_subscriptions.bot_events).toEqual([
     "app_mention",
     "message.channels",

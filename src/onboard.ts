@@ -56,7 +56,7 @@ export interface OnboardDependencies {
   readonly runCommand: CommandRunner;
   /** Exchanges an administrative T3 token for a restricted orchestration token and verifies it. */
   readonly enrollT3: (input: { readonly baseUrl: string; readonly administrativeToken: SecretString }) => Promise<SecretString>;
-  readonly listT3Providers: (t3: AgentTagConfig["t3"]) => Promise<T3ServerInfo>;
+  readonly listT3Providers: (t3: Pick<AgentTagConfig["t3"], "baseUrl" | "tokenFile">) => Promise<T3ServerInfo>;
   /** Undefined when this platform has no supported service manager. */
   readonly installService: ((configPath: string) => Promise<ServiceStatusReport>) | undefined;
   /** Parsed `config/agent-tag.example.json`; supplies profile, memory, and limit defaults. */
@@ -210,8 +210,10 @@ export interface OnboardAnswers {
 /** Builds a config from the example template plus answers; throws with readable issues when invalid. */
 export function buildOnboardConfig(template: unknown, answers: OnboardAnswers): { readonly config: AgentTagConfig; readonly json: string } {
   const base = agentTagConfigSchema.parse(template);
-  const baseProfile = base.profiles[0];
-  if (baseProfile === undefined) throw new Error("config template has no profile");
+  const templateProfile = base.profiles[0];
+  if (templateProfile === undefined) throw new Error("config template has no profile");
+  // Model policy keys keep their schema defaults rather than being written out; the wizard does not ask about them.
+  const { allowedModels: _allowedModels, modelSwitch: _modelSwitch, ...baseProfile } = templateProfile;
   const candidate = {
     version: 1,
     dataDir: answers.paths.dataDir,
@@ -532,7 +534,7 @@ interface ProviderDiscovery {
   readonly providerInstanceId?: string;
 }
 
-async function discoverProviders(context: Context, t3: AgentTagConfig["t3"]): Promise<ProviderDiscovery | undefined> {
+async function discoverProviders(context: Context, t3: Pick<AgentTagConfig["t3"], "baseUrl" | "tokenFile">): Promise<ProviderDiscovery | undefined> {
   const { deps } = context;
   try {
     const server = await deps.listT3Providers(t3);

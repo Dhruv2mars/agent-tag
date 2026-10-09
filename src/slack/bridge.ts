@@ -3,16 +3,21 @@ import { z } from "zod";
 
 import type { AgentTagConfig } from "../config.ts";
 import { readSecretFile } from "../security/secret-file.ts";
+import type { ServiceLogger } from "../service.ts";
 import type { AgentTagStore } from "../store/store.ts";
 import { SLACK_ACTION_IDS, SlackActionRouter, USER_INPUT_MODAL_CALLBACK_ID } from "./actions.ts";
+import type { SlackContextSource } from "./context-source.ts";
 import { SlackEventRouter } from "./events.ts";
 import { deliverNextSlackOutbox, type RefreshRenderers, type SlackOutboxOutcome } from "./outbox.ts";
 import { installUndiciWebSocketCompat } from "./undici-compat.ts";
+import { SlackUserDirectory } from "./users.ts";
 
 const authTestSchema = z.object({
   ok: z.literal(true),
   team_id: z.string().min(1),
   user_id: z.string().min(1),
+  /** Documented for bot tokens; absent on older or unusual installs. */
+  bot_id: z.string().min(1).optional(),
 });
 
 /**
@@ -28,6 +33,41 @@ export const SLACK_CLIENT_OPTIONS = {
   timeout: 20_000,
 } as const;
 
+/**
+ * Options for the separate client that serves speaker lookups (`users.info`). Lookups never share
+ * the outbox client's request queue: a slow or hung lookup holds a slot in its own small queue, so
+ * it cannot delay a `chat.postMessage` past the outbox lease. The timeout matches the directory's,
+ * so an abandoned lookup frees its slot about when the caller stops waiting for it.
+ */
+export const SLACK_LOOKUP_CLIENT_OPTIONS = {
+  retryConfig: { retries: 0 },
+  rejectRateLimitedCalls: true,
+  maxRequestConcurrency: 4,
+  timeout: 5_000,
+} as const;
+
+/** Builds the speaker directory on its own Web API client (see SLACK_LOOKUP_CLIENT_OPTIONS). */
+export async function createSlackUserDirectory(input: {
+  readonly botToken: string;
+  readonly logger?: ServiceLogger;
+  /** Tests point this at a local fake. */
+  readonly slackApiUrl?: string;
+}): Promise<SlackUserDirectory> {
+  const { LogLevel, webApi } = await import("@slack/bolt");
+  const client = new webApi.WebClient(input.botToken, {
+    ...SLACK_LOOKUP_CLIENT_OPTIONS,
+    retryConfig: { ...SLACK_LOOKUP_CLIENT_OPTIONS.retryConfig },
+    logLevel: LogLevel.WARN,
+    ...(input.slackApiUrl === undefined ? {} : { slackApiUrl: input.slackApiUrl }),
+  });
+  return new SlackUserDirectory({
+    lookup: (userId) => client.users.info({ user: userId }),
+    lookupTimeoutMs: SLACK_LOOKUP_CLIENT_OPTIONS.timeout,
+    maxOutstandingLookups: SLACK_LOOKUP_CLIENT_OPTIONS.maxRequestConcurrency * 2,
+    ...(input.logger === undefined ? {} : { logger: input.logger }),
+  });
+}
+
 /** Delivery-time renderers for outbox refresh rows. None yet: PR-I I2 and PR-F register theirs here. */
 const REFRESH_RENDERERS: RefreshRenderers = {};
 
@@ -36,16 +76,25 @@ export class SlackSocketBridge {
   readonly #store: AgentTagStore;
   readonly #config: AgentTagConfig;
   readonly #workerId = `slack-outbox-${crypto.randomUUID()}`;
+  /** Read-only Slack lookups for turn composition (speaker labels). */
+  readonly contextSource: SlackContextSource;
 
-  private constructor(app: SlackApp, store: AgentTagStore, config: AgentTagConfig) {
+  private constructor(
+    app: SlackApp,
+    store: AgentTagStore,
+    config: AgentTagConfig,
+    contextSource: SlackContextSource,
+  ) {
     this.#app = app;
     this.#store = store;
     this.#config = config;
+    this.contextSource = contextSource;
   }
 
   static async create(input: {
     readonly config: AgentTagConfig;
     readonly store: AgentTagStore;
+    readonly logger?: ServiceLogger;
   }): Promise<SlackSocketBridge> {
     installUndiciWebSocketCompat();
     const { App, LogLevel } = await import("@slack/bolt");
@@ -96,7 +145,16 @@ export class SlackSocketBridge {
         await ack();
       }
     });
-    return new SlackSocketBridge(app, input.store, input.config);
+    const users = await createSlackUserDirectory({
+      botToken: botToken.exposeToBoundary(),
+      ...(input.logger === undefined ? {} : { logger: input.logger }),
+    });
+    const contextSource: SlackContextSource = {
+      botUserId: auth.user_id,
+      ...(auth.bot_id === undefined ? {} : { selfBotId: auth.bot_id }),
+      users,
+    };
+    return new SlackSocketBridge(app, input.store, input.config, contextSource);
   }
 
   async start(): Promise<void> {

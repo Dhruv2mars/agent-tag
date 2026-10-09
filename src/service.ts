@@ -3,12 +3,15 @@ import { join } from "node:path";
 import type { AgentTagConfig } from "./config.ts";
 import { AgentTagCoordinator } from "./coordinator.ts";
 import { InteractionWorker } from "./interaction-worker.ts";
-import { validateConfiguredProviders } from "./policy/provider.ts";
+import { type AllowedModelReport, reportAllowedModels, validateConfiguredProviders } from "./policy/provider.ts";
 import { createScheduleWorkers } from "./scheduler.ts";
 import { SlackSocketBridge } from "./slack/bridge.ts";
 import { createRetentionWorker } from "./store/retention.ts";
 import { AgentTagStore } from "./store/store.ts";
-import { inspectT3 } from "./t3/gateway.ts";
+import { createT3GateWorker, T3RuntimeGate } from "./t3/gate.ts";
+import { inspectT3, type T3ServerInfo } from "./t3/gateway.ts";
+import { PINNED_T3 } from "./t3/lock.ts";
+import { prepareManagedT3Binary, T3ManagedRuntime } from "./t3/supervisor.ts";
 
 interface ServiceWorkerOutcome {
   readonly kind: string;
@@ -17,6 +20,22 @@ interface ServiceWorkerOutcome {
 export interface ServiceWorker {
   /** The signal aborts when the service stops; long-running work should release durable leases promptly. */
   readonly processNext: (signal: AbortSignal) => Promise<ServiceWorkerOutcome>;
+  /**
+   * Whether the worker talks to T3 and must sit out while the T3 gate is closed. Defaults to true
+   * for coordinators, interaction and schedule workers and to false for maintenance workers.
+   */
+  readonly requiresT3?: boolean;
+}
+
+/** Read-only view of the T3 gate (`src/t3/gate.ts`). */
+export interface ServiceT3Gate {
+  readonly open: boolean;
+}
+
+/** The managed T3 runtime, stopped after the workers and before the store. */
+export interface ServiceT3Runtime {
+  readonly stop: () => Promise<void>;
+  readonly onFatal: (listener: (error: Error) => void) => void;
 }
 
 export interface ServiceOutboxOutcome {
@@ -39,6 +58,11 @@ export interface ServiceLogRecord {
   readonly outcome?: string;
   readonly errorCode?: string;
   readonly count?: number;
+  /** Redacted, human-readable context (T3 runtime and gate events). */
+  readonly detail?: string;
+  readonly profileId?: string;
+  readonly instanceId?: string;
+  readonly model?: string;
 }
 
 export type ServiceLogger = (record: ServiceLogRecord) => void;
@@ -53,6 +77,10 @@ export interface AgentTagServiceOptions {
   readonly idleMs?: number;
   readonly logger?: ServiceLogger;
   readonly now?: () => Date;
+  /** When present, workers with `requiresT3` skip their turn while it is closed. */
+  readonly gate?: ServiceT3Gate;
+  /** Managed T3: stopped after the workers; its crash loop is reported through `onFatal`. */
+  readonly runtime?: ServiceT3Runtime;
 }
 
 function errorCode(error: unknown): string {
@@ -87,6 +115,8 @@ export class AgentTagService {
   readonly #idleMs: number;
   readonly #logger: ServiceLogger;
   readonly #now: () => Date;
+  readonly #gate: ServiceT3Gate | undefined;
+  readonly #runtime: ServiceT3Runtime | undefined;
   #controller: AbortController | null = null;
   #loops: ReadonlyArray<Promise<void>> = [];
   #state: "created" | "running" | "stopping" | "stopped" = "created";
@@ -105,6 +135,13 @@ export class AgentTagService {
     this.#idleMs = idleMs;
     this.#logger = options.logger ?? defaultLogger;
     this.#now = options.now ?? (() => new Date());
+    this.#gate = options.gate;
+    this.#runtime = options.runtime;
+  }
+
+  /** Called when the managed T3 runtime gives up (crash loop); the caller should stop and exit 75. */
+  onFatal(listener: (error: Error) => void): void {
+    this.#runtime?.onFatal(listener);
   }
 
   async start(): Promise<void> {
@@ -113,6 +150,7 @@ export class AgentTagService {
       await this.#bridge.start();
     } catch (error) {
       this.#state = "stopped";
+      await this.#stopRuntime();
       this.#store.close();
       throw error;
     }
@@ -121,16 +159,16 @@ export class AgentTagService {
     const signal = this.#controller.signal;
     this.#loops = [
       ...this.#coordinators.map((worker, index) =>
-        this.#runWorkerLoop(`coordinator-${index + 1}`, worker, signal),
+        this.#runWorkerLoop(`coordinator-${index + 1}`, worker, signal, worker.requiresT3 ?? true),
       ),
       ...this.#interactionWorkers.map((worker, index) =>
-        this.#runWorkerLoop(`interaction-${index + 1}`, worker, signal),
+        this.#runWorkerLoop(`interaction-${index + 1}`, worker, signal, worker.requiresT3 ?? true),
       ),
       ...this.#scheduleWorkers.map((worker, index) =>
-        this.#runWorkerLoop(`schedule-${index + 1}`, worker, signal),
+        this.#runWorkerLoop(`schedule-${index + 1}`, worker, signal, worker.requiresT3 ?? true),
       ),
       ...this.#maintenanceWorkers.map((worker, index) =>
-        this.#runWorkerLoop(`maintenance-${index + 1}`, worker, signal),
+        this.#runWorkerLoop(`maintenance-${index + 1}`, worker, signal, worker.requiresT3 ?? false),
       ),
       this.#runOutboxLoop(signal),
     ];
@@ -141,6 +179,7 @@ export class AgentTagService {
     if (this.#state === "stopped") return;
     if (this.#state === "created") {
       this.#state = "stopped";
+      await this.#stopRuntime();
       this.#store.close();
       return;
     }
@@ -156,13 +195,28 @@ export class AgentTagService {
         this.#log({ level: "warn", event: "service.stop.failed", errorCode: errorCode(result.reason) });
       }
     }
+    // Workers are stopped, so no T3 call is in flight when the managed runtime goes down.
+    await this.#stopRuntime();
     this.#store.close();
     this.#state = "stopped";
     this.#log({ level: "info", event: "service.stopped" });
   }
 
-  async #runWorkerLoop(name: string, worker: ServiceWorker, signal: AbortSignal): Promise<void> {
+  async #stopRuntime(): Promise<void> {
+    try {
+      await this.#runtime?.stop();
+    } catch (error) {
+      this.#log({ level: "warn", event: "service.stop.failed", errorCode: errorCode(error) });
+    }
+  }
+
+  async #runWorkerLoop(name: string, worker: ServiceWorker, signal: AbortSignal, requiresT3: boolean): Promise<void> {
     while (!signal.aborted) {
+      // Fail closed: a T3 worker does not claim work while the gate is closed; queued work waits in SQLite.
+      if (requiresT3 && this.#gate !== undefined && !this.#gate.open) {
+        await waitUntilWorkOrStop(this.#idleMs, signal);
+        continue;
+      }
       try {
         const outcome = await worker.processNext(signal);
         if (outcome.kind !== "idle") {
@@ -206,6 +260,28 @@ export class AgentTagService {
   }
 }
 
+/**
+ * One warning per allowed model T3 cannot run now. These never block startup: only profile and route
+ * defaults are validated strictly.
+ */
+export function allowedModelLogRecords(
+  config: AgentTagConfig,
+  server: T3ServerInfo,
+  at: string,
+): ReadonlyArray<ServiceLogRecord> {
+  return reportAllowedModels(config, server)
+    .filter((entry) => entry.status !== "available")
+    .map((entry) => ({
+      level: "warn",
+      event: "provider.allowed-model",
+      errorCode: entry.status,
+      profileId: entry.profileId,
+      instanceId: entry.instanceId,
+      model: entry.model,
+      at,
+    }));
+}
+
 export async function createAgentTagService(input: {
   readonly config: AgentTagConfig;
   readonly logger?: ServiceLogger;
@@ -216,13 +292,33 @@ export async function createAgentTagService(input: {
   const databasePath = join(input.config.dataDir, "agent-tag.sqlite");
   const store = await AgentTagStore.open(databasePath);
   const quarantined = store.quarantineExpiredOutbox(now().toISOString());
+  let runtime: T3ManagedRuntime | undefined;
   try {
-    validateConfiguredProviders(input.config, await inspectT3(input.config.t3));
-    const bridge = await SlackSocketBridge.create({ config: input.config, store });
+    const t3 = input.config.t3;
+    if (t3.mode === "managed") {
+      const installed = await prepareManagedT3Binary({ settings: t3.managed, pin: PINNED_T3, logger, now });
+      runtime = new T3ManagedRuntime({ settings: t3.managed, installed, logger, now });
+      await runtime.start();
+    }
+    const server = await inspectT3(t3);
+    validateConfiguredProviders(input.config, server);
+    for (const record of allowedModelLogRecords(input.config, server, now().toISOString())) logger(record);
+    const gate = new T3RuntimeGate({
+      baseUrl: t3.baseUrl,
+      ...(runtime === undefined ? {} : { pinnedVersion: PINNED_T3.version }),
+      logger,
+      now,
+    });
+    if (!(await gate.check())) throw new Error(`refusing to run against T3 at ${t3.baseUrl}: ${gate.reason}`);
+    // Every supervisor ready (start or restart) re-checks the gate; a restart closes it as unreachable first.
+    runtime?.onStateChange((state) => {
+      if (state === "ready" || state === "restarting") void gate.check();
+    });
+    const bridge = await SlackSocketBridge.create({ config: input.config, store, logger });
     let nextMemoryExpiryAt = 0;
     const coordinators = Array.from(
       { length: input.config.limits.maxConcurrentTasks },
-      () => new AgentTagCoordinator({ config: input.config, store }),
+      () => new AgentTagCoordinator({ config: input.config, store, slackContext: bridge.contextSource }),
     );
     const service = new AgentTagService({
       store,
@@ -241,9 +337,12 @@ export async function createAgentTagService(input: {
           },
         },
         createRetentionWorker({ databasePath, policy: input.config.retention, now }),
+        createT3GateWorker({ gate, now }),
       ],
       logger,
       now,
+      gate,
+      ...(runtime === undefined ? {} : { runtime }),
     });
     if (quarantined > 0) {
       logger({
@@ -255,6 +354,7 @@ export async function createAgentTagService(input: {
     }
     return service;
   } catch (error) {
+    await runtime?.stop().catch(() => undefined);
     store.close();
     throw error;
   }
@@ -270,6 +370,7 @@ export async function diagnoseAgentTag(config: AgentTagConfig): Promise<{
       readonly status: string;
       readonly authenticated: boolean;
     }>;
+    readonly models: ReadonlyArray<AllowedModelReport>;
   };
   readonly slack: { readonly authenticated: true };
 }> {
@@ -290,6 +391,7 @@ export async function diagnoseAgentTag(config: AgentTagConfig): Promise<{
           status: provider.status,
           authenticated: provider.auth.status === "authenticated",
         })),
+        models: reportAllowedModels(config, t3),
       },
       slack: { authenticated: true },
     };
