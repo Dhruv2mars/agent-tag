@@ -82,7 +82,7 @@ describe("T3 provider catalog and model selection", () => {
       threadId: "thread-1",
       modelSelection: { instanceId: "codex", model: "gpt-5.6-mini" },
     });
-    const valid = { type: "thread.meta.update", commandId: "c-1", threadId: "t-1", modelSelection: { instanceId: "codex", model: "m" } };
+    const valid = { type: "thread.meta.update", commandId: "c-1", threadId: "t-1", modelSelection: { instanceId: "codex", model: "m" } } as const;
     expect(t3CommandSchema.parse({ ...valid, title: "ignored" })).toEqual(valid);
     for (const invalid of [
       { ...valid, commandId: "" },

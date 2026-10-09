@@ -67,7 +67,10 @@ describe("allowed choices", () => {
   });
 
   test("an existing config allows only its default, labelled by slug", () => {
-    const legacy = agentTagConfigSchema.parse(example);
+    // The example config without the P2a keys, as an existing install has it.
+    const input = structuredClone(example) as Record<string, any>;
+    delete input.profiles[0].allowedModels;
+    const legacy = agentTagConfigSchema.parse(input);
     expect(allowedChoices(legacy.profiles[0]!, legacy.routes[0])).toEqual([
       { instanceId: "codex", model: "gpt-5.6-sol", label: "gpt-5.6-sol", aliases: [], source: "profile-default" },
     ]);

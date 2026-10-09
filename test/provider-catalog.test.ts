@@ -47,16 +47,16 @@ describe("ProviderCatalog", () => {
       onRefreshFailed: (error) => errors.push(error),
     });
     expect(await catalog.refresh()).toBe(true);
-    expect(catalog.current()?.environment.label).toBe("first");
+    expect(catalog.current()?.environment.environmentId).toBe("env-first");
     time.advance(1_000);
     expect(await catalog.refresh()).toBe(false);
     expect(errors.map((error) => (error as Error).message)).toEqual(["T3 down"]);
-    expect(catalog.current()?.environment.label).toBe("first");
+    expect(catalog.current()?.environment.environmentId).toBe("env-first");
     // The kept snapshot still ages from when it was read, not from the failed refresh.
     time.advance(PROVIDER_CATALOG_MAX_AGE_MS);
     expect(catalog.current()).toBeNull();
     expect(await catalog.refresh()).toBe(true);
-    expect(catalog.current()?.environment.label).toBe("third");
+    expect(catalog.current()?.environment.environmentId).toBe("env-third");
   });
 
   test("concurrent refreshes share one T3 read", async () => {
@@ -77,7 +77,7 @@ describe("ProviderCatalog", () => {
     expect(calls).toBe(2);
     release(info("later"));
     expect(await later).toBe(true);
-    expect(catalog.current()?.environment.label).toBe("later");
+    expect(catalog.current()?.environment.environmentId).toBe("env-later");
   });
 });
 
@@ -105,7 +105,7 @@ describe("provider catalog worker", () => {
     time.advance(1);
     await worker.processNext(signal);
     expect(reads).toBe(2);
-    expect(catalog.current()?.environment.label).toBe("read-2");
+    expect(catalog.current()?.environment.environmentId).toBe("env-read-2");
   });
 
   test("stays idle when a refresh fails", async () => {

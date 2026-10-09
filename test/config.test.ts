@@ -189,10 +189,14 @@ describe("Agent Tag config", () => {
       expect(agentTagConfigSchema.parse(JSON.parse(JSON.stringify(parsed)))).toEqual(parsed);
     });
 
-    test("the shipped example config still parses unchanged", async () => {
+    test("the shipped example config parses with its codex and claudeAgent allowlist entries", async () => {
       const example = await Bun.file(new URL("../config/agent-tag.example.json", import.meta.url)).json();
       const parsed = agentTagConfigSchema.parse(example);
-      expect(parsed.profiles.map((profile) => profile.allowedModels)).toEqual([[]]);
+      expect(parsed.profiles[0]!.allowedModels).toEqual([
+        { instanceId: "codex", model: "gpt-5.6-mini", label: "GPT-5.6 mini", aliases: ["mini"] },
+        { instanceId: "claudeAgent", model: "claude-opus-5-5", label: "Opus 5.5", aliases: ["opus"] },
+      ]);
+      expect(parsed.profiles[0]!.modelSwitch).toEqual({ enabled: true, crossProvider: "before-first-turn" });
     });
 
     test("accepts allowed models, aliases, labels and a route default from the allowed set", () => {
