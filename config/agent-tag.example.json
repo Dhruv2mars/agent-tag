@@ -3,7 +3,8 @@
   "dataDir": "/var/lib/agent-tag/data",
   "t3": {
     "baseUrl": "http://127.0.0.1:37841",
-    "tokenFile": "/var/lib/agent-tag/secrets/t3-token"
+    "tokenFile": "/var/lib/agent-tag/secrets/t3-token",
+    "watch": { "enabled": true, "safetyPollMs": 15000, "lingerMs": 30000 }
   },
   "slack": {
     "workspaceId": "T0EXAMPLE",

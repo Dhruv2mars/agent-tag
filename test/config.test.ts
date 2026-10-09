@@ -298,6 +298,7 @@ describe("t3 config", () => {
       mode: "external",
       baseUrl: "http://127.0.0.1:37841",
       tokenFile: "/secrets/t3",
+      watch: { enabled: true, safetyPollMs: 15_000, lingerMs: 30_000 },
     });
   });
 
@@ -307,6 +308,7 @@ describe("t3 config", () => {
       mode: "managed",
       baseUrl: "http://127.0.0.1:37841",
       tokenFile: "/secrets/t3",
+      watch: { enabled: true, safetyPollMs: 15_000, lingerMs: 30_000 },
       managed: {
         port: 37841,
         homeDir: "/var/lib/agent-tag/t3/home",

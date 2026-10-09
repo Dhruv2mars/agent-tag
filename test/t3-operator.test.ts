@@ -38,6 +38,7 @@ async function managedConfig(root: string): Promise<ManagedT3Config> {
     mode: "managed",
     baseUrl: "http://127.0.0.1:37841",
     tokenFile: "/x",
+    watch: { enabled: true, safetyPollMs: 15_000, lingerMs: 30_000 },
     managed: {
       port: 37841,
       homeDir,
@@ -55,7 +56,7 @@ function descriptorFetch(body: { serverVersion: string; orchestrationProtocolVer
 
 describe("requireManagedT3", () => {
   test("rejects an external config and names the managed mode", () => {
-    const external: ResolvedT3Config = { mode: "external", baseUrl: "http://127.0.0.1:37841", tokenFile: "/x" };
+    const external: ResolvedT3Config = { mode: "external", baseUrl: "http://127.0.0.1:37841", tokenFile: "/x", watch: { enabled: true, safetyPollMs: 15_000, lingerMs: 30_000 } };
     expect(() => requireManagedT3(external, "serve")).toThrow('t3.mode "managed"');
   });
 

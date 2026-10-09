@@ -67,6 +67,20 @@ const stalledTurnSchema = z
   })
   .default({ timeoutSeconds: 300, retryDelaySeconds: 30, maxAttempts: 5, maxTurnSeconds: 21_600 });
 
+/**
+ * Coordinators wait on the shared T3 thread stream instead of polling. The stream only wakes them:
+ * settlement still reads the snapshot, at the latest every `safetyPollMs`, so a dead stream delays
+ * a reply but never loses it. `enabled: false` restores fixed 500 ms polling.
+ */
+const t3WatchSchema = z
+  .object({
+    enabled: z.boolean().default(true),
+    safetyPollMs: z.number().int().min(1_000).max(60_000).default(15_000),
+    lingerMs: z.number().int().min(0).max(600_000).default(30_000),
+  })
+  .default({ enabled: true, safetyPollMs: 15_000, lingerMs: 30_000 });
+export type T3WatchConfig = z.infer<typeof t3WatchSchema>;
+
 /** How long an approval or question may wait for a human before the turn is cancelled. */
 const interactionExpirySchema = z.number().int().min(60).max(2_592_000).default(86_400);
 
@@ -200,6 +214,7 @@ const externalT3Schema = z.object({
   mode: z.literal("external").default("external"),
   baseUrl: loopbackUrl,
   tokenFile: absolutePath,
+  watch: t3WatchSchema,
 });
 
 /** A T3 server Agent Tag installs from t3.lock.json and supervises itself (`t3 serve` on loopback). */
@@ -212,6 +227,7 @@ const managedT3Schema = z.object({
   /** Verified binaries and supervisor state; default `<dataDir>/t3/runtime`. */
   runtimeDir: absolutePath.optional(),
   autoInstall: z.boolean().default(true),
+  watch: t3WatchSchema,
   /** Mirror for the pinned release assets; https only (http only on loopback). */
   downloadBaseUrl: z
     .string()
@@ -242,11 +258,12 @@ export interface ResolvedManagedT3 {
  * `T3ConnectionConfig` keeps working; managed mode derives `baseUrl` from its loopback port.
  */
 export type ResolvedT3Config =
-  | { readonly mode: "external"; readonly baseUrl: string; readonly tokenFile: string }
+  | { readonly mode: "external"; readonly baseUrl: string; readonly tokenFile: string; readonly watch: T3WatchConfig }
   | {
       readonly mode: "managed";
       readonly baseUrl: string;
       readonly tokenFile: string;
+      readonly watch: T3WatchConfig;
       readonly managed: ResolvedManagedT3;
     };
 
@@ -269,9 +286,9 @@ function resolveManagedT3(t3: z.infer<typeof managedT3Schema>, dataDir: string):
 }
 
 function resolveT3Config(t3: z.infer<typeof t3Schema>, dataDir: string): ResolvedT3Config {
-  if (t3.mode === "external") return { mode: "external", baseUrl: t3.baseUrl, tokenFile: t3.tokenFile };
+  if (t3.mode === "external") return { mode: "external", baseUrl: t3.baseUrl, tokenFile: t3.tokenFile, watch: t3.watch };
   const managed = resolveManagedT3(t3, dataDir);
-  return { mode: "managed", baseUrl: `http://127.0.0.1:${managed.port}`, tokenFile: t3.tokenFile, managed };
+  return { mode: "managed", baseUrl: `http://127.0.0.1:${managed.port}`, tokenFile: t3.tokenFile, watch: t3.watch, managed };
 }
 
 type ParsedProfile = z.infer<typeof profileSchema>;
