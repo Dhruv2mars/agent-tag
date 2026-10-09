@@ -373,7 +373,7 @@ export function claimDueSchedule(database: Database, input: ClaimDueScheduleInpu
         .query(
           `SELECT schedule_id, task_id, workspace_id, conversation_id, thread_ts, actor_user_id,
                   profile_id, repository_root, kind, prompt, cadence_seconds, recurrence_json, missed_run_policy,
-                  misfire_grace_seconds, overlap_policy, next_run_at, attempts, lease_expires_at
+                  misfire_grace_seconds, overlap_policy, notify_user_id, next_run_at, attempts, lease_expires_at
            FROM schedules WHERE schedule_id = ?`,
         )
         .get(identity.schedule_id),
@@ -406,6 +406,7 @@ export function claimDueSchedule(database: Database, input: ClaimDueScheduleInpu
       missedRunPolicy: row.missed_run_policy,
       misfireGraceSeconds: row.misfire_grace_seconds,
       overlapPolicy: row.overlap_policy,
+      notifyUserId: row.notify_user_id,
       dueAt: row.next_run_at,
       attempt: row.attempts,
       leaseExpiresAt: row.lease_expires_at,

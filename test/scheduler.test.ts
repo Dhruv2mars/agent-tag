@@ -532,4 +532,49 @@ describe("durable scheduler", () => {
       await rm(directory, { recursive: true });
     }
   });
+
+  test("a reminder @mentions its notify user on delivery", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "agent-tag-scheduler-"));
+    const store = await AgentTagStore.open(join(directory, "agent-tag.sqlite"));
+    try {
+      const taskId = store.ensureTaskForThread({
+        workspaceId: "T1",
+        conversationId: "C1",
+        threadTs: "4000.000001",
+        actorUserId: "U1",
+        conversationType: "channel",
+        profileId: "engineering",
+        repositoryRoot: "/srv/repos/example",
+        now: createdAt,
+      });
+      const context: ScheduleContext = { workspaceId: "T1", actorUserId: "U1", profileId: "engineering", taskId };
+      const schedules = new AgentTagSchedules({ config, store });
+      const reminder = (prompt: string, runAt: string, notifyUserId?: string) =>
+        acceptedSchedule(
+          schedules.create({
+            context,
+            spec: { kind: "reminder", prompt, runAt, missedRunPolicy: "run-once", misfireGraceSeconds: 60, overlapPolicy: "skip" },
+            now: createdAt,
+            ...(notifyUserId === undefined ? {} : { source: { eventKey: `C1:${runAt}`, notifyUserId } }),
+          }),
+        );
+      reminder("tell <!channel> to *deploy*", "2026-09-21T00:01:00.000Z", "U2");
+      reminder("review the release", "2026-09-21T00:02:00.000Z");
+
+      const texts: Array<string | undefined> = [];
+      for (const at of ["2026-09-21T00:01:00.000Z", "2026-09-21T00:02:00.000Z"]) {
+        const worker = new ScheduleWorker({ config, store, workerId: "schedule-n", now: () => new Date(at) });
+        expect(await worker.processNext()).toMatchObject({ kind: "dispatched" });
+        const outbox = store.claimNextOutbox({ workerId: "slack-n", now: at, leaseMs: 10_000 });
+        texts.push(outbox?.payload.text);
+      }
+      expect(texts).toEqual(["<@U2> :alarm_clock: Reminder: tell @\u200bchannel to *deploy*", "Reminder: review the release"]);
+    } finally {
+      store.close();
+      if (!directory.startsWith(`${tmpdir()}/agent-tag-scheduler-`)) {
+        throw new Error(`refusing to remove unexpected fixture path ${directory}`);
+      }
+      await rm(directory, { recursive: true });
+    }
+  });
 });
