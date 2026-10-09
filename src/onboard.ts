@@ -9,6 +9,12 @@ import { checkT3Environment } from "./doctor.ts";
 import type { Prompter } from "./prompt.ts";
 import { createSecretFile, readSecretFile, SecretString } from "./security/secret-file.ts";
 import type { ServiceStatusReport } from "./service-manager.ts";
+import {
+  parseIssuedT3Session,
+  T3_ADMIN_SESSION_TTL,
+  t3AdminSessionIssueCommand,
+  t3AdminSessionRevokeCommand,
+} from "./t3/admin-session.ts";
 import type { T3ServerInfo } from "./t3/gateway.ts";
 
 export const SLACK_APP_TOKEN_ENV = "AGENT_TAG_SLACK_APP_TOKEN";
@@ -392,23 +398,8 @@ async function slackWorkspace(context: Context, botToken: SecretString): Promise
 }
 
 /** The onboarding admin session is short-lived, labeled, and revoked as soon as enrollment ends. */
-export const T3_ADMIN_SESSION_TTL = "10m";
+export { parseIssuedT3Session, T3_ADMIN_SESSION_TTL };
 export const T3_ADMIN_SESSION_LABEL = "agent-tag-onboard";
-
-const issuedSessionSchema = z.object({ sessionId: z.string().min(1), token: z.string().min(1) });
-
-/** Parses `t3 auth session issue --json` output. Errors never include the output, which holds the token. */
-export function parseIssuedT3Session(stdout: string): { readonly sessionId: string; readonly token: SecretString } | undefined {
-  let raw: unknown;
-  try {
-    raw = JSON.parse(stdout);
-  } catch {
-    return undefined;
-  }
-  const parsed = issuedSessionSchema.safeParse(raw);
-  if (!parsed.success) return undefined;
-  return { sessionId: parsed.data.sessionId, token: new SecretString(parsed.data.token) };
-}
 
 type T3Probe =
   | { readonly usable: true }
@@ -440,10 +431,7 @@ async function provisionT3Token(
     return "kept";
   }
   const t3Bin = options.t3Bin ?? deps.env.AGENT_TAG_T3_BIN ?? "t3";
-  const issueCommand = [
-    t3Bin, "auth", "session", "issue", "--base-dir", input.baseDir,
-    "--ttl", T3_ADMIN_SESSION_TTL, "--label", T3_ADMIN_SESSION_LABEL, "--json",
-  ];
+  const issueCommand = t3AdminSessionIssueCommand({ t3Bin, baseDir: input.baseDir, label: T3_ADMIN_SESSION_LABEL });
   const enrollHint = `bun run enroll:t3 -- --base-url ${input.baseUrl} --admin-token-file ADMIN_TOKEN_FILE --output ${input.path}`;
 
   let administrativeToken: SecretString | undefined;
@@ -509,7 +497,7 @@ async function revokeT3Session(
   input: { readonly t3Bin: string; readonly baseDir: string; readonly sessionId: string },
 ): Promise<void> {
   const { deps } = context;
-  const command = [input.t3Bin, "auth", "session", "revoke", "--base-dir", input.baseDir, input.sessionId];
+  const command = t3AdminSessionRevokeCommand(input);
   let failure: string | undefined;
   try {
     const result = await deps.runCommand(command);

@@ -1,10 +1,10 @@
 import { mkdir, open, readFile, rm } from "node:fs/promises";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 
 import { z } from "zod";
 
-import type { CommandRunner } from "../command.ts";
-import type { T3RotationConfig } from "../config.ts";
+import { type CommandRunner, runCommand } from "../command.ts";
+import type { ResolvedT3Config, T3RotationConfig } from "../config.ts";
 import { readSecretFile, replaceSecretFile, SecretString } from "../security/secret-file.ts";
 import type { ServiceLogger, ServiceLogRecord, ServiceWorker } from "../service.ts";
 import { issueT3AdminSession, revokeT3AdminSession } from "./admin-session.ts";
@@ -461,4 +461,65 @@ export function createT3CredentialWorker(input: { readonly credentials: T3Creden
     requiresT3: true,
     processNext: async () => ({ kind: await input.credentials.maintain() }),
   };
+}
+
+/** The managed runtime's credential lifecycle: admin sessions via the installed binary, state in `runtimeDir`. */
+export function managedT3Credentials(input: {
+  readonly t3: Extract<ResolvedT3Config, { readonly mode: "managed" }>;
+  readonly binary: string;
+  readonly logger: ServiceLogger;
+  readonly now?: () => Date;
+  readonly run?: CommandRunner;
+}): T3CredentialLifecycle {
+  const { managed } = input.t3;
+  return new T3CredentialLifecycle({
+    mode: "managed",
+    baseUrl: input.t3.baseUrl,
+    tokenFile: input.t3.tokenFile,
+    rotation: managed.rotation,
+    admin: { kind: "cli", t3Bin: input.binary, baseDir: managed.homeDir, run: input.run ?? runCommand },
+    stateFile: join(managed.runtimeDir, T3_CREDENTIAL_STATE_FILE),
+    logger: input.logger,
+    ...(input.now === undefined ? {} : { now: input.now }),
+  });
+}
+
+export interface T3TokenStatus {
+  readonly expiresAt: string | null;
+  readonly daysRemaining: number | null;
+  readonly label: string | null;
+  readonly rotatedAt: string | null;
+  readonly pendingRevocations: number;
+  readonly problem: string | null;
+}
+
+/**
+ * The `token` part of `t3 status`. Call it only after the server passed the descriptor check, since
+ * it presents the restricted token. Never includes the token.
+ */
+export async function inspectT3TokenStatus(input: {
+  readonly baseUrl: string;
+  readonly tokenFile: string;
+  readonly stateFile?: string;
+  readonly now?: () => Date;
+}): Promise<T3TokenStatus> {
+  const now = input.now ?? (() => new Date());
+  let state = EMPTY_STATE;
+  let problem: string | null = null;
+  if (input.stateFile !== undefined) {
+    try {
+      state = await readT3CredentialState(input.stateFile);
+    } catch (error) {
+      problem = errorMessage(error);
+    }
+  }
+  const recorded = { label: state.currentLabel, rotatedAt: state.rotatedAt, pendingRevocations: state.retired.length };
+  try {
+    const token = await readSecretFile(input.tokenFile);
+    const session = await inspectT3Session({ baseUrl: input.baseUrl, token, signal: AbortSignal.timeout(5_000) });
+    assertRestrictedOrchestrationSession(session);
+    return { ...t3TokenExpiry(session.expiresAt, now()), ...recorded, problem };
+  } catch (error) {
+    return { expiresAt: null, daysRemaining: null, ...recorded, problem: problem ?? errorMessage(error) };
+  }
 }

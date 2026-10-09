@@ -8,9 +8,8 @@ import { createScheduleWorkers } from "./scheduler.ts";
 import { SlackSocketBridge } from "./slack/bridge.ts";
 import { createRetentionWorker } from "./store/retention.ts";
 import { AgentTagStore } from "./store/store.ts";
-import { runCommand } from "./command.ts";
 import { T3Connection } from "./t3/connection.ts";
-import { createT3CredentialWorker, T3_CREDENTIAL_STATE_FILE, T3CredentialLifecycle } from "./t3/credentials.ts";
+import { createT3CredentialWorker, managedT3Credentials, T3CredentialLifecycle } from "./t3/credentials.ts";
 import { createT3GateWorker, T3RuntimeGate } from "./t3/gate.ts";
 import { inspectT3, type T3ServerInfo } from "./t3/gateway.ts";
 import { PINNED_T3 } from "./t3/lock.ts";
@@ -300,27 +299,6 @@ export function allowedModelLogRecords(
       model: entry.model,
       at,
     }));
-}
-
-/** The managed runtime's credential lifecycle: admin sessions via the installed binary, state in `runtimeDir`. */
-export function managedT3Credentials(input: {
-  readonly t3: Extract<AgentTagConfig["t3"], { readonly mode: "managed" }>;
-  readonly binary: string;
-  readonly logger: ServiceLogger;
-  readonly now?: () => Date;
-  readonly run?: typeof runCommand;
-}): T3CredentialLifecycle {
-  const { managed } = input.t3;
-  return new T3CredentialLifecycle({
-    mode: "managed",
-    baseUrl: input.t3.baseUrl,
-    tokenFile: input.t3.tokenFile,
-    rotation: managed.rotation,
-    admin: { kind: "cli", t3Bin: input.binary, baseDir: managed.homeDir, run: input.run ?? runCommand },
-    stateFile: join(managed.runtimeDir, T3_CREDENTIAL_STATE_FILE),
-    logger: input.logger,
-    ...(input.now === undefined ? {} : { now: input.now }),
-  });
 }
 
 export async function createAgentTagService(input: {
