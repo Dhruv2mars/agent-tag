@@ -246,12 +246,19 @@ export async function createAgentTagService(input: {
   };
   try {
     validateConfiguredProviders(input.config, await inspectT3(input.config.t3));
-    const bridge = await SlackSocketBridge.create({ config: input.config, store });
+    const bridge = await SlackSocketBridge.create({ config: input.config, store, logger });
     let nextMemoryExpiryAt = 0;
     let nextT3StatsAt = now().getTime() + 60_000;
     const coordinators = Array.from(
       { length: input.config.limits.maxConcurrentTasks },
-      () => new AgentTagCoordinator({ config: input.config, store, t3, ...(watcher === undefined ? {} : { watcher }) }),
+      () =>
+        new AgentTagCoordinator({
+          config: input.config,
+          store,
+          slackContext: bridge.contextSource,
+          t3,
+          ...(watcher === undefined ? {} : { watcher }),
+        }),
     );
     const service = new AgentTagService({
       store,
