@@ -179,6 +179,46 @@ describe("data retention", () => {
     });
   });
 
+  test("redacts the prompts of long-ended schedules and keeps active ones", async () => {
+    await withSeededStore(({ store, path }) => {
+      const taskId = store.ensureTaskForThread({
+        workspaceId: "T1",
+        conversationId: "C1",
+        threadTs: "1009.0001",
+        actorUserId: "U1",
+        conversationType: "channel",
+        profileId: "engineering",
+        repositoryRoot: "/srv/repos/example",
+        now: oldAt,
+      });
+      const schedule = (prompt: string) =>
+        store.createSchedule({
+          taskId,
+          actorUserId: "U1",
+          kind: "reminder",
+          prompt,
+          runAt: plusSeconds(nowAt, 3_600),
+          cadenceSeconds: 3_600,
+          missedRunPolicy: "skip",
+          misfireGraceSeconds: 60,
+          overlapPolicy: "skip",
+          now: oldAt,
+        }).scheduleId;
+      const ended = schedule("old ended routine");
+      const active = schedule("old active routine");
+      const recent = schedule("recently ended routine");
+      store.cancelSchedule({ scheduleId: ended, taskId, actorUserId: "U1", now: plusSeconds(oldAt, 60) });
+      store.cancelSchedule({ scheduleId: recent, taskId, actorUserId: "U1", now: recentAt });
+
+      expect(pruneDatabaseFile(path, { policy, now: nowAt, dryRun: true }).schedulesRedacted).toBe(1);
+      expect(pruneDatabaseFile(path, { policy, now: nowAt }).schedulesRedacted).toBe(1);
+      expect(store.getSchedule(ended)?.prompt).toBe(PRUNED_TEXT);
+      expect(store.getSchedule(active)?.prompt).toBe("old active routine");
+      expect(store.getSchedule(recent)?.prompt).toBe("recently ended routine");
+      expect(pruneDatabaseFile(path, { policy, now: nowAt }).schedulesRedacted).toBe(0);
+    });
+  });
+
   test("pruned text is gone from the database file and its WAL", async () => {
     await withSeededStore(async ({ path }) => {
       const pruned = ["old delivered request", "old delivered reply", "old quarantined request"];

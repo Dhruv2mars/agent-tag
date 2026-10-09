@@ -89,7 +89,7 @@ function seedVersionOne(database: Database): void {
 
 test("upgrades every historical SQLite schema while preserving existing work", async () => {
   const versions = STORE_MIGRATIONS.map((migration) => migration.version);
-  expect(versions).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
+  expect(versions).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
   // Each historical prefix, plus a store that applied 14 (from main) before 13 existed: applied
   // versions are tracked as a set, so 13 must still apply on top of it.
   const startingSets: ReadonlyArray<{ readonly label: string; readonly applied: ReadonlyArray<number> }> = [
@@ -331,6 +331,205 @@ test("the message-edit migration enforces the outbox method and target reference
     expect(() => insert("edit-3", "update", "missing")).toThrow("FOREIGN KEY constraint failed");
     database.close();
   } finally {
+    await rm(directory, { recursive: true });
+  }
+});
+
+test("routine migration backfills run outcomes and end reasons from the previous schema", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-tag-migration-routines-"));
+  const path = join(directory, "agent-tag.sqlite");
+  try {
+    const historical = new Database(path, { create: true, strict: true });
+    historical.exec("PRAGMA foreign_keys = ON");
+    historical.exec("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)");
+    applyMigration(historical, 1);
+    seedVersionOne(historical);
+    for (const { version } of STORE_MIGRATIONS) {
+      if (version > 1 && version < 16) applyMigration(historical, version);
+    }
+    const insertSchedule = historical.query(
+      `INSERT INTO schedules (
+        schedule_id, task_id, workspace_id, conversation_id, thread_ts, actor_user_id, profile_id,
+        repository_root, kind, prompt, cadence_seconds, missed_run_policy, misfire_grace_seconds,
+        overlap_policy, state, next_run_at, created_at, updated_at
+      ) VALUES (?, 'task-1', 'T1', 'C1', '1000.000001', 'U1', 'engineering', '/srv/repos/example', 'agent',
+        ?, 3600, 'skip', 60, 'skip', ?, ?, ?, ?)`,
+    );
+    insertSchedule.run("s-active", "hourly check", "active", createdAt, createdAt, createdAt);
+    insertSchedule.run("s-cancelled", "old check", "cancelled", createdAt, createdAt, "2026-09-22T00:00:00.000Z");
+    insertSchedule.run("s-completed", "one check", "completed", createdAt, createdAt, "2026-09-23T00:00:00.000Z");
+    const insertRun = historical.query(
+      `INSERT INTO schedule_runs (run_id, schedule_id, due_at, disposition, operation_id, created_at)
+       VALUES (?, 's-active', ?, ?, ?, ?)`,
+    );
+    insertRun.run("s-active:a", "2026-09-21T01:00:00.000Z", "dispatched", "operation-1", "2026-09-21T01:00:01.000Z");
+    insertRun.run("s-active:b", "2026-09-21T02:00:00.000Z", "missed-skipped", null, "2026-09-21T02:00:01.000Z");
+    insertRun.run("s-active:c", "2026-09-21T03:00:00.000Z", "overlap-skipped", null, "2026-09-21T03:00:01.000Z");
+    historical.close();
+
+    (await AgentTagStore.open(path)).close();
+
+    const upgraded = new Database(path, { strict: true });
+    expect(
+      upgraded
+        .query("SELECT run_id, outcome, outcome_at FROM schedule_runs ORDER BY run_id")
+        .all(),
+    ).toEqual([
+      { run_id: "s-active:a", outcome: null, outcome_at: null },
+      { run_id: "s-active:b", outcome: "skipped", outcome_at: "2026-09-21T02:00:01.000Z" },
+      { run_id: "s-active:c", outcome: "skipped", outcome_at: "2026-09-21T03:00:01.000Z" },
+    ]);
+    expect(
+      upgraded
+        .query(
+          `SELECT schedule_id, prompt, ended_reason, ended_at, consecutive_failures, failure_streak_started_at,
+                  source_event_key FROM schedules ORDER BY schedule_id`,
+        )
+        .all(),
+    ).toEqual([
+      { schedule_id: "s-active", prompt: "hourly check", ended_reason: null, ended_at: null, consecutive_failures: 0, failure_streak_started_at: null, source_event_key: null },
+      { schedule_id: "s-cancelled", prompt: "old check", ended_reason: "user-cancelled", ended_at: "2026-09-22T00:00:00.000Z", consecutive_failures: 0, failure_streak_started_at: null, source_event_key: null },
+      { schedule_id: "s-completed", prompt: "one check", ended_reason: "completed", ended_at: "2026-09-23T00:00:00.000Z", consecutive_failures: 0, failure_streak_started_at: null, source_event_key: null },
+    ]);
+    // The source key is unique per workspace only when set; NULLs (CLI schedules) never collide.
+    upgraded.exec("UPDATE schedules SET source_event_key = 'C1:1.000001' WHERE schedule_id = 's-active'");
+    expect(() =>
+      upgraded.exec("UPDATE schedules SET source_event_key = 'C1:1.000001' WHERE schedule_id = 's-cancelled'"),
+    ).toThrow(/UNIQUE/);
+    expect(() =>
+      upgraded.exec("UPDATE schedules SET ended_reason = 'bogus' WHERE schedule_id = 's-cancelled'"),
+    ).toThrow(/CHECK/);
+    expect(
+      upgraded.query<{ quick_check: string }, []>("PRAGMA quick_check").get()?.quick_check,
+    ).toBe("ok");
+    upgraded.close();
+  } finally {
+    if (!directory.startsWith(`${tmpdir()}/agent-tag-migration-routines-`)) {
+      throw new Error(`refusing to remove unexpected migration fixture path ${directory}`);
+    }
+    await rm(directory, { recursive: true });
+  }
+});
+
+test("runs dispatched before the routine migration never count toward an auto-disable", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-tag-migration-legacy-runs-"));
+  const path = join(directory, "agent-tag.sqlite");
+  try {
+    const historical = new Database(path, { create: true, strict: true });
+    historical.exec("PRAGMA foreign_keys = ON");
+    historical.exec("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)");
+    applyMigration(historical, 1);
+    seedVersionOne(historical);
+    for (const { version } of STORE_MIGRATIONS) {
+      if (version > 1 && version < 16) applyMigration(historical, version);
+    }
+    historical.exec("UPDATE operations SET status = 'failed', last_error_code = 'T3TurnFailed'");
+    historical
+      .query(
+        `INSERT INTO schedules (
+          schedule_id, task_id, workspace_id, conversation_id, thread_ts, actor_user_id, profile_id,
+          repository_root, kind, prompt, cadence_seconds, missed_run_policy, misfire_grace_seconds,
+          overlap_policy, state, next_run_at, created_at, updated_at
+        ) VALUES ('s-legacy', 'task-1', 'T1', 'C1', '1000.000001', 'U1', 'engineering', '/srv/repos/example',
+          'agent', 'hourly check', 3600, 'skip', 60, 'skip', 'active', ?, ?, ?)`,
+      )
+      .run(createdAt, createdAt, createdAt);
+    // Five failed hourly runs from before outcome tracking: well past 3 failures over an hour.
+    for (let hour = 1; hour <= 5; hour += 1) {
+      const dueAt = `2026-09-21T0${hour}:00:00.000Z`;
+      historical
+        .query(
+          `INSERT INTO schedule_runs (run_id, schedule_id, due_at, disposition, operation_id, created_at)
+           VALUES (?, 's-legacy', ?, 'dispatched', 'operation-1', ?)`,
+        )
+        .run(`s-legacy:${dueAt}`, dueAt, dueAt);
+    }
+    historical.close();
+
+    const store = await AgentTagStore.open(path);
+    try {
+      const result = store.reconcileScheduleRunOutcomes({
+        now: "2026-09-21T06:00:00.000Z",
+        consecutiveFailures: 3,
+        minFailureSpanSeconds: 3_600,
+        renderAutoDisabledNotice: () => ({ text: "unexpected" }),
+      });
+      // Outcomes are recorded for history, but the routine stays on with no streak.
+      expect(result).toEqual({ recorded: 5, autoDisabled: [] });
+      expect(store.getSchedule("s-legacy")).toMatchObject({
+        state: "active",
+        endedReason: null,
+        consecutiveFailures: 0,
+        failureStreakStartedAt: null,
+      });
+    } finally {
+      store.close();
+    }
+    const upgraded = new Database(path, { strict: true });
+    expect(
+      upgraded.query("SELECT DISTINCT legacy, outcome FROM schedule_runs WHERE schedule_id = 's-legacy'").all(),
+    ).toEqual([{ legacy: 1, outcome: "failed" }]);
+    upgraded.close();
+  } finally {
+    if (!directory.startsWith(`${tmpdir()}/agent-tag-migration-legacy-runs-`)) {
+      throw new Error(`refusing to remove unexpected migration fixture path ${directory}`);
+    }
+    await rm(directory, { recursive: true });
+  }
+});
+
+test("routine migration recovers authority revocations from the audit log", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-tag-migration-revoked-"));
+  const path = join(directory, "agent-tag.sqlite");
+  try {
+    const historical = new Database(path, { create: true, strict: true });
+    historical.exec("PRAGMA foreign_keys = ON");
+    historical.exec("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)");
+    applyMigration(historical, 1);
+    seedVersionOne(historical);
+    for (const { version } of STORE_MIGRATIONS) {
+      if (version > 1 && version < 16) applyMigration(historical, version);
+    }
+    const insertSchedule = historical.query(
+      `INSERT INTO schedules (
+        schedule_id, task_id, workspace_id, conversation_id, thread_ts, actor_user_id, profile_id,
+        repository_root, kind, prompt, cadence_seconds, missed_run_policy, misfire_grace_seconds,
+        overlap_policy, state, next_run_at, created_at, updated_at
+      ) VALUES (?, 'task-1', 'T1', 'C1', '1000.000001', 'U1', 'engineering', '/srv/repos/example', 'agent',
+        'hourly check', 3600, 'skip', 60, 'skip', 'cancelled', ?, ?, ?)`,
+    );
+    const insertAudit = historical.query(
+      `INSERT INTO audit_log (
+        audit_id, actor_type, actor_id, authority, source, target, action, result,
+        correlation_id, metadata_json, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, 'cancelled', ?, '{}', ?)`,
+    );
+    // Exactly the rows the previous revokeClaimedSchedule and cancelSchedule wrote.
+    insertSchedule.run("s-revoked", createdAt, createdAt, "2026-09-22T00:00:00.000Z");
+    insertAudit.run("audit-revoked", "worker", "schedule-worker", "schedule-dispatch", "s-revoked", "s-revoked",
+      "schedule.authority-revoked", "s-revoked", "2026-09-22T00:00:00.000Z");
+    insertSchedule.run("s-user", createdAt, createdAt, "2026-09-23T00:00:00.000Z");
+    insertAudit.run("audit-user", "slack-user", "U1", "schedule-cancel", "s-user", "s-user",
+      "schedule.cancelled", "s-user", "2026-09-23T00:00:00.000Z");
+    // Audit rows pruned by retention: nothing to recover, so it stays attributed to the user.
+    insertSchedule.run("s-pruned", createdAt, createdAt, "2026-09-24T00:00:00.000Z");
+    historical.close();
+
+    (await AgentTagStore.open(path)).close();
+
+    const upgraded = new Database(path, { strict: true });
+    expect(
+      upgraded.query("SELECT schedule_id, ended_reason, ended_at FROM schedules ORDER BY schedule_id").all(),
+    ).toEqual([
+      { schedule_id: "s-pruned", ended_reason: "user-cancelled", ended_at: "2026-09-24T00:00:00.000Z" },
+      { schedule_id: "s-revoked", ended_reason: "authority-revoked", ended_at: "2026-09-22T00:00:00.000Z" },
+      { schedule_id: "s-user", ended_reason: "user-cancelled", ended_at: "2026-09-23T00:00:00.000Z" },
+    ]);
+    upgraded.close();
+  } finally {
+    if (!directory.startsWith(`${tmpdir()}/agent-tag-migration-revoked-`)) {
+      throw new Error(`refusing to remove unexpected migration fixture path ${directory}`);
+    }
     await rm(directory, { recursive: true });
   }
 });

@@ -181,6 +181,25 @@ function resolveT3Config(t3: z.infer<typeof t3Schema>, dataDir: string): Resolve
   return { mode: "managed", baseUrl: `http://127.0.0.1:${managed.port}`, tokenFile: t3.tokenFile, managed };
 }
 
+/**
+ * Routines. A recurring routine is turned off after `consecutiveFailures` failed runs in a row whose
+ * due times span at least `minFailureSpanSeconds` (Claude Tag: 3 failures over at least 1 hour).
+ * The decision waits until every run due since the last success has an outcome, and runs dispatched
+ * before outcome tracking existed never count (see src/store/schedule-outcomes.ts).
+ */
+const routinesSchema = z
+  .object({
+    autoDisable: z
+      .object({
+        consecutiveFailures: z.number().int().min(1).max(50).default(3),
+        minFailureSpanSeconds: z.number().int().min(0).max(604_800).default(3_600),
+      })
+      .strict()
+      .prefault({}),
+  })
+  .strict()
+  .prefault({});
+
 export const agentTagConfigSchema = z
   .object({
     version: z.literal(1),
@@ -204,6 +223,7 @@ export const agentTagConfigSchema = z
       interactionExpirySeconds: interactionExpirySchema,
     }),
     retention: retentionSchema,
+    routines: routinesSchema,
   })
   .superRefine((config, context) => {
     const profiles = new Map(config.profiles.map((profile) => [profile.id, profile]));
