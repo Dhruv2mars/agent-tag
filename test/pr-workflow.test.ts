@@ -12,6 +12,7 @@ import { githubRemoteUrl } from "../src/git/push.ts";
 import { createGitRunner, type GitRunner, type GitSpawn } from "../src/git/runner.ts";
 import type { GitHubCredentials } from "../src/github/auth.ts";
 import {
+  createGitHubClient,
   type CreatePullInput,
   type CreatePullResult,
   GitHubApiError,
@@ -134,6 +135,94 @@ class FakeGitHub implements GitHubClient {
   }
 }
 
+/** GitHub REST over real HTTP (Bun.serve). The client insists on https, so its fetch is pointed here. */
+function serveGitHub(remotePath: string) {
+  interface RawPull {
+    number: number;
+    html_url: string;
+    state: "open" | "closed";
+    draft: boolean;
+    merged: boolean;
+    title: string;
+    head: { ref: string; sha: string };
+    base: { ref: string };
+    additions: number;
+    deletions: number;
+    changed_files: number;
+    commits: number;
+  }
+  const pulls: RawPull[] = [];
+  const posts: Array<Record<string, unknown>> = [];
+  const authorizations: string[] = [];
+  let loseNextCreateResponse = false;
+  const server = Bun.serve({
+    port: 0,
+    hostname: "127.0.0.1",
+    fetch: async (request) => {
+      const url = new URL(request.url);
+      authorizations.push(request.headers.get("authorization") ?? "");
+      const json = (status: number, body: unknown) => Response.json(body, { status });
+      if (url.pathname === `/repos/${REPO}/pulls` && request.method === "GET") {
+        const head = url.searchParams.get("head")?.split(":")[1];
+        return json(200, pulls.filter((pull) => pull.head.ref === head).map(({ additions: _a, deletions: _d, changed_files: _c, commits: _n, ...listed }) => listed));
+      }
+      if (url.pathname === `/repos/${REPO}/pulls` && request.method === "POST") {
+        const body = (await request.json()) as Record<string, unknown>;
+        posts.push(body);
+        if (pulls.some((pull) => pull.head.ref === body.head && pull.state === "open")) {
+          return json(422, { message: "Validation Failed", errors: [{ message: "A pull request already exists for octo:x." }] });
+        }
+        const number = pulls.length + 1;
+        const head = String(body.head);
+        const pull: RawPull = {
+          number,
+          html_url: `https://github.example/${REPO}/pull/${number}`,
+          state: "open",
+          draft: body.draft === true,
+          merged: false,
+          title: String(body.title),
+          head: { ref: head, sha: git(remotePath, "rev-parse", `refs/heads/${head}`) },
+          base: { ref: String(body.base) },
+          additions: 3,
+          deletions: 1,
+          changed_files: 1,
+          commits: Number(git(remotePath, "rev-list", "--count", `refs/heads/${head}`)) - 1,
+        };
+        pulls.push(pull);
+        if (loseNextCreateResponse) {
+          loseNextCreateResponse = false;
+          return json(502, { message: "Bad Gateway" });
+        }
+        return json(201, pull);
+      }
+      const single = new RegExp(`^/repos/${REPO}/pulls/(\\d+)$`).exec(url.pathname);
+      if (single !== null && request.method === "GET") {
+        const pull = pulls.find((candidate) => candidate.number === Number(single[1]));
+        if (pull === undefined) return json(404, { message: "Not Found" });
+        pull.head.sha = git(remotePath, "rev-parse", `refs/heads/${pull.head.ref}`);
+        pull.commits = Number(git(remotePath, "rev-list", "--count", `refs/heads/${pull.head.ref}`)) - 1;
+        return json(200, pull);
+      }
+      return json(404, { message: `no route ${request.method} ${url.pathname}` });
+    },
+  });
+  const client = createGitHubClient({
+    apiBaseUrl: "https://api.github.example",
+    credentials,
+    fetch: (input, init) => fetch(input.replace("https://api.github.example", `http://127.0.0.1:${server.port}`), init),
+  });
+  return {
+    client,
+    pulls,
+    posts,
+    authorizations,
+    loseNextCreateResponse: () => {
+      loseNextCreateResponse = true;
+    },
+    stop: () => server.stop(true),
+  };
+}
+
 const credentials: GitHubCredentials = {
   token: async () => new SecretString(canaryToken()),
   describe: () => "test token",
@@ -150,7 +239,7 @@ interface Harness {
   advance(milliseconds: number): void;
   now(): Date;
   coordinator(options?: { readonly runner?: GitRunner; readonly config?: AgentTagConfig; readonly noPullRequests?: boolean }): AgentTagCoordinator;
-  worker(options?: { readonly config?: AgentTagConfig }): PrWorker;
+  worker(options?: { readonly config?: AgentTagConfig; readonly github?: GitHubClient }): PrWorker;
   /** Ingests one Slack mention in the shared thread and runs the coordinator to completion. */
   turn(text: string, coordinator?: AgentTagCoordinator): Promise<string>;
   /** Claims and delivers every queued Slack message, oldest first. */
@@ -273,7 +362,7 @@ async function withHarness(body: (harness: Harness) => Promise<void>): Promise<v
         new PrWorker({
           config: options.config ?? config,
           store,
-          github,
+          github: options.github ?? github,
           credentials,
           runner: isolatedRunner(),
           gitRoot: repo.gitRoot,
@@ -535,6 +624,39 @@ describe("draft PR workflow", () => {
       expect(notice[0]?.payload.text).toContain("github.auth");
       h.advance(3_600_000);
       expect(await worker.processNext()).toEqual({ kind: "idle" });
+    });
+  });
+
+  test("over HTTP: one draft POST, a follow-up reuses the PR, a lost create response replays without a second PR", async () => {
+    await withHarness(async (h) => {
+      const server = serveGitHub(h.remotePath);
+      try {
+        const worker = h.worker({ github: server.client });
+        await Bun.write(join(h.repo.worktree, "feature.txt"), "feature\n");
+        const first = await h.turn("add a feature file");
+        h.drain();
+        server.loseNextCreateResponse();
+        expect(await worker.processNext()).toMatchObject({ kind: "retry-scheduled", code: "github.transient" });
+        h.advance(31_000);
+        expect(await worker.processNext()).toMatchObject({ kind: "created", number: 1 });
+        expect(server.posts).toHaveLength(1);
+        expect(server.posts[0]).toMatchObject({ draft: true, head: h.repo.branch, base: "main", maintainer_can_modify: false });
+        expect(server.pulls).toHaveLength(1);
+        expect(server.authorizations.every((value) => value.includes("github_pat_"))).toBe(true);
+        const card = h.drain();
+        expect(card.map((message) => message.clientMessageId)).toEqual([`${first}:pr`]);
+        expect(card[0]?.payload.text).toContain("https://github.example/octo/example/pull/1");
+
+        await Bun.write(join(h.repo.worktree, "second.txt"), "second\n");
+        const second = await h.turn("add a second file");
+        h.drain();
+        expect(await worker.processNext()).toMatchObject({ kind: "pushed", number: 1 });
+        expect(server.posts).toHaveLength(1);
+        expect(server.pulls[0]?.commits).toBe(2);
+        expect(h.drain().map((message) => message.clientMessageId)).toEqual([`${second}:pr-push`]);
+      } finally {
+        server.stop();
+      }
     });
   });
 
