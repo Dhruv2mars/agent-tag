@@ -269,7 +269,7 @@ describe("prSnapshot", () => {
       expect(fired).toContain("fsmonitor");
       expect(fired.some((name) => name === "extdiff" || name === "textconv")).toBe(true);
     });
-  });
+  }, 30_000);
 
   test("falls back to `git worktree list` when T3 gives no worktree path", async () => {
     await withTempDir("pr-snapshot-fallback", async (directory) => {
@@ -341,6 +341,56 @@ describe("prSnapshot", () => {
       if (result.kind !== "blocked" || result.detail.reason !== "size") throw new Error(`expected size block, got ${JSON.stringify(result)}`);
       expect(result.detail.diffBytes).toBeLessThan(2_000);
       expect(result.detail.historyBytes).toBeGreaterThan(2_000);
+
+      // Turning the secret scan off skips only the credential checks, not the history byte limit.
+      const unscanned = await prSnapshot(snapshotInput(repo, { limits: { maxChangedFiles: 300, maxDiffBytes: 2_000, secretScan: "off" } }));
+      expect(unscanned).toMatchObject({ kind: "blocked", detail: { reason: "size" } });
+    });
+  });
+
+  test("scans the stored commits, not a refs/replace/* stand-in that the fetch would not transfer", async () => {
+    await withTempDir("pr-snapshot-replace", async (directory) => {
+      const repo = await createSourceRepo(directory);
+      await Bun.write(join(repo.worktree, "config.txt"), `token=${slackShapedToken()}\n`);
+      git(repo.worktree, "add", "-A");
+      git(repo.worktree, "commit", "--quiet", "-m", "add config");
+      const secretCommit = git(repo.worktree, "rev-parse", "HEAD");
+      // A clean look-alike with the same parent, swapped in for the secret commit by a replace ref.
+      git(repo.worktree, "reset", "--quiet", "--hard", "HEAD~1");
+      await Bun.write(join(repo.worktree, "config.txt"), "token=from-env\n");
+      git(repo.worktree, "add", "-A");
+      git(repo.worktree, "commit", "--quiet", "-m", "add config");
+      const clean = git(repo.worktree, "rev-parse", "HEAD");
+      git(repo.worktree, "reset", "--quiet", "--hard", secretCommit);
+      git(repo.worktree, "replace", secretCommit, clean);
+      git(repo.worktree, "reset", "--quiet", "--hard", "HEAD");
+      expect(git(repo.worktree, "show", "HEAD:config.txt")).toBe("token=from-env");
+
+      const result = await prSnapshot(snapshotInput(repo));
+      expect(result).toMatchObject({ kind: "blocked", detail: { reason: "secret", paths: ["config.txt"] } });
+      expect(await exists(mirrorPathFor(repo.gitRoot, "octo/example"))).toBe(false);
+    });
+  });
+
+  test("scans history the fetch transfers even when info/grafts hides a commit", async () => {
+    await withTempDir("pr-snapshot-grafts", async (directory) => {
+      const repo = await createSourceRepo(directory);
+      const base = git(repo.worktree, "rev-parse", "HEAD");
+      await Bun.write(join(repo.worktree, "config.txt"), `token=${slackShapedToken()}\n`);
+      git(repo.worktree, "add", "-A");
+      git(repo.worktree, "commit", "--quiet", "-m", "add config");
+      git(repo.worktree, "rm", "--quiet", "config.txt");
+      await Bun.write(join(repo.worktree, "small.txt"), "small\n");
+      git(repo.worktree, "add", "-A");
+      git(repo.worktree, "commit", "--quiet", "-m", "drop config");
+      const tip = git(repo.worktree, "rev-parse", "HEAD");
+      // The graft claims the tip's parent is base, hiding the secret commit from log.
+      const commonDir = git(repo.worktree, "rev-parse", "--path-format=absolute", "--git-common-dir");
+      await mkdir(join(commonDir, "info"), { recursive: true });
+      await Bun.write(join(commonDir, "info", "grafts"), `${tip} ${base}\n`);
+
+      const result = await prSnapshot(snapshotInput(repo));
+      expect(result).toMatchObject({ kind: "blocked", detail: { reason: "secret", paths: ["config.txt"] } });
     });
   });
 

@@ -149,6 +149,10 @@ export function gitBaseEnv(parentEnv: Readonly<Record<string, string | undefined
     // helpers, url.*.insteadOf, fsmonitor), so it is not trusted for commands Agent Tag runs.
     GIT_CONFIG_GLOBAL: "/dev/null",
     GIT_OPTIONAL_LOCKS: "0",
+    // History is inspected as stored, not as rewritten by `refs/replace/*` or `info/grafts`: the scans
+    // must see the same objects a fetch into the mirror transfers.
+    GIT_NO_REPLACE_OBJECTS: "1",
+    GIT_GRAFT_FILE: "/dev/null",
     GIT_PAGER: "cat",
     LC_ALL: "C",
   };

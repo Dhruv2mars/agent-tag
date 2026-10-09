@@ -331,22 +331,11 @@ async function scanDelta(
   if (changedFiles > maxChangedFiles || diff.stdoutTruncated || diffBytes > maxDiffBytes) {
     return { block: { reason: "size", changedFiles, diffBytes, maxChangedFiles, maxDiffBytes }, changedFiles, diffBytes };
   }
-  if (input.limits.secretScan === "off") return { changedFiles, diffBytes };
 
-  const added = addedLinesByPath(diff.stdout);
-  const hitPaths = new Set<string>();
-  const patternNames = new Set<string>();
-  const record = (findings: readonly TextSecretFinding[], pathOf: (line: number) => string) => {
-    for (const finding of findings) {
-      hitPaths.add(pathOf(finding.line));
-      patternNames.add(finding.kind === "known-token-pattern" ? finding.patternName : finding.canaryName);
-    }
-  };
-  record(scanTextForSecrets(added.text), (line) => added.paths[line - 1] ?? "");
-
-  // The push transfers every new commit, not just the net result: a credential added in one commit and
-  // deleted in the next is still in the pushed history. So each new commit's own patch is scanned too
-  // (`--cc`: a merge shows only what it adds beyond its parents). A cut patch fails closed as a size block.
+  // The push transfers every new commit, not just the net result: a file or credential added in one
+  // commit and deleted in the next is still in the pushed history. So each new commit's own patch counts
+  // against the byte limit (scan on or off) and is scanned too (`--cc`: a merge shows only what it adds
+  // beyond its parents). A cut patch fails closed as a size block.
   const history = await mustRun(
     input,
     root,
@@ -373,6 +362,18 @@ async function scanDelta(
       diffBytes,
     };
   }
+  if (input.limits.secretScan === "off") return { changedFiles, diffBytes };
+
+  const hitPaths = new Set<string>();
+  const patternNames = new Set<string>();
+  const record = (findings: readonly TextSecretFinding[], pathOf: (line: number) => string) => {
+    for (const finding of findings) {
+      hitPaths.add(pathOf(finding.line));
+      patternNames.add(finding.kind === "known-token-pattern" ? finding.patternName : finding.canaryName);
+    }
+  };
+  const added = addedLinesByPath(diff.stdout);
+  record(scanTextForSecrets(added.text), (line) => added.paths[line - 1] ?? "");
   const historyAdded = addedLinesByPath(history.stdout);
   record(scanTextForSecrets(historyAdded.text), (line) => historyAdded.paths[line - 1] ?? "");
 

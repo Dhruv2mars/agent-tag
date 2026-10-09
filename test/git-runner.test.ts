@@ -86,6 +86,8 @@ describe("git runner", () => {
       [
         "GIT_CONFIG_GLOBAL",
         "GIT_CONFIG_NOSYSTEM",
+        "GIT_GRAFT_FILE",
+        "GIT_NO_REPLACE_OBJECTS",
         "GIT_OPTIONAL_LOCKS",
         "GIT_PAGER",
         "GIT_TERMINAL_PROMPT",
