@@ -62,7 +62,10 @@ export class T3RuntimeGate {
       });
       const pinnedVersion = this.#options.pinnedVersion;
       reason = t3DescriptorProblem(descriptor, pinnedVersion === undefined ? {} : { pinnedVersion })?.message;
-      if (reason === undefined && pinnedVersion !== undefined && descriptor.environmentId !== undefined) {
+      // Managed mode pins the runtime's identity: a missing or malformed id fails closed, like a changed one.
+      if (reason === undefined && pinnedVersion !== undefined && descriptor.environmentId === undefined) {
+        reason = "managed T3 reported no environment id; it must identify its base dir";
+      } else if (reason === undefined && pinnedVersion !== undefined && descriptor.environmentId !== undefined) {
         this.#environmentId ??= descriptor.environmentId;
         if (descriptor.environmentId !== this.#environmentId) {
           reason = `managed T3 environment id changed from ${this.#environmentId} to ${descriptor.environmentId}: its base dir was replaced; restart Agent Tag after checking t3.homeDir`;

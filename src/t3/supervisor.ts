@@ -275,6 +275,7 @@ export class T3ManagedRuntime {
   readonly #processArgs: (pid: number) => Promise<string | undefined>;
   readonly #timing: T3RuntimeTiming;
   readonly #fatalListeners: Array<(error: Error) => void> = [];
+  #fatalError: Error | undefined;
   readonly #stateListeners: Array<(state: T3RuntimeState) => void> = [];
   readonly #stderrTail: string[] = [];
   #state: T3RuntimeState = "stopped";
@@ -316,8 +317,15 @@ export class T3ManagedRuntime {
     };
   }
 
-  /** Called once when T3 keeps crashing; the runtime is then `failed` and will not restart. */
+  /**
+   * Called once when T3 keeps crashing; the runtime is then `failed` and will not restart. A listener
+   * added after the failure is called right away, so a crash loop during slow startup is not lost.
+   */
   onFatal(listener: (error: Error) => void): void {
+    if (this.#fatalError !== undefined) {
+      listener(this.#fatalError);
+      return;
+    }
     this.#fatalListeners.push(listener);
   }
 
@@ -379,14 +387,14 @@ export class T3ManagedRuntime {
     const child: RunningChild = { process: spawned, exit: undefined, stderrDone: this.#pumpStderr(spawned.stderr) };
     this.#child = child;
     void spawned.exited.then((exit) => this.#onExit(child, exit));
-    await writeJsonAtomically(join(this.#settings.runtimeDir, SUPERVISED_FILE), {
-      pid: spawned.pid,
-      binary: this.#installed.binary,
-      homeDir,
-      port,
-      startedAt: this.#now().toISOString(),
-    });
     try {
+      await writeJsonAtomically(join(this.#settings.runtimeDir, SUPERVISED_FILE), {
+        pid: spawned.pid,
+        binary: this.#installed.binary,
+        homeDir,
+        port,
+        startedAt: this.#now().toISOString(),
+      });
       const descriptor = await this.#waitUntilReady(child);
       this.#startedAt = this.#now().toISOString();
       await this.#recordVersionStarted();
@@ -485,6 +493,7 @@ export class T3ManagedRuntime {
   }
 
   #fail(error: Error): void {
+    this.#fatalError = error;
     this.#setState("failed");
     this.#log("warn", "t3.runtime.crashloop", error.message);
     for (const listener of this.#fatalListeners) listener(error);
@@ -526,7 +535,7 @@ export class T3ManagedRuntime {
     for (const pid of pids) {
       if (!processAlive(pid)) continue;
       const args = await this.#processArgs(pid);
-      if (args === undefined || !isManagedServeCommand(args, this.#settings.homeDir)) continue;
+      if (args === undefined || !isManagedServeCommand(args, { homeDir: this.#settings.homeDir, runtimeDir: this.#settings.runtimeDir, binary: this.#installed.binary })) continue;
       this.#log("warn", "t3.runtime.orphan_reaped", `pid ${pid} from a previous Agent Tag run`);
       signalProcessGroup(pid, "SIGTERM");
       const deadline = Date.now() + this.#timing.orphanTimeoutMs;
@@ -631,10 +640,22 @@ export class T3ManagedRuntime {
   }
 }
 
-/** True for `<anything> serve ... --base-dir <homeDir>` (the shape `T3ManagedRuntime` spawns). */
-export function isManagedServeCommand(args: string, homeDir: string): boolean {
-  const padded = ` ${args} `;
-  return /\sserve\s/.test(padded) && padded.includes(` --base-dir ${homeDir} `);
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * True for `<our t3> serve ... --base-dir <homeDir>`: the executable must be the installed binary or
+ * another pinned install under `<runtimeDir>/versions/<version>/t3` (an orphan from before an
+ * upgrade), and the base dir must be our own home. A foreign executable with the same arguments is
+ * never ours.
+ */
+export function isManagedServeCommand(
+  args: string,
+  owner: { readonly homeDir: string; readonly runtimeDir: string; readonly binary: string },
+): boolean {
+  const executable = new RegExp(`^(?:${escapeRegExp(owner.binary)}|${escapeRegExp(owner.runtimeDir)}/versions/[^/\\s]+/t3) serve(?: |$)`);
+  return executable.test(args) && ` ${args} `.includes(` --base-dir ${owner.homeDir} `);
 }
 
 /**

@@ -76,6 +76,22 @@ describe("T3 runtime gate", () => {
     t3.descriptor = { serverVersion: "0.0.45", orchestrationProtocolVersion: 1, environmentId: "env-2" };
     expect(await gate.check()).toBe(false);
     expect(gate.reason).toContain("environment id changed");
+    // Dropping the id (or sending a malformed one) must not reopen the gate.
+    t3.descriptor = { serverVersion: "0.0.45", orchestrationProtocolVersion: 1 };
+    expect(await gate.check()).toBe(false);
+    expect(gate.reason).toContain("no environment id");
+    t3.descriptor = { serverVersion: "0.0.45", orchestrationProtocolVersion: 1, environmentId: 42 };
+    expect(await gate.check()).toBe(false);
+    t3.descriptor = { serverVersion: "0.0.45", orchestrationProtocolVersion: 1, environmentId: "env-1" };
+    expect(await gate.check()).toBe(true);
+  });
+
+  test("managed mode never opens for a runtime without an environment id; external mode does not need one", async () => {
+    const t3 = fakeT3({ serverVersion: "0.0.45", orchestrationProtocolVersion: 1 });
+    const managed = new T3RuntimeGate({ baseUrl: "http://127.0.0.1:1", pinnedVersion: "0.0.45", logger: () => {}, fetch: t3.fetch });
+    expect(await managed.check()).toBe(false);
+    const external = new T3RuntimeGate({ baseUrl: "http://127.0.0.1:1", logger: () => {}, fetch: t3.fetch });
+    expect(await external.check()).toBe(true);
   });
 
   test("concurrent checks share one probe", async () => {

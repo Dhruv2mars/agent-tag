@@ -9,7 +9,13 @@ import type { ServiceLogger } from "../service.ts";
 import { inspectInstalledT3 } from "./install.ts";
 import type { T3Pin } from "./pin.ts";
 import { type EnvironmentFetch, fetchT3EnvironmentDescriptor, t3DescriptorProblem } from "./protocol.ts";
-import { prepareManagedT3Binary, redactT3Output, T3ManagedRuntime } from "./supervisor.ts";
+import {
+  type ManagedT3Binary,
+  prepareManagedT3Binary,
+  redactT3Output,
+  T3ManagedRuntime,
+  type T3ManagedRuntimeOptions,
+} from "./supervisor.ts";
 
 export type ManagedT3Config = Extract<ResolvedT3Config, { readonly mode: "managed" }>;
 
@@ -51,9 +57,18 @@ export async function runManagedT3Serve(input: {
   readonly logger: ServiceLogger;
   readonly print: (line: string) => void;
   readonly wait?: typeof waitForShutdownOrFatal;
+  /** Tests: skip install with an already verified binary, and tune the runtime (env, timing). */
+  readonly installed?: ManagedT3Binary;
+  readonly runtimeOptions?: Partial<Omit<T3ManagedRuntimeOptions, "settings" | "installed" | "logger">>;
 }): Promise<number> {
-  const installed = await prepareManagedT3Binary({ settings: input.t3.managed, pin: input.pin, logger: input.logger });
-  const runtime = new T3ManagedRuntime({ settings: input.t3.managed, installed, logger: input.logger });
+  const installed = input.installed
+    ?? (await prepareManagedT3Binary({ settings: input.t3.managed, pin: input.pin, logger: input.logger }));
+  const runtime = new T3ManagedRuntime({
+    ...input.runtimeOptions,
+    settings: input.t3.managed,
+    installed,
+    logger: input.logger,
+  });
   const descriptor = await runtime.start();
   try {
     input.print(JSON.stringify({
@@ -148,12 +163,14 @@ export async function runManagedT3Pair(input: {
   readonly allowNonTty: boolean;
   readonly print: (line: string) => void;
   readonly fetch?: EnvironmentFetch;
+  /** Tests: stands in for the read-only install check. */
+  readonly inspectInstall?: typeof inspectInstalledT3;
 }): Promise<number> {
   if (!input.stdoutIsTty && !input.allowNonTty) {
     throw new Error("t3 pair prints a live credential; run it in a terminal (or pass --allow-non-tty to print it anyway)");
   }
   const { managed, baseUrl } = input.t3;
-  const install = await inspectInstalledT3({ pin: input.pin, runtimeDir: managed.runtimeDir });
+  const install = await (input.inspectInstall ?? inspectInstalledT3)({ pin: input.pin, runtimeDir: managed.runtimeDir });
   if (!install.filesVerified || install.binary === null) {
     throw new Error(
       `managed T3 ${input.pin.version} is not installed and verified in ${managed.runtimeDir}${install.problem === null ? "" : ` (${install.problem})`}; run \`agent-tag t3 install CONFIG\``,

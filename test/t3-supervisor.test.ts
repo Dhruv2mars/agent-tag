@@ -218,7 +218,9 @@ describe("managed T3 supervisor", () => {
     strays.push(foreign.pid);
     await writeFile(join(h.runtimeDir, "supervised.json"), JSON.stringify({ pid: foreign.pid }));
 
-    const runtime = h.runtime();
+    // The fake CLI runs as `bun fake-t3.ts ...`; report the command line real T3 shows (`<binary> serve ...`).
+    const serveArgs = `${FAKE_T3_BINARY} serve --host 127.0.0.1 --port ${h.port} --base-dir ${h.homeDir}`;
+    const runtime = h.runtime({ processArgs: async (pid) => (pid === orphan.pid ? serveArgs : `sleep 30`) });
     await runtime.start();
     expect(alive(orphan.pid)).toBe(false);
     expect(alive(foreign.pid)).toBe(true);
@@ -226,6 +228,39 @@ describe("managed T3 supervisor", () => {
     expect(h.logs.filter((record) => record.event === "t3.runtime.orphan_reaped").map((record) => record.detail)).toEqual([
       `pid ${orphan.pid} from a previous Agent Tag run`,
     ]);
+  });
+
+  test("leaves a foreign executable alone even when it runs serve with our base dir", async () => {
+    const h = await harness();
+    await mkdir(h.runtimeDir, { recursive: true, mode: 0o700 });
+    const foreign = Bun.spawn(["sleep", "30"], { stdout: "ignore", stderr: "ignore" });
+    strays.push(foreign.pid);
+    await writeFile(join(h.runtimeDir, "supervised.json"), JSON.stringify({ pid: foreign.pid }));
+    const runtime = h.runtime({
+      processArgs: async () => `/usr/local/bin/other-server serve --host 127.0.0.1 --port ${h.port} --base-dir ${h.homeDir}`,
+    });
+    await runtime.start();
+    expect(alive(foreign.pid)).toBe(true);
+    expect(h.logs.map((record) => record.event)).not.toContain("t3.runtime.orphan_reaped");
+  });
+
+  test("a failure writing supervisor bookkeeping kills the spawned child", async () => {
+    const h = await harness();
+    // A non-empty directory where supervised.json goes makes the atomic rename fail after spawn.
+    await mkdir(join(h.runtimeDir, "supervised.json", "blocker"), { recursive: true });
+    await chmod(h.runtimeDir, 0o700);
+    const spawned: number[] = [];
+    const runtime = h.runtime({
+      spawn: (command, options) => {
+        const child = defaultT3Spawn(command, options);
+        spawned.push(child.pid);
+        return child;
+      },
+    });
+    await expect(runtime.start()).rejects.toThrow();
+    expect(spawned).toHaveLength(1);
+    expect(alive(spawned[0] ?? 0)).toBe(false);
+    expect(runtime.status().state).toBe("stopped");
   });
 
   test("restarts a crashed runtime with exponential backoff and gives up after the crash budget", async () => {
@@ -260,6 +295,10 @@ describe("managed T3 supervisor", () => {
     expect(fatal[0]).toBeInstanceOf(T3CrashLoopError);
     expect(runtime.status().state).toBe("failed");
     expect(h.logs.map((record) => record.event)).toContain("t3.runtime.crashloop");
+    // A listener registered after the crash loop (e.g. once slow Slack startup finishes) still hears it.
+    const late: Error[] = [];
+    runtime.onFatal((error) => late.push(error));
+    expect(late).toEqual([fatal[0] as Error]);
   });
 
   test("a restart that hits a protocol change fails instead of looping", async () => {
@@ -317,9 +356,14 @@ describe("managed T3 helpers", () => {
     expect(redactT3Output('{"token":"s3cr3t"}')).not.toContain("s3cr3t");
   });
 
-  test("orphan matching requires serve and our exact base dir", () => {
-    expect(isManagedServeCommand("/r/t3 serve --host 127.0.0.1 --port 1 --base-dir /data/home", "/data/home")).toBe(true);
-    expect(isManagedServeCommand("/r/t3 serve --base-dir /data/home2", "/data/home")).toBe(false);
-    expect(isManagedServeCommand("/r/t3 auth session issue --base-dir /data/home", "/data/home")).toBe(false);
+  test("orphan matching requires our executable, serve, and our exact base dir", () => {
+    const owner = { homeDir: "/data/home", runtimeDir: "/data/rt", binary: "/data/rt/versions/0.0.45/t3" };
+    expect(isManagedServeCommand("/data/rt/versions/0.0.45/t3 serve --host 127.0.0.1 --port 1 --base-dir /data/home", owner)).toBe(true);
+    // An orphan from the previous pinned version (before an upgrade) is still ours.
+    expect(isManagedServeCommand("/data/rt/versions/0.0.44/t3 serve --base-dir /data/home", owner)).toBe(true);
+    expect(isManagedServeCommand("/usr/local/bin/other-server serve --base-dir /data/home", owner)).toBe(false);
+    expect(isManagedServeCommand("/data/rt/versions/0.0.45/t3-evil serve --base-dir /data/home", owner)).toBe(false);
+    expect(isManagedServeCommand("/data/rt/versions/0.0.45/t3 serve --base-dir /data/home2", owner)).toBe(false);
+    expect(isManagedServeCommand("/data/rt/versions/0.0.45/t3 auth session issue --base-dir /data/home", owner)).toBe(false);
   });
 });
