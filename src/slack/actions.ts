@@ -3,6 +3,7 @@ import { z } from "zod";
 
 import type { AgentTagConfig } from "../config.ts";
 import type { AgentTagStore, UserInputQuestionPrompt, UserInputSelection } from "../store/store.ts";
+import { alreadyHandledText } from "./cards.ts";
 
 const slackId = z.string().regex(/^[A-Z][A-Z0-9]+$/);
 const slackActionIdSchema = z.enum([
@@ -79,7 +80,12 @@ type IgnoredReason =
   | "interaction-expired";
 
 export type SlackActionResult =
-  | { readonly kind: "accepted" | "duplicate"; readonly commandId: string }
+  | { readonly kind: "accepted"; readonly commandId: string }
+  /**
+   * A repeat click. `resolution` says how the request was already handled when it is no longer pending
+   * (sent to the clicker as an ephemeral); null for a redelivered click on a still-pending request.
+   */
+  | { readonly kind: "duplicate"; readonly commandId: string; readonly resolution: string | null }
   | { readonly kind: "partial"; readonly commandId: string; readonly answered: number; readonly total: number }
   | { readonly kind: "open-modal"; readonly triggerId: string; readonly view: SlackTypes.ModalView }
   | { readonly kind: "ignored"; readonly reason: IgnoredReason };
@@ -214,7 +220,9 @@ export class SlackActionRouter {
         now: this.#now(),
       });
       if (result.kind === "denied") return { kind: "ignored", reason: "interaction-denied" };
-      return { kind: result.kind, commandId: result.commandId };
+      return result.kind === "duplicate"
+        ? { kind: "duplicate", commandId: result.commandId, resolution: null }
+        : { kind: "accepted", commandId: result.commandId };
     }
 
     if (action.action_id === "agent-tag.user-input.open") {
@@ -263,7 +271,9 @@ export class SlackActionRouter {
       if (result.kind === "denied") return { kind: "ignored", reason: "interaction-denied" };
       if (result.kind === "expired") return { kind: "ignored", reason: "interaction-expired" };
       if (result.kind === "invalid") return { kind: "ignored", reason: "invalid-action" };
-      return result;
+      if (result.kind === "duplicate") return this.#duplicate(value.interactionId, result.commandId);
+      if (result.kind === "partial") return result;
+      return { kind: "accepted", commandId: result.commandId };
     }
 
     let response: unknown;
@@ -294,7 +304,16 @@ export class SlackActionRouter {
     });
     if (result.kind === "denied") return { kind: "ignored", reason: "interaction-denied" };
     if (result.kind === "expired") return { kind: "ignored", reason: "interaction-expired" };
-    return { kind: result.kind, commandId: result.commandId };
+    if (result.kind === "duplicate") return this.#duplicate(action.value, result.commandId);
+    return { kind: "accepted", commandId: result.commandId };
+  }
+
+  /** A click on a request that was already answered, failed or expired: no state change, only feedback. */
+  #duplicate(interactionId: string, commandId: string): SlackActionResult {
+    const resolution = alreadyHandledText(this.#store.getInteractionCardView(interactionId), {
+      expirySeconds: this.#config.limits.interactionExpirySeconds,
+    });
+    return { kind: "duplicate", commandId, resolution };
   }
 
   /** Handles a submitted answer modal. `invalid-input` results should be acked with `response_action: "errors"`. */
