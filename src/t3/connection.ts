@@ -178,12 +178,15 @@ export class T3Connection {
     ) {
       return cached;
     }
+    if (signal?.aborted) throw signal.reason;
     // Concurrent callers share one freshness check, so none returns the old session while a rotated
     // token is still being validated.
     if (this.#sessionCheck === null) {
       const check: Promise<LoadedSession> = this.#checkSession().finally(() => {
         if (this.#sessionCheck === check) this.#sessionCheck = null;
       });
+      // Every caller may stop waiting; the shared failure must still count as observed.
+      check.catch(() => undefined);
       this.#sessionCheck = check;
     }
     return raceAbort(this.#sessionCheck, signal);
@@ -318,14 +321,19 @@ export class T3Connection {
     } else if (current !== null) {
       return Promise.resolve(current);
     }
-    this.#connecting ??= this.#connect(signal).finally(() => {
-      this.#connecting = null;
-    });
-    return this.#connecting;
+    if (this.#connecting === null) {
+      const connecting: Promise<Generation> = this.#connect().finally(() => {
+        if (this.#connecting === connecting) this.#connecting = null;
+      });
+      connecting.catch(() => undefined);
+      this.#connecting = connecting;
+    }
+    return raceAbort(this.#connecting, signal);
   }
 
-  async #connect(callerSignal: AbortSignal | undefined): Promise<Generation> {
-    const signal = callerSignal === undefined ? this.#closing.signal : AbortSignal.any([callerSignal, this.#closing.signal]);
+  /** Shared by every waiting caller, so only close() cancels it; each caller's signal ends its own wait. */
+  async #connect(): Promise<Generation> {
+    const signal = this.#closing.signal;
     if (this.#failures > 0) {
       const ceiling = Math.min(RECONNECT_MAX_MS, RECONNECT_BASE_MS * 2 ** (this.#failures - 1));
       await abortableDelay(Math.round(ceiling / 2 + Math.random() * (ceiling / 2)), signal);

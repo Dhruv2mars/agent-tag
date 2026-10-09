@@ -159,6 +159,48 @@ describe("T3Connection", () => {
     await expect(shared).resolves.toBeDefined();
   });
 
+  test("aborting the caller that started a connect does not fail another caller waiting on it", async () => {
+    let releaseTicket = () => {};
+    fake.ticketGate = new Promise((resolve) => {
+      releaseTicket = resolve;
+    });
+    const controller = new AbortController();
+    const first = connection.dispatch(interrupt("command-1"), controller.signal);
+    await eventually(() => fake.counts.tickets === 1);
+    const second = connection.dispatch(interrupt("command-2"));
+    controller.abort();
+    await expect(first).rejects.toBeDefined();
+    releaseTicket();
+    expect(await second).toEqual({ sequence: 1 });
+    expect(fake.counts).toMatchObject({ tickets: 1, wsConnects: 1 });
+  });
+
+  test("a failed shared session check is never an unhandled rejection, even if every caller stopped waiting", async () => {
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => unhandled.push(reason);
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      await connection.session();
+      fake.scopes = ["orchestration:read", "orchestration:operate", "access:write"];
+      await utimes(fake.tokenFile, new Date(clock + 10_000), new Date(clock + 10_000));
+      clock += 6_000;
+
+      const preAborted = new AbortController();
+      preAborted.abort();
+      await expect(connection.session(preAborted.signal)).rejects.toBeDefined();
+      await Bun.sleep(50);
+      const controller = new AbortController();
+      const waiting = connection.session(controller.signal);
+      controller.abort();
+      await expect(waiting).rejects.toBeDefined();
+      await Bun.sleep(50);
+      expect(unhandled).toEqual([]);
+      await expect(connection.session()).rejects.toThrow("extra=access:write");
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
+  });
+
   test("close() during a pending connect leaves no socket open", async () => {
     let releaseTicket = () => {};
     fake.ticketGate = new Promise((resolve) => {
