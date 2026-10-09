@@ -201,7 +201,7 @@ class WatchHandle implements ThreadWatch {
   readonly #onRelease: (watch: WatchHandle) => void;
   readonly #listeners = new Set<(item: NormalizedThreadItem) => void>();
   #pending: "event" | "resync" | null = null;
-  #wake: (() => void) | null = null;
+  #wake: ((now?: ThreadWakeReason) => void) | null = null;
   #released = false;
 
   constructor(subscription: Subscription, coalesceMs: number, onRelease: (watch: WatchHandle) => void) {
@@ -249,8 +249,9 @@ class WatchHandle implements ThreadWatch {
       const onAbort = () => finish("timeout");
       const timer = setTimeout(() => finish(this.#pending ?? "timeout"), timeoutMs);
       signal?.addEventListener("abort", onAbort, { once: true });
-      this.#wake = () => {
-        coalesce ??= setTimeout(() => finish(this.#pending ?? "event"), this.#coalesceMs);
+      this.#wake = (now) => {
+        if (now !== undefined) finish(now);
+        else coalesce ??= setTimeout(() => finish(this.#pending ?? "event"), this.#coalesceMs);
       };
     });
   }
@@ -264,7 +265,7 @@ class WatchHandle implements ThreadWatch {
     if (this.#released) return;
     this.#released = true;
     this.#listeners.clear();
-    this.#wake?.();
+    this.#wake?.("timeout");
     this.#onRelease(this);
   }
 }
