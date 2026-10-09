@@ -9,11 +9,12 @@ import * as RpcSerialization from "effect/unstable/rpc/RpcSerialization";
 import * as Socket from "effect/unstable/socket/Socket";
 import { z } from "zod";
 
-import { readSecretFile } from "../security/secret-file.ts";
+import { readSecretFile, type SecretString } from "../security/secret-file.ts";
 import {
   assertRestrictedOrchestrationSession,
   inspectT3Session,
   issueT3WebSocketUrl,
+  T3HttpError,
 } from "./auth.ts";
 import { assertSupportedT3Protocol } from "./protocol.ts";
 
@@ -163,7 +164,7 @@ const providerSchema = z.object({
   ),
 });
 
-const serverConfigSchema = z.object({
+export const serverConfigSchema = z.object({
   environment: z.object({
     environmentId: id,
     capabilities: z.record(z.string(), z.unknown()),
@@ -173,7 +174,7 @@ const serverConfigSchema = z.object({
 
 export type T3ServerInfo = z.infer<typeof serverConfigSchema>;
 
-const dispatchResultSchema = z.object({ sequence: z.number().int().nonnegative() });
+export const dispatchResultSchema = z.object({ sequence: z.number().int().nonnegative() });
 export type T3DispatchResult = z.infer<typeof dispatchResultSchema>;
 
 const latestTurnSchema = z
@@ -221,7 +222,7 @@ const sessionSchema = z
   })
   .nullable();
 
-const threadSnapshotSchema = z.object({
+export const threadSnapshotSchema = z.object({
   snapshotSequence: z.number().int().nonnegative(),
   thread: z.object({
     id,
@@ -410,7 +411,7 @@ export function awaitingT3AnswerContinuation(snapshot: T3ThreadSnapshot, request
   return endedAt === null || Date.parse(endedAt) < answeredAt;
 }
 
-const threadStreamItemSchema = z.discriminatedUnion("kind", [
+export const threadStreamItemSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("synchronized") }),
   z.object({ kind: z.literal("snapshot"), snapshot: z.unknown() }),
   z.object({
@@ -458,7 +459,7 @@ const attachmentDeleteRpc = Rpc.make("attachments.delete", {
 const assetUrlRpc = Rpc.make("assets.createUrl", {
   payload: Schema.Unknown, success: Schema.Unknown, error: Schema.Unknown,
 });
-const rpcGroup = RpcGroup.make(
+export const rpcGroup = RpcGroup.make(
   probeRpc, configRpc, dispatchRpc, subscribeThreadRpc, attachmentUploadRpc, attachmentDeleteRpc, assetUrlRpc,
 );
 
@@ -486,7 +487,7 @@ function runRpc<A, E>(program: Effect.Effect<A, E>, signal: AbortSignal | undefi
   return Effect.runPromise(program, signalOption(signal));
 }
 
-function protocolLayer(url: string) {
+export function protocolLayer(url: string) {
   const socketLayer = Socket.layerWebSocket(url, { openTimeout: "10 seconds" }).pipe(
     Layer.provide(Socket.layerWebSocketConstructorGlobal),
   );
@@ -547,17 +548,27 @@ export async function fetchT3ThreadSnapshot(input: {
   readonly threadId: string;
   readonly signal?: AbortSignal;
 }): Promise<T3ThreadSnapshot> {
-  const threadId = id.parse(input.threadId);
   const token = await readSecretFile(input.config.tokenFile);
   const session = await inspectT3Session({ baseUrl: input.config.baseUrl, token, ...signalOption(input.signal) });
   assertRestrictedOrchestrationSession(session);
-  const url = new URL(`/api/orchestration/threads/${encodeURIComponent(threadId)}`, input.config.baseUrl);
+  return requestT3ThreadSnapshot({ baseUrl: input.config.baseUrl, token, threadId: input.threadId, ...signalOption(input.signal) });
+}
+
+/** The snapshot GET alone, with a token whose session the caller has already checked. */
+export async function requestT3ThreadSnapshot(input: {
+  readonly baseUrl: string;
+  readonly token: SecretString;
+  readonly threadId: string;
+  readonly signal?: AbortSignal;
+}): Promise<T3ThreadSnapshot> {
+  const threadId = id.parse(input.threadId);
+  const url = new URL(`/api/orchestration/threads/${encodeURIComponent(threadId)}`, input.baseUrl);
   const response = await fetch(url, {
-    headers: { authorization: `Bearer ${token.exposeToBoundary()}` },
-    ...(input.signal === undefined ? {} : { signal: input.signal }),
+    headers: { authorization: `Bearer ${input.token.exposeToBoundary()}` },
+    ...signalOption(input.signal),
   });
   if (response.status === 404) throw new T3ThreadNotFoundError(threadId);
-  if (!response.ok) throw new Error(`T3 thread snapshot endpoint returned HTTP ${response.status}`);
+  if (!response.ok) throw new T3HttpError("thread snapshot", response.status);
   const raw: unknown = await response.json();
   return threadSnapshotSchema.parse(raw);
 }

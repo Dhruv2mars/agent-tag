@@ -175,7 +175,11 @@ describe("agent-tag onboard (non-interactive)", () => {
     const config = agentTagConfigSchema.parse(JSON.parse(await readFile(configPath, "utf8")));
     expect(config.dataDir).toBe(join(harness.home, "data"));
     expect(config.slack.workspaceId).toBe("T0FIXTURE");
-    expect(config.t3).toEqual({ baseUrl: "http://127.0.0.1:3774", tokenFile: join(harness.home, "secrets", "t3-token") });
+    expect(config.t3).toEqual({
+      baseUrl: "http://127.0.0.1:3774",
+      tokenFile: join(harness.home, "secrets", "t3-token"),
+      watch: { enabled: true, safetyPollMs: 15_000, lingerMs: 30_000 },
+    });
     expect(config.access).toEqual({ allowedUserIds: ["U0ALICE", "U0BOB"], allowedChannelIds: ["C0ENG", "G0PRIVATE"] });
     expect(config.profiles[0]).toMatchObject({
       id: "default",

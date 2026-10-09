@@ -8,7 +8,9 @@ import { createScheduleWorkers } from "./scheduler.ts";
 import { SlackSocketBridge } from "./slack/bridge.ts";
 import { createRetentionWorker } from "./store/retention.ts";
 import { AgentTagStore } from "./store/store.ts";
+import { T3Connection } from "./t3/connection.ts";
 import { inspectT3 } from "./t3/gateway.ts";
+import { protocolV1Source, ThreadWatcher } from "./t3/watcher.ts";
 
 interface ServiceWorkerOutcome {
   readonly kind: string;
@@ -39,6 +41,7 @@ export interface ServiceLogRecord {
   readonly outcome?: string;
   readonly errorCode?: string;
   readonly count?: number;
+  readonly stats?: Readonly<Record<string, number>>;
 }
 
 export type ServiceLogger = (record: ServiceLogRecord) => void;
@@ -50,6 +53,8 @@ export interface AgentTagServiceOptions {
   readonly interactionWorkers: ReadonlyArray<ServiceWorker>;
   readonly scheduleWorkers?: ReadonlyArray<ServiceWorker>;
   readonly maintenanceWorkers?: ReadonlyArray<ServiceWorker>;
+  /** Closed after every loop has stopped, before the store (e.g. the shared T3 connection). */
+  readonly resources?: ReadonlyArray<{ readonly close: () => Promise<void> }>;
   readonly idleMs?: number;
   readonly logger?: ServiceLogger;
   readonly now?: () => Date;
@@ -84,6 +89,7 @@ export class AgentTagService {
   readonly #interactionWorkers: ReadonlyArray<ServiceWorker>;
   readonly #scheduleWorkers: ReadonlyArray<ServiceWorker>;
   readonly #maintenanceWorkers: ReadonlyArray<ServiceWorker>;
+  readonly #resources: ReadonlyArray<{ readonly close: () => Promise<void> }>;
   readonly #idleMs: number;
   readonly #logger: ServiceLogger;
   readonly #now: () => Date;
@@ -102,6 +108,7 @@ export class AgentTagService {
     this.#interactionWorkers = options.interactionWorkers;
     this.#scheduleWorkers = options.scheduleWorkers ?? [];
     this.#maintenanceWorkers = options.maintenanceWorkers ?? [];
+    this.#resources = options.resources ?? [];
     this.#idleMs = idleMs;
     this.#logger = options.logger ?? defaultLogger;
     this.#now = options.now ?? (() => new Date());
@@ -113,6 +120,7 @@ export class AgentTagService {
       await this.#bridge.start();
     } catch (error) {
       this.#state = "stopped";
+      await this.#closeResources();
       this.#store.close();
       throw error;
     }
@@ -141,6 +149,7 @@ export class AgentTagService {
     if (this.#state === "stopped") return;
     if (this.#state === "created") {
       this.#state = "stopped";
+      await this.#closeResources();
       this.#store.close();
       return;
     }
@@ -156,6 +165,7 @@ export class AgentTagService {
         this.#log({ level: "warn", event: "service.stop.failed", errorCode: errorCode(result.reason) });
       }
     }
+    await this.#closeResources();
     this.#store.close();
     this.#state = "stopped";
     this.#log({ level: "info", event: "service.stopped" });
@@ -201,6 +211,14 @@ export class AgentTagService {
     }
   }
 
+  async #closeResources(): Promise<void> {
+    for (const result of await Promise.allSettled(this.#resources.map((resource) => resource.close()))) {
+      if (result.status === "rejected") {
+        this.#log({ level: "warn", event: "service.stop.failed", errorCode: errorCode(result.reason) });
+      }
+    }
+  }
+
   #log(input: Omit<ServiceLogRecord, "at">): void {
     this.#logger({ ...input, at: this.#now().toISOString() });
   }
@@ -216,19 +234,30 @@ export async function createAgentTagService(input: {
   const databasePath = join(input.config.dataDir, "agent-tag.sqlite");
   const store = await AgentTagStore.open(databasePath);
   const quarantined = store.quarantineExpiredOutbox(now().toISOString());
+  // One T3 session and WebSocket for the whole service, and one subscription per watched thread.
+  const t3 = new T3Connection({ config: input.config.t3, logger, now });
+  const watch = input.config.t3.watch;
+  const watcher = watch.enabled
+    ? new ThreadWatcher({ source: protocolV1Source(t3), logger, now, lingerMs: watch.lingerMs })
+    : undefined;
+  const closeT3 = async () => {
+    await watcher?.close();
+    await t3.close();
+  };
   try {
     validateConfiguredProviders(input.config, await inspectT3(input.config.t3));
     const bridge = await SlackSocketBridge.create({ config: input.config, store });
     let nextMemoryExpiryAt = 0;
+    let nextT3StatsAt = now().getTime() + 60_000;
     const coordinators = Array.from(
       { length: input.config.limits.maxConcurrentTasks },
-      () => new AgentTagCoordinator({ config: input.config, store }),
+      () => new AgentTagCoordinator({ config: input.config, store, t3, ...(watcher === undefined ? {} : { watcher }) }),
     );
     const service = new AgentTagService({
       store,
       bridge,
       coordinators,
-      interactionWorkers: [new InteractionWorker({ store, config: input.config, t3Config: input.config.t3 })],
+      interactionWorkers: [new InteractionWorker({ store, config: input.config, t3 })],
       scheduleWorkers: createScheduleWorkers({ config: input.config, store }),
       maintenanceWorkers: [
         {
@@ -241,7 +270,22 @@ export async function createAgentTagService(input: {
           },
         },
         createRetentionWorker({ databasePath, policy: input.config.retention, now }),
+        {
+          processNext: async () => {
+            const current = now();
+            if (current.getTime() < nextT3StatsAt) return { kind: "idle" };
+            nextT3StatsAt = current.getTime() + 60_000;
+            logger({
+              level: "info",
+              event: "t3.connection.stats",
+              at: current.toISOString(),
+              stats: { ...t3.stats, watchedThreads: watcher?.subscriptionCount ?? 0 },
+            });
+            return { kind: "idle" };
+          },
+        },
       ],
+      resources: [{ close: closeT3 }],
       logger,
       now,
     });
@@ -255,6 +299,7 @@ export async function createAgentTagService(input: {
     }
     return service;
   } catch (error) {
+    await closeT3();
     store.close();
     throw error;
   }

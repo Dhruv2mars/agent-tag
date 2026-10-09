@@ -147,7 +147,7 @@ export async function issueT3WebSocketUrl(input: {
     headers: bearerHeaders(input.token),
     ...(input.signal === undefined ? {} : { signal: input.signal }),
   });
-  if (!response.ok) throw new Error(`T3 WebSocket ticket endpoint returned HTTP ${response.status}`);
+  if (!response.ok) throw new T3HttpError("WebSocket ticket", response.status);
   const issued = webSocketTicketSchema.parse(await parseJson(response));
   const url = new URL("/ws", input.baseUrl);
   url.protocol = url.protocol === "https:" ? "wss:" : "ws:";

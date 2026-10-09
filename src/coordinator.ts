@@ -16,6 +16,7 @@ import {
   type T3PendingUserInput,
   type T3ThreadSnapshot,
 } from "./t3/gateway.ts";
+import type { ThreadWatch, ThreadWatchSource } from "./t3/watcher.ts";
 
 export interface T3CoordinatorGateway {
   /** Implementations should stop the RPC (closing its socket) when `signal` aborts. */
@@ -39,9 +40,10 @@ export type CoordinatorOutcome =
   | { readonly kind: "released"; readonly operationId: string }
   | { readonly kind: "failed"; readonly operationId: string; readonly outboxId: string; readonly errorCode: string };
 
-/** When this claim started polling its T3 turn; null until the turn has been dispatched. */
+/** When this claim started polling its T3 turn (null until dispatched), and its thread watch if any. */
 interface TurnPolling {
   startedAt: number | null;
+  watch: ThreadWatch | null;
 }
 
 export interface CoordinatorOptions {
@@ -51,7 +53,12 @@ export interface CoordinatorOptions {
   readonly memory?: AgentTagMemory;
   readonly workerId?: string;
   readonly leaseMs?: number;
+  /** Poll interval without a watcher, and while a snapshot lags an event the watcher already saw. */
   readonly pollMs?: number;
+  /** Wakes the wait loop on T3 thread events instead of polling every `pollMs`. */
+  readonly watcher?: ThreadWatchSource;
+  /** Longest wait for a watcher wake-up before re-reading the snapshot. Defaults to `t3.watch.safetyPollMs`. */
+  readonly safetyPollMs?: number;
   /** No-progress window before a turn counts as stalled. Defaults to `stalledTurn.timeoutSeconds`. */
   readonly stallMs?: number;
   /** Absolute ceiling on a turn's active polling time. Defaults to `stalledTurn.maxTurnSeconds`. */
@@ -380,6 +387,8 @@ export class AgentTagCoordinator {
   readonly #workerId: string;
   readonly #leaseMs: number;
   readonly #pollMs: number;
+  readonly #watcher: ThreadWatchSource | null;
+  readonly #safetyPollMs: number;
   readonly #stallMs: number;
   readonly #maxTurnMs: number;
   readonly #now: () => Date;
@@ -393,6 +402,8 @@ export class AgentTagCoordinator {
     this.#workerId = options.workerId ?? `t3-worker-${crypto.randomUUID()}`;
     this.#leaseMs = options.leaseMs ?? 30_000;
     this.#pollMs = options.pollMs ?? 500;
+    this.#watcher = options.watcher ?? null;
+    this.#safetyPollMs = options.safetyPollMs ?? options.config.t3.watch.safetyPollMs;
     this.#stallMs = options.stallMs ?? options.config.limits.stalledTurn.timeoutSeconds * 1_000;
     this.#maxTurnMs = options.maxTurnMs ?? options.config.limits.stalledTurn.maxTurnSeconds * 1_000;
     this.#now = options.now ?? (() => new Date());
@@ -415,7 +426,7 @@ export class AgentTagCoordinator {
 
     // Active polling time is persisted whenever the claim ends, not only on lease renewal, so short
     // attempts, retries and shutdowns cannot keep the turn ceiling from accumulating.
-    const polling: TurnPolling = { startedAt: null };
+    const polling: TurnPolling = { startedAt: null, watch: null };
     const turnActiveMs = () =>
       polling.startedAt === null ? undefined : operation.turnActiveMs + (this.#now().getTime() - polling.startedAt);
     try {
@@ -490,6 +501,8 @@ export class AgentTagCoordinator {
         turnActiveMs: turnActiveMs(),
       });
       return { kind: "failed", operationId: operation.operationId, outboxId, errorCode: failure.name };
+    } finally {
+      polling.watch?.release();
     }
   }
 
@@ -582,6 +595,9 @@ export class AgentTagCoordinator {
       createdAt: this.#now().toISOString(),
     }, signal), signal);
     this.#store.markT3ThreadStarted({ taskId: task.taskId, now: this.#now().toISOString() });
+    // Watching from the receipt's sequence skips the initial snapshot frame; the loop's first fetch
+    // reads the thread anyway.
+    polling.watch = this.#watcher?.acquire(task.threadId, { afterSequence: turn.sequence }) ?? null;
     // From here a cancel interrupts this turn in T3 instead of dropping the queued operation.
     this.#store.markOperationTurnStarted({
       operationId: operation.operationId,
@@ -667,13 +683,15 @@ export class AgentTagCoordinator {
         return { kind: "failed", operationId: operation.operationId, outboxId, errorCode: "T3TurnCeiling" };
       }
       const snapshot = await abortable(this.#t3.fetchThread(task.threadId, signal), signal);
-      const marker = t3ProgressMarker(snapshot);
+      // Events the stream saw count as progress even when they did not wake us for a fetch (streamed
+      // text, tool updates), so a long tool call is not mistaken for a stall.
+      const marker = `${t3ProgressMarker(snapshot)}:${polling.watch?.lastSequence ?? 0}`;
       if (marker !== progressMarker) {
         progressMarker = marker;
         progressAt = this.#now().getTime();
       }
       if (task.threadStarted && !snapshotHasCurrentTurn(snapshot, operation.messageId)) {
-        await this.#pollAgain(progressAt, signal);
+        await this.#pollAgain(progressAt, signal, polling.watch, snapshot);
         continue;
       }
       if (!turnIdRecorded && snapshot.thread.latestTurn !== null) {
@@ -758,7 +776,7 @@ export class AgentTagCoordinator {
           // completed with a message-mode question pending would otherwise settle and close the answer
           // before the interaction worker sends it. A delivery that never lands ends via the stall,
           // ceiling and failure paths, which close the response.
-          await this.#pollAgain(progressAt, signal);
+          await this.#pollAgain(progressAt, signal, polling.watch, snapshot);
           continue;
         }
         // "stale": every reported request is one an earlier operation gave up on; the turn decides.
@@ -767,7 +785,7 @@ export class AgentTagCoordinator {
         // T3 took this operation's message-mode answer, but the latest turn is still the one that
         // asked and ended before it. Settle only from the turn that continues from the answer (a new
         // turn, or the running turn the answer steered).
-        await this.#pollAgain(progressAt, signal);
+        await this.#pollAgain(progressAt, signal, polling.watch, snapshot);
         continue;
       }
       const latestTurn = snapshot.thread.latestTurn;
@@ -803,13 +821,33 @@ export class AgentTagCoordinator {
         });
         return { kind: "completed", operationId: operation.operationId, outboxId };
       }
-      await this.#pollAgain(progressAt, signal);
+      await this.#pollAgain(progressAt, signal, polling.watch, snapshot);
     }
   }
 
-  /** Sleeps one poll interval, unless T3 has shown no progress for the whole stall window. */
-  async #pollAgain(progressAt: number, signal: AbortSignal | undefined): Promise<void> {
-    if (this.#now().getTime() - progressAt > this.#stallMs) throw new T3TurnStalled();
-    await abortable(this.#sleep(this.#pollMs), signal);
+  /**
+   * Waits until T3 may have changed, unless it has shown no progress for the whole stall window.
+   * With a watch, that is the next settlement-relevant thread event, a stream resync, or the safety
+   * poll, never longer than half the lease (renewal) or past the stall deadline. Without one, or
+   * while `snapshot` predates an event the stream already delivered, it is one poll interval.
+   */
+  async #pollAgain(
+    progressAt: number,
+    signal: AbortSignal | undefined,
+    watch: ThreadWatch | null,
+    snapshot: T3ThreadSnapshot,
+  ): Promise<void> {
+    const now = this.#now().getTime();
+    if (now - progressAt > this.#stallMs) throw new T3TurnStalled();
+    // `snapshotSequence` is T3's global read-model sequence, the same space as event sequences.
+    if (watch === null || snapshot.snapshotSequence < watch.lastSequence) {
+      await abortable(this.#sleep(this.#pollMs), signal);
+      return;
+    }
+    const timeoutMs = Math.max(
+      1,
+      Math.min(this.#safetyPollMs, Math.floor(this.#leaseMs / 2), progressAt + this.#stallMs + 1 - now),
+    );
+    await abortable(watch.next(timeoutMs, signal), signal);
   }
 }

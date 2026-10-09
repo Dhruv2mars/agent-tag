@@ -47,6 +47,19 @@ const stalledTurnSchema = z
   })
   .default({ timeoutSeconds: 300, retryDelaySeconds: 30, maxAttempts: 5, maxTurnSeconds: 21_600 });
 
+/**
+ * Coordinators wait on the shared T3 thread stream instead of polling. The stream only wakes them:
+ * settlement still reads the snapshot, at the latest every `safetyPollMs`, so a dead stream delays
+ * a reply but never loses it. `enabled: false` restores fixed 500 ms polling.
+ */
+const t3WatchSchema = z
+  .object({
+    enabled: z.boolean().default(true),
+    safetyPollMs: z.number().int().min(1_000).max(60_000).default(15_000),
+    lingerMs: z.number().int().min(0).max(600_000).default(30_000),
+  })
+  .default({ enabled: true, safetyPollMs: 15_000, lingerMs: 30_000 });
+
 /** How long an approval or question may wait for a human before the turn is cancelled. */
 const interactionExpirySchema = z.number().int().min(60).max(2_592_000).default(86_400);
 
@@ -123,6 +136,7 @@ export const agentTagConfigSchema = z
         return host === "127.0.0.1" || host === "localhost" || host === "[::1]";
       }, "T3 must use a loopback URL"),
       tokenFile: absolutePath,
+      watch: t3WatchSchema,
     }),
     slack: z.object({
       workspaceId: slackId,

@@ -56,7 +56,7 @@ export interface OnboardDependencies {
   readonly runCommand: CommandRunner;
   /** Exchanges an administrative T3 token for a restricted orchestration token and verifies it. */
   readonly enrollT3: (input: { readonly baseUrl: string; readonly administrativeToken: SecretString }) => Promise<SecretString>;
-  readonly listT3Providers: (t3: AgentTagConfig["t3"]) => Promise<T3ServerInfo>;
+  readonly listT3Providers: (t3: Pick<AgentTagConfig["t3"], "baseUrl" | "tokenFile">) => Promise<T3ServerInfo>;
   /** Undefined when this platform has no supported service manager. */
   readonly installService: ((configPath: string) => Promise<ServiceStatusReport>) | undefined;
   /** Parsed `config/agent-tag.example.json`; supplies profile, memory, and limit defaults. */
@@ -532,7 +532,7 @@ interface ProviderDiscovery {
   readonly providerInstanceId?: string;
 }
 
-async function discoverProviders(context: Context, t3: AgentTagConfig["t3"]): Promise<ProviderDiscovery | undefined> {
+async function discoverProviders(context: Context, t3: Pick<AgentTagConfig["t3"], "baseUrl" | "tokenFile">): Promise<ProviderDiscovery | undefined> {
   const { deps } = context;
   try {
     const server = await deps.listT3Providers(t3);
