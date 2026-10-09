@@ -96,6 +96,18 @@ A terminal stall says only that Agent Tag could not confirm completion; the oper
 
 `limits.interactionExpirySeconds` (default `86400`, 24 h; minimum `60`, maximum 30 days) bounds how long an approval or question waits for a human. While it waits, the operation is deferred until the earliest unanswered request expires, and a Slack response wakes it immediately. If every request T3 still shows as pending already has a response in Agent Tag (queued or delivered), the turn keeps polling instead of deferring, so a response that lands while T3 catches up is never lost. Each request stops accepting responses at its own deadline (posting time plus the expiry), even before the coordinator's next poll closes it, so a late click is never delivered to T3. When the wait expires, Agent Tag closes the requests (late button clicks are ignored), posts a notice, fails the operation with `InteractionExpired`, and queues a durable `thread.turn.interrupt`. The next queued message in the thread starts once that interrupt has been delivered to T3, or has failed terminally.
 
+`t3.watch` (optional; defaults shown in the table) controls how the service talks to T3 while turns run. The service keeps one shared T3 connection. The T3 session is inspected once and cached, and re-inspected before it expires, when the token file changes on disk (checked at most every 5 s), or after T3 answers 401 or 403. One long-lived WebSocket is shared by all workers, and a WebSocket ticket is minted only when that socket (re)opens.
+
+With `t3.watch.enabled`, coordinators subscribe to each running T3 thread's event stream (`orchestration.subscribeThread`, one subscription per thread shared by all waiters) and re-read the thread snapshot when a settlement-relevant event arrives, instead of polling every 500 ms. Streamed text and tool-progress events do not trigger a re-read, but they still count as progress for the stalled-turn timer.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `enabled` | `true` | When `false`, the service falls back to the 500 ms snapshot poll. |
+| `safetyPollMs` | `15000` (1000–60000) | Longest wait between snapshot reads while a turn runs, even if no event arrives. Also capped at half the lease and at the stall deadline. If the stream dies, turns still settle at this cadence. |
+| `lingerMs` | `30000` (0–600000) | How long a thread's subscription stays open after its turn ends, so a follow-up turn reuses it. |
+
+Every 60 s the service logs `t3.connection.stats` with the counters `sessionInspects`, `wsTickets`, `wsConnects`, `snapshotFetches`, `rpcCalls`, and `watchedThreads`. Other connection events are `t3.connection.opened`, `t3.connection.reconnect`, `t3.connection.lost`, and `t3.connection.closed`; watch events are `t3.watch.subscribed`, `t3.watch.ended`, `t3.watch.failed`, `t3.watch.resync`, and `t3.watch.released`. Logs never contain the token or the WebSocket ticket URL.
+
 ## Background service
 
 One command works on both platforms: `agent-tag service install|upgrade|uninstall|status|restart|logs [CONFIG]`. Each `bun run service:<action>` script runs exactly that command, so the scripts behave the same on macOS (launchd) and Linux (systemd). `logs` accepts `--lines N` (default 200) and `--follow`. `status` prints JSON with `installed`, `loaded`, `running`, the unit path, and hints. Both platforms run `doctor` before installing or upgrading.
