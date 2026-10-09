@@ -746,6 +746,8 @@ export function normalizeRoutineRequest(text: string): string {
     .trim()
     .replace(/^(?:<@[^>]+>\s*)+/, "")
     .replace(/^please[\s,]+/i, "")
+    // "routine:every day…" and "cron:0 9 * * *" parse like their spaced forms.
+    .replace(/^(routine|cron)\s*:\s*/i, (_match, lead: string) => `${lead}: `)
     .trim();
 }
 

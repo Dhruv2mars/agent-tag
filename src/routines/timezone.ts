@@ -1,4 +1,4 @@
-import { normalizeRoutineRequest, parseRoutineRequest, type RoutineParseResult } from "./parse.ts";
+import { normalizeRoutineRequest, parseRoutineRequest, splitRoutineRequest, type RoutineParseResult } from "./parse.ts";
 import { isValidTimeZone } from "./zoned.ts";
 
 /**
@@ -106,41 +106,105 @@ export function extractTimeZone(text: string): TimeZoneExtraction {
   // Zones inside code are task content ("run `date --date='9am UTC'`"): blank them out for the scan
   // with a filler no pattern matches, keeping offsets aligned with the original text.
   const scan = text.replace(CODE_SPAN, (span) => "\u0000".repeat(span.length));
-  const found: Array<{ readonly start: number; readonly end: number; readonly keep: string; readonly zone: string }> = [];
+  const candidates: ZoneCandidate[] = [];
   for (const { pattern, keep } of ZONE_PATTERNS) {
     pattern.lastIndex = 0;
     for (let match = pattern.exec(scan); match !== null; match = pattern.exec(scan)) {
-      const token = match.groups?.zone ?? match.groups?.paren ?? "";
-      const zone = zoneFor(token);
-      if (zone === null) return { kind: "error", message: unknownTimeZoneMessage(token), token };
       const start = match.index;
       const end = start + match[0].length;
-      if (found.some((other) => start < other.end && other.start < end)) continue;
-      found.push({ start, end, keep: keep(match), zone });
+      if (candidates.some((other) => start < other.end && other.start < end)) continue;
+      const token = match.groups?.zone ?? match.groups?.paren ?? "";
+      const clock = match.groups?.clock;
+      candidates.push({ start, end, keep: keep(match), token, zone: zoneFor(token), ...(clock === undefined ? {} : { clock }) });
     }
   }
+  if (candidates.length === 0) return { kind: "ok", text: text.trim() };
+
+  // Only zones attached to the schedule's timing count; "check the 10am PT incident" is task text.
+  const timing = timingSpan(splice(scan, candidates));
+  const found = timing === null ? candidates : candidates.filter((entry) => belongsToTiming(scan, candidates, entry, timing));
+  const unknown = found.find((entry) => entry.zone === null);
+  if (unknown !== undefined) return { kind: "error", message: unknownTimeZoneMessage(unknown.token), token: unknown.token };
   if (found.length === 0) return { kind: "ok", text: text.trim() };
-  const zones = new Set(found.map((entry) => entry.zone));
-  if (zones.size > 1) {
+  const zones = [...new Set(found.map((entry) => entry.zone as string))];
+  if (zones.length > 1) {
     return {
       kind: "error",
-      message: `That names more than one time zone (${[...zones].join(", ")}). Use just one.`,
-      token: [...zones].join(", "),
+      message: `That names more than one time zone (${zones.join(", ")}). Use just one.`,
+      token: zones.join(", "),
     };
   }
-  // Splice each zone phrase out, tidying spaces only at the seams so the rest of the text is unchanged.
+  return { kind: "ok", text: splice(text, found), explicit: zones[0] as string };
+}
+
+interface ZoneCandidate {
+  readonly start: number;
+  readonly end: number;
+  /** Text that replaces the match (the clock time before the zone, if any). */
+  readonly keep: string;
+  readonly token: string;
+  /** Canonical zone, or null when the token is unknown. */
+  readonly zone: string | null;
+  /** The clock the zone follows ("9am PT"); absent for "in Europe/London" and "(UTC)". */
+  readonly clock?: string;
+}
+
+/** Word positions [start, end) of the parsed timing in the zone-free request. */
+interface TimingSpan {
+  readonly start: number;
+  readonly end: number;
+  readonly words: readonly string[];
+}
+
+/** Lower-case words without surrounding punctuation, for comparing text with the parsed timing. */
+function words(text: string): string[] {
+  return text
+    .toLowerCase()
+    .split(/\s+/)
+    .map((word) => word.replace(/^[(\[{"'“‘]+|[)\]}"'”’:,;.!?\-–—]+$/g, ""))
+    .filter((word) => word.length > 0);
+}
+
+/** Where the timing sits in the zone-free request, or null when it does not split (create reports it). */
+function timingSpan(stripped: string): TimingSpan | null {
+  const split = splitRoutineRequest(stripped);
+  if (split.kind !== "ok") return null;
+  const all = words(stripped);
+  const timing = words(split.timing);
+  // The parser takes the timing from the start ("every day at 9am …") or the end ("… every day at 9am").
+  const matches = (at: number): boolean => timing.every((word, offset) => all[at + offset] === word);
+  const start = matches(0) ? 0 : all.length - timing.length;
+  if (start < 0 || !matches(start)) return null;
+  return { start, end: start + timing.length, words: all };
+}
+
+const CONNECTORS = new Set(["and", "or", "&", "then"]);
+
+/**
+ * A clock-anchored zone ("9am PT") counts when its clock is inside the timing, or follows it with
+ * only "and"/"or" between ("at 9am PT and 10am ET" names two zones). A bare zone ("in
+ * Europe/London", "(UTC)") counts when it sits in or next to the timing, or ends the request.
+ */
+function belongsToTiming(scan: string, all: readonly ZoneCandidate[], entry: ZoneCandidate, timing: TimingSpan): boolean {
+  const at = words(splice(scan.slice(0, entry.start), all.filter((other) => other.end <= entry.start))).length;
+  if (entry.clock !== undefined) {
+    const clockEnd = at + words(entry.clock).length;
+    if (at >= timing.start && clockEnd <= timing.end) return true;
+    return at > timing.end && timing.words.slice(timing.end, at).every((word) => CONNECTORS.has(word));
+  }
+  return (at >= timing.start && at <= timing.end) || scan.slice(entry.end).trim() === "";
+}
+
+/** Splice zone phrases out, tidying spaces only at the seams so the rest of the text is unchanged. */
+function splice(text: string, entries: ReadonlyArray<ZoneCandidate>): string {
   let stripped = text;
-  for (const entry of [...found].sort((left, right) => right.start - left.start)) {
+  for (const entry of [...entries].sort((left, right) => right.start - left.start)) {
     const before = entry.keep === "" ? stripped.slice(0, entry.start).trimEnd() : stripped.slice(0, entry.start) + entry.keep;
     const after = stripped.slice(entry.end).trimStart();
     const seam = before === "" || after === "" || /^[,.:;!?)]/.test(after) ? "" : " ";
     stripped = `${before}${seam}${after}`;
   }
-  return {
-    kind: "ok",
-    text: stripped.trim(),
-    explicit: found[0]?.zone as string,
-  };
+  return stripped.trim();
 }
 
 export type TimeZoneSource = "explicit" | "profile" | "default";

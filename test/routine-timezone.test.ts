@@ -37,6 +37,9 @@ describe("extractTimeZone", () => {
     ["every day at 9am ET and 5pm ET check", "every day at 9am and 5pm check", "America/New_York"],
     ["every day at 9am (PT) check CI", "every day at 9am check CI", "America/Los_Angeles"],
     ["every day at 9am et check CI", "every day at 9am check CI", "America/New_York"],
+    // Zones in the task text stay there; only the timing's zone counts.
+    ["every day at 9am ET check the 10am PT incident", "every day at 9am check the 10am PT incident", "America/New_York"],
+    ["check the 10am PT incident every day at 9am ET", "check the 10am PT incident every day at 9am", "America/New_York"],
   ])("%s", (input, text, explicit) => {
     expect(extractTimeZone(input)).toEqual({ kind: "ok", text, explicit });
   });
@@ -51,6 +54,10 @@ describe("extractTimeZone", () => {
     'every day at 9am run `date --date="9am UTC"`',
     "every day at 9am:\n```\necho 9am in Europe/London\n```",
     "every day at 9am check `noon PT` handling",
+    "every day at 9am check the 10am PT incident",
+    "every day at 9am check the 9am PT incident",
+    "every day at 9am review the noon UTC report",
+    "every day at 9am compare 9am ET with 9am PT",
   ])("keeps %j as task text", (input) => {
     expect(extractTimeZone(input)).toEqual({ kind: "ok", text: input });
   });
@@ -170,6 +177,28 @@ describe("resolveRoutineSchedule", () => {
       kind: "ok",
       task: "check CI",
     });
+  });
+
+  test("colon leads without a space parse like the spaced forms", () => {
+    expect(resolveRoutineSchedule({ text: "routine:every day at 9am check CI", now: NOW })).toMatchObject({
+      kind: "ok",
+      task: "check CI",
+      recurring: true,
+    });
+    expect(resolveRoutineSchedule({ text: "cron:0 9 * * 1-5 check CI", now: NOW })).toMatchObject({
+      kind: "ok",
+      task: "check CI",
+      spec: { recurrence: { kind: "cron", expression: "0 9 * * 1-5" } },
+    });
+  });
+
+  test("a zone in the task text does not change or conflict with the schedule", () => {
+    expect(
+      resolveRoutineSchedule({ text: "every day at 9am ET check the 10am PT incident", now: NOW, profileTimeZone: "Asia/Tokyo" }),
+    ).toMatchObject({ kind: "ok", task: "check the 10am PT incident", timeZone: "America/New_York", timeZoneSource: "explicit" });
+    expect(
+      resolveRoutineSchedule({ text: "every day at 9am check the 10am PT incident", now: NOW, profileTimeZone: "Asia/Tokyo" }),
+    ).toMatchObject({ kind: "ok", task: "check the 10am PT incident", timeZone: "Asia/Tokyo", timeZoneSource: "profile" });
   });
 
   test("reports zone and parse errors as user-facing messages", () => {
