@@ -52,7 +52,7 @@ const ID_REF = /^[0-9a-f][0-9a-f-]{5,35}$/i;
 /** "remind me how/why/what ..." asks for an explanation, not a reminder. */
 const REMINDER_QUESTION = /^(?:how|why|what|which|who|whom|whose|where|whether|if)\b/i;
 
-const RECURRING_LEADS = new Set(["every", "each", "daily", "weekly", "monthly", "hourly", "weekdays", "weeknights"]);
+const RECURRING_LEADS = new Set(["every", "each", "daily", "weekly", "monthly", "hourly", "weekdays", "weekends", "weeknights"]);
 
 /**
  * A recurring lead is a routine only when its timing parses and is more than one bare word, or the

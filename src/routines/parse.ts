@@ -738,7 +738,7 @@ export type RoutineSplitResult =
   | { readonly kind: "error"; readonly message: string };
 
 /**
- * Trim, drop leading bot mentions and "please", and collapse whitespace. Create requests must be
+ * Trim and drop leading bot mentions and "please". Inner whitespace is kept (multi-line prompts, code). Create requests must be
  * parsed from this same text, so detection and parsing never disagree about the lead.
  */
 export function normalizeRoutineRequest(text: string): string {
@@ -746,7 +746,6 @@ export function normalizeRoutineRequest(text: string): string {
     .trim()
     .replace(/^(?:<@[^>]+>\s*)+/, "")
     .replace(/^please[\s,]+/i, "")
-    .replace(/\s+/g, " ")
     .trim();
 }
 

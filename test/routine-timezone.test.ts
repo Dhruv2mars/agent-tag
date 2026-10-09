@@ -25,6 +25,11 @@ describe("extractTimeZone", () => {
     ["at 3pm IST remind me", "at 3pm remind me", "Asia/Kolkata"],
     ["every day at noon UTC check", "every day at noon check", "UTC"],
     ["remind me tomorrow at midday PT to deploy", "remind me tomorrow at midday to deploy", "America/Los_Angeles"],
+    ["every day at NOON Europe/London check CI", "every day at NOON check CI", "Europe/London"],
+    ["every day at Midnight pt check", "every day at Midnight check", "America/Los_Angeles"],
+    ["every day at 9am PT, check CI", "every day at 9am, check CI", "America/Los_Angeles"],
+    ["every day at 9am PT summarize\n- PRs\n-  issues", "every day at 9am summarize\n- PRs\n-  issues", "America/Los_Angeles"],
+    ["every day at 9am PT run `date  --utc`", "every day at 9am run `date  --utc`", "America/Los_Angeles"],
     ["every day at midnight CET check", "every day at midnight check", "Europe/Paris"],
     ["at 9 in utc every day check", "at 9 every day check", "UTC"],
     ["every day at 9am GMT check", "every day at 9am check", "UTC"],
@@ -43,6 +48,9 @@ describe("extractTimeZone", () => {
     "every day at 9am in Mars/Olympus check",
     "every day at 9am check us/eu traffic",
     "post IST updates daily at 9am",
+    'every day at 9am run `date --date="9am UTC"`',
+    "every day at 9am:\n```\necho 9am in Europe/London\n```",
+    "every day at 9am check `noon PT` handling",
   ])("keeps %j as task text", (input) => {
     expect(extractTimeZone(input)).toEqual({ kind: "ok", text: input });
   });

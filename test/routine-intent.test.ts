@@ -21,6 +21,7 @@ describe("detectRoutineIntent: create", () => {
     ["monthly on the 1st at 9am send the invoice", "recurring"],
     ["hourly, check the deploy status", "recurring"],
     ["weekdays at 9am post standup", "recurring"],
+    ["weekends at 9am check CI", "recurring"],
     ["every 15 minutes check the deploy status", "recurring"],
     ["every weekday at 9am PT summarize open PRs", "recurring"],
     ["every day at 9am in Europe/London check CI", "recurring"],
@@ -127,6 +128,7 @@ describe("detectRoutineIntent: normal prompts stay normal", () => {
     "summarize open PRs every day at 9am",
     "tomorrow at 3pm run the release checklist",
     "weekly report is broken",
+    "weekends are when the cron job runs",
   ])("%j", (text) => {
     expect(detectRoutineIntent(text)).toEqual({ kind: "none" });
   });

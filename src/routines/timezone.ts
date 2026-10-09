@@ -34,11 +34,17 @@ const AREA = IANA_AREAS.flatMap((area) => (area.length <= 3 ? [area] : [area, ar
 /** "Europe/London", "America/Argentina/Buenos_Aires", "Etc/GMT+5". Case-sensitive, so "us/eu" is task text. */
 const IANA_NAME = `(?:${AREA})(?:\\/[A-Za-z0-9_+\\-]+)+`;
 const ABBREVIATION = Object.keys(TIME_ZONE_ABBREVIATIONS).join("|");
-/** Clock-shaped (any letter case): has am/pm or a colon, or follows "at" ("at 9"). */
+/** A word in any letter case, for patterns that are otherwise case-sensitive ("NOON", "Noon"). */
+const anyCase = (word: string): string => [...word].map((char) => `[${char.toUpperCase()}${char.toLowerCase()}]`).join("");
+/** Clock-shaped (any letter case): has am/pm or a colon, or follows "at" ("at 9"), or is a named time. */
 const CLOCK =
-  "(?:\\d{1,2}(?::\\d{2})?\\s*[AaPp]\\.?[Mm]\\.?|\\d{1,2}:\\d{2}|\\b[Aa][Tt]\\s+\\d{1,2}|\\b[Nn]oon|\\b[Mm]idday|\\b[Mm]idnight)";
+  `(?:\\d{1,2}(?::\\d{2})?\\s*[AaPp]\\.?[Mm]\\.?|\\d{1,2}:\\d{2}|\\b${anyCase("at")}\\s+\\d{1,2}|` +
+  `\\b(?:${["noon", "midday", "midnight"].map(anyCase).join("|")})\\b)`;
 /** The zone ends at a word boundary that is not part of a longer name. */
 const END = "(?![A-Za-z0-9_/+\\-])";
+
+/** Inline and fenced code spans. */
+const CODE_SPAN = /```[\s\S]*?```|`[^`\n]*`/g;
 
 interface ZonePattern {
   readonly pattern: RegExp;
@@ -97,10 +103,13 @@ export function unknownTimeZoneMessage(token: string): string {
  * elsewhere stays task text. An unknown IANA-looking name is an error, not task text.
  */
 export function extractTimeZone(text: string): TimeZoneExtraction {
+  // Zones inside code are task content ("run `date --date='9am UTC'`"): blank them out for the scan
+  // with a filler no pattern matches, keeping offsets aligned with the original text.
+  const scan = text.replace(CODE_SPAN, (span) => "\u0000".repeat(span.length));
   const found: Array<{ readonly start: number; readonly end: number; readonly keep: string; readonly zone: string }> = [];
   for (const { pattern, keep } of ZONE_PATTERNS) {
     pattern.lastIndex = 0;
-    for (let match = pattern.exec(text); match !== null; match = pattern.exec(text)) {
+    for (let match = pattern.exec(scan); match !== null; match = pattern.exec(scan)) {
       const token = match.groups?.zone ?? match.groups?.paren ?? "";
       const zone = zoneFor(token);
       if (zone === null) return { kind: "error", message: unknownTimeZoneMessage(token), token };
@@ -119,13 +128,17 @@ export function extractTimeZone(text: string): TimeZoneExtraction {
       token: [...zones].join(", "),
     };
   }
+  // Splice each zone phrase out, tidying spaces only at the seams so the rest of the text is unchanged.
   let stripped = text;
   for (const entry of [...found].sort((left, right) => right.start - left.start)) {
-    stripped = `${stripped.slice(0, entry.start)}${entry.keep}${stripped.slice(entry.end)}`;
+    const before = entry.keep === "" ? stripped.slice(0, entry.start).trimEnd() : stripped.slice(0, entry.start) + entry.keep;
+    const after = stripped.slice(entry.end).trimStart();
+    const seam = before === "" || after === "" || /^[,.:;!?)]/.test(after) ? "" : " ";
+    stripped = `${before}${seam}${after}`;
   }
   return {
     kind: "ok",
-    text: stripped.replace(/\s+/g, " ").replace(/\s+([,.:;!?])/g, "$1").trim(),
+    text: stripped.trim(),
     explicit: found[0]?.zone as string,
   };
 }
