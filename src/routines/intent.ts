@@ -49,6 +49,9 @@ const REF_LEAD = /^(?:(?:about|for|called|named|titled|that|which|with\s+id|id|n
 const INDEX_REF = /^#?([1-9]\d{0,4})$/;
 const ID_REF = /^[0-9a-f][0-9a-f-]{5,35}$/i;
 
+/** "remind me how/why/what ..." asks for an explanation, not a reminder. */
+const REMINDER_QUESTION = /^(?:how|why|what|which|who|whom|whose|where|whether|if)\b/i;
+
 const RECURRING_LEADS = new Set(["every", "each", "daily", "weekly", "monthly", "hourly", "weekdays", "weeknights"]);
 
 /**
@@ -61,12 +64,17 @@ function isRecurringRequest(request: string): boolean {
   const text = extracted.kind === "ok" ? extracted.text : request;
   const split = splitRoutineRequest(text);
   if (split.kind !== "ok") return false;
-  const timing = split.timing.toLowerCase().split(/\s+/);
+  const timing = comparableWords(split.timing);
   // The whole timing must lead the request: "every build fails every day at 9am" and "every day
   // check CI at 9am" (timing merged from the end) stay normal prompts.
-  const words = text.toLowerCase().split(/\s+/);
-  if (!timing.every((word, index) => (words[index] ?? "").replace(/[:,\-–—]+$/, "") === word)) return false;
+  const words = comparableWords(text);
+  if (!timing.every((word, index) => words[index] === word)) return false;
   return timing.length > 1 || /^[^\s:,\-–—]+\s*[:,\-–—]/.test(text);
+}
+
+/** Lower-case words without trailing punctuation, so "Monday," matches "monday,". */
+function comparableWords(text: string): string[] {
+  return text.toLowerCase().split(/\s+/).map((word) => word.replace(/[:,;\-–—]+$/, ""));
 }
 
 function leadWord(text: string): string {
@@ -104,8 +112,13 @@ export function detectRoutineIntent(text: string): RoutineIntent {
   const cancel = CANCEL.exec(request);
   if (cancel !== null) return { kind: "cancel", ref: cancelRef(cancel.groups?.ref ?? "") };
 
-  // Reminders: "remind me how X works" is a question, so the lead only counts with a timing.
-  if (REMINDER_LEAD.test(request)) return hasRecognizedTiming(request) ? { kind: "create", lead: "reminder" } : NONE;
+  // Reminders: "remind me how X works" is a question, so the lead only counts with a timing, and
+  // "remind me how the cron job runs every day at 9am" asks about the timing rather than setting one.
+  const reminder = REMINDER_LEAD.exec(request);
+  if (reminder !== null) {
+    if (REMINDER_QUESTION.test(request.slice(reminder[0].length))) return NONE;
+    return hasRecognizedTiming(request) ? { kind: "create", lead: "reminder" } : NONE;
+  }
   if (/^cron\s*:/i.test(request)) return { kind: "create", lead: "cron" };
   if (/^(?:schedule\s+\S|routine\s*:\s*\S)/i.test(request)) return { kind: "create", lead: "schedule" };
 

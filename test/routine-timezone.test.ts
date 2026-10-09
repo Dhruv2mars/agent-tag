@@ -24,6 +24,8 @@ describe("extractTimeZone", () => {
     ["tomorrow at 09:00 CET: deploy", "tomorrow at 09:00: deploy", "Europe/Paris"],
     ["at 3pm IST remind me", "at 3pm remind me", "Asia/Kolkata"],
     ["every day at noon UTC check", "every day at noon check", "UTC"],
+    ["remind me tomorrow at midday PT to deploy", "remind me tomorrow at midday to deploy", "America/Los_Angeles"],
+    ["every day at midnight CET check", "every day at midnight check", "Europe/Paris"],
     ["at 9 in utc every day check", "at 9 every day check", "UTC"],
     ["every day at 9am GMT check", "every day at 9am check", "UTC"],
     ["every day at 9am (GMT) check", "every day at 9am check", "UTC"],

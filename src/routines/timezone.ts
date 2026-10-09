@@ -36,7 +36,7 @@ const IANA_NAME = `(?:${AREA})(?:\\/[A-Za-z0-9_+\\-]+)+`;
 const ABBREVIATION = Object.keys(TIME_ZONE_ABBREVIATIONS).join("|");
 /** Clock-shaped (any letter case): has am/pm or a colon, or follows "at" ("at 9"). */
 const CLOCK =
-  "(?:\\d{1,2}(?::\\d{2})?\\s*[AaPp]\\.?[Mm]\\.?|\\d{1,2}:\\d{2}|\\b[Aa][Tt]\\s+\\d{1,2}|\\b[Nn]oon|\\b[Mm]idnight)";
+  "(?:\\d{1,2}(?::\\d{2})?\\s*[AaPp]\\.?[Mm]\\.?|\\d{1,2}:\\d{2}|\\b[Aa][Tt]\\s+\\d{1,2}|\\b[Nn]oon|\\b[Mm]idday|\\b[Mm]idnight)";
 /** The zone ends at a word boundary that is not part of a longer name. */
 const END = "(?![A-Za-z0-9_/+\\-])";
 
