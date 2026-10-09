@@ -70,10 +70,15 @@ describe("describeSchedule", () => {
 
 describe("reminderText", () => {
   test("mentions only the notify user, never broadcasts", () => {
-    expect(reminderText({ prompt: "deploy", notifyUserId: "U2" })).toBe("<@U2> :alarm_clock: Reminder: *deploy*");
+    expect(reminderText({ prompt: "deploy", notifyUserId: "U2" })).toBe("<@U2> :alarm_clock: Reminder: deploy");
     expect(reminderText({ prompt: "tell <!channel> *now*", notifyUserId: "U2" })).toBe(
-      "<@U2> :alarm_clock: Reminder: *tell @​channel now*",
+      "<@U2> :alarm_clock: Reminder: tell @​channel *now*",
     );
+  });
+
+  test("delivers the full prompt, not a lossy preview", () => {
+    const prompt = `delete *.log files\nthen ${"x".repeat(300)}`;
+    expect(reminderText({ prompt, notifyUserId: "U2" })).toBe(`<@U2> :alarm_clock: Reminder: ${prompt}`);
   });
 
   test("keeps the plain form without a valid notify user", () => {

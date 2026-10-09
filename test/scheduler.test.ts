@@ -477,7 +477,7 @@ describe("durable scheduler", () => {
         const outbox = store.claimNextOutbox({ workerId: "slack-n", now: at, leaseMs: 10_000 });
         texts.push(outbox?.payload.text);
       }
-      expect(texts).toEqual(["<@U2> :alarm_clock: Reminder: *tell @\u200bchannel to deploy*", "Reminder: review the release"]);
+      expect(texts).toEqual(["<@U2> :alarm_clock: Reminder: tell @\u200bchannel to *deploy*", "Reminder: review the release"]);
     } finally {
       store.close();
       if (!directory.startsWith(`${tmpdir()}/agent-tag-scheduler-`)) {

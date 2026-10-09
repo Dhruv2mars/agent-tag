@@ -62,8 +62,10 @@ function isRecurringRequest(request: string): boolean {
   const split = splitRoutineRequest(text);
   if (split.kind !== "ok") return false;
   const timing = split.timing.toLowerCase().split(/\s+/);
-  // The timing must be the leading phrase: "every build fails at 3am" is not a routine.
-  if (timing[0] !== leadWord(text)) return false;
+  // The whole timing must lead the request: "every build fails every day at 9am" and "every day
+  // check CI at 9am" (timing merged from the end) stay normal prompts.
+  const words = text.toLowerCase().split(/\s+/);
+  if (!timing.every((word, index) => (words[index] ?? "").replace(/[:,\-–—]+$/, "") === word)) return false;
   return timing.length > 1 || /^[^\s:,\-–—]+\s*[:,\-–—]/.test(text);
 }
 
@@ -88,9 +90,9 @@ function cancelRef(raw: string): RoutineCancelRef {
 /** Whether the request names a timing the parser understands (time zone phrases removed first). */
 function hasRecognizedTiming(text: string): boolean {
   const extracted = extractTimeZone(text);
-  // A misspelled zone is still a scheduling request: let the create path explain the error.
-  if (extracted.kind === "error") return true;
-  const split = splitRoutineRequest(extracted.text);
+  // A misspelled zone next to a real timing is still a scheduling request (the create path explains
+  // the zone error); "remind me how DST differs in Europe/London and in America/New_York" is not.
+  const split = splitRoutineRequest(extracted.kind === "ok" ? extracted.text : text);
   return split.kind === "ok" || split.message !== GENERIC_PARSE_ERROR;
 }
 

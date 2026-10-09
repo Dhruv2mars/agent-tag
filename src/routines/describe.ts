@@ -69,5 +69,5 @@ export function reminderText(input: { readonly prompt: string; readonly notifyUs
   const prompt = escapeSlackText(input.prompt.trim());
   const notify = input.notifyUserId === null ? null : /^[UW][A-Z0-9]+$/.exec(input.notifyUserId)?.[0];
   if (notify === null || notify === undefined) return `Reminder: ${prompt}`;
-  return `<@${notify}> :alarm_clock: Reminder: *${promptPreview(input.prompt, 4_000)}*`;
+  return `<@${notify}> :alarm_clock: Reminder: ${prompt}`;
 }
