@@ -21,6 +21,12 @@ import {
 import { inspectT3 } from "./t3/gateway.ts";
 import { defaultT3RuntimeDir, inspectInstalledT3, installPinnedT3, parseT3DownloadBaseUrl } from "./t3/install.ts";
 import { PINNED_T3 } from "./t3/lock.ts";
+import {
+  inspectManagedT3Runtime,
+  requireManagedT3,
+  runManagedT3Pair,
+  runManagedT3Serve,
+} from "./t3/operator.ts";
 
 /** CONFIG positional, else $AGENT_TAG_CONFIG, else the onboarding default `~/.agent-tag/agent-tag.json`. */
 export function resolveConfigPath(
@@ -79,22 +85,30 @@ export async function runServiceCommand(argv: readonly string[]): Promise<number
   return 0;
 }
 
-export const T3_USAGE = "usage: agent-tag t3 <install|status> [CONFIG] [--download-base-url URL]";
+export const T3_USAGE =
+  "usage: agent-tag t3 <install|status> [CONFIG] [--download-base-url URL] | agent-tag t3 serve [CONFIG] | agent-tag t3 pair [CONFIG] [--allow-non-tty]";
+
+const T3_ACTIONS = new Set(["install", "status", "serve", "pair"]);
 
 /**
- * `t3 install` downloads and verifies the pinned T3 runtime into `<dataDir>/t3/runtime`;
- * `t3 status` reports that install without touching the network or running T3.
+ * `t3 install` downloads and verifies the pinned T3 runtime (into `<dataDir>/t3/runtime`, or the
+ * managed `t3.runtimeDir`); `t3 status` reports that install without touching the network or
+ * running T3 (managed mode adds the running server's pid, protocol and version). `t3 serve` runs the
+ * managed runtime in the foreground and `t3 pair` prints a pairing link for its web UI.
  */
 export async function runT3Command(argv: readonly string[]): Promise<number> {
-  const args = parseArguments(argv, { booleans: [], values: ["download-base-url"] });
+  const args = parseArguments(argv, { booleans: ["allow-non-tty"], values: ["download-base-url"] });
   const action = args.positionals[0];
-  if ((action !== "install" && action !== "status") || args.positionals.length > 2) throw new Error(T3_USAGE);
+  if (action === undefined || !T3_ACTIONS.has(action) || args.positionals.length > 2) throw new Error(T3_USAGE);
   const baseUrlArgument = args.values.get("download-base-url");
   if (baseUrlArgument !== undefined && action !== "install") throw new Error("--download-base-url only applies to t3 install");
-  const baseUrl = baseUrlArgument === undefined ? undefined : parseT3DownloadBaseUrl(baseUrlArgument);
+  if (args.flags.has("allow-non-tty") && action !== "pair") throw new Error("--allow-non-tty only applies to t3 pair");
   const config = await loadConfig(resolveConfigPath(args.positionals[1]));
-  const runtimeDir = defaultT3RuntimeDir(config.dataDir);
+  const t3 = config.t3;
+  const managed = t3.mode === "managed" ? t3.managed : undefined;
+  const runtimeDir = managed?.runtimeDir ?? defaultT3RuntimeDir(config.dataDir);
   if (action === "install") {
+    const baseUrl = baseUrlArgument === undefined ? managed?.downloadBaseUrl : parseT3DownloadBaseUrl(baseUrlArgument);
     const installed = await installPinnedT3({
       pin: PINNED_T3,
       runtimeDir,
@@ -109,9 +123,41 @@ export async function runT3Command(argv: readonly string[]): Promise<number> {
     }, null, 2));
     return 0;
   }
-  // Managed mode, the supervisor, and token fields arrive with the config union (PR-O O2/O3).
+  if (action === "serve") {
+    return runManagedT3Serve({
+      t3: requireManagedT3(t3, "serve"),
+      pin: PINNED_T3,
+      // Logs go to stderr so stdout carries only the ready JSON.
+      logger: (record) => console.error(JSON.stringify(record)),
+      print: (line) => console.log(line),
+    });
+  }
+  if (action === "pair") {
+    return runManagedT3Pair({
+      t3: requireManagedT3(t3, "pair"),
+      pin: PINNED_T3,
+      run: runCommand,
+      stdoutIsTty: process.stdout.isTTY === true,
+      allowNonTty: args.flags.has("allow-non-tty"),
+      print: (line) => console.log(line),
+    });
+  }
+  // Token fields arrive with credential rotation (PR-O O3).
   const status = await inspectInstalledT3({ pin: PINNED_T3, runtimeDir });
-  console.log(JSON.stringify({ mode: "external", ...status }, null, 2));
+  if (t3.mode === "external") {
+    console.log(JSON.stringify({ mode: "external", ...status }, null, 2));
+    return 0;
+  }
+  const runtime = await inspectManagedT3Runtime({ t3, pinnedVersion: PINNED_T3.version });
+  console.log(JSON.stringify({
+    mode: "managed",
+    ...status,
+    baseUrl: t3.baseUrl,
+    homeDir: t3.managed.homeDir,
+    pid: runtime.pid,
+    protocol: runtime.protocol,
+    runtime,
+  }, null, 2));
   return 0;
 }
 

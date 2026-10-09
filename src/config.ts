@@ -1,6 +1,9 @@
-import { isAbsolute } from "node:path";
+import { homedir } from "node:os";
+import { isAbsolute, join, resolve } from "node:path";
 
 import { z } from "zod";
+
+import { parseT3DownloadBaseUrl } from "./t3/install.ts";
 
 const absolutePath = z.string().min(1).refine(isAbsolute, "must be an absolute path");
 const slackId = z.string().regex(/^[A-Z][A-Z0-9]+$/);
@@ -94,17 +97,95 @@ const retentionSchema = z
   .strict()
   .default({});
 
+const loopbackUrl = z.url().refine((value) => {
+  const host = new URL(value).hostname;
+  return host === "127.0.0.1" || host === "localhost" || host === "[::1]";
+}, "T3 must use a loopback URL");
+
+/** An operator-run T3 server. Configs without `t3.mode` (every config before managed mode) parse as this. */
+const externalT3Schema = z.object({
+  mode: z.literal("external").default("external"),
+  baseUrl: loopbackUrl,
+  tokenFile: absolutePath,
+});
+
+/** A T3 server Agent Tag installs from t3.lock.json and supervises itself (`t3 serve` on loopback). */
+const managedT3Schema = z.object({
+  mode: z.literal("managed"),
+  port: z.number().int().min(1024).max(65_535).default(37_841),
+  tokenFile: absolutePath,
+  /** T3's `--base-dir` (its SQLite, logs, environment id); default `<dataDir>/t3/home`. */
+  homeDir: absolutePath.optional(),
+  /** Verified binaries and supervisor state; default `<dataDir>/t3/runtime`. */
+  runtimeDir: absolutePath.optional(),
+  autoInstall: z.boolean().default(true),
+  /** Mirror for the pinned release assets; https only (http only on loopback). */
+  downloadBaseUrl: z
+    .string()
+    .transform((value, context) => {
+      try {
+        return parseT3DownloadBaseUrl(value);
+      } catch (error) {
+        context.addIssue({ code: "custom", message: error instanceof Error ? error.message : String(error) });
+        return z.NEVER;
+      }
+    })
+    .optional(),
+});
+
+const t3Schema = z.union([externalT3Schema, managedT3Schema]);
+
+/** Managed-mode settings with every default resolved against `dataDir`. */
+export interface ResolvedManagedT3 {
+  readonly port: number;
+  readonly homeDir: string;
+  readonly runtimeDir: string;
+  readonly autoInstall: boolean;
+  readonly downloadBaseUrl?: string;
+}
+
+/**
+ * The normalized `config.t3`. Both modes carry `baseUrl` and `tokenFile`, so every consumer typed as
+ * `T3ConnectionConfig` keeps working; managed mode derives `baseUrl` from its loopback port.
+ */
+export type ResolvedT3Config =
+  | { readonly mode: "external"; readonly baseUrl: string; readonly tokenFile: string }
+  | {
+      readonly mode: "managed";
+      readonly baseUrl: string;
+      readonly tokenFile: string;
+      readonly managed: ResolvedManagedT3;
+    };
+
+/** T3's own default base dir (`$T3CODE_HOME`, else `~/.t3`): the desktop app's data, never shared. */
+function desktopT3Homes(env: Readonly<Record<string, string | undefined>>, home: string): string[] {
+  const homes = [resolve(home, ".t3")];
+  const configured = env.T3CODE_HOME?.trim();
+  if (configured !== undefined && configured.length > 0) homes.push(resolve(configured));
+  return homes;
+}
+
+function resolveManagedT3(t3: z.infer<typeof managedT3Schema>, dataDir: string): ResolvedManagedT3 {
+  return {
+    port: t3.port,
+    homeDir: t3.homeDir ?? join(dataDir, "t3", "home"),
+    runtimeDir: t3.runtimeDir ?? join(dataDir, "t3", "runtime"),
+    autoInstall: t3.autoInstall,
+    ...(t3.downloadBaseUrl === undefined ? {} : { downloadBaseUrl: t3.downloadBaseUrl }),
+  };
+}
+
+function resolveT3Config(t3: z.infer<typeof t3Schema>, dataDir: string): ResolvedT3Config {
+  if (t3.mode === "external") return { mode: "external", baseUrl: t3.baseUrl, tokenFile: t3.tokenFile };
+  const managed = resolveManagedT3(t3, dataDir);
+  return { mode: "managed", baseUrl: `http://127.0.0.1:${managed.port}`, tokenFile: t3.tokenFile, managed };
+}
+
 export const agentTagConfigSchema = z
   .object({
     version: z.literal(1),
     dataDir: absolutePath,
-    t3: z.object({
-      baseUrl: z.url().refine((value) => {
-        const host = new URL(value).hostname;
-        return host === "127.0.0.1" || host === "localhost" || host === "[::1]";
-      }, "T3 must use a loopback URL"),
-      tokenFile: absolutePath,
-    }),
+    t3: t3Schema,
     slack: z.object({
       workspaceId: slackId,
       appTokenFile: absolutePath,
@@ -192,7 +273,21 @@ export const agentTagConfigSchema = z
         });
       }
     }
-  });
+    if (config.t3.mode === "managed") {
+      const { homeDir, runtimeDir } = resolveManagedT3(config.t3, config.dataDir);
+      if (desktopT3Homes(process.env, homedir()).includes(resolve(homeDir))) {
+        context.addIssue({
+          code: "custom",
+          path: ["t3", "homeDir"],
+          message: "managed T3 must not share the desktop T3 base dir (~/.t3 or $T3CODE_HOME); use its own homeDir",
+        });
+      }
+      if (resolve(homeDir) === resolve(runtimeDir)) {
+        context.addIssue({ code: "custom", path: ["t3", "runtimeDir"], message: "t3.runtimeDir must differ from t3.homeDir" });
+      }
+    }
+  })
+  .transform(({ t3, ...config }) => ({ ...config, t3: resolveT3Config(t3, config.dataDir) }));
 
 export type AgentTagConfig = z.infer<typeof agentTagConfigSchema>;
 

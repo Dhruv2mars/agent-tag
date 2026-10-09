@@ -249,8 +249,8 @@ describe("data retention", () => {
   });
 
   test("config accepts optional retention days and rejects unknown or invalid fields", () => {
-    const parse = (retention: unknown) => agentTagConfigSchema.shape.retention.safeParse(retention);
-    expect(agentTagConfigSchema.shape.retention.parse(undefined)).toEqual({});
+    const parse = (retention: unknown) => agentTagConfigSchema.in.shape.retention.safeParse(retention);
+    expect(agentTagConfigSchema.in.shape.retention.parse(undefined)).toEqual({});
     expect(parse({ auditDays: 365, messageDays: 30 }).success).toBe(true);
     expect(parse({ auditDays: 0 }).success).toBe(false);
     expect(parse({ auditDays: 1.5 }).success).toBe(false);
