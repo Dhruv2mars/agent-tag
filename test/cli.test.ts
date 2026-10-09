@@ -152,3 +152,68 @@ test("t3 argument mistakes print a clean error", async () => {
   const statusFlag = await runCli(["t3", "status", "--download-base-url", "https://mirror.example"]);
   expect(statusFlag.stderr).toContain("--download-base-url only applies to t3 install");
 });
+
+async function writeConfigWithT3(t3: Record<string, unknown>): Promise<{ configPath: string; dataDir: string }> {
+  const home = await mkdtemp(join(tmpdir(), "agent-tag-cli-t3-"));
+  const dataDir = await mkdtemp(join(tmpdir(), "agent-tag-cli-t3-data-"));
+  const configPath = join(home, "agent-tag.json");
+  await writeFile(configPath, JSON.stringify({
+    version: 1,
+    dataDir,
+    t3,
+    slack: { workspaceId: "T123", appTokenFile: join(home, "app"), botTokenFile: join(home, "bot") },
+    access: { allowedUserIds: ["U123"], allowedChannelIds: ["C123"] },
+    profiles: [{
+      id: "engineering",
+      repositoryRoots: ["/repos/example"],
+      defaultProviderInstanceId: "codex",
+      defaultModel: "gpt-5.6-sol",
+      runtimeMode: "approval-required",
+      isolation: { mode: "trusted-same-user", acknowledgedSharedMachineAccess: true },
+      externalWrites: { mode: "approval-required", allowedTools: ["github"] },
+      memory: { shared: true, privateDm: false, retentionDays: 180 },
+    }],
+    routes: [{ conversationId: "C123", profileId: "engineering", repositoryRoot: "/repos/example" }],
+    limits: { maxConcurrentTasks: 2 },
+  }));
+  return { configPath, dataDir };
+}
+
+test("t3 serve and t3 pair refuse an external config and say how to enable managed mode", async () => {
+  const { configPath } = await writeT3Config();
+  for (const action of ["serve", "pair"]) {
+    const result = await runCli(["t3", action, configPath]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stdout).toBe("");
+    expect(result.stderr).toContain(`t3.mode "managed"`);
+    expect(result.stderr).not.toMatch(/^\s+at /m);
+  }
+});
+
+test("t3 status reports a managed runtime that is not installed or running", async () => {
+  const tokenFile = join(await mkdtemp(join(tmpdir(), "agent-tag-cli-t3-token-")), "t3-token");
+  const { configPath, dataDir } = await writeConfigWithT3({ mode: "managed", port: 39871, tokenFile });
+  const result = await runCli(["t3", "status", configPath]);
+  expect(result.stderr).toBe("");
+  expect(result.exitCode).toBe(0);
+  const status = JSON.parse(result.stdout) as Record<string, unknown> & { runtime: Record<string, unknown> };
+  expect(status).toMatchObject({
+    mode: "managed",
+    pinnedVersion: PINNED_T3.version,
+    installed: false,
+    binarySha256Verified: false,
+    filesVerified: false,
+    pid: null,
+    protocol: null,
+    baseUrl: "http://127.0.0.1:39871",
+    homeDir: join(dataDir, "t3", "home"),
+  });
+  expect(status.runtime).toMatchObject({ running: false, pid: null, protocol: null });
+  expect(status.runtime.problem).toContain("not reachable on http://127.0.0.1:39871");
+});
+
+test("t3 status rejects --allow-non-tty, which only applies to t3 pair", async () => {
+  const result = await runCli(["t3", "status", "--allow-non-tty"]);
+  expect(result.exitCode).toBe(1);
+  expect(result.stderr).toContain("--allow-non-tty only applies to t3 pair");
+});

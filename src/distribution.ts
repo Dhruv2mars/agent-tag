@@ -21,6 +21,8 @@ Usage:
                                        Show the service logs
   agent-tag t3 install|status [CONFIG] Install the T3 runtime pinned in t3.lock.json (sha256-verified)
                                        into DATA_DIR/t3/runtime, or report that install
+  agent-tag t3 serve [CONFIG]          Run the managed T3 (t3.mode "managed") in the foreground, without Slack
+  agent-tag t3 pair [CONFIG]           Print a 5-minute pairing link for the managed T3 web UI (terminal only)
   agent-tag run CONFIG                 Start the Slack service in the foreground
   agent-tag status CONFIG              Print operational status from the local store
   agent-tag audit CONFIG               Export audit records as JSON lines
