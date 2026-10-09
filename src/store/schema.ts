@@ -16,6 +16,8 @@ export const operationPayloadSchema = z.object({
   messageTs: nonEmpty.optional(),
   /** What created the operation. Absent means "slack". */
   origin: z.enum(["slack", "schedule"]).optional(),
+  /** Seed for the thread window: set only on the first mention in an existing, unbound thread. */
+  threadContext: z.object({ rootTs: nonEmpty, beforeTs: nonEmpty }).optional(),
 });
 export const plainTextObjectSchema = z.object({ type: z.literal("plain_text"), text: z.string(), emoji: z.boolean().optional() });
 export const mrkdwnObjectSchema = z.object({ type: z.literal("mrkdwn"), text: z.string() });
@@ -224,6 +226,8 @@ export const AUDIT_ACTIONS = [
   "slack.outbox.retry-scheduled",
   "task.cancellation.requested",
   "task.t3-bound",
+  "thread-context.loaded",
+  "thread-context.unavailable",
 ] as const;
 export const auditActionSchema = z.enum(AUDIT_ACTIONS);
 export type AuditAction = z.infer<typeof auditActionSchema>;

@@ -13,6 +13,7 @@ const baseMessage = z.object({
   text: z.string(),
   bot_id: slackId.optional(),
   subtype: z.string().optional(),
+  edited: z.object({}).passthrough().optional(),
 });
 const slackEventCallbackSchema = z.object({
   type: z.literal("event_callback"),
@@ -41,7 +42,8 @@ export type SlackIngressResult =
         | "ambient-not-relevant"
         | "ambient-quiet"
         | "dm-owner-denied"
-        | "task-route-denied";
+        | "task-route-denied"
+        | "edit-irrelevant";
     };
 
 export interface SlackEventRouterOptions {
@@ -82,6 +84,11 @@ export class SlackEventRouter {
       return { kind: "ignored", reason: "user-denied" };
     }
     if (event.subtype !== undefined) return { kind: "ignored", reason: "message-subtype" };
+    // Slack does not document whether app_mention re-fires when a message is edited to add the
+    // mention. An edit never starts work, so a mention carrying `edited` is dropped either way.
+    if (event.type === "app_mention" && event.edited !== undefined) {
+      return { kind: "ignored", reason: "edit-irrelevant" };
+    }
 
     const threadTs = event.thread_ts ?? event.ts;
     const eventKey = `${event.channel}:${event.ts}`;
@@ -140,6 +147,12 @@ export class SlackEventRouter {
       repositoryRoot = selectedRoot;
     }
 
+    // First mention partway into an existing thread: the coordinator reads the earlier messages.
+    // Only an explicit mention gets here for an unbound reply (plain replies stop at unbound-thread).
+    const firstMentionInThread = binding === null && event.thread_ts !== undefined && event.thread_ts !== event.ts;
+    const threadContext = firstMentionInThread && profile.threadContext.enabled
+      ? { rootTs: threadTs, beforeTs: event.ts }
+      : undefined;
     const text = event.text.replaceAll(`<@${this.#botUserId}>`, "").trim();
     const receipt = this.#store.ingestSlackEvent({
       deliveryId: body.event_id,
@@ -156,6 +169,7 @@ export class SlackEventRouter {
       sourceOrderKey: event.ts,
       messageTs: event.ts,
       origin: "slack",
+      ...(threadContext === undefined ? {} : { threadContext }),
     });
     return { kind: receipt.kind, receipt };
   }

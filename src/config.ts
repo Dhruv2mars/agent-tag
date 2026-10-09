@@ -191,6 +191,28 @@ const profileSchema = z.object({
       maxTurnsPerHour: z.number().int().positive().max(60),
     })
     .default({ enabled: false, keywords: [], cooldownSeconds: 300, maxTurnsPerHour: 4 }),
+  /** Earlier thread messages sent with the first mention in an existing thread (PR-G). */
+  threadContext: z
+    .object({
+      enabled: z.boolean(),
+      maxMessages: z.number().int().min(1).max(200),
+      maxChars: z.number().int().min(1_000).max(100_000),
+      maxMessageChars: z.number().int().min(200).max(10_000),
+      includeBotMessages: z.enum(["none", "root-only", "all"]),
+      includeNonAllowedUsers: z.boolean(),
+    })
+    .refine((value) => value.maxMessageChars <= value.maxChars, {
+      message: "threadContext.maxMessageChars must not exceed maxChars",
+      path: ["maxMessageChars"],
+    })
+    .default({
+      enabled: true,
+      maxMessages: 30,
+      maxChars: 12_000,
+      maxMessageChars: 2_000,
+      includeBotMessages: "root-only",
+      includeNonAllowedUsers: true,
+    }),
   pullRequests: pullRequestsSchema,
 });
 
@@ -541,6 +563,7 @@ export const agentTagConfigSchema = z
 export type AgentTagConfig = z.infer<typeof agentTagConfigSchema>;
 export type AgentTagProfile = AgentTagConfig["profiles"][number];
 export type AgentTagRoute = AgentTagConfig["routes"][number];
+export type ThreadContextConfig = AgentTagConfig["profiles"][number]["threadContext"];
 export type ConfiguredModelRef = ModelRef;
 
 export interface ResolvedPullRequestRepository {

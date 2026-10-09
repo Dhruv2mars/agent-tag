@@ -7,6 +7,7 @@ import type { ServiceLogger } from "../service.ts";
 import type { AgentTagStore } from "../store/store.ts";
 import { SLACK_ACTION_IDS, SlackActionRouter, USER_INPUT_MODAL_CALLBACK_ID } from "./actions.ts";
 import type { SlackContextSource } from "./context-source.ts";
+import { THREAD_CONTEXT_TIMEOUT_MS, type SlackRepliesPage } from "./context.ts";
 import { SlackEventRouter } from "./events.ts";
 import { deliverNextSlackOutbox, type RefreshRenderers, type SlackOutboxOutcome } from "./outbox.ts";
 import { installUndiciWebSocketCompat } from "./undici-compat.ts";
@@ -46,6 +47,35 @@ export const SLACK_LOOKUP_CLIENT_OPTIONS = {
   timeout: 5_000,
 } as const;
 
+/**
+ * Options for the client that reads thread history (`conversations.replies`). Like lookups, it has
+ * its own queue so a slow history read never delays outbox sends or speaker lookups. The request
+ * timeout matches the thread window's wall-clock budget.
+ */
+export const SLACK_CONTEXT_CLIENT_OPTIONS = {
+  retryConfig: { retries: 0 },
+  rejectRateLimitedCalls: true,
+  maxRequestConcurrency: 2,
+  timeout: THREAD_CONTEXT_TIMEOUT_MS,
+} as const;
+
+/** `conversations.replies` on its own Web API client (see SLACK_CONTEXT_CLIENT_OPTIONS). */
+export async function createSlackRepliesReader(input: {
+  readonly botToken: string;
+  /** Tests point this at a local fake. */
+  readonly slackApiUrl?: string;
+}): Promise<SlackRepliesPage> {
+  const { LogLevel, webApi } = await import("@slack/bolt");
+  const client = new webApi.WebClient(input.botToken, {
+    ...SLACK_CONTEXT_CLIENT_OPTIONS,
+    retryConfig: { ...SLACK_CONTEXT_CLIENT_OPTIONS.retryConfig },
+    logLevel: LogLevel.WARN,
+    ...(input.slackApiUrl === undefined ? {} : { slackApiUrl: input.slackApiUrl }),
+  });
+  // The Web API client has no per-call abort; the caller's wall-clock race drops a late response.
+  return (args) => client.conversations.replies({ ...args });
+}
+
 /** Builds the speaker directory on its own Web API client (see SLACK_LOOKUP_CLIENT_OPTIONS). */
 export async function createSlackUserDirectory(input: {
   readonly botToken: string;
@@ -76,7 +106,7 @@ export class SlackSocketBridge {
   readonly #store: AgentTagStore;
   readonly #config: AgentTagConfig;
   readonly #workerId = `slack-outbox-${crypto.randomUUID()}`;
-  /** Read-only Slack lookups for turn composition (speaker labels). */
+  /** Read-only Slack lookups for turn composition (speaker labels, thread window). */
   readonly contextSource: SlackContextSource;
 
   private constructor(
@@ -149,10 +179,12 @@ export class SlackSocketBridge {
       botToken: botToken.exposeToBoundary(),
       ...(input.logger === undefined ? {} : { logger: input.logger }),
     });
+    const replies = await createSlackRepliesReader({ botToken: botToken.exposeToBoundary() });
     const contextSource: SlackContextSource = {
       botUserId: auth.user_id,
       ...(auth.bot_id === undefined ? {} : { selfBotId: auth.bot_id }),
       users,
+      replies,
     };
     return new SlackSocketBridge(app, input.store, input.config, contextSource);
   }

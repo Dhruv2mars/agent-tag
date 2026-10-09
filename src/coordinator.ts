@@ -1,12 +1,13 @@
-import type { AgentTagConfig } from "./config.ts";
+import type { AgentTagConfig, AgentTagProfile } from "./config.ts";
 import { ExecutionAuthorityDenied, requireExecutionAuthority } from "./policy/execution.ts";
 import { AgentTagMemory } from "./memory.ts";
 import type { SlackContextSource } from "./slack/context-source.ts";
+import { fetchThreadWindow, SlackContextUnavailable, THREAD_CONTEXT_TIMEOUT_MS } from "./slack/context.ts";
 import { collectMentionedUserIds, type SpeakerIdentity } from "./slack/markup.ts";
 import { escapeSlackText, markdownToMrkdwn, renderCodeBlock, splitForSlack, truncateBlockText } from "./slack/render.ts";
-import { unresolvedSpeaker } from "./slack/users.ts";
+import { slackErrorCode, unresolvedSpeaker } from "./slack/users.ts";
 import type { AgentTagStore, ClaimedOperation, SlackOutboxPayload, TaskExecutionBinding } from "./store/store.ts";
-import { composeTurnText } from "./turn-text.ts";
+import { composeTurnText, type TurnWindow } from "./turn-text.ts";
 import {
   awaitingT3AnswerContinuation,
   dispatchT3Command,
@@ -59,6 +60,8 @@ export interface CoordinatorOptions {
   readonly slackContext?: SlackContextSource;
   /** Turn-wide wall-clock budget for speaker lookups. Defaults to min(5s, lease / 4). */
   readonly speakerLookupBudgetMs?: number;
+  /** Wall-clock budget for reading the thread window. Defaults to min(8s, lease / 3). */
+  readonly threadContextBudgetMs?: number;
   readonly workerId?: string;
   readonly leaseMs?: number;
   /** Poll interval without a watcher, and while a snapshot lags an event the watcher already saw. */
@@ -376,6 +379,7 @@ export class AgentTagCoordinator {
   readonly #memory: AgentTagMemory;
   readonly #slackContext: SlackContextSource | undefined;
   readonly #speakerLookupBudgetMs: number;
+  readonly #threadContextBudgetMs: number;
   readonly #workerId: string;
   readonly #leaseMs: number;
   readonly #pollMs: number;
@@ -395,6 +399,8 @@ export class AgentTagCoordinator {
     this.#workerId = options.workerId ?? `t3-worker-${crypto.randomUUID()}`;
     this.#leaseMs = options.leaseMs ?? 30_000;
     this.#speakerLookupBudgetMs = options.speakerLookupBudgetMs ?? Math.min(5_000, Math.floor(this.#leaseMs / 4));
+    this.#threadContextBudgetMs = options.threadContextBudgetMs
+      ?? Math.min(THREAD_CONTEXT_TIMEOUT_MS, Math.floor(this.#leaseMs / 3));
     this.#pollMs = options.pollMs ?? 500;
     this.#watcher = options.watcher ?? null;
     this.#safetyPollMs = options.safetyPollMs ?? options.config.t3.watch.safetyPollMs;
@@ -507,12 +513,14 @@ export class AgentTagCoordinator {
   async #composeTurn(
     operation: ClaimedOperation,
     task: TaskExecutionBinding,
+    profile: AgentTagProfile,
     signal: AbortSignal | undefined,
   ): Promise<string> {
     const lease = { operationId: operation.operationId, workerId: this.#workerId };
     const frozen = this.#store.peekResolvedTurnText({ ...lease, now: this.#now().toISOString() });
     if (frozen !== null) return frozen;
     const { actorUserId, text, origin } = operation.payload;
+    const window = await this.#readThreadWindow(operation, profile, signal);
     const memories = this.#memory.list({
       context: {
         workspaceId: this.#config.slack.workspaceId,
@@ -525,7 +533,13 @@ export class AgentTagCoordinator {
     });
     // Schedule prompts are plain text, so only Slack-origin text is scanned for mentions.
     const mentioned = origin === "slack" ? collectMentionedUserIds(text) : [];
-    const ids = [...new Set([actorUserId, ...mentioned])]
+    const windowIds = window === null || "unavailable" in window
+      ? []
+      : window.messages.flatMap((message) => [
+        ...(message.speakerKind === "human" ? [message.speakerId] : []),
+        ...collectMentionedUserIds(message.text),
+      ]);
+    const ids = [...new Set([actorUserId, ...mentioned, ...windowIds])]
       .filter((id) => id !== this.#slackContext?.botUserId)
       .slice(0, MAX_TURN_SPEAKER_IDS);
     let names: ReadonlyMap<string, SpeakerIdentity> = new Map();
@@ -543,11 +557,69 @@ export class AgentTagCoordinator {
       primaryText: text,
       names,
       ...(this.#slackContext === undefined ? {} : { botUserId: this.#slackContext.botUserId }),
-      window: null,
+      window,
       notes: [],
       memories,
     });
     return this.#store.resolveOperationTurnText({ ...lease, proposedText, now: this.#now().toISOString() });
+  }
+
+  /**
+   * Reads the earlier thread messages for a first mention in an existing thread. Fails open: any
+   * Slack error or timeout becomes an "unavailable" window (and an audit row); only shutdown aborts.
+   */
+  async #readThreadWindow(
+    operation: ClaimedOperation,
+    profile: AgentTagProfile,
+    signal: AbortSignal | undefined,
+  ): Promise<TurnWindow | null> {
+    const seed = operation.payload.threadContext;
+    if (seed === undefined || this.#slackContext === undefined) return null;
+    const source = this.#slackContext;
+    let window: TurnWindow;
+    try {
+      window = await abortable(
+        fetchThreadWindow({
+          replies: source.replies,
+          channel: operation.payload.conversationId,
+          rootTs: seed.rootTs,
+          beforeTs: seed.beforeTs,
+          botUserId: source.botUserId,
+          ...(source.selfBotId === undefined ? {} : { selfBotId: source.selfBotId }),
+          allowedUserIds: this.#config.access.allowedUserIds,
+          policy: profile.threadContext,
+          timeoutMs: this.#threadContextBudgetMs,
+          ...(signal === undefined ? {} : { signal }),
+        }),
+        signal,
+      );
+    } catch (error) {
+      if (error instanceof CoordinatorAborted || signal?.aborted === true) throw new CoordinatorAborted();
+      window = { unavailable: error instanceof SlackContextUnavailable ? error.code : slackErrorCode(error) };
+    }
+    const now = this.#now().toISOString();
+    this.#store.recordThreadContextAudit({
+      operationId: operation.operationId,
+      taskId: operation.taskId,
+      workerId: this.#workerId,
+      outcome: "unavailable" in window
+        ? { kind: "unavailable", code: window.unavailable }
+        : {
+          kind: "loaded",
+          messages: window.messages.length,
+          omitted: window.omitted,
+          truncated: window.truncated,
+          chars: window.messages.reduce((total, message) => total + message.text.length, 0),
+        },
+      now,
+    });
+    this.#store.renewOperationLease({
+      operationId: operation.operationId,
+      workerId: this.#workerId,
+      now,
+      leaseMs: this.#leaseMs,
+    });
+    return window;
   }
 
   async #run(
@@ -565,7 +637,7 @@ export class AgentTagCoordinator {
       instanceId: profile.defaultProviderInstanceId,
       model: profile.defaultModel,
     };
-    const turnText = await this.#composeTurn(operation, task, signal);
+    const turnText = await this.#composeTurn(operation, task, profile, signal);
     // Shutdown aborts these dispatches (the gateway interrupts the RPC and closes its socket). Both
     // commands use stable ids, so T3 deduplicates the replay when the released operation resumes.
     await abortable(this.#t3.dispatch({

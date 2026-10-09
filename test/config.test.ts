@@ -283,6 +283,64 @@ describe("Agent Tag config", () => {
         .toEqual([{ path: "routes.0.defaultModel", message }]);
     });
   });
+
+  describe("thread context", () => {
+    const validThreadContext = {
+      enabled: true,
+      maxMessages: 30,
+      maxChars: 12_000,
+      maxMessageChars: 2_000,
+      includeBotMessages: "root-only",
+      includeNonAllowedUsers: true,
+    };
+    // Overrides merge over a fully valid block so each test fails only on the key under test.
+    const withThreadContext = (overrides: Record<string, unknown>) => {
+      const input = structuredClone(baseConfig);
+      Object.assign(input.profiles[0]!, { threadContext: { ...validThreadContext, ...overrides } });
+      return input;
+    };
+
+    test("a profile without threadContext gets the defaults", () => {
+      expect(agentTagConfigSchema.parse(baseConfig).profiles[0]!.threadContext).toEqual({
+        enabled: true,
+        maxMessages: 30,
+        maxChars: 12_000,
+        maxMessageChars: 2_000,
+        includeBotMessages: "root-only",
+        includeNonAllowedUsers: true,
+      });
+    });
+
+    test("rejects maxMessageChars above maxChars at the threadContext path", () => {
+      const result = agentTagConfigSchema.safeParse(
+        withThreadContext({ maxChars: 1_000, maxMessageChars: 10_000 }),
+      );
+      expect(result.success).toBe(false);
+      expect(result.error?.issues).toContainEqual(
+        expect.objectContaining({
+          path: ["profiles", 0, "threadContext", "maxMessageChars"],
+          message: "threadContext.maxMessageChars must not exceed maxChars",
+        }),
+      );
+      // Equal limits are allowed.
+      expect(
+        agentTagConfigSchema.safeParse(withThreadContext({ maxChars: 2_000, maxMessageChars: 2_000 })).success,
+      ).toBe(true);
+    });
+
+    test("rejects out-of-range maxMessages", () => {
+      for (const maxMessages of [0, 201]) {
+        expect(agentTagConfigSchema.safeParse(withThreadContext({ maxMessages })).success).toBe(false);
+      }
+      expect(agentTagConfigSchema.safeParse(withThreadContext({ maxMessages: 200 })).success).toBe(true);
+    });
+
+    test("accepts includeBotMessages set to all", () => {
+      const parsed = agentTagConfigSchema.parse(withThreadContext({ includeBotMessages: "all" }));
+      expect(parsed.profiles[0]!.threadContext.includeBotMessages).toBe("all");
+      expect(parsed.profiles[0]!.threadContext.maxMessages).toBe(30);
+    });
+  });
 });
 
 describe("t3 config", () => {

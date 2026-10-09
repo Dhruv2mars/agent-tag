@@ -224,6 +224,10 @@ export class AgentTagStore {
     return operations.resolveOperationTurnText(this.#database, input);
   }
 
+  recordThreadContextAudit(input: operations.RecordThreadContextAuditInput): void {
+    operations.recordThreadContextAudit(this.#database, input);
+  }
+
   countActiveSchedules(workspaceId: string): number {
     return schedules.countActiveSchedules(this.#database, workspaceId);
   }
