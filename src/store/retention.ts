@@ -13,7 +13,10 @@ export interface RetentionPolicy {
   readonly auditDays?: number | undefined;
   /** Replace payloads of settled Slack outbox rows older than this many days. */
   readonly outboxDays?: number | undefined;
-  /** Replace stored Slack message text, settled operation text and ended schedule prompts older than this many days. */
+  /**
+   * Replace stored Slack message text, settled operation text, ended schedule prompts and consumed
+   * thread note text older than this many days; delete unconsumed thread notes that old.
+   */
   readonly messageDays?: number | undefined;
 }
 
@@ -32,6 +35,10 @@ export interface PruneResult {
   readonly operationsRedacted: number;
   /** Prompts of ended (cancelled, auto-disabled or completed) schedules. */
   readonly schedulesRedacted: number;
+  /** Text of thread context notes already shown to a turn. */
+  readonly notesRedacted: number;
+  /** Thread context notes never shown to a turn: stale, so deleted outright. */
+  readonly notesDeleted: number;
 }
 
 export function retentionEnabled(policy: RetentionPolicy): boolean {
@@ -72,6 +79,11 @@ const SCHEDULE_WHERE = `state <> 'active'
   AND julianday(COALESCE(ended_at, updated_at)) < julianday(?)
   AND prompt <> '${PRUNED_TEXT}'`;
 
+const CONSUMED_NOTE_WHERE = `consumed_by_operation_id IS NOT NULL
+  AND julianday(created_at) < julianday(?)
+  AND (text <> '${PRUNED_TEXT}' OR (previous_text IS NOT NULL AND previous_text <> '${PRUNED_TEXT}'))`;
+const PENDING_NOTE_WHERE = "consumed_by_operation_id IS NULL AND julianday(created_at) < julianday(?)";
+
 function count(database: Database, table: string, where: string, cutoff: string): number {
   const row = database
     .query<{ count: number }, [string]>(`SELECT COUNT(*) AS count FROM ${table} WHERE ${where}`)
@@ -98,6 +110,8 @@ export function pruneRetainedData(
     let eventsRedacted = 0;
     let operationsRedacted = 0;
     let schedulesRedacted = 0;
+    let notesRedacted = 0;
+    let notesDeleted = 0;
     if (cutoffs.audit !== null) {
       auditDeleted = dryRun
         ? count(database, "audit_log", AUDIT_WHERE, cutoffs.audit)
@@ -131,8 +145,30 @@ export function pruneRetainedData(
         : database
             .query(`UPDATE schedules SET prompt = ? WHERE ${SCHEDULE_WHERE}`)
             .run(PRUNED_TEXT, cutoffs.message).changes;
+      notesRedacted = dryRun
+        ? count(database, "thread_context_notes", CONSUMED_NOTE_WHERE, cutoffs.message)
+        : database
+            .query(
+              `UPDATE thread_context_notes
+               SET text = ?, previous_text = CASE WHEN previous_text IS NULL THEN NULL ELSE ? END
+               WHERE ${CONSUMED_NOTE_WHERE}`,
+            )
+            .run(PRUNED_TEXT, PRUNED_TEXT, cutoffs.message).changes;
+      notesDeleted = dryRun
+        ? count(database, "thread_context_notes", PENDING_NOTE_WHERE, cutoffs.message)
+        : database.query(`DELETE FROM thread_context_notes WHERE ${PENDING_NOTE_WHERE}`).run(cutoffs.message).changes;
     }
-    return { dryRun, cutoffs, auditDeleted, outboxRedacted, eventsRedacted, operationsRedacted, schedulesRedacted };
+    return {
+      dryRun,
+      cutoffs,
+      auditDeleted,
+      outboxRedacted,
+      eventsRedacted,
+      operationsRedacted,
+      schedulesRedacted,
+      notesRedacted,
+      notesDeleted,
+    };
   });
   // A dry run only reads, so it takes no write lock and works on a read-only connection.
   return dryRun ? run.deferred() : run.immediate();
@@ -144,7 +180,9 @@ export function prunedRowCount(result: PruneResult): number {
     result.outboxRedacted +
     result.eventsRedacted +
     result.operationsRedacted +
-    result.schedulesRedacted
+    result.schedulesRedacted +
+    result.notesRedacted +
+    result.notesDeleted
   );
 }
 

@@ -149,6 +149,7 @@ export class SlackSocketBridge {
       config: input.config,
       store: input.store,
       botUserId: auth.user_id,
+      ...(auth.bot_id === undefined ? {} : { selfBotId: auth.bot_id }),
     });
     const actions = new SlackActionRouter({ config: input.config, store: input.store });
     app.event("app_mention", async ({ body }) => {

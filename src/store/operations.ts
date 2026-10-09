@@ -6,6 +6,7 @@ import { type StoreContext, requiredId, parseStoredJson } from "./context.ts";
 import { OPERATION_SETTLED, closeOperationInteractions } from "./interactions.ts";
 import { leaseExpiry, requireLeaseHeld } from "./lease.ts";
 import { insertOutboxMessage } from "./outbox.ts";
+import { consumeThreadNotes } from "./thread-notes.ts";
 import {
   isoDateTime,
   operationIdentitySchema,
@@ -194,6 +195,8 @@ export interface ResolveOperationTurnTextInput {
   readonly operationId: string;
   readonly workerId: string;
   readonly proposedText: string;
+  /** Pending thread notes shown in `proposedText`; consumed only when this call freezes the text. */
+  readonly consumeNoteIds?: readonly string[];
   readonly now: string;
 }
 
@@ -272,6 +275,22 @@ export function resolveOperationTurnText(database: Database, input: ResolveOpera
       )
       .run(input.proposedText, now, operationId, input.workerId, now);
     if (result.changes !== 1) throw new Error("operation turn text could not be resolved");
+    // Only the call that freezes the text consumes notes: a retry returns the frozen text above, so
+    // notes recorded since stay pending for the next turn.
+    const noteIds = input.consumeNoteIds ?? [];
+    const notesConsumed = noteIds.length === 0
+      ? 0
+      : consumeThreadNotes(database, {
+        operationId,
+        taskId: requiredId(
+          database
+            .query<{ task_id: string }, [string]>("SELECT task_id FROM operations WHERE operation_id = ?")
+            .get(operationId)?.task_id ?? "",
+          "taskId",
+        ),
+        noteIds,
+        now,
+      });
     writeAudit(database, {
       actorType: "worker",
       actorId: input.workerId,
@@ -281,7 +300,7 @@ export function resolveOperationTurnText(database: Database, input: ResolveOpera
       action: "operation.turn-text.resolved",
       result: "immutable",
       correlationId: operationId,
-      metadata: {},
+      metadata: { notesConsumed },
       createdAt: now,
     });
     return input.proposedText;

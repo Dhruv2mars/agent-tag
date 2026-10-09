@@ -10,6 +10,7 @@
  *   ambient.ts      ambient trigger decisions              audit.ts        audit log write/export
  *   diagnostics.ts  counts and operational status          lease.ts        shared lease helpers
  *   waits.ts        human waits, expiry, abandoned turns   schedule-outcomes.ts run outcomes, auto-disable
+ *   thread-notes.ts thread context notes (bot, edit, non-allowlisted updates)
  *   schema.ts       zod schemas                            types.ts        public types (re-exported)
  */
 import type { Database } from "bun:sqlite";
@@ -31,6 +32,7 @@ import type {
   SlackOutboxInput,
   StoreOpenOptions,
   TaskExecutionBinding,
+  ThreadNote,
   UserInputAnswerResult,
   UserInputQuestionPrompt,
 } from "./types.ts";
@@ -48,6 +50,7 @@ import * as userInput from "./user-input.ts";
 import * as outbox from "./outbox.ts";
 import * as messageEdits from "./message-edits.ts";
 import * as waits from "./waits.ts";
+import * as threadNotes from "./thread-notes.ts";
 
 export { AUDIT_ACTIONS, type AuditAction } from "./schema.ts";
 export type {
@@ -73,6 +76,7 @@ export type {
   StoreFaultPoint,
   StoreOpenOptions,
   TaskExecutionBinding,
+  ThreadNote,
   UserInputAnswerResult,
   UserInputQuestionPrompt,
   UserInputSelection,
@@ -226,6 +230,18 @@ export class AgentTagStore {
 
   recordThreadContextAudit(input: operations.RecordThreadContextAuditInput): void {
     operations.recordThreadContextAudit(this.#database, input);
+  }
+
+  recordThreadNote(input: threadNotes.RecordThreadNoteInput): threadNotes.RecordThreadNoteResult {
+    return threadNotes.recordThreadNote(this.#database, input);
+  }
+
+  listPendingThreadNotes(taskId: string, limit?: number): ThreadNote[] {
+    return threadNotes.listPendingThreadNotes(this.#database, taskId, limit);
+  }
+
+  findIngestedText(workspaceId: string, eventKey: string): string | null {
+    return threadNotes.findIngestedText(this.#database, workspaceId, eventKey);
   }
 
   countActiveSchedules(workspaceId: string): number {

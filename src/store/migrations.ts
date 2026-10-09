@@ -395,4 +395,36 @@ export const STORE_MIGRATIONS: readonly StoreMigration[] = [
         ended_at = updated_at WHERE state <> 'active';
     `,
   },
+  {
+    // Thread context notes (PR-G3): bot, non-allowlisted and edit updates in a bound thread, shown on
+    // the next human turn and consumed by it. Independent table, so it applies in any order relative
+    // to other new versions.
+    version: 17,
+    sql: `
+      CREATE TABLE thread_context_notes (
+        note_id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL REFERENCES tasks(task_id),
+        workspace_id TEXT NOT NULL,
+        conversation_id TEXT NOT NULL,
+        thread_ts TEXT NOT NULL,
+        source_event_key TEXT NOT NULL,
+        source_delivery_id TEXT NOT NULL,
+        kind TEXT NOT NULL CHECK (kind IN ('message', 'edit')),
+        speaker_kind TEXT NOT NULL CHECK (speaker_kind IN ('human', 'bot')),
+        speaker_id TEXT NOT NULL,
+        speaker_label TEXT,
+        steering_allowed INTEGER NOT NULL CHECK (steering_allowed IN (0, 1)),
+        message_ts TEXT NOT NULL,
+        text TEXT NOT NULL,
+        previous_text TEXT,
+        source_order_key TEXT NOT NULL,
+        consumed_by_operation_id TEXT REFERENCES operations(operation_id),
+        consumed_at TEXT,
+        created_at TEXT NOT NULL,
+        UNIQUE (workspace_id, source_event_key)
+      );
+      CREATE INDEX thread_context_notes_pending_idx
+        ON thread_context_notes(task_id, consumed_by_operation_id, source_order_key);
+    `,
+  },
 ];

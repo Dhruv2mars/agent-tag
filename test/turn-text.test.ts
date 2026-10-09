@@ -20,7 +20,7 @@ function input(overrides: Partial<ComposeTurnInput> = {}): ComposeTurnInput {
     names,
     botUserId: "UBOT",
     window: null,
-    notes: [],
+    notes: null,
     memories: [],
     ...overrides,
   };

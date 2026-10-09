@@ -228,6 +228,8 @@ export const AUDIT_ACTIONS = [
   "task.t3-bound",
   "thread-context.loaded",
   "thread-context.unavailable",
+  "thread-note.dropped",
+  "thread-note.recorded",
 ] as const;
 export const auditActionSchema = z.enum(AUDIT_ACTIONS);
 export type AuditAction = z.infer<typeof auditActionSchema>;

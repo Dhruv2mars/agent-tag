@@ -120,6 +120,7 @@ describe("Slack event ingress", () => {
         eventBody({ eventId: "EvDM1", type: "message", channel: "D1", text: "private request" }),
       );
       if (accepted.kind === "ignored") throw new Error(`DM event was ignored: ${accepted.reason}`);
+      if (accepted.kind === "noted") throw new Error("DM event became a note");
       expect(store.getTaskExecution(accepted.receipt.taskId)).toMatchObject({
         conversationType: "dm",
         ownerUserId: "U1",
@@ -356,6 +357,9 @@ describe("Slack event ingress", () => {
       });
       expect(
         router.ingest(eventBody({ eventId: "Ev4", type: "message", user: "U0BOT", botId: "B1" })),
+      ).toEqual({ kind: "ignored", reason: "self-event" });
+      expect(
+        router.ingest(eventBody({ eventId: "Ev4b", type: "message", user: "U9", botId: "B9" })),
       ).toEqual({ kind: "ignored", reason: "bot-event" });
       expect(
         router.ingest(eventBody({ eventId: "Ev5", type: "message", subtype: "message_changed" })),
