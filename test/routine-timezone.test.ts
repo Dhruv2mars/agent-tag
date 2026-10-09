@@ -28,6 +28,8 @@ describe("extractTimeZone", () => {
     ["every day at 9am GMT check", "every day at 9am check", "UTC"],
     ["every day at 9am (GMT) check", "every day at 9am check", "UTC"],
     ["every day at 9am ET and 5pm ET check", "every day at 9am and 5pm check", "America/New_York"],
+    ["every day at 9am (PT) check CI", "every day at 9am check CI", "America/Los_Angeles"],
+    ["every day at 9am et check CI", "every day at 9am check CI", "America/New_York"],
   ])("%s", (input, text, explicit) => {
     expect(extractTimeZone(input)).toEqual({ kind: "ok", text, explicit });
   });
@@ -143,6 +145,21 @@ describe("resolveRoutineSchedule", () => {
         resolveRoutineSchedule({ text: "tomorrow at 3pm: deploy", now: NOW, profileTimeZone, defaultTimeZone: "Europe/Paris" }),
       ).toMatchObject({ kind: "ok", nextRunAt: "2026-10-10T13:00:00.000Z", timeZone: "Europe/Paris", timeZoneSource: "default" });
     }
+  });
+
+  test("parses the same normalized text the detector saw", () => {
+    for (const text of ["please, remind me tomorrow at 3pm to deploy", "<@U0BOT> Please   remind me tomorrow at 3pm to deploy"]) {
+      expect(resolveRoutineSchedule({ text, now: NOW, actorUserId: "U1", profileTimeZone: "America/New_York" })).toMatchObject({
+        kind: "ok",
+        task: "deploy",
+        nextRunAt: "2026-10-10T19:00:00.000Z",
+        notifyUserId: "U1",
+      });
+    }
+    expect(resolveRoutineSchedule({ text: "please, every day at 9am check CI", now: NOW })).toMatchObject({
+      kind: "ok",
+      task: "check CI",
+    });
   });
 
   test("reports zone and parse errors as user-facing messages", () => {

@@ -1,4 +1,4 @@
-import { parseRoutineRequest, type RoutineParseResult } from "./parse.ts";
+import { normalizeRoutineRequest, parseRoutineRequest, type RoutineParseResult } from "./parse.ts";
 import { isValidTimeZone } from "./zoned.ts";
 
 /**
@@ -56,9 +56,9 @@ const ZONE_PATTERNS: ReadonlyArray<ZonePattern> = [
     pattern: new RegExp(`(?<clock>${CLOCK})\\s+(?<zone>${IANA_NAME})${END}`, "g"),
     keep: (match) => match.groups?.clock ?? "",
   },
-  // "9am PT", "09:00 cet": abbreviations only right after a clock time
+  // "9am PT", "09:00 cet", "9am (PT)": abbreviations only right after a clock time
   {
-    pattern: new RegExp(`(?<clock>${CLOCK})\\s+(?<zone>${ABBREVIATION})${END}`, "gi"),
+    pattern: new RegExp(`(?<clock>${CLOCK})\\s*(?:\\((?<paren>${ABBREVIATION})\\)|\\s(?<zone>${ABBREVIATION})${END})`, "gi"),
     keep: (match) => match.groups?.clock ?? "",
   },
 ];
@@ -101,7 +101,7 @@ export function extractTimeZone(text: string): TimeZoneExtraction {
   for (const { pattern, keep } of ZONE_PATTERNS) {
     pattern.lastIndex = 0;
     for (let match = pattern.exec(text); match !== null; match = pattern.exec(text)) {
-      const token = match.groups?.zone ?? "";
+      const token = match.groups?.zone ?? match.groups?.paren ?? "";
       const zone = zoneFor(token);
       if (zone === null) return { kind: "error", message: unknownTimeZoneMessage(token), token };
       const start = match.index;
@@ -186,7 +186,7 @@ const PAST_ERROR = "That time has already passed. Try a time in the future.";
  * profile zone only when {@link extractTimeZone} found no explicit one (it is the only I/O).
  */
 export function resolveRoutineSchedule(input: RoutineScheduleInput): RoutineScheduleResult {
-  const extracted = extractTimeZone(input.text);
+  const extracted = extractTimeZone(normalizeRoutineRequest(input.text));
   if (extracted.kind === "error") return { kind: "error", message: extracted.message };
   const zone = resolveTimeZone({
     explicit: extracted.explicit ?? null,

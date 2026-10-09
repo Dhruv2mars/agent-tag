@@ -1,4 +1,4 @@
-import { GENERIC_PARSE_ERROR, REMINDER_LEAD, splitRoutineRequest } from "./parse.ts";
+import { GENERIC_PARSE_ERROR, normalizeRoutineRequest, REMINDER_LEAD, splitRoutineRequest } from "./parse.ts";
 import { extractTimeZone } from "./timezone.ts";
 
 /**
@@ -68,16 +68,6 @@ function leadWord(text: string): string {
   return (text.split(/\s+/, 1)[0] ?? "").toLowerCase().replace(/[:,\-–—]+$/, "");
 }
 
-/** Trim, drop leading bot mentions and "please", and collapse whitespace. */
-function normalizeRequest(text: string): string {
-  return text
-    .trim()
-    .replace(/^(?:<@[^>]+>\s*)+/, "")
-    .replace(/^please[\s,]+/i, "")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
 function cancelRef(raw: string): RoutineCancelRef {
   const ref = raw
     .replace(REF_LEAD, "")
@@ -102,7 +92,7 @@ function hasRecognizedTiming(text: string): boolean {
 }
 
 export function detectRoutineIntent(text: string): RoutineIntent {
-  const request = normalizeRequest(text);
+  const request = normalizeRoutineRequest(text);
   if (request === "") return NONE;
   if (LIST_BARE.test(request) || LIST.test(request)) return { kind: "list" };
 

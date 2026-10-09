@@ -737,6 +737,19 @@ export type RoutineSplitResult =
     }
   | { readonly kind: "error"; readonly message: string };
 
+/**
+ * Trim, drop leading bot mentions and "please", and collapse whitespace. Create requests must be
+ * parsed from this same text, so detection and parsing never disagree about the lead.
+ */
+export function normalizeRoutineRequest(text: string): string {
+  return text
+    .trim()
+    .replace(/^(?:<@[^>]+>\s*)+/, "")
+    .replace(/^please[\s,]+/i, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 export interface SplitRoutineOptions {
   /** The requester: `remind me ...` and `set a reminder ...` notify them. */
   readonly actorUserId?: string;
