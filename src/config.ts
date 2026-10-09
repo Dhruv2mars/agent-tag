@@ -162,8 +162,11 @@ function checkAllowedModels(
     ];
     for (const name of entryNames) {
       const issuePath = name.kind === "label" ? [...path, index, "label"] : [...path, index, "aliases", name.field];
-      if (refs.some((ref) => !sameModel(ref, entry) && ref.model.toLowerCase() === name.key)) {
-        context.addIssue({ code: "custom", path: issuePath, message: `${name.kind} collides with another model's slug` });
+      // Queries match `instance/model` and slugs before labels, so a name equal to either would select the other model.
+      const shadows = (ref: ModelRef): boolean =>
+        ref.model.toLowerCase() === name.key || `${ref.instanceId}/${ref.model}`.toLowerCase() === name.key;
+      if (refs.some((ref) => !sameModel(ref, entry) && shadows(ref))) {
+        context.addIssue({ code: "custom", path: issuePath, message: `${name.kind} collides with another model's slug or instance/model` });
       }
       if (seen.has(name.key)) {
         // A label that equals the entry's own alias is harmless; a repeated alias is not.

@@ -255,12 +255,18 @@ describe("Agent Tag config", () => {
         { path: "profiles.0.allowedModels.0.aliases.1", message: "aliases must be unique" },
       ]);
       expect(issues(withModels({ allowedModels: [opus, { ...mini, aliases: ["claude-opus-5-5"] }] }))).toEqual([
-        { path: "profiles.0.allowedModels.1.aliases.0", message: "alias collides with another model's slug" },
+        { path: "profiles.0.allowedModels.1.aliases.0", message: "alias collides with another model's slug or instance/model" },
       ]);
       // The profile default's slug is reserved too.
       expect(issues(withModels({ allowedModels: [{ ...opus, label: "GPT-5.6-SOL" }] }))).toEqual([
-        { path: "profiles.0.allowedModels.0.label", message: "label collides with another model's slug" },
+        { path: "profiles.0.allowedModels.0.label", message: "label collides with another model's slug or instance/model" },
       ]);
+      // A label equal to another model's `instance/model` would resolve to that model first.
+      expect(issues(withModels({ allowedModels: [{ ...opus, label: "Codex/GPT-5.6-sol" }] }))).toEqual([
+        { path: "profiles.0.allowedModels.0.label", message: "label collides with another model's slug or instance/model" },
+      ]);
+      // Its own qualified name is harmless.
+      expect(issues(withModels({ allowedModels: [{ ...opus, label: "claudeAgent/claude-opus-5-5" }] }))).toEqual([]);
     });
 
     test("rejects a route default outside the profile's allowed set, including a provider instance mismatch", () => {
