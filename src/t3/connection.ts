@@ -2,6 +2,7 @@ import { stat } from "node:fs/promises";
 
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
+import * as Layer from "effect/Layer";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as RpcClient from "effect/unstable/rpc/RpcClient";
@@ -276,7 +277,12 @@ export class T3Connection {
       });
       const scope = await Effect.runPromise(Scope.make());
       const client = await Effect.runPromise(
-        RpcClient.make(rpcGroup).pipe(Effect.provide(protocolLayer(url)), Scope.provide(scope)),
+        // The protocol layer is built into the generation's scope: `Effect.provide(layer)` alone would
+        // close the socket as soon as `RpcClient.make` returned.
+        Layer.buildWithScope(protocolLayer(url), scope).pipe(
+          Effect.flatMap((context) => RpcClient.make(rpcGroup).pipe(Effect.provide(context))),
+          Scope.provide(scope),
+        ),
       ).catch(async (error: unknown) => {
         await Effect.runPromise(Scope.close(scope, Exit.void));
         throw error;
