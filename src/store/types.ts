@@ -39,6 +39,8 @@ export interface SlackEventInput {
   /** Slack ts of the triggering message; copied into the operation payload. */
   readonly messageTs?: string;
   readonly origin?: "slack" | "schedule";
+  /** Thread window seed (first mention in an existing thread); copied into the operation payload. */
+  readonly threadContext?: { readonly rootTs: string; readonly beforeTs: string };
 }
 
 export interface ActiveTaskBinding {

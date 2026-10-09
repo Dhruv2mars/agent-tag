@@ -44,6 +44,14 @@
         "keywords": [],
         "cooldownSeconds": 300,
         "maxTurnsPerHour": 4
+      },
+      "threadContext": {
+        "enabled": true,
+        "maxMessages": 30,
+        "maxChars": 12000,
+        "maxMessageChars": 2000,
+        "includeBotMessages": "root-only",
+        "includeNonAllowedUsers": true
       }
     }
   ],

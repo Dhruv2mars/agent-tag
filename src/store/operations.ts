@@ -213,6 +213,44 @@ export function peekResolvedTurnText(database: Database, input: PeekResolvedTurn
   ).resolved_text;
 }
 
+export type ThreadContextOutcome =
+  | {
+      readonly kind: "loaded";
+      readonly messages: number;
+      readonly omitted: number;
+      readonly truncated: boolean;
+      readonly chars: number;
+    }
+  | { readonly kind: "unavailable"; readonly code: string };
+
+export interface RecordThreadContextAuditInput {
+  readonly operationId: string;
+  readonly taskId: string;
+  readonly workerId: string;
+  readonly outcome: ThreadContextOutcome;
+  readonly now: string;
+}
+
+/** Audits a thread-window read for an operation: counts or an error code, never message text. */
+export function recordThreadContextAudit(database: Database, input: RecordThreadContextAuditInput): void {
+  const operationId = requiredId(input.operationId, "operationId");
+  const { outcome } = input;
+  writeAudit(database, {
+    actorType: "worker",
+    actorId: requiredId(input.workerId, "workerId"),
+    authority: "operation-dispatch",
+    source: operationId,
+    target: requiredId(input.taskId, "taskId"),
+    action: outcome.kind === "loaded" ? "thread-context.loaded" : "thread-context.unavailable",
+    result: outcome.kind,
+    correlationId: operationId,
+    metadata: outcome.kind === "loaded"
+      ? { messages: outcome.messages, omitted: outcome.omitted, truncated: outcome.truncated, chars: outcome.chars }
+      : { code: outcome.code },
+    createdAt: isoDateTime.parse(input.now),
+  });
+}
+
 export function resolveOperationTurnText(database: Database, input: ResolveOperationTurnTextInput): string {
   const now = isoDateTime.parse(input.now);
   const resolve = database.transaction(() => {

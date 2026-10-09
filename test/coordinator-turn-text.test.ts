@@ -7,6 +7,7 @@ import { agentTagConfigSchema } from "../src/config.ts";
 import { AgentTagCoordinator, type T3CoordinatorGateway } from "../src/coordinator.ts";
 import type { ServiceLogRecord } from "../src/service.ts";
 import type { SlackContextSource } from "../src/slack/context-source.ts";
+import type { SlackRepliesPage } from "../src/slack/context.ts";
 import { SlackUserDirectory } from "../src/slack/users.ts";
 import { AgentTagStore, type SlackEventInput } from "../src/store/store.ts";
 import type { T3Command, T3ThreadSnapshot } from "../src/t3/gateway.ts";
@@ -96,9 +97,16 @@ function completedSnapshot(threadId: string, userMessageId: string, requestedAt:
   };
 }
 
-/** A users.info fake that counts every Slack call. */
-function countingSlack(options: { readonly names?: Record<string, string>; readonly error?: string } = {}) {
+/** Slack fakes (users.info, conversations.replies) that count every call. */
+function countingSlack(
+  options: {
+    readonly names?: Record<string, string>;
+    readonly error?: string;
+    readonly replies?: (args: Parameters<SlackRepliesPage>[0]) => Promise<unknown>;
+  } = {},
+) {
   const calls: string[] = [];
+  const repliesCalls: Parameters<SlackRepliesPage>[0][] = [];
   const logs: ServiceLogRecord[] = [];
   const users = new SlackUserDirectory({
     lookup: async (userId) => {
@@ -113,8 +121,13 @@ function countingSlack(options: { readonly names?: Record<string, string>; reado
     },
     logger: (record) => logs.push(record),
   });
-  const source: SlackContextSource = { botUserId: "UBOT", selfBotId: "BSELF", users };
-  return { calls, logs, source };
+  const replies: SlackRepliesPage = async (args) => {
+    repliesCalls.push(args);
+    if (options.replies === undefined) throw new Error("unexpected conversations.replies call");
+    return options.replies(args);
+  };
+  const source: SlackContextSource = { botUserId: "UBOT", selfBotId: "BSELF", users, replies };
+  return { calls, repliesCalls, logs, source };
 }
 
 function recordingT3(clock: () => Date, options: { failTurnStarts?: number } = {}) {
@@ -346,7 +359,7 @@ describe("coordinator turn envelope", () => {
         config,
         store,
         t3,
-        slackContext: { botUserId: "UBOT", users },
+        slackContext: { botUserId: "UBOT", users, replies: async () => ({ ok: true, messages: [] }) },
         workerId: "worker-a",
         leaseMs: 30_000,
         speakerLookupBudgetMs: 20,
