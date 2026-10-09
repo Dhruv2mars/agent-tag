@@ -283,12 +283,15 @@ export function getTaskExecution(database: Database, taskIdInput: string): TaskE
     createdAt: row.created_at,
     desiredModelSelection: storedModelSelection(row.model_selection_json),
     appliedModelSelection: storedModelSelection(row.t3_model_selection_json),
+    invalidModelSelection: (row.model_selection_json !== null && storedModelSelection(row.model_selection_json) === null)
+      || (row.t3_model_selection_json !== null && storedModelSelection(row.t3_model_selection_json) === null),
   };
 }
 
 /**
  * A stored selection column. Unparseable or invalid JSON reads as NULL (the default) rather than
- * failing the task; the coordinator re-records the applied selection on the next turn.
+ * failing the task; the binding flags it so the coordinator clears and audits it
+ * (`clearInvalidModelSelection`) and re-records the applied selection on the next turn.
  */
 function storedModelSelection(json: string | null): T3ModelSelection | null {
   if (json === null) return null;
@@ -411,6 +414,12 @@ export function recordAppliedModelSelection(database: Database, input: RecordApp
 
 export type ModelRevertReason = "revoked" | "refused" | "t3-rejected";
 
+/** A reverted desired selection: what it was and what it is now (null = route or profile default). */
+export interface ModelRevert {
+  readonly previous: T3ModelSelection | null;
+  readonly next: T3ModelSelection | null;
+}
+
 export interface RevertDesiredModelSelectionInput {
   readonly taskId: string;
   /**
@@ -426,20 +435,23 @@ export interface RevertDesiredModelSelectionInput {
 }
 
 /**
- * Drops a desired selection that cannot be honoured, audited as `task.model.reverted`. Returns the
- * selection it dropped, or null when there was nothing to revert (already reverted, or no choice made).
+ * Drops a desired selection that cannot be honoured, audited as `task.model.reverted`. When T3
+ * rejects a switch to a route or profile default (no desired selection), the applied selection is
+ * pinned as the desired one so later turns stop retrying it. Returns the change, or null when there
+ * was nothing to revert (already reverted, or nothing to pin).
  */
 export function revertDesiredModelSelection(
   database: Database,
   input: RevertDesiredModelSelectionInput,
-): T3ModelSelection | null {
+): ModelRevert | null {
   const taskId = requiredId(input.taskId, "taskId");
   const now = isoDateTime.parse(input.now);
   return database.transaction(() => {
     const current = taskModelRow(database, taskId);
-    if (current.desired === null) return null;
+    if (current.desired === null && (input.reason !== "t3-rejected" || current.applied === null)) return null;
     const next = input.reason === "revoked" ? null : current.applied;
-    if (next !== null && next.instanceId === current.desired.instanceId && next.model === current.desired.model) {
+    if (next !== null && current.desired !== null && next.instanceId === current.desired.instanceId
+      && next.model === current.desired.model) {
       return null;
     }
     database
@@ -457,7 +469,58 @@ export function revertDesiredModelSelection(
       metadata: selectionMetadata(next, current.desired, requiredId(input.code, "code")),
       createdAt: now,
     });
-    return current.desired;
+    return { previous: current.desired, next };
+  }).immediate();
+}
+
+export type TaskModelColumn = "model_selection_json" | "t3_model_selection_json";
+
+export interface ClearInvalidModelSelectionInput {
+  readonly taskId: string;
+  readonly correlationId: string;
+  readonly now: string;
+}
+
+/**
+ * Resets selection columns holding an unreadable value to NULL, audited as `task.model.reverted`
+ * (result `invalid`) naming the columns but never their contents. Returns the columns it cleared.
+ */
+export function clearInvalidModelSelection(
+  database: Database,
+  input: ClearInvalidModelSelectionInput,
+): readonly TaskModelColumn[] {
+  const taskId = requiredId(input.taskId, "taskId");
+  const now = isoDateTime.parse(input.now);
+  return database.transaction(() => {
+    const row = z.object({
+      model_selection_json: z.string().nullable(),
+      t3_model_selection_json: z.string().nullable(),
+    }).nullable().parse(
+      database
+        .query("SELECT model_selection_json, t3_model_selection_json FROM tasks WHERE task_id = ? AND state = 'active'")
+        .get(taskId),
+    );
+    if (row === null) return [];
+    const columns = (["model_selection_json", "t3_model_selection_json"] as const).filter(
+      (column) => row[column] !== null && storedModelSelection(row[column]) === null,
+    );
+    if (columns.length === 0) return [];
+    database
+      .query(`UPDATE tasks SET ${columns.map((column) => `${column} = NULL`).join(", ")}, updated_at = ? WHERE task_id = ?`)
+      .run(now, taskId);
+    writeAudit(database, {
+      actorType: "service",
+      actorId: "agent-tag",
+      authority: "task-model",
+      source: "store",
+      target: taskId,
+      action: "task.model.reverted",
+      result: "invalid",
+      correlationId: requiredId(input.correlationId, "correlationId"),
+      metadata: { columns: columns.join(",") },
+      createdAt: now,
+    });
+    return columns;
   }).immediate();
 }
 

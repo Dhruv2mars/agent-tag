@@ -178,7 +178,7 @@ describe("per-task model selection store", () => {
         now: revertAt,
       });
 
-      expect(dropped).toEqual(selectionB);
+      expect(dropped).toEqual({ previous: selectionB, next: null });
       expect(store.getTaskExecution(taskId).desiredModelSelection).toBeNull();
 
       const rows = modelAuditRows(store, "task.model.reverted", taskId);
@@ -207,7 +207,7 @@ describe("per-task model selection store", () => {
         now: revertAt,
       });
 
-      expect(dropped).toEqual(selectionB);
+      expect(dropped).toEqual({ previous: selectionB, next: selectionA });
       const afterFirst = store.getTaskExecution(taskId);
       expect(afterFirst.desiredModelSelection).toEqual(selectionA);
       expect(afterFirst.appliedModelSelection).toEqual(selectionA);
@@ -240,6 +240,24 @@ describe("per-task model selection store", () => {
       expect(dropped).toBeNull();
       expect(store.getTaskExecution(taskId).desiredModelSelection).toBeNull();
       expect(modelAuditRows(store, "task.model.reverted", taskId)).toHaveLength(0);
+    });
+  });
+
+  test("a T3 rejection with no desired selection pins the applied one, audited once", async () => {
+    await withTask(({ store, taskId, threadId }) => {
+      store.recordAppliedModelSelection({ taskId, threadId, selection: selectionA, now: setAt });
+      const input = {
+        taskId,
+        reason: "t3-rejected" as const,
+        code: "T3ModelSwitchRejected",
+        correlationId: "corr-pin",
+        now: revertAt,
+      };
+
+      expect(store.revertDesiredModelSelection(input)).toEqual({ previous: null, next: selectionA });
+      expect(store.getTaskExecution(taskId).desiredModelSelection).toEqual(selectionA);
+      expect(store.revertDesiredModelSelection(input)).toBeNull();
+      expect(modelAuditRows(store, "task.model.reverted", taskId)).toHaveLength(1);
     });
   });
 

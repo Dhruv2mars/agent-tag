@@ -225,6 +225,14 @@ export class AgentTagStore {
     return operations.peekResolvedTurnText(this.#database, input);
   }
 
+  peekOperationTurnModel(input: operations.PeekResolvedTurnTextInput): operations.OperationTurnModel | null {
+    return operations.peekOperationTurnModel(this.#database, input);
+  }
+
+  resolveOperationTurnModel(input: operations.ResolveOperationTurnModelInput): operations.OperationTurnModel {
+    return operations.resolveOperationTurnModel(this.#database, input);
+  }
+
   resolveOperationTurnText(input: operations.ResolveOperationTurnTextInput): string {
     return operations.resolveOperationTurnText(this.#database, input);
   }
@@ -405,8 +413,12 @@ export class AgentTagStore {
     return tasks.recordAppliedModelSelection(this.#database, input);
   }
 
-  revertDesiredModelSelection(input: tasks.RevertDesiredModelSelectionInput): T3ModelSelection | null {
+  revertDesiredModelSelection(input: tasks.RevertDesiredModelSelectionInput): tasks.ModelRevert | null {
     return tasks.revertDesiredModelSelection(this.#database, input);
+  }
+
+  clearInvalidModelSelection(input: tasks.ClearInvalidModelSelectionInput): readonly tasks.TaskModelColumn[] {
+    return tasks.clearInvalidModelSelection(this.#database, input);
   }
 
   recordPendingInteraction(

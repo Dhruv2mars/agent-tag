@@ -729,7 +729,7 @@ export class AgentTagCoordinator {
     });
     const route = this.#config.routes.find((candidate) => candidate.conversationId === task.conversationId);
     const turnText = await this.#composeTurn(operation, task, profile, signal);
-    const model = await this.#chooseModel(operation, task, profile, route, signal);
+    const model = await this.#turnModel(operation, task, profile, route, signal);
     const modelSelection = model.selection;
     // Shutdown aborts these dispatches (the gateway interrupts the RPC and closes its socket). Both
     // commands use stable ids, so T3 deduplicates the replay when the released operation resumes.
@@ -1034,6 +1034,36 @@ export class AgentTagCoordinator {
   }
 
   /**
+   * The model this operation's turn runs on, chosen once and frozen on the operation: a replay sends
+   * (and later records as applied) the same selection T3 deduplicated, even if the task's desired
+   * model or the config changed in between. A thread move is re-sent under its stable command id.
+   */
+  async #turnModel(
+    operation: ClaimedOperation,
+    task: TaskExecutionBinding,
+    profile: AgentTagProfile,
+    route: AgentTagRoute | undefined,
+    signal: AbortSignal | undefined,
+  ): Promise<TurnModel> {
+    const lease = { operationId: operation.operationId, workerId: this.#workerId };
+    const model = this.#store.peekOperationTurnModel({ ...lease, now: this.#now().toISOString() })
+      ?? this.#store.resolveOperationTurnModel({
+        ...lease,
+        proposed: await this.#chooseModel(operation, task, profile, route, signal),
+        now: this.#now().toISOString(),
+      });
+    if (model.movedThread) {
+      // A stable id per operation: a replay after a lost receipt deduplicates in T3.
+      await abortable(this.#t3.dispatch(threadModelSelectionCommand({
+        commandId: `${operation.operationId}:model`,
+        threadId: task.threadId,
+        modelSelection: model.selection,
+      }), signal), signal);
+    }
+    return model;
+  }
+
+  /**
    * Picks the selection for this turn (P2 §3.7): the task's desired model while config allows it, else
    * the route or profile default. A started thread only moves where T3 0.0.45 would follow (same
    * driver and resume state), via `thread.meta.update` so the snapshot names the model in use;
@@ -1048,6 +1078,14 @@ export class AgentTagCoordinator {
     route: AgentTagRoute | undefined,
     signal: AbortSignal | undefined,
   ): Promise<TurnModel> {
+    if (task.invalidModelSelection) {
+      // Unreadable columns already read as unset; clearing them leaves an audit trail without the value.
+      this.#store.clearInvalidModelSelection({
+        taskId: task.taskId,
+        correlationId: operation.operationId,
+        now: this.#now().toISOString(),
+      });
+    }
     let applied = task.appliedModelSelection;
     if (task.threadStarted && applied === null) {
       // A thread started before selections were recorded: T3's projected selection is what it runs.
@@ -1099,12 +1137,6 @@ export class AgentTagCoordinator {
       policy: effective.reason === "desired" ? profile.modelSwitch : { ...profile.modelSwitch, enabled: true },
     });
     if (plan.kind === "in-place" || plan.kind === "pre-start" || plan.kind === "noop") {
-      // A stable id per operation: a replay after a lost receipt deduplicates in T3.
-      await abortable(this.#t3.dispatch(threadModelSelectionCommand({
-        commandId: `${operation.operationId}:model`,
-        threadId: task.threadId,
-        modelSelection: target,
-      }), signal), signal);
       return { selection: target, previous: applied, movedThread: true };
     }
     if (effective.reason === "desired") {

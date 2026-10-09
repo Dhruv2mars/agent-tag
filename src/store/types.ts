@@ -70,6 +70,8 @@ export interface TaskExecutionBinding {
   readonly desiredModelSelection: T3ModelSelection | null;
   /** The last selection T3 accepted for `threadId`; null before the first turn (or for older tasks). */
   readonly appliedModelSelection: T3ModelSelection | null;
+  /** A selection column held an unreadable value (read as null); see `clearInvalidModelSelection`. */
+  readonly invalidModelSelection: boolean;
 }
 
 export interface IngestReceipt {

@@ -55,6 +55,8 @@ class FakeT3 {
   #rejectedDetail = "";
   /** Fail the next `thread.turn.start` dispatch with a transport error. */
   failNextTurnDispatch = false;
+  /** Fail the next `fetchThread` with a transport error (after a turn T3 accepted). */
+  failNextFetch = false;
 
   readonly gateway = {
     dispatch: async (command: T3Command) => {
@@ -77,7 +79,13 @@ class FakeT3 {
       }
       return { sequence: this.commands.length };
     },
-    fetchThread: async (threadId: string): Promise<T3ThreadSnapshot> => this.snapshot(threadId),
+    fetchThread: async (threadId: string): Promise<T3ThreadSnapshot> => {
+      if (this.failNextFetch) {
+        this.failNextFetch = false;
+        throw new Error("socket closed");
+      }
+      return this.snapshot(threadId);
+    },
   };
 
   turnStarts(): Array<Extract<T3Command, { type: "thread.turn.start" }>> {
@@ -445,6 +453,71 @@ describe("per-task model selection (P2b)", () => {
       "T3 refused to move this thread to the requested model; it stays on *Sol*. Start a new thread to use a different provider.",
     );
     expect(h.audits("task.model.reverted")).toMatchObject([{ result: "t3-rejected", metadata: { code: "T3ModelSwitchRejected" } }]);
+  });
+
+  test("6: T3 refusing a default change pins the accepted model so later turns stop retrying it", async () => {
+    const h = await harness();
+    const first = h.send();
+    await h.process();
+    h.reconfigure(configWith({ defaultModel: MINI.model, allowedModels: ALLOWED }));
+    h.t3.rejectNextTurn =
+      "Thread 'thread-1' cannot switch from instance 'codex' to 'codex' because their provider resume state is incompatible.";
+    h.send();
+    expect(await h.process()).toMatchObject({ kind: "failed", errorCode: "T3ModelSwitchRejected" });
+
+    const task = h.store.getTaskExecution(first.taskId);
+    expect(task.desiredModelSelection).toEqual(SOL);
+    expect(task.appliedModelSelection).toEqual(SOL);
+    expect(h.audits("task.model.reverted")).toEqual([{
+      result: "t3-rejected",
+      metadata: { ...SOL, code: "T3ModelSwitchRejected" },
+    }]);
+
+    const updates = h.t3.metaUpdates().length;
+    h.send();
+    expect(await h.process()).toMatchObject({ kind: "completed" });
+    expect(h.t3.metaUpdates()).toHaveLength(updates);
+    expect(h.t3.turnStarts().at(-1)!.modelSelection).toEqual(SOL);
+    expect(h.audits("task.model.reverted")).toHaveLength(1);
+  });
+
+  test("a replay keeps the model frozen for the operation even if the choice changed in between", async () => {
+    const h = await harness();
+    const first = h.send();
+    await h.process();
+    h.choose(first.taskId, MINI);
+    const second = h.send();
+    // T3 accepts the switch and the turn, then the snapshot read fails.
+    h.t3.failNextFetch = true;
+    expect(await h.process()).toMatchObject({ kind: "retry-scheduled" });
+    h.choose(first.taskId, null);
+    h.advance(60_000);
+    expect(await h.process()).toMatchObject({ kind: "completed" });
+
+    expect(h.t3.turnStarts().map((command) => command.modelSelection)).toEqual([SOL, MINI, MINI]);
+    expect(h.t3.metaUpdates().map((command) => [command.commandId, command.modelSelection])).toEqual([
+      [`${second.operationId}:model`, MINI],
+      [`${second.operationId}:model`, MINI],
+    ]);
+    expect(h.store.getTaskExecution(first.taskId).appliedModelSelection).toEqual(MINI);
+  });
+
+  test("an unreadable stored selection is cleared and audited without its contents", async () => {
+    const h = await harness();
+    const first = h.send();
+    await h.process();
+    h.database.query("UPDATE tasks SET model_selection_json = ?").run("{\"secret\":\"not a selection\"}");
+    h.send();
+    expect(await h.process()).toMatchObject({ kind: "completed" });
+
+    expect(h.t3.turnStarts().at(-1)!.modelSelection).toEqual(SOL);
+    const row = h.database
+      .query<{ model_selection_json: string | null }, []>("SELECT model_selection_json FROM tasks")
+      .get();
+    expect(row?.model_selection_json).toBeNull();
+    expect(h.store.getTaskExecution(first.taskId).invalidModelSelection).toBe(false);
+    expect(h.audits("task.model.reverted")).toEqual([{ result: "invalid", metadata: { columns: "model_selection_json" } }]);
+    expect(JSON.stringify(h.audits("task.model.reverted"))).not.toContain("secret");
   });
 
   test("an asynchronous turn-start failure for this message fails fast instead of stalling", async () => {
