@@ -235,6 +235,7 @@ describe("agent-tag doctor", () => {
       ["t3-session", "pass"],
       ["t3-providers", "pass"],
       ["t3-models", "pass"],
+      ["t3-token-rotation", "skip"],
       ["slack-bot-auth", "pass"],
       ["slack-app-auth", "pass"],
       ["service", "pass"],
@@ -242,7 +243,7 @@ describe("agent-tag doctor", () => {
     expect(world.seenAuthorization).toEqual([`Bearer ${BOT_TOKEN}`, `Bearer ${APP_TOKEN}`]);
     const output = `${formatDoctorReport(report)}\n${JSON.stringify(report)}`;
     for (const secret of [APP_TOKEN, BOT_TOKEN, T3_TOKEN]) expect(output).not.toContain(secret);
-    expect(formatDoctorReport(report)).toContain("15 passed, 0 warning(s), 0 failed, 0 skipped");
+    expect(formatDoctorReport(report)).toContain("15 passed, 0 warning(s), 0 failed, 1 skipped");
   });
 
   test("reports every allowed model, and warns without failing when one is unavailable", async () => {
@@ -340,10 +341,10 @@ describe("agent-tag doctor", () => {
   function expectCompleteReport(report: DoctorReport): void {
     expect(report.checks.map((item) => item.id)).toEqual([
       "bun-version", "config", "data-dir", "secret:slack-app-token", "secret:slack-bot-token", "secret:t3-token",
-      "store", "t3-environment", "t3-version", "t3-session", "t3-providers", "t3-models", "slack-bot-auth", "slack-app-auth",
-      "service",
+      "store", "t3-environment", "t3-version", "t3-session", "t3-providers", "t3-models", "t3-token-rotation", "slack-bot-auth",
+      "slack-app-auth", "service",
     ]);
-    expect(JSON.parse(JSON.stringify(report)).checks).toHaveLength(15);
+    expect(JSON.parse(JSON.stringify(report)).checks).toHaveLength(16);
   }
 
   test.skipIf(process.getuid?.() === 0)("reports a data dir without owner search permission as a failed check instead of aborting", async () => {

@@ -14,6 +14,7 @@ import { SecretString } from "./security/secret-file.ts";
 import type { ServiceManager } from "./service-manager.ts";
 import { describeInstalledProgram } from "./service-unit.ts";
 import { AgentTagStore } from "./store/store.ts";
+import { readT3CredentialState, T3_CREDENTIAL_STATE_FILE, type T3CredentialState } from "./t3/credentials.ts";
 import { assertRestrictedOrchestrationSession, inspectT3Session, type T3Session } from "./t3/auth.ts";
 import { inspectT3, type T3ServerInfo } from "./t3/gateway.ts";
 import { parseT3Pin, type T3Pin } from "./t3/pin.ts";
@@ -265,7 +266,9 @@ export function secretFileSpecs(config: AgentTagConfig): readonly SecretFileSpec
     {
       id: "secret:t3-token",
       path: config.t3.tokenFile,
-      missingHint: "rerun `agent-tag onboard` or `bun run enroll:t3` to mint a restricted T3 token",
+      missingHint: config.t3.mode === "managed"
+        ? "start Agent Tag (managed mode mints the token) or run `agent-tag t3 rotate CONFIG`"
+        : "rerun `agent-tag onboard` or `agent-tag t3 rotate CONFIG --admin-token-file FILE` (or `bun run enroll:t3`) to mint a restricted T3 token",
     },
   ];
 }
@@ -439,25 +442,61 @@ export function checkT3Version(serverVersion: string | undefined, pin: T3Pin): D
   };
 }
 
+function rotateHint(config: AgentTagConfig): string {
+  return config.t3.mode === "managed"
+    ? `managed mode rotates it ${config.t3.managed.rotation.rotateBeforeDays} days before expiry; to rotate now run \`agent-tag t3 rotate CONFIG\``
+    : "rotate it with `agent-tag t3 rotate CONFIG --admin-token-file FILE` (or `--t3-base-dir DIR`)";
+}
+
+/**
+ * Managed mode only: the last rotation and the replaced tokens still waiting for revocation, from
+ * `<runtimeDir>/credential-state.json`. A replacement overdue by more than an hour means revocation
+ * keeps failing (the token then expires on its own).
+ */
+export async function checkT3TokenRotation(config: AgentTagConfig, now: Date): Promise<DoctorCheck> {
+  const id = "t3-token-rotation";
+  if (config.t3.mode !== "managed") {
+    return skipped(id, "external T3: rotate with `agent-tag t3 rotate CONFIG --admin-token-file FILE`");
+  }
+  const { rotation, runtimeDir } = config.t3.managed;
+  let state: T3CredentialState;
+  try {
+    state = await readT3CredentialState(join(runtimeDir, T3_CREDENTIAL_STATE_FILE));
+  } catch (error) {
+    return { id, status: "warn", summary: errorMessage(error) };
+  }
+  if (state.rotatedAt === null) {
+    return { id, status: "pass", summary: "no rotation recorded yet; Agent Tag mints and rotates the managed T3 token itself" };
+  }
+  const overdueMs = (rotation.revokeGraceMinutes + 60) * 60_000;
+  const overdue = state.retired.filter((entry) => Date.parse(entry.retiredAt) + overdueMs < now.getTime());
+  const summary = `last rotation ${state.rotatedAt} (${state.rotationReason ?? "unknown"}); ${state.retired.length} replaced token(s) awaiting revocation`;
+  if (overdue.length > 0) {
+    return { id, status: "warn", summary, hint: "the running service revokes replaced tokens; check its logs for t3.token.revoke_skipped" };
+  }
+  return { id, status: "pass", summary };
+}
+
 export async function checkT3Session(
   config: AgentTagConfig,
   token: SecretString,
   dependencies: Pick<DoctorDependencies, "inspectSession" | "now">,
 ): Promise<DoctorCheck> {
   const id = "t3-session";
+  const mint = rotateHint(config);
   let session: T3Session;
   try {
     session = await dependencies.inspectSession({ baseUrl: config.t3.baseUrl, token });
     assertRestrictedOrchestrationSession(session);
   } catch (error) {
-    return { id, status: "fail", summary: `T3 token rejected: ${errorMessage(error)}`, hint: "mint a new restricted token with `bun run enroll:t3`" };
+    return { id, status: "fail", summary: `T3 token rejected: ${errorMessage(error)}`, hint: mint };
   }
   const remainingDays = (Date.parse(session.expiresAt) - dependencies.now().getTime()) / 86_400_000;
   if (remainingDays <= 0) {
-    return { id, status: "fail", summary: `T3 token expired at ${session.expiresAt}`, hint: "mint a new restricted token with `bun run enroll:t3`" };
+    return { id, status: "fail", summary: `T3 token expired at ${session.expiresAt}`, hint: mint };
   }
   if (remainingDays < TOKEN_EXPIRY_WARNING_DAYS) {
-    return { id, status: "warn", summary: `T3 token expires in ${remainingDays.toFixed(1)} days (${session.expiresAt})`, hint: "rotate it with `bun run enroll:t3` before it expires" };
+    return { id, status: "warn", summary: `T3 token expires in ${remainingDays.toFixed(1)} days (${session.expiresAt})`, hint: mint };
   }
   return { id, status: "pass", summary: `T3 token has exact orchestration scopes; expires ${session.expiresAt}` };
 }
@@ -712,6 +751,8 @@ export async function runDoctor(input: {
       }
     }
   }
+
+  checks.push(await checkT3TokenRotation(config, dependencies.now()));
 
   const botToken = secrets.get("secret:slack-bot-token");
   checks.push(
