@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { STORE_MIGRATIONS } from "../src/store/migrations.ts";
+import { operationPayloadSchema } from "../src/store/schema.ts";
 import { AgentTagStore } from "../src/store/store.ts";
 
 const createdAt = "2026-09-21T00:00:00.000Z";
@@ -131,6 +132,14 @@ test("upgrades every historical SQLite schema while preserving existing work", a
       expect(
         upgraded.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM schema_migrations").get()?.count,
       ).toBe(STORE_MIGRATIONS.length);
+      expect(
+        upgraded
+          .query<{ name: string }, []>(
+            "SELECT name FROM sqlite_master WHERE type IN ('table', 'index') AND name LIKE 'thread_context_notes%' ORDER BY name",
+          )
+          .all()
+          .map((row) => row.name),
+      ).toEqual(["thread_context_notes", "thread_context_notes_pending_idx"]);
       expect(
         upgraded
           .query<{
@@ -528,6 +537,101 @@ test("routine migration recovers authority revocations from the audit log", asyn
     upgraded.close();
   } finally {
     if (!directory.startsWith(`${tmpdir()}/agent-tag-migration-revoked-`)) {
+      throw new Error(`refusing to remove unexpected migration fixture path ${directory}`);
+    }
+    await rm(directory, { recursive: true });
+  }
+});
+
+test("D12: a fresh store creates the thread context notes table and its pending index", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-tag-migration-notes-fresh-"));
+  const path = join(directory, "agent-tag.sqlite");
+  try {
+    (await AgentTagStore.open(path)).close();
+
+    const fresh = new Database(path, { readonly: true, strict: true });
+    expect(
+      fresh
+        .query<{ type: string; name: string; tbl_name: string }, []>(
+          `SELECT type, name, tbl_name FROM sqlite_master
+           WHERE name IN ('thread_context_notes', 'thread_context_notes_pending_idx') ORDER BY name`,
+        )
+        .all(),
+    ).toEqual([
+      { type: "table", name: "thread_context_notes", tbl_name: "thread_context_notes" },
+      { type: "index", name: "thread_context_notes_pending_idx", tbl_name: "thread_context_notes" },
+    ]);
+    expect(
+      fresh
+        .query<{ name: string }, []>("SELECT name FROM pragma_index_info('thread_context_notes_pending_idx') ORDER BY seqno")
+        .all()
+        .map((row) => row.name),
+    ).toEqual(["task_id", "consumed_by_operation_id", "source_order_key"]);
+    expect(
+      fresh.query<{ version: number }, []>("SELECT version FROM schema_migrations WHERE version = 17").get(),
+    ).toEqual({ version: 17 });
+    fresh.close();
+  } finally {
+    if (!directory.startsWith(`${tmpdir()}/agent-tag-migration-notes-fresh-`)) {
+      throw new Error(`refusing to remove unexpected migration fixture path ${directory}`);
+    }
+    await rm(directory, { recursive: true });
+  }
+});
+
+test("D12: an operation payload written before messageTs, origin and threadContext still parses", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-tag-migration-legacy-payload-"));
+  const path = join(directory, "agent-tag.sqlite");
+  try {
+    // Version 1 wrote payloads without the fields added later (seedVersionOne's JSON has none of them).
+    const historical = new Database(path, { create: true, strict: true });
+    historical.exec("PRAGMA foreign_keys = ON");
+    historical.exec("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)");
+    applyMigration(historical, 1);
+    seedVersionOne(historical);
+    for (const { version } of STORE_MIGRATIONS) {
+      if (version > 1) applyMigration(historical, version);
+    }
+    historical.close();
+
+    const reader = new Database(path, { readonly: true, strict: true });
+    const legacyJson = reader
+      .query<{ payload_json: string }, []>("SELECT payload_json FROM operations WHERE operation_id = 'operation-1'")
+      .get()?.payload_json;
+    reader.close();
+    if (legacyJson === undefined) throw new Error("legacy operation fixture is missing");
+    expect(JSON.parse(legacyJson)).not.toHaveProperty("messageTs");
+    expect(JSON.parse(legacyJson)).not.toHaveProperty("origin");
+    expect(JSON.parse(legacyJson)).not.toHaveProperty("threadContext");
+
+    const legacyPayload = {
+      text: "preserve me",
+      actorUserId: "U1",
+      conversationId: "C1",
+      threadTs: "1000.000001",
+      profileId: "engineering",
+      repositoryRoot: "/srv/repos/example",
+    };
+    expect(operationPayloadSchema.parse(JSON.parse(legacyJson))).toEqual(legacyPayload);
+
+    const store = await AgentTagStore.open(path);
+    try {
+      const claimed = store.claimNextOperation({
+        workerId: "worker-a",
+        now: "2026-09-21T00:00:01.000Z",
+        leaseMs: 10_000,
+        maxConcurrentTasks: 1,
+      });
+      expect(claimed?.operationId).toBe("operation-1");
+      // Claiming fills what the legacy payload lacks: origin "slack" and messageTs from the event key
+      // (withDerivedOrigin). threadContext has no legacy source, so it stays absent.
+      expect(claimed?.payload).toEqual({ ...legacyPayload, origin: "slack", messageTs: "1000.000001" });
+      expect(claimed?.payload.threadContext).toBeUndefined();
+    } finally {
+      store.close();
+    }
+  } finally {
+    if (!directory.startsWith(`${tmpdir()}/agent-tag-migration-legacy-payload-`)) {
       throw new Error(`refusing to remove unexpected migration fixture path ${directory}`);
     }
     await rm(directory, { recursive: true });

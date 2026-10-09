@@ -14,6 +14,7 @@ import {
   retentionEnabled,
 } from "../src/store/retention.ts";
 import { AgentTagStore, type SlackEventInput } from "../src/store/store.ts";
+import type { RecordThreadNoteInput } from "../src/store/thread-notes.ts";
 
 const oldAt = "2026-01-01T00:00:00.000Z";
 const recentAt = "2026-09-20T00:00:00.000Z";
@@ -130,6 +131,53 @@ function readRows(path: string): {
   }
 }
 
+/** A thread note on the thread of `slackEvent(3, ...)`, the old pending turn in `withSeededStore`. */
+function threadNote(overrides: Partial<RecordThreadNoteInput>): RecordThreadNoteInput {
+  return {
+    workspaceId: "T1",
+    conversationId: "C1",
+    threadTs: "1003.0001",
+    sourceEventKey: "C1:1003.0003",
+    sourceDeliveryId: "delivery-note",
+    kind: "message",
+    speakerKind: "human",
+    speakerId: "U1",
+    speakerLabel: null,
+    steeringAllowed: false,
+    messageTs: "1003.0003",
+    text: "note",
+    previousText: null,
+    sourceOrderKey: "1003.0003",
+    now: oldAt,
+    ...overrides,
+  };
+}
+
+function readNotes(path: string): ReadonlyArray<{
+  readonly key: string;
+  readonly text: string;
+  readonly previousText: string | null;
+  readonly consumed: boolean;
+}> {
+  const database = new Database(path, { readonly: true, strict: true });
+  try {
+    return database
+      .query<{ source_event_key: string; text: string; previous_text: string | null; consumed: number }, []>(
+        `SELECT source_event_key, text, previous_text, consumed_by_operation_id IS NOT NULL AS consumed
+         FROM thread_context_notes ORDER BY source_event_key`,
+      )
+      .all()
+      .map((row) => ({
+        key: row.source_event_key,
+        text: row.text,
+        previousText: row.previous_text,
+        consumed: row.consumed === 1,
+      }));
+  } finally {
+    database.close();
+  }
+}
+
 describe("data retention", () => {
   test("computes cutoffs and rejects invalid policies", () => {
     expect(retentionCutoff(nowAt, 30)).toBe("2026-08-22T00:00:00.000Z");
@@ -216,6 +264,95 @@ describe("data retention", () => {
       expect(store.getSchedule(active)?.prompt).toBe("old active routine");
       expect(store.getSchedule(recent)?.prompt).toBe("recently ended routine");
       expect(pruneDatabaseFile(path, { policy, now: nowAt }).schedulesRedacted).toBe(0);
+    });
+  });
+
+  test("redacts consumed thread notes past messageDays, deletes stale unconsumed ones, keeps recent ones", async () => {
+    await withSeededStore(({ store, path }) => {
+      // Old notes on the old pending turn's thread (1003.0001), one of them an edit with previous text.
+      const oldEdit = store.recordThreadNote(
+        threadNote({
+          kind: "edit",
+          sourceEventKey: "C1:1003.0001:edit:1003.0002",
+          messageTs: "1003.0001",
+          sourceOrderKey: "1003.0002",
+          text: "old consumed edit",
+          previousText: "old text before the edit",
+        }),
+      );
+      const oldMessage = store.recordThreadNote(threadNote({ text: "old consumed message" }));
+      const oldUnconsumed = store.recordThreadNote(
+        threadNote({ sourceEventKey: "C1:1003.0004", messageTs: "1003.0004", sourceOrderKey: "1003.0004", text: "stale note" }),
+      );
+      // Recent notes: one consumed by the same turn, one still pending on the other (1004.0001) thread.
+      const recentConsumed = store.recordThreadNote(
+        threadNote({
+          sourceEventKey: "C1:1003.0005",
+          messageTs: "1003.0005",
+          sourceOrderKey: "1003.0005",
+          text: "recent consumed note",
+          now: recentAt,
+        }),
+      );
+      const recentPending = store.recordThreadNote(
+        threadNote({
+          threadTs: "1004.0001",
+          sourceEventKey: "C1:1004.0002",
+          messageTs: "1004.0002",
+          sourceOrderKey: "1004.0002",
+          text: "recent pending note",
+          now: recentAt,
+        }),
+      );
+      if ([oldEdit, oldMessage, oldUnconsumed, recentConsumed, recentPending].some((note) => note === null)) {
+        throw new Error("thread notes were not recorded");
+      }
+      const ids = [oldEdit, oldMessage, recentConsumed].map((note) => note?.noteId ?? "");
+
+      // Consumes the three notes on the old pending turn; the claim and resolve happen at the recent time.
+      const claimed = store.claimNextOperation({ workerId: "w3", now: recentAt, leaseMs: 10_000, maxConcurrentTasks: 4 });
+      if (claimed?.payload.text !== "old pending request") throw new Error("old pending turn was not claimed");
+      expect(
+        store.resolveOperationTurnText({
+          operationId: claimed.operationId,
+          workerId: "w3",
+          proposedText: "old pending request",
+          consumeNoteIds: ids,
+          now: recentAt,
+        }),
+      ).toBe("old pending request");
+
+      const before = readNotes(path);
+      expect(before.map((row) => row.key)).toEqual([
+        "C1:1003.0001:edit:1003.0002",
+        "C1:1003.0003",
+        "C1:1003.0004",
+        "C1:1003.0005",
+        "C1:1004.0002",
+      ]);
+
+      // Dry run: the counts match a real prune, and no row changes.
+      const dryRun = pruneDatabaseFile(path, { policy, now: nowAt, dryRun: true });
+      expect(dryRun).toMatchObject({ notesRedacted: 2, notesDeleted: 1 });
+      expect(readNotes(path)).toEqual(before);
+
+      const result = pruneDatabaseFile(path, { policy, now: nowAt });
+      expect(result).toEqual({ ...dryRun, dryRun: false });
+      expect(readNotes(path)).toEqual([
+        {
+          key: "C1:1003.0001:edit:1003.0002",
+          text: PRUNED_TEXT,
+          previousText: PRUNED_TEXT,
+          consumed: true,
+        },
+        // A message never had previous text, so the redaction leaves it NULL.
+        { key: "C1:1003.0003", text: PRUNED_TEXT, previousText: null, consumed: true },
+        // Recent consumed notes are untouched, and so are recent pending notes.
+        { key: "C1:1003.0005", text: "recent consumed note", previousText: null, consumed: true },
+        { key: "C1:1004.0002", text: "recent pending note", previousText: null, consumed: false },
+      ]);
+
+      expect(pruneDatabaseFile(path, { policy, now: nowAt })).toMatchObject({ notesRedacted: 0, notesDeleted: 0 });
     });
   });
 
