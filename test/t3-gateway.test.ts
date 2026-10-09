@@ -10,9 +10,87 @@ import {
   pendingT3UserInputs,
   t3CommandSchema,
   t3AttachmentSchema,
+  t3ServerConfigSchema,
   T3ThreadNotFoundError,
   type T3ThreadSnapshot,
+  threadModelSelectionCommand,
 } from "../src/t3/gateway.ts";
+
+describe("T3 provider catalog and model selection", () => {
+  // Shape of T3 0.0.45 `server.getConfig` (tag v0.0.45, commit 6c8fed35): ServerConfig and ServerProvider in
+  // packages/contracts/src/server.ts (ServerProvider :207-264, ServerProviderModel :71-82,
+  // ServerProviderContinuation :148-150), stamped by apps/server/src/provider/Drivers/instanceIdentity.ts.
+  const fixture = async (): Promise<Record<string, any>> =>
+    Bun.file(new URL("./fixtures/t3-0.0.45-server-config.json", import.meta.url)).json();
+
+  test("parses the 0.0.45 catalog, keeping the fields the model policy reads", async () => {
+    const parsed = t3ServerConfigSchema.parse(await fixture());
+    expect(parsed.providers.map((provider) => [
+      provider.instanceId,
+      provider.driver,
+      provider.displayName,
+      provider.continuation?.groupKey,
+      provider.requiresNewThreadForModelChange,
+      provider.models.map((model) => model.slug),
+    ])).toEqual([
+      ["codex", "codex", "Codex", "codex:home:/Users/fixture/.codex", undefined, ["gpt-5.6-sol", "gpt-5.6-mini"]],
+      ["codex-work", "codex", "Codex (work)", "codex:home:/Users/fixture/.codex-work", undefined, ["gpt-5.6-sol"]],
+      ["claudeAgent", "claudeAgent", "Claude", "claude:home:/Users/fixture/.claude", undefined, ["claude-opus-5-5", "claude-sonnet-5"]],
+      ["grok", "grok", "Grok", "grok:default", true, ["grok-5", "grok-5-fast"]],
+      ["opencode", "opencode", "OpenCode", "opencode:default", undefined, []],
+    ]);
+    const opus = parsed.providers[2]!.models[0]!;
+    expect({ shortName: opus.shortName, aliases: opus.aliases }).toEqual({ shortName: "Opus 5.5", aliases: ["opus"] });
+    // Fields this client does not use are stripped rather than trusted.
+    expect(Object.keys(parsed)).toEqual(["environment", "providers"]);
+    expect("versionAdvisory" in parsed.providers[0]!).toBe(false);
+  });
+
+  test("still accepts a catalog without the new optional fields, and ignores malformed ones", async () => {
+    const raw = await fixture();
+    for (const provider of raw.providers) {
+      delete provider.displayName;
+      delete provider.continuation;
+      delete provider.requiresNewThreadForModelChange;
+      for (const model of provider.models) {
+        delete model.shortName;
+        delete model.aliases;
+      }
+    }
+    const bare = t3ServerConfigSchema.parse(raw);
+    expect(bare.providers[0]!.continuation).toBeUndefined();
+    expect(bare.providers[0]!.displayName).toBeUndefined();
+
+    raw.providers[0].continuation = { groupKey: "" };
+    raw.providers[0].requiresNewThreadForModelChange = "yes";
+    raw.providers[0].models[0].aliases = "opus";
+    const malformed = t3ServerConfigSchema.parse(raw);
+    expect(malformed.providers[0]!.continuation).toBeUndefined();
+    expect(malformed.providers[0]!.requiresNewThreadForModelChange).toBeUndefined();
+    expect(malformed.providers[0]!.models[0]!.aliases).toBeUndefined();
+  });
+
+  test("builds a thread.meta.update that carries only the model selection", () => {
+    // T3 0.0.45 ThreadMetaUpdateCommand: packages/contracts/src/orchestration.ts:1241-1259 (no createdAt).
+    expect(threadModelSelectionCommand({
+      commandId: "operation-1:model",
+      threadId: "thread-1",
+      modelSelection: { instanceId: "codex", model: "gpt-5.6-mini" },
+    })).toEqual({
+      type: "thread.meta.update",
+      commandId: "operation-1:model",
+      threadId: "thread-1",
+      modelSelection: { instanceId: "codex", model: "gpt-5.6-mini" },
+    });
+    const valid = { type: "thread.meta.update", commandId: "c-1", threadId: "t-1", modelSelection: { instanceId: "codex", model: "m" } };
+    expect(t3CommandSchema.parse({ ...valid, title: "ignored" })).toEqual(valid);
+    for (const invalid of [
+      { ...valid, commandId: "" },
+      { ...valid, modelSelection: undefined },
+      { ...valid, modelSelection: { instanceId: "codex", model: " " } },
+    ]) expect(t3CommandSchema.safeParse(invalid).success).toBe(false);
+  });
+});
 
 describe("T3 gateway command boundary", () => {
   test("rejects a missing stable command id", () => {

@@ -3,12 +3,12 @@ import { join } from "node:path";
 import type { AgentTagConfig } from "./config.ts";
 import { AgentTagCoordinator } from "./coordinator.ts";
 import { InteractionWorker } from "./interaction-worker.ts";
-import { validateConfiguredProviders } from "./policy/provider.ts";
+import { type AllowedModelReport, reportAllowedModels, validateConfiguredProviders } from "./policy/provider.ts";
 import { ScheduleWorker } from "./scheduler.ts";
 import { SlackSocketBridge } from "./slack/bridge.ts";
 import { createRetentionWorker } from "./store/retention.ts";
 import { AgentTagStore } from "./store/store.ts";
-import { inspectT3 } from "./t3/gateway.ts";
+import { inspectT3, type T3ServerInfo } from "./t3/gateway.ts";
 
 interface ServiceWorkerOutcome {
   readonly kind: string;
@@ -39,6 +39,9 @@ export interface ServiceLogRecord {
   readonly outcome?: string;
   readonly errorCode?: string;
   readonly count?: number;
+  readonly profileId?: string;
+  readonly instanceId?: string;
+  readonly model?: string;
 }
 
 export type ServiceLogger = (record: ServiceLogRecord) => void;
@@ -206,6 +209,28 @@ export class AgentTagService {
   }
 }
 
+/**
+ * One warning per allowed model T3 cannot run now. These never block startup: only profile and route
+ * defaults are validated strictly.
+ */
+export function allowedModelLogRecords(
+  config: AgentTagConfig,
+  server: T3ServerInfo,
+  at: string,
+): ReadonlyArray<ServiceLogRecord> {
+  return reportAllowedModels(config, server)
+    .filter((entry) => entry.status !== "available")
+    .map((entry) => ({
+      level: "warn",
+      event: "provider.allowed-model",
+      errorCode: entry.status,
+      profileId: entry.profileId,
+      instanceId: entry.instanceId,
+      model: entry.model,
+      at,
+    }));
+}
+
 export async function createAgentTagService(input: {
   readonly config: AgentTagConfig;
   readonly logger?: ServiceLogger;
@@ -217,7 +242,9 @@ export async function createAgentTagService(input: {
   const store = await AgentTagStore.open(databasePath);
   const quarantined = store.quarantineExpiredOutbox(now().toISOString());
   try {
-    validateConfiguredProviders(input.config, await inspectT3(input.config.t3));
+    const server = await inspectT3(input.config.t3);
+    validateConfiguredProviders(input.config, server);
+    for (const record of allowedModelLogRecords(input.config, server, now().toISOString())) logger(record);
     const bridge = await SlackSocketBridge.create({ config: input.config, store });
     let nextMemoryExpiryAt = 0;
     const coordinators = Array.from(
@@ -270,6 +297,7 @@ export async function diagnoseAgentTag(config: AgentTagConfig): Promise<{
       readonly status: string;
       readonly authenticated: boolean;
     }>;
+    readonly models: ReadonlyArray<AllowedModelReport>;
   };
   readonly slack: { readonly authenticated: true };
 }> {
@@ -290,6 +318,7 @@ export async function diagnoseAgentTag(config: AgentTagConfig): Promise<{
           status: provider.status,
           authenticated: provider.auth.status === "authenticated",
         })),
+        models: reportAllowedModels(config, t3),
       },
       slack: { authenticated: true },
     };
