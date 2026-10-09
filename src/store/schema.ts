@@ -192,6 +192,7 @@ export const AUDIT_ACTIONS = [
   "interaction.response.completed",
   "interaction.response.failed",
   "interaction.response.submitted",
+  "interaction.resolved-elsewhere",
   "interaction.user-input.answer-recorded",
   "interaction.user-input.requested",
   "memory.created",

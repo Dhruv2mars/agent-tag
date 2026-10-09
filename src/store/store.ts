@@ -6,6 +6,7 @@
  *   operations.ts   operation leases and outcomes          interactions.ts approvals, cancel, responses
  *   user-input.ts   multi-question user-input answers      outbox.ts       Slack outbox queue
  *   message-edits.ts  chat.update edit/refresh rows (outbox)
+ *   interaction-cards.ts  interaction card view, refresh hooks, reconcile
  *   schedules.ts    schedules and runs                     memory.ts       memory entries
  *   ambient.ts      ambient trigger decisions              audit.ts        audit log write/export
  *   diagnostics.ts  counts and operational status          lease.ts        shared lease helpers
@@ -46,6 +47,7 @@ import * as diagnostics from "./diagnostics.ts";
 import * as tasks from "./tasks.ts";
 import * as operations from "./operations.ts";
 import * as interactions from "./interactions.ts";
+import * as interactionCards from "./interaction-cards.ts";
 import * as userInput from "./user-input.ts";
 import * as outbox from "./outbox.ts";
 import * as messageEdits from "./message-edits.ts";
@@ -148,6 +150,12 @@ export type {
   PendingInteractionRequest,
 } from "./waits.ts";
 export type { GetPendingUserInputQuestionInput, SubmitUserInputAnswerInput } from "./user-input.ts";
+export { RESOLVED_ELSEWHERE } from "./interaction-cards.ts";
+export type {
+  InteractionCardState,
+  InteractionCardView,
+  ReconcileThreadInteractionsInput,
+} from "./interaction-cards.ts";
 export type {
   EnqueueOutboxResult,
   ClaimNextOutboxInput,
@@ -400,6 +408,16 @@ export class AgentTagStore {
     input: interactions.RecordPendingInteractionInput,
   ): interactions.RecordPendingInteractionResult {
     return interactions.recordPendingInteraction(this.#database, input);
+  }
+
+  /** The interaction card's current state (null for cancels and unknown ids); read at delivery time. */
+  getInteractionCardView(interactionId: string): interactionCards.InteractionCardView | null {
+    return interactionCards.getInteractionCardView(this.#database, interactionId);
+  }
+
+  /** Closes pending approvals/questions of the thread that T3 no longer reports (resolved outside Slack). */
+  reconcileThreadInteractions(input: interactionCards.ReconcileThreadInteractionsInput): number {
+    return interactionCards.reconcileThreadInteractions(this.#database, input);
   }
 
   submitInteractionResponse(
