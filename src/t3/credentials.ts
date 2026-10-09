@@ -21,6 +21,9 @@ import {
 } from "./auth.ts";
 import { redactT3Output } from "./supervisor.ts";
 
+/** `<runtimeDir>/credential-state.json`: current label, last rotation, replaced tokens awaiting revocation. */
+export const T3_CREDENTIAL_STATE_FILE = "credential-state.json";
+
 /** Every restricted token Agent Tag mints carries this label prefix plus a UTC timestamp. */
 export const T3_ORCHESTRATION_LABEL_PREFIX = "agent-tag-orchestration-";
 const ADMIN_ROTATE_LABEL = "agent-tag-rotate";
@@ -77,7 +80,8 @@ export interface T3CredentialLifecycleOptions {
   readonly mode: "managed" | "external";
   readonly baseUrl: string;
   readonly tokenFile: string;
-  readonly rotation: T3RotationConfig;
+  /** Managed rotation thresholds; external mode warns at `EXTERNAL_WARN_DAYS` instead. */
+  readonly rotation?: T3RotationConfig;
   /** Needed to enroll, rotate and revoke; external mode without it only reports expiry. */
   readonly admin?: T3AdminSource;
   /** `credential-state.json` (0600, in a 0700 dir); without it no replaced token is revoked later. */
@@ -250,12 +254,15 @@ export class T3CredentialLifecycle {
   }
 
   async #checkAndRotate(nowMs: number): Promise<string> {
-    const { mode, rotation } = this.#options;
+    const { mode } = this.#options;
     let reason: T3RotationReason | undefined;
     let expiry: T3TokenExpiry | undefined;
     try {
       expiry = await this.check();
-      if (expiry.daysRemaining < rotation.rotateBeforeDays) reason = "expiring";
+      const expiring = mode === "managed"
+        ? expiry.daysRemaining < (this.#options.rotation?.rotateBeforeDays ?? 7)
+        : expiry.daysRemaining <= EXTERNAL_WARN_DAYS;
+      if (expiring) reason = "expiring";
     } catch (error) {
       if (!isT3CredentialRejection(error) && (error as NodeJS.ErrnoException).code !== "ENOENT") {
         // T3 is unreachable (or the gate closed under us): try again soon, never rotate blind.
@@ -285,7 +292,6 @@ export class T3CredentialLifecycle {
 
   #warnExternal(reason: T3RotationReason, expiry: T3TokenExpiry | undefined): void {
     const command = this.#options.rotateCommand ?? "agent-tag t3 rotate CONFIG --admin-token-file FILE";
-    if (expiry !== undefined && reason === "expiring" && expiry.daysRemaining > EXTERNAL_WARN_DAYS) return;
     const severe = expiry === undefined || expiry.daysRemaining <= EXTERNAL_ERROR_DAYS;
     const what = expiry === undefined
       ? reason === "missing" ? "the T3 token file is missing" : "T3 rejected the token"
@@ -300,9 +306,9 @@ export class T3CredentialLifecycle {
 
   /** Revokes replaced tokens whose grace period is over; returns how many clients were revoked. */
   async revokeRetired(): Promise<number> {
-    const { stateFile, admin, rotation } = this.#options;
+    const { stateFile, admin } = this.#options;
     if (stateFile === undefined || admin === undefined) return 0;
-    const graceMs = rotation.revokeGraceMinutes * 60_000;
+    const graceMs = (this.#options.rotation?.revokeGraceMinutes ?? 15) * 60_000;
     const nowMs = this.#now().getTime();
     const state = await readT3CredentialState(stateFile);
     if (!state.retired.some((entry) => Date.parse(entry.retiredAt) + graceMs <= nowMs)) return 0;

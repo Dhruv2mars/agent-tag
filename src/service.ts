@@ -8,7 +8,9 @@ import { createScheduleWorkers } from "./scheduler.ts";
 import { SlackSocketBridge } from "./slack/bridge.ts";
 import { createRetentionWorker } from "./store/retention.ts";
 import { AgentTagStore } from "./store/store.ts";
+import { runCommand } from "./command.ts";
 import { T3Connection } from "./t3/connection.ts";
+import { createT3CredentialWorker, T3_CREDENTIAL_STATE_FILE, T3CredentialLifecycle } from "./t3/credentials.ts";
 import { createT3GateWorker, T3RuntimeGate } from "./t3/gate.ts";
 import { inspectT3, type T3ServerInfo } from "./t3/gateway.ts";
 import { PINNED_T3 } from "./t3/lock.ts";
@@ -300,6 +302,27 @@ export function allowedModelLogRecords(
     }));
 }
 
+/** The managed runtime's credential lifecycle: admin sessions via the installed binary, state in `runtimeDir`. */
+export function managedT3Credentials(input: {
+  readonly t3: Extract<AgentTagConfig["t3"], { readonly mode: "managed" }>;
+  readonly binary: string;
+  readonly logger: ServiceLogger;
+  readonly now?: () => Date;
+  readonly run?: typeof runCommand;
+}): T3CredentialLifecycle {
+  const { managed } = input.t3;
+  return new T3CredentialLifecycle({
+    mode: "managed",
+    baseUrl: input.t3.baseUrl,
+    tokenFile: input.t3.tokenFile,
+    rotation: managed.rotation,
+    admin: { kind: "cli", t3Bin: input.binary, baseDir: managed.homeDir, run: input.run ?? runCommand },
+    stateFile: join(managed.runtimeDir, T3_CREDENTIAL_STATE_FILE),
+    logger: input.logger,
+    ...(input.now === undefined ? {} : { now: input.now }),
+  });
+}
+
 export async function createAgentTagService(input: {
   readonly config: AgentTagConfig;
   readonly logger?: ServiceLogger;
@@ -312,7 +335,13 @@ export async function createAgentTagService(input: {
   const quarantined = store.quarantineExpiredOutbox(now().toISOString());
   // One T3 session and WebSocket for the whole service, and one subscription per watched thread.
   // The connection is lazy, so building it before a managed runtime starts makes no request.
-  const t3 = new T3Connection({ config: input.config.t3, logger, now });
+  let credentials: T3CredentialLifecycle | undefined;
+  const t3 = new T3Connection({
+    config: input.config.t3,
+    logger,
+    now,
+    onCredentialRejected: () => credentials?.noteRejected(),
+  });
   const watch = input.config.t3.watch;
   const watcher = watch.enabled
     ? new ThreadWatcher({ source: protocolV1Source(t3), logger, now, lingerMs: watch.lingerMs })
@@ -328,6 +357,18 @@ export async function createAgentTagService(input: {
       const installed = await prepareManagedT3Binary({ settings: t3Config.managed, pin: PINNED_T3, logger, now });
       runtime = new T3ManagedRuntime({ settings: t3Config.managed, installed, logger, now });
       await runtime.start();
+      credentials = managedT3Credentials({ t3: t3Config, binary: installed.binary, logger, now });
+      // The runtime passed its version and protocol check, so the admin session goes to our own server.
+      await credentials.ensureToken();
+    } else {
+      credentials = new T3CredentialLifecycle({
+        mode: "external",
+        baseUrl: t3Config.baseUrl,
+        tokenFile: t3Config.tokenFile,
+        rotateCommand: "agent-tag t3 rotate CONFIG --admin-token-file FILE",
+        logger,
+        now,
+      });
     }
     const server = await inspectT3(t3Config);
     validateConfiguredProviders(input.config, server);
@@ -389,6 +430,7 @@ export async function createAgentTagService(input: {
           },
         },
         createT3GateWorker({ gate, now }),
+        createT3CredentialWorker({ credentials }),
       ],
       resources: [{ close: closeT3 }],
       logger,
