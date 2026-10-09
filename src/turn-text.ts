@@ -86,7 +86,9 @@ function windowText(message: ThreadWindowMessage, input: ComposeTurnInput): stri
 }
 
 function omittedNote(window: ThreadWindow): string {
-  if (window.truncated) return ` (${window.omitted} earlier messages omitted; the oldest replies were not read)`;
+  if (window.truncated) {
+    return ` (${window.omitted} earlier messages omitted; the thread is too long to read in full, so the newest replies before this message are missing)`;
+  }
   if (window.omitted === 0) return "";
   return ` (${window.omitted} earlier ${window.omitted === 1 ? "message" : "messages"} omitted)`;
 }

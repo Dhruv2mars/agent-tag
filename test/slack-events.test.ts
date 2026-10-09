@@ -369,3 +369,140 @@ describe("Slack event ingress", () => {
     });
   });
 });
+
+describe("thread context seed", () => {
+  function claimOne(store: AgentTagStore) {
+    return store.claimNextOperation({
+      workerId: "worker-a",
+      now: receivedAt,
+      leaseMs: 10_000,
+      maxConcurrentTasks: 2,
+    });
+  }
+
+  function withEdited(body: unknown, edited: Record<string, unknown>): unknown {
+    const parsed = body as { event: Record<string, unknown> };
+    return { ...parsed, event: { ...parsed.event, edited } };
+  }
+
+  test("seeds thread context on the first mention inside an existing unbound thread", async () => {
+    await withRouter(({ store, router }) => {
+      expect(
+        router.ingest(
+          eventBody({ eventId: "Ev1", type: "app_mention", ts: "1000.000009", threadTs: "1000.000001" }),
+        ),
+      ).toMatchObject({ kind: "accepted" });
+      expect(claimOne(store)?.payload.threadContext).toEqual({
+        rootTs: "1000.000001",
+        beforeTs: "1000.000009",
+      });
+    });
+  });
+
+  test("does not seed thread context on a top-level mention", async () => {
+    await withRouter(({ store, router }) => {
+      expect(router.ingest(eventBody({ eventId: "Ev1", type: "app_mention" }))).toMatchObject({
+        kind: "accepted",
+      });
+      expect(claimOne(store)?.payload).not.toHaveProperty("threadContext");
+    });
+  });
+
+  test("does not seed thread context on steering inside an already-bound thread", async () => {
+    await withRouter(({ store, router }) => {
+      expect(router.ingest(eventBody({ eventId: "Ev1", type: "app_mention" }))).toMatchObject({
+        kind: "accepted",
+      });
+      expect(
+        router.ingest(
+          eventBody({
+            eventId: "Ev2",
+            type: "message",
+            user: "U2",
+            ts: "1000.000002",
+            threadTs: "1000.000001",
+            text: "also check the retry path",
+          }),
+        ),
+      ).toMatchObject({ kind: "accepted" });
+
+      const first = claimOne(store);
+      if (first === null) throw new Error("initial mention was not claimable");
+      store.completeOperation({
+        operationId: first.operationId,
+        workerId: "worker-a",
+        resultSequence: 1,
+        now: "2026-09-21T00:00:01.000Z",
+      });
+      const steering = store.claimNextOperation({
+        workerId: "worker-a",
+        now: "2026-09-21T00:00:02.000Z",
+        leaseMs: 10_000,
+        maxConcurrentTasks: 2,
+      });
+      expect(steering?.payload).toMatchObject({ text: "also check the retry path", actorUserId: "U2" });
+      expect(steering?.payload).not.toHaveProperty("threadContext");
+    });
+  });
+
+  test("does not seed thread context when the route profile disables it", async () => {
+    const disabledConfig = agentTagConfigSchema.parse({
+      ...config,
+      profiles: config.profiles.map((profile) => ({
+        ...profile,
+        threadContext: {
+          enabled: false,
+          maxMessages: 30,
+          maxChars: 12_000,
+          maxMessageChars: 2_000,
+          includeBotMessages: "root-only",
+          includeNonAllowedUsers: true,
+        },
+      })),
+    });
+    const directory = await mkdtemp(join(tmpdir(), "agent-tag-slack-events-"));
+    const store = await AgentTagStore.open(join(directory, "agent-tag.sqlite"));
+    const router = new SlackEventRouter({ config: disabledConfig, store, botUserId: "U0BOT", now: () => receivedAt });
+    try {
+      expect(
+        router.ingest(
+          eventBody({ eventId: "Ev1", type: "app_mention", ts: "1000.000009", threadTs: "1000.000001" }),
+        ),
+      ).toMatchObject({ kind: "accepted" });
+      expect(claimOne(store)?.payload).not.toHaveProperty("threadContext");
+    } finally {
+      store.close();
+      if (!directory.startsWith(`${tmpdir()}/agent-tag-slack-events-`)) {
+        throw new Error(`refusing to remove unexpected fixture path ${directory}`);
+      }
+      await rm(directory, { recursive: true });
+    }
+  });
+
+  test("ignores edited app mentions without creating an operation", async () => {
+    await withRouter(({ store, router }) => {
+      expect(router.ingest(eventBody({ eventId: "Ev1", type: "app_mention" }))).toMatchObject({
+        kind: "accepted",
+      });
+      const before = store.diagnostics().operations;
+      expect(before).toBe(1);
+      expect(
+        router.ingest(
+          withEdited(eventBody({ eventId: "Ev2", type: "app_mention" }), { user: "U1", ts: "1000.000010" }),
+        ),
+      ).toEqual({ kind: "ignored", reason: "edit-irrelevant" });
+      expect(store.diagnostics().operations).toBe(before);
+    });
+  });
+
+  test("treats a mention whose thread_ts equals its ts as top-level", async () => {
+    await withRouter(({ store, router }) => {
+      expect(
+        router.ingest(
+          eventBody({ eventId: "Ev1", type: "app_mention", ts: "1000.000005", threadTs: "1000.000005" }),
+        ),
+      ).toMatchObject({ kind: "accepted" });
+      expect(claimOne(store)?.payload).not.toHaveProperty("threadContext");
+    });
+  });
+});

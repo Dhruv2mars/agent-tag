@@ -35,7 +35,10 @@ export interface ThreadWindow {
   readonly messages: readonly ThreadWindowMessage[];
   /** Eligible messages left out by the message or character budget. */
   readonly omitted: number;
-  /** True when the thread had more replies than the fetch ceiling, so older ones were never read. */
+  /**
+   * True when the thread had more replies than the fetch ceiling. Slack pages oldest first, so the
+   * replies closest to the mention were never read and the window ends early.
+   */
   readonly truncated: boolean;
 }
 
@@ -212,7 +215,14 @@ class WindowAccumulator {
     }
     this.#replies.push(message);
     if (this.#replies.length > this.#capacity) {
-      this.#replies.shift();
+      // Evict the oldest by ts, not by arrival, so page order cannot change which replies are kept.
+      let oldest = 0;
+      for (let index = 1; index < this.#replies.length; index += 1) {
+        const candidate = this.#replies[index];
+        const current = this.#replies[oldest];
+        if (candidate !== undefined && current !== undefined && compareTs(candidate.ts, current.ts) < 0) oldest = index;
+      }
+      this.#replies.splice(oldest, 1);
       this.#dropped += 1;
     }
   }
