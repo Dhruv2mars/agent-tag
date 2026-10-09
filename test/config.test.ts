@@ -1,6 +1,9 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtemp, rm } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
+import { join } from "node:path";
 
-import { agentTagConfigSchema } from "../src/config.ts";
+import { agentTagConfigSchema, type ResolvedT3Config } from "../src/config.ts";
 
 const baseConfig = {
   version: 1,
@@ -162,5 +165,123 @@ describe("Agent Tag config", () => {
         routes: [...baseConfig.routes, ...baseConfig.routes],
       }),
     ).toThrow("route conversation ids must be unique");
+  });
+});
+
+describe("t3 config", () => {
+  const managedBase = { mode: "managed", tokenFile: "/secrets/t3" };
+  const withT3 = (t3: Record<string, unknown>) => ({ ...baseConfig, t3 });
+  const managedOf = (t3: ResolvedT3Config) => {
+    if (t3.mode !== "managed") throw new Error(`expected managed t3, got ${t3.mode}`);
+    return t3.managed;
+  };
+
+  test("a legacy t3 block without mode parses as external", () => {
+    expect(agentTagConfigSchema.parse(baseConfig).t3).toEqual({
+      mode: "external",
+      baseUrl: "http://127.0.0.1:37841",
+      tokenFile: "/secrets/t3",
+    });
+  });
+
+  test("managed mode derives the loopback baseUrl and data-dir defaults", () => {
+    const { t3 } = agentTagConfigSchema.parse(withT3(managedBase));
+    expect(t3).toEqual({
+      mode: "managed",
+      baseUrl: "http://127.0.0.1:37841",
+      tokenFile: "/secrets/t3",
+      managed: {
+        port: 37841,
+        homeDir: "/var/lib/agent-tag/t3/home",
+        runtimeDir: "/var/lib/agent-tag/t3/runtime",
+        autoInstall: true,
+      },
+    });
+    expect(managedOf(t3)).not.toHaveProperty("downloadBaseUrl");
+  });
+
+  test("managed mode derives baseUrl from a custom port and keeps explicit dirs", () => {
+    const { t3 } = agentTagConfigSchema.parse(
+      withT3({
+        ...managedBase,
+        port: 40_000,
+        homeDir: "/srv/t3/home",
+        runtimeDir: "/srv/t3/runtime",
+      }),
+    );
+    expect(t3.baseUrl).toBe("http://127.0.0.1:40000");
+    expect(managedOf(t3)).toEqual({
+      port: 40_000,
+      homeDir: "/srv/t3/home",
+      runtimeDir: "/srv/t3/runtime",
+      autoInstall: true,
+    });
+  });
+
+  test("rejects a managed homeDir equal to the desktop ~/.t3 base dir", () => {
+    const result = agentTagConfigSchema.safeParse(
+      withT3({ ...managedBase, homeDir: join(homedir(), ".t3") }),
+    );
+    expect(result.success).toBe(false);
+    expect(result.error?.issues).toContainEqual(expect.objectContaining({ path: ["t3", "homeDir"] }));
+  });
+
+  test("rejects a managed homeDir equal to $T3CODE_HOME", async () => {
+    const previous = process.env.T3CODE_HOME;
+    const dir = await mkdtemp(join(tmpdir(), "agent-tag-t3-home-"));
+    process.env.T3CODE_HOME = dir;
+    try {
+      const result = agentTagConfigSchema.safeParse(withT3({ ...managedBase, homeDir: dir }));
+      expect(result.success).toBe(false);
+      expect(result.error?.issues).toContainEqual(expect.objectContaining({ path: ["t3", "homeDir"] }));
+    } finally {
+      if (previous === undefined) delete process.env.T3CODE_HOME;
+      else process.env.T3CODE_HOME = previous;
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("validates the managed download mirror", () => {
+    const parse = (downloadBaseUrl: string) =>
+      agentTagConfigSchema.safeParse(withT3({ ...managedBase, downloadBaseUrl }));
+    expect(parse("http://mirror.example").success).toBe(false);
+
+    const accepted = parse("https://mirror.example/releases");
+    expect(accepted.success).toBe(true);
+    if (!accepted.success) throw new Error("https mirror should parse");
+    expect(managedOf(accepted.data.t3).downloadBaseUrl).toBe("https://mirror.example/releases");
+
+    // parseT3DownloadBaseUrl strips trailing slashes from an accepted mirror.
+    const trailing = parse("https://mirror.example/releases/");
+    expect(trailing.success).toBe(true);
+    if (!trailing.success) throw new Error("https mirror with trailing slash should parse");
+    expect(managedOf(trailing.data.t3).downloadBaseUrl).toBe("https://mirror.example/releases");
+  });
+
+  test("rejects a managed homeDir equal to runtimeDir", () => {
+    const result = agentTagConfigSchema.safeParse(
+      withT3({ ...managedBase, homeDir: "/srv/t3/shared", runtimeDir: "/srv/t3/shared" }),
+    );
+    expect(result.success).toBe(false);
+    expect(result.error?.issues).toContainEqual(
+      expect.objectContaining({ path: ["t3", "runtimeDir"], message: "t3.runtimeDir must differ from t3.homeDir" }),
+    );
+  });
+
+  test("rejects a managed port below 1024 and a non-loopback external baseUrl", () => {
+    expect(agentTagConfigSchema.safeParse(withT3({ ...managedBase, port: 80 })).success).toBe(false);
+    expect(
+      agentTagConfigSchema.safeParse(
+        withT3({ mode: "external", baseUrl: "http://192.168.1.10:37841", tokenFile: "/secrets/t3" }),
+      ).success,
+    ).toBe(false);
+  });
+
+  test("rejects an unknown t3 mode", () => {
+    expect(
+      agentTagConfigSchema.safeParse(
+        withT3({ mode: "remote", baseUrl: "http://127.0.0.1:37841", tokenFile: "/secrets/t3" }),
+      ).success,
+    ).toBe(false);
   });
 });

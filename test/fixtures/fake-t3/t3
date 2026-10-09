@@ -1,0 +1,3 @@
+#!/bin/sh
+# The fake T3 CLI; exec keeps the pid, so server-runtime.json names this process.
+exec bun "$(dirname "$0")/fake-t3.ts" "$@"

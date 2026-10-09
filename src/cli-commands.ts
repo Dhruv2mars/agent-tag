@@ -103,12 +103,13 @@ export async function runT3Command(argv: readonly string[]): Promise<number> {
   const baseUrlArgument = args.values.get("download-base-url");
   if (baseUrlArgument !== undefined && action !== "install") throw new Error("--download-base-url only applies to t3 install");
   if (args.flags.has("allow-non-tty") && action !== "pair") throw new Error("--allow-non-tty only applies to t3 pair");
+  const baseUrlOverride = baseUrlArgument === undefined ? undefined : parseT3DownloadBaseUrl(baseUrlArgument);
   const config = await loadConfig(resolveConfigPath(args.positionals[1]));
   const t3 = config.t3;
   const managed = t3.mode === "managed" ? t3.managed : undefined;
   const runtimeDir = managed?.runtimeDir ?? defaultT3RuntimeDir(config.dataDir);
   if (action === "install") {
-    const baseUrl = baseUrlArgument === undefined ? managed?.downloadBaseUrl : parseT3DownloadBaseUrl(baseUrlArgument);
+    const baseUrl = baseUrlOverride ?? managed?.downloadBaseUrl;
     const installed = await installPinnedT3({
       pin: PINNED_T3,
       runtimeDir,

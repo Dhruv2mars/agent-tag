@@ -284,8 +284,8 @@ export async function createAgentTagService(input: {
     });
     if (!(await gate.check())) throw new Error(`refusing to run against T3 at ${t3.baseUrl}: ${gate.reason}`);
     // Every supervisor ready (start or restart) re-checks the gate; a restart closes it as unreachable first.
-    runtime?.onStateChange(() => {
-      void gate.check();
+    runtime?.onStateChange((state) => {
+      if (state === "ready" || state === "restarting") void gate.check();
     });
     const bridge = await SlackSocketBridge.create({ config: input.config, store });
     let nextMemoryExpiryAt = 0;
