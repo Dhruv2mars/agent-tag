@@ -288,6 +288,7 @@ export const scheduleRowSchema = z.object({
   missed_run_policy: z.enum(["run-once", "skip"]),
   misfire_grace_seconds: z.number().int().nonnegative(),
   overlap_policy: z.enum(["skip", "queue"]),
+  notify_user_id: nonEmpty.nullable(),
   next_run_at: isoDateTime,
   attempts: z.number().int().nonnegative(),
   lease_expires_at: isoDateTime,

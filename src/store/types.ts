@@ -260,6 +260,8 @@ export interface ClaimedSchedule {
   readonly missedRunPolicy: "run-once" | "skip";
   readonly misfireGraceSeconds: number;
   readonly overlapPolicy: "skip" | "queue";
+  /** Reminders: the Slack user to @mention on delivery. */
+  readonly notifyUserId: string | null;
   readonly dueAt: string;
   readonly attempt: number;
   readonly leaseExpiresAt: string;
