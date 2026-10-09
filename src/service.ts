@@ -245,11 +245,11 @@ export async function createAgentTagService(input: {
     const server = await inspectT3(input.config.t3);
     validateConfiguredProviders(input.config, server);
     for (const record of allowedModelLogRecords(input.config, server, now().toISOString())) logger(record);
-    const bridge = await SlackSocketBridge.create({ config: input.config, store });
+    const bridge = await SlackSocketBridge.create({ config: input.config, store, logger });
     let nextMemoryExpiryAt = 0;
     const coordinators = Array.from(
       { length: input.config.limits.maxConcurrentTasks },
-      () => new AgentTagCoordinator({ config: input.config, store }),
+      () => new AgentTagCoordinator({ config: input.config, store, slackContext: bridge.contextSource }),
     );
     const service = new AgentTagService({
       store,
