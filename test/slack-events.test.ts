@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { type AgentTagConfig, agentTagConfigSchema } from "../src/config.ts";
+import { resolveSelfBotId } from "../src/slack/bridge.ts";
 import { SlackEventRouter } from "../src/slack/events.ts";
 import { AgentTagStore } from "../src/store/store.ts";
 
@@ -966,5 +967,75 @@ describe("bot, self and edit routing", () => {
       ).toEqual({ kind: "ignored", reason: "message-subtype" });
       expect(store.diagnostics()).toEqual(before);
     });
+  });
+});
+
+describe("self bot ID resolution", () => {
+  test("uses auth.test's bot_id without a users.info call", async () => {
+    const calls: string[] = [];
+    const resolved = await resolveSelfBotId({ user_id: "U0BOT", bot_id: "B0AUTH" }, async (user) => {
+      calls.push(user);
+      return {};
+    });
+    expect(resolved).toBe("B0AUTH");
+    expect(calls).toEqual([]);
+  });
+
+  test("falls back to users.info profile.bot_id, and to none when the lookup fails", async () => {
+    expect(
+      await resolveSelfBotId({ user_id: "U0BOT" }, async (user) => ({
+        ok: true,
+        user: { id: user, profile: { bot_id: "B0INFO" } },
+      })),
+    ).toBe("B0INFO");
+    expect(await resolveSelfBotId({ user_id: "U0BOT" }, async () => ({ ok: true, user: { id: "U0BOT" } }))).toBeUndefined();
+    expect(
+      await resolveSelfBotId({ user_id: "U0BOT" }, async () => {
+        throw new Error("missing_scope");
+      }),
+    ).toBeUndefined();
+  });
+
+  test("a self edit carrying only bot_id writes nothing when auth.test omitted bot_id (D7)", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "agent-tag-self-bot-"));
+    const store = await AgentTagStore.open(join(directory, "agent-tag.sqlite"));
+    try {
+      const resolved = await resolveSelfBotId({ user_id: "U0BOT" }, async () => ({
+        ok: true,
+        user: { profile: { bot_id: "B0INFO" } },
+      }));
+      const router = new SlackEventRouter({
+        config,
+        store,
+        botUserId: "U0BOT",
+        ...(resolved === undefined ? {} : { selfBotId: resolved }),
+        now: () => receivedAt,
+      });
+      expect(router.ingest(eventBody({ eventId: "EvStart", type: "app_mention", user: "U1", ts: "1000.000001", text: "<@U0BOT> start" }))).toMatchObject({
+        kind: "accepted",
+      });
+      const before = store.diagnostics();
+      const result = router.ingest(
+        editBody({
+          eventId: "EvSelfEdit",
+          changeTs: "1000.000009",
+          message: {
+            type: "message",
+            subtype: "bot_message",
+            bot_id: "B0INFO",
+            text: "updated status",
+            ts: "1000.000004",
+            thread_ts: "1000.000001",
+            edited: { ts: "1000.000009" },
+          },
+          previous: { type: "message", subtype: "bot_message", bot_id: "B0INFO", text: "status", ts: "1000.000004", thread_ts: "1000.000001" },
+        }),
+      );
+      expect(result).toEqual({ kind: "ignored", reason: "self-event" });
+      expect(store.diagnostics()).toEqual(before);
+    } finally {
+      store.close();
+      await rm(directory, { recursive: true, force: true });
+    }
   });
 });
