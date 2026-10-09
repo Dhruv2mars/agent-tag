@@ -12,9 +12,11 @@ export const KNOWN_CREDENTIAL_PATTERNS = [
   { name: "slack-token", expression: /\bxox[baprs]-[A-Za-z0-9-]{20,}\b/ },
   { name: "slack-app-token", expression: /\bxapp-[A-Za-z0-9-]{20,}\b/ },
   { name: "github-token", expression: /\bgh[pousr]_[A-Za-z0-9]{20,}\b/ },
+  { name: "github-fine-grained-token", expression: /\bgithub_pat_[A-Za-z0-9_]{22,}\b/ },
   { name: "aws-access-key", expression: /\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/ },
   { name: "anthropic-api-key", expression: /\bsk-ant-[A-Za-z0-9_-]{20,}\b/ },
   { name: "openai-api-key", expression: /\bsk-(?!ant-)(?:proj-)?[A-Za-z0-9_-]{20,}\b/ },
+  { name: "private-key", expression: /-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----/ },
 ] as const;
 
 export interface SecretCanary {
@@ -33,6 +35,40 @@ export type SecretFinding =
       readonly path: string;
       readonly patternName: string;
     };
+
+/** A credential found in a block of text. `line` is 1-based; the matched value is never returned. */
+export type TextSecretFinding =
+  | { readonly kind: "exact-secret"; readonly line: number; readonly canaryName: string }
+  | { readonly kind: "known-token-pattern"; readonly line: number; readonly patternName: string };
+
+/**
+ * Scans in-memory text (for example the added lines of a diff, or commit messages) line by line for the
+ * canaries and the known credential shapes in `KNOWN_CREDENTIAL_PATTERNS`. Each canary or pattern is
+ * reported once per line. Findings carry only the line number and the class, never the matched value.
+ */
+export function scanTextForSecrets(
+  text: string,
+  options: { readonly canaries?: readonly SecretCanary[] } = {},
+): readonly TextSecretFinding[] {
+  const canaries = (options.canaries ?? []).map((canary) => ({
+    name: canary.name,
+    value: canary.secret.exposeToBoundary(),
+  }));
+  const findings: TextSecretFinding[] = [];
+  const lines = text.split("\n");
+  for (const [index, line] of lines.entries()) {
+    if (line.length === 0) continue;
+    for (const canary of canaries) {
+      if (line.includes(canary.value)) findings.push({ kind: "exact-secret", line: index + 1, canaryName: canary.name });
+    }
+    for (const pattern of KNOWN_CREDENTIAL_PATTERNS) {
+      if (pattern.expression.test(line)) {
+        findings.push({ kind: "known-token-pattern", line: index + 1, patternName: pattern.name });
+      }
+    }
+  }
+  return findings;
+}
 
 /** A path the scan could not check. `reason` is an error code (for example `EACCES`), never file content. */
 export interface SkippedScanEntry {

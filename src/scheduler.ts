@@ -3,6 +3,7 @@ import { z } from "zod";
 import { ExecutionAuthorityDenied, requireExecutionAuthority } from "./policy/execution.ts";
 import type { AgentTagConfig } from "./config.ts";
 import { nextRecurrenceRun, scheduleRecurrenceSchema } from "./routines/cron.ts";
+import { oneLine, promptPreview, reminderText, shortScheduleId, slackDateToken } from "./routines/describe.ts";
 import { escapeSlackText } from "./slack/render.ts";
 import type {
   AgentTagStore,
@@ -250,7 +251,7 @@ export class ScheduleWorker {
         conversationId: schedule.conversationId,
         threadTs: schedule.threadTs,
         clientMessageId: `${schedule.scheduleId}:${schedule.dueAt}:reminder`,
-        payload: { text: `Reminder: ${schedule.prompt}` },
+        payload: { text: reminderText(schedule) },
         createdAt: current.toISOString(),
       });
     } else {
@@ -301,25 +302,9 @@ export class ScheduleWorker {
   }
 }
 
-/** First six hex characters of a schedule id, as shown to users. */
-function shortScheduleId(scheduleId: string): string {
-  return scheduleId.replaceAll("-", "").slice(0, 6).toLowerCase();
-}
-
-/** A Slack date token: rendered in each viewer's own time zone, with the ISO time as fallback text. */
-function slackDateToken(iso: string): string {
-  const epoch = Math.floor(Date.parse(iso) / 1_000);
-  return `<!date^${epoch}^{date_short_pretty} at {time}|${iso}>`;
-}
-
-function oneLine(text: string, limit: number): string {
-  const flat = text.replace(/\s+/g, " ").trim();
-  return flat.length <= limit ? flat : `${flat.slice(0, limit - 1)}…`;
-}
-
 /** The thread notice posted when a recurring routine is turned off after repeated failures. */
 export function renderAutoDisabledNotice(input: AutoDisabledNoticeInput): SlackOutboxPayload {
-  const prompt = escapeSlackText(oneLine(input.prompt, 150)).replaceAll("*", "");
+  const prompt = promptPreview(input.prompt);
   const errorCode = input.lastErrorCode === null
     ? ""
     : ` Last error: \`${escapeSlackText(oneLine(input.lastErrorCode, 80)).replaceAll("`", "'")}\`.`;

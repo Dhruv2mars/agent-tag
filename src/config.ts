@@ -84,6 +84,73 @@ export type T3WatchConfig = z.infer<typeof t3WatchSchema>;
 /** How long an approval or question may wait for a human before the turn is cancelled. */
 const interactionExpirySchema = z.number().int().min(60).max(2_592_000).default(86_400);
 
+/** `owner/name` of a GitHub repository. Always taken from config, never from a repository's git config. */
+export const GITHUB_REPOSITORY_PATTERN = /^[A-Za-z0-9-]+\/[A-Za-z0-9._-]+$/;
+
+/** A conservative subset of `git check-ref-format --branch`: no `..`, `@{`, control characters or leading `-`. */
+export const GIT_BRANCH_NAME_PATTERN = /^(?!-)(?!.*\.\.)(?!.*@\{)(?!.*\/\/)(?!.*\/\.)(?!\.)(?!.*\.lock$)(?!.*[/.]$)[A-Za-z0-9._/-]{1,200}$/;
+
+const httpsBaseUrl = z
+  .url()
+  .refine((value) => {
+    const url = new URL(value);
+    return url.protocol === "https:" && url.username === "" && url.password === "" && url.search === "" && url.hash === "";
+  }, "must be an https URL without credentials, query or fragment")
+  .transform((value) => value.replace(/\/+$/, ""));
+
+/**
+ * Top-level GitHub settings. Only a fine-grained personal access token (`type: "token"`) is supported;
+ * GitHub App auth arrives with the button-mode follow-up. The token stays in `tokenFile` and is read by
+ * Agent Tag only: it is never put in a worktree, a git config, a remote URL or a child's argv.
+ */
+const githubSchema = z
+  .object({
+    apiBaseUrl: httpsBaseUrl.default("https://api.github.com"),
+    webBaseUrl: httpsBaseUrl.default("https://github.com"),
+    auth: z.discriminatedUnion("type", [z.object({ type: z.literal("token"), tokenFile: absolutePath })]),
+  })
+  .strict();
+
+const commitIdentityText = z
+  .string()
+  .trim()
+  .min(1)
+  .max(200)
+  .refine((value) => !/[<>\u0000-\u001f\u007f]/.test(value), "must not contain angle brackets or control characters");
+
+const pullRequestRepositorySchema = z
+  .object({
+    root: absolutePath,
+    repo: z.string().regex(GITHUB_REPOSITORY_PATTERN, "repo must be owner/name"),
+    /** Defaults to the profile's `baseBranch`. */
+    baseBranch: z.string().regex(GIT_BRANCH_NAME_PATTERN, "baseBranch is not a valid branch name").optional(),
+  })
+  .strict();
+
+const enabledPullRequestsSchema = z
+  .object({
+    mode: z.enum(["auto", "button"]),
+    repositories: z.array(pullRequestRepositorySchema).min(1),
+    draft: z.boolean().default(true),
+    commitAuthor: z
+      .object({ name: commitIdentityText, email: commitIdentityText })
+      .strict()
+      .default({ name: "Agent Tag", email: "agent-tag@users.noreply.github.com" }),
+    maxChangedFiles: z.number().int().positive().max(100_000).default(300),
+    maxDiffBytes: z.number().int().positive().max(100_000_000).default(2_000_000),
+    secretScan: z.enum(["block", "off"]).default("block"),
+  })
+  .strict();
+
+/** Draft PR workflow per profile. Off unless configured; not yet wired into the coordinator. */
+const pullRequestsSchema = z
+  .discriminatedUnion("mode", [z.object({ mode: z.literal("off") }), enabledPullRequestsSchema])
+  .default({ mode: "off" });
+
+export type PullRequestsConfig = z.infer<typeof pullRequestsSchema>;
+export type EnabledPullRequestsConfig = Extract<PullRequestsConfig, { readonly mode: "auto" | "button" }>;
+export type GitHubConfig = z.infer<typeof githubSchema>;
+
 const routeBaseSchema = z.object({
   conversationId: slackId,
   profileId,
@@ -124,6 +191,7 @@ const profileSchema = z.object({
       maxTurnsPerHour: z.number().int().positive().max(60),
     })
     .default({ enabled: false, keywords: [], cooldownSeconds: 300, maxTurnsPerHour: 4 }),
+  pullRequests: pullRequestsSchema,
 });
 
 const retentionDays = z.number().int().positive().max(3650);
@@ -337,6 +405,7 @@ export const agentTagConfigSchema = z
     }),
     retention: retentionSchema,
     routines: routinesSchema,
+    github: githubSchema.optional(),
   })
   .superRefine((config, context) => {
     const profiles = new Map(config.profiles.map((profile) => [profile.id, profile]));
@@ -420,6 +489,39 @@ export const agentTagConfigSchema = z
         });
       }
     }
+    for (const [index, profile] of config.profiles.entries()) {
+      const pullRequests = profile.pullRequests;
+      if (pullRequests.mode === "off") continue;
+      const path = ["profiles", index, "pullRequests"];
+      if (config.github === undefined) {
+        context.addIssue({ code: "custom", path: [...path, "mode"], message: "pull requests require the top-level github config" });
+      }
+      if (profile.externalWrites.mode === "deny") {
+        context.addIssue({
+          code: "custom",
+          path: [...path, "mode"],
+          message: 'pull requests push to GitHub, so they must be "off" when externalWrites.mode is "deny"',
+        });
+      }
+      const roots = new Set<string>();
+      for (const [repositoryIndex, repository] of pullRequests.repositories.entries()) {
+        if (!profile.repositoryRoots.includes(repository.root)) {
+          context.addIssue({
+            code: "custom",
+            path: [...path, "repositories", repositoryIndex, "root"],
+            message: "pull request repository root is not in the profile's repositoryRoots",
+          });
+        }
+        if (roots.has(repository.root)) {
+          context.addIssue({
+            code: "custom",
+            path: [...path, "repositories", repositoryIndex, "root"],
+            message: "pull request repository roots must be unique",
+          });
+        }
+        roots.add(repository.root);
+      }
+    }
     if (config.t3.mode === "managed") {
       const { homeDir, runtimeDir } = resolveManagedT3(config.t3, config.dataDir);
       if (desktopT3Homes(process.env, homedir()).includes(resolve(homeDir))) {
@@ -440,6 +542,35 @@ export type AgentTagConfig = z.infer<typeof agentTagConfigSchema>;
 export type AgentTagProfile = AgentTagConfig["profiles"][number];
 export type AgentTagRoute = AgentTagConfig["routes"][number];
 export type ConfiguredModelRef = ModelRef;
+
+export interface ResolvedPullRequestRepository {
+  readonly root: string;
+  readonly repo: string;
+  readonly owner: string;
+  readonly name: string;
+  readonly baseBranch: string;
+}
+
+/**
+ * The pull request target for a task's repository root, or undefined when the profile's pull requests are
+ * off or the root is not configured. `baseBranch` falls back to the profile's `baseBranch`.
+ */
+export function pullRequestRepositoryFor(
+  profile: AgentTagConfig["profiles"][number],
+  repositoryRoot: string,
+): ResolvedPullRequestRepository | undefined {
+  if (profile.pullRequests.mode === "off") return undefined;
+  const repository = profile.pullRequests.repositories.find((candidate) => candidate.root === repositoryRoot);
+  if (repository === undefined) return undefined;
+  const [owner = "", name = ""] = repository.repo.split("/");
+  return {
+    root: repository.root,
+    repo: repository.repo,
+    owner,
+    name,
+    baseBranch: repository.baseBranch ?? profile.baseBranch,
+  };
+}
 
 export async function loadConfig(path: string): Promise<AgentTagConfig> {
   const input: unknown = await Bun.file(path).json();

@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 
 import { SecretString } from "../src/security/secret-file.ts";
-import { CHANGED_DURING_SCAN, scanForSecrets } from "../src/security/secret-scan.ts";
+import { CHANGED_DURING_SCAN, scanForSecrets, scanTextForSecrets } from "../src/security/secret-scan.ts";
 
 test("secret scan reports exact and structured credentials without returning their values", async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-tag-secret-scan-"));
@@ -220,4 +220,23 @@ test("secret scan reports a log that keeps growing past the pass cap as unchecke
     });
     expect(result.skippedEntries).toEqual([{ path: live, reason: CHANGED_DURING_SCAN }]);
   });
+});
+
+test("scanTextForSecrets reports line numbers and classes, never values", () => {
+  const pat = `github_pat_${"A".repeat(30)}`;
+  const slackToken = `xoxb-${"C".repeat(30)}`;
+  const canary = `canary-${"d".repeat(40)}`;
+  const text = ["clean line", `const a = "${pat}";`, "", `x ${slackToken} and ${canary}`, `-----BEGIN ${"OPENSSH"} PRIVATE KEY-----`].join("\n");
+  const findings = scanTextForSecrets(text, { canaries: [{ name: "configured", secret: new SecretString(canary) }] });
+  expect(findings).toEqual([
+    { kind: "known-token-pattern", line: 2, patternName: "github-fine-grained-token" },
+    { kind: "exact-secret", line: 4, canaryName: "configured" },
+    { kind: "known-token-pattern", line: 4, patternName: "slack-token" },
+    { kind: "known-token-pattern", line: 5, patternName: "private-key" },
+  ]);
+  const serialized = JSON.stringify(findings);
+  expect(serialized).not.toContain(pat);
+  expect(serialized).not.toContain(slackToken);
+  expect(serialized).not.toContain(canary);
+  expect(scanTextForSecrets("nothing to see\nhere")).toEqual([]);
 });
