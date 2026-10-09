@@ -32,7 +32,9 @@ export type RoutineIntent =
 const NONE: RoutineIntent = { kind: "none" };
 
 const LIST = new RegExp(
-  "^(?:list|show|what are|what's|whats|what is)\\b(?:\\s+\\S+){0,5}?\\s+" +
+  "^(?:list|show|what are|what's|whats|what is)\\b" +
+    // Only qualifiers between the verb and the noun: "show me the code that handles reminders" is a prompt.
+    "(?:\\s+(?:me|us|all|the|my|our|your|these|any|active|current|existing|upcoming|recurring|pending|scheduled))*\\s+" +
     "(?:routines?|reminders?|schedules?|scheduled\\s+(?:jobs|tasks))" +
     "(?:\\s+(?:here|in\\s+(?:this|the)\\s+(?:channel|thread|conversation|dm)|for\\s+this\\s+(?:channel|thread)))?" +
     "\\s*\\??$",
@@ -43,7 +45,8 @@ const CANCEL =
   /^(?:cancel|stop|delete|remove|disable|turn\s+off|unschedule)\s+(?:the\s+|my\s+|this\s+|that\s+)?(?:routine|reminder|schedule|scheduled\s+job)s?\b\s*(?<ref>.*)$/i;
 /** Words between the noun and the reference: "cancel the reminder about deploys". */
 const REF_LEAD = /^(?:(?:about|for|called|named|titled|that|which|with\s+id|id|number|no\.?)\s+|[:\-–—]\s*)+/i;
-const INDEX_REF = /^#?(\d{1,2})$/;
+/** List positions up to `limits.maxActiveSchedules` (at most 10,000). */
+const INDEX_REF = /^#?([1-9]\d{0,4})$/;
 const ID_REF = /^[0-9a-f][0-9a-f-]{5,35}$/i;
 
 const RECURRING_LEADS = new Set(["every", "each", "daily", "weekly", "monthly", "hourly", "weekdays", "weeknights"]);
@@ -71,8 +74,8 @@ function leadWord(text: string): string {
 function cancelRef(raw: string): RoutineCancelRef {
   const ref = raw
     .replace(REF_LEAD, "")
-    .replace(/^`(.*)`$/, "$1")
     .replace(/[\s.!?]+$/, "")
+    .replace(/^`(.*)`$/, "$1")
     .replace(/^["'“‘](.*)["'”’]$/, "$1")
     .trim();
   if (ref === "" || /^(?:this|that|it|here)$/i.test(ref)) return { kind: "only" };
