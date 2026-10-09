@@ -42,6 +42,8 @@ describe("extractTimeZone", () => {
     ["check the 10am PT incident every day at 9am ET", "check the 10am PT incident every day at 9am", "America/New_York"],
     ["remind me every day at 9am ET to check the 10am PT incident", "remind me every day at 9am to check the 10am PT incident", "America/New_York"],
     ["schedule tomorrow at 9am PT: review the noon UTC report", "schedule tomorrow at 9am: review the noon UTC report", "America/Los_Angeles"],
+    // The parser merges "tomorrow … at 3pm" around the task.
+    ["remind me tomorrow to review the noon UTC report at 3pm ET", "remind me tomorrow to review the noon UTC report at 3pm", "America/New_York"],
   ])("%s", (input, text, explicit) => {
     expect(extractTimeZone(input)).toEqual({ kind: "ok", text, explicit });
   });
@@ -63,6 +65,7 @@ describe("extractTimeZone", () => {
     "remind me every day at 9am to check the 10am PT incident",
     "routine: every day at 9am check the 10am PT incident",
     "schedule tomorrow at 9am: review the noon UTC report",
+    "remind me tomorrow to review the noon UTC report at 3pm",
   ])("keeps %j as task text", (input) => {
     expect(extractTimeZone(input)).toEqual({ kind: "ok", text: input });
   });
@@ -212,6 +215,15 @@ describe("resolveRoutineSchedule", () => {
         profileTimeZone: "Asia/Tokyo",
       }),
     ).toMatchObject({ kind: "ok", task: "check the 10am PT incident", timeZone: "Asia/Tokyo", timeZoneSource: "profile" });
+    expect(
+      resolveRoutineSchedule({ text: "remind me tomorrow to review the noon UTC report at 3pm ET", now: NOW, actorUserId: "U1" }),
+    ).toMatchObject({
+      kind: "ok",
+      task: "review the noon UTC report",
+      nextRunAt: "2026-10-10T19:00:00.000Z",
+      timeZone: "America/New_York",
+      timeZoneSource: "explicit",
+    });
   });
 
   test("reports zone and parse errors as user-facing messages", () => {

@@ -120,9 +120,9 @@ export function extractTimeZone(text: string): TimeZoneExtraction {
   }
   if (candidates.length === 0) return { kind: "ok", text: text.trim() };
 
-  // Only zones attached to the schedule's timing count; "check the 10am PT incident" is task text.
-  const timing = timingSpan(splice(scan, candidates));
-  const found = timing === null ? candidates : candidates.filter((entry) => belongsToTiming(scan, candidates, entry, timing));
+  // Zones inside the task stay task text ("check the 10am PT incident"); the rest belong to the timing.
+  const task = taskSpan(splice(scan, candidates));
+  const found = task === null ? candidates : candidates.filter((entry) => belongsToTiming(scan, candidates, entry, task));
   const unknown = found.find((entry) => entry.zone === null);
   if (unknown !== undefined) return { kind: "error", message: unknownTimeZoneMessage(unknown.token), token: unknown.token };
   if (found.length === 0) return { kind: "ok", text: text.trim() };
@@ -149,14 +149,14 @@ interface ZoneCandidate {
   readonly clock?: string;
 }
 
-/** Word positions [start, end) of the parsed timing in the zone-free request. */
-interface TimingSpan {
+/** Word positions [start, end) of the parsed task in the zone-free request. */
+interface TaskSpan {
   readonly start: number;
   readonly end: number;
   readonly words: readonly string[];
 }
 
-/** Lower-case words without surrounding punctuation, for comparing text with the parsed timing. */
+/** Lower-case words without surrounding punctuation, for comparing text with the parsed task. */
 function words(text: string): string[] {
   return text
     .toLowerCase()
@@ -165,36 +165,36 @@ function words(text: string): string[] {
     .filter((word) => word.length > 0);
 }
 
-/** Where the timing sits in the zone-free request, or null when it does not split (create reports it). */
-function timingSpan(stripped: string): TimingSpan | null {
+/**
+ * Where the task sits in the zone-free request, or null when it does not split (create reports it).
+ * The task is one contiguous run even when the timing is not: the parser merges "tomorrow … at 3pm"
+ * around "review the report", and strips leads such as "remind me".
+ */
+function taskSpan(stripped: string): TaskSpan | null {
   const split = splitRoutineRequest(stripped);
   if (split.kind !== "ok") return null;
   const all = words(stripped);
-  const timing = words(split.timing);
-  // The parser takes the timing from the start ("every day at 9am …"), the end ("… every day at
-  // 9am"), or right after a lead it strips ("remind me every day at 9am …", "routine: daily …").
-  const matches = (at: number): boolean => at >= 0 && timing.every((word, offset) => all[at + offset] === word);
-  const last = all.length - timing.length;
-  const start = matches(0) ? 0 : matches(last) ? last : all.findIndex((_, at) => matches(at));
+  const task = words(split.task);
+  const matches = (at: number): boolean => at >= 0 && task.every((word, offset) => all[at + offset] === word);
+  const last = all.length - task.length;
+  const start = matches(last) ? last : all.findIndex((_, at) => matches(at));
   if (start < 0) return null;
-  return { start, end: start + timing.length, words: all };
+  return { start, end: start + task.length, words: all };
 }
 
-const CONNECTORS = new Set(["and", "or", "&", "then"]);
+const CONNECTORS = new Set(["and", "or", "&"]);
 
 /**
- * A clock-anchored zone ("9am PT") counts when its clock is inside the timing, or follows it with
- * only "and"/"or" between ("at 9am PT and 10am ET" names two zones). A bare zone ("in
- * Europe/London", "(UTC)") counts when it sits in or next to the timing, or ends the request.
+ * A zone belongs to the timing unless it sits inside the task. One exception: a clock zone opening
+ * the task right after "and"/"or" ("at 9am PT and 10am ET check") is a second time the parser did
+ * not take, so it still counts and the two zones conflict.
  */
-function belongsToTiming(scan: string, all: readonly ZoneCandidate[], entry: ZoneCandidate, timing: TimingSpan): boolean {
+function belongsToTiming(scan: string, all: readonly ZoneCandidate[], entry: ZoneCandidate, task: TaskSpan): boolean {
   const at = words(splice(scan.slice(0, entry.start), all.filter((other) => other.end <= entry.start))).length;
-  if (entry.clock !== undefined) {
-    const clockEnd = at + words(entry.clock).length;
-    if (at >= timing.start && clockEnd <= timing.end) return true;
-    return at > timing.end && timing.words.slice(timing.end, at).every((word) => CONNECTORS.has(word));
-  }
-  return (at >= timing.start && at <= timing.end) || scan.slice(entry.end).trim() === "";
+  if (entry.clock === undefined) return at <= task.start || at >= task.end;
+  const clockEnd = at + words(entry.clock).length;
+  if (clockEnd <= task.start || at >= task.end) return true;
+  return at === task.start && CONNECTORS.has(task.words[at - 1] ?? "");
 }
 
 /** Splice zone phrases out, tidying spaces only at the seams so the rest of the text is unchanged. */
