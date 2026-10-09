@@ -61,6 +61,7 @@ Doctor reports each check as `PASS`, `WARN`, `FAIL`, or `SKIP` and exits non-zer
 - T3 is reachable, and `/.well-known/t3/environment` reports orchestration protocol `1`. A missing field counts as `1`, and an older server without the endpoint gives a warning.
 - The T3 server version matches `t3.lock.json`. A mismatch is a warning.
 - The restricted T3 session has exactly the orchestration scopes, has not expired, and warns within 7 days of expiry.
+- Managed T3 only (`t3-token-rotation`): the last token rotation and how many replaced tokens still await revocation, from `<runtimeDir>/credential-state.json`. A replaced token still pending an hour after its grace period is a warning. External mode skips this check.
 - Every profile's provider and model are ready in T3.
 - Slack `auth.test` belongs to the configured workspace, and the app token can open a Socket Mode connection.
 - The background service is installed, runs this install (the same checkout and Bun, or the same release binary) with the same config, matches the current unit template, and is running. A missing or stopped service is a warning, so doctor still passes before the first install.
@@ -107,6 +108,37 @@ With `t3.watch.enabled`, coordinators subscribe to each running T3 thread's even
 | `lingerMs` | `30000` (0–600000) | How long a thread's subscription stays open after its turn ends, so a follow-up turn reuses it. |
 
 Every 60 s the service logs `t3.connection.stats` with the counters `sessionInspects`, `wsTickets`, `wsConnects`, `snapshotFetches`, `rpcCalls`, and `watchedThreads`. Other connection events are `t3.connection.opened`, `t3.connection.reconnect`, `t3.connection.lost`, `t3.connection.rotated` (the token file changed, so the socket is replaced after the new token passes inspection), and `t3.connection.closed`; watch events are `t3.watch.subscribed`, `t3.watch.ended`, `t3.watch.failed`, `t3.watch.resync`, and `t3.watch.released`. Logs never contain the token or the WebSocket ticket URL.
+
+## T3 token rotation
+
+The restricted T3 token (scopes `orchestration:read orchestration:operate`) lasts 30 days. Each token Agent Tag mints is labeled `agent-tag-orchestration-YYYYMMDDTHHMMSSZ` (UTC).
+
+With `t3.mode: "managed"` the service owns the token:
+
+- At startup, after the managed runtime is ready, it mints a token when the token file is missing or T3 rejects it.
+- Every 6 h it checks expiry and rotates when fewer than `t3.managed.rotation.rotateBeforeDays` days are left. When the T3 connection reports a 401/403 (or a revoked token), it checks at once and rotates, at most once per 5 minutes.
+- A rotation issues a 10-minute admin session with `t3 auth session issue`, mints the new token, verifies its scopes and that it cannot reach admin endpoints, writes it atomically over the token file (`0600`), and revokes the admin session in `finally`. Admin tokens are held in memory only.
+- The replaced token is recorded in `<runtimeDir>/credential-state.json` and revoked after `revokeGraceMinutes`, so turns already running keep working. Only that token is revoked: by label, or, for a token minted outside Agent Tag, by its exact expiry and restricted scopes. Other clients, including other `agent-tag-orchestration-*` tokens, are never touched.
+- Nothing is sent to a T3 that failed the version or protocol gate, and an unreachable T3 never causes a rotation.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `t3.managed.rotation.rotateBeforeDays` | `7` (1–25) | Rotate when fewer than this many days are left. |
+| `t3.managed.rotation.revokeGraceMinutes` | `15` (1–1440) | How long a replaced token keeps working before it is revoked. |
+
+With `t3.mode: "external"` the service cannot mint tokens. It logs `t3.token.expiring` as a warning from 7 days before expiry, and as an error from 1 day before, when the token is missing, or when T3 rejects it. The log line includes the rotate command.
+
+Rotate by hand with:
+
+```sh
+agent-tag t3 rotate CONFIG                                   # managed: the runtime must be running
+agent-tag t3 rotate CONFIG --admin-token-file FILE           # external: an admin token for that T3
+agent-tag t3 rotate CONFIG --t3-base-dir DIR [--t3-bin BIN]  # external: issue an admin session from the T3 base dir
+```
+
+It prints `{mode, tokenFile, label, expiresAt, daysRemaining, previousToken}`. In managed mode the running service revokes the old token after the grace period. In external mode the old token is not revoked; it expires on its own. A running service picks up the new token file within 5 s. `agent-tag t3 status CONFIG` reports `token.expiresAt`, `token.daysRemaining`, `token.label`, `token.rotatedAt` and `token.pendingRevocations`.
+
+Log events: `t3.token.rotated`, `t3.token.rotate_failed`, `t3.token.expiring`, `t3.token.revoked`, `t3.token.revoke_skipped` (the client list was unreadable or T3 failed; the token expires on its own), and `t3.token.admin_revoke_failed` (the admin session expires within 10 minutes). None contains a token.
 
 ## Background service
 

@@ -84,6 +84,27 @@ describe("T3Connection", () => {
     expect(fake.counts.session).toBe(2);
   });
 
+  test("a rejected token is reported to onCredentialRejected so the lifecycle can rotate it", async () => {
+    let rejected = 0;
+    const reporting = new T3Connection({
+      config: fake.config,
+      logger: () => {},
+      now: () => new Date(clock),
+      onCredentialRejected: () => {
+        rejected += 1;
+      },
+    });
+    try {
+      await reporting.fetchThread("thread-1");
+      expect(rejected).toBe(0);
+      fake.acceptedToken = "someone-elses-token";
+      await reporting.fetchThread("thread-1").catch(() => undefined);
+      expect(rejected).toBeGreaterThan(0);
+    } finally {
+      await reporting.close();
+    }
+  });
+
   test("a token file whose mtime changed is re-read once the stat interval passes", async () => {
     await connection.session();
     fake.acceptedToken = "rotated-token";
