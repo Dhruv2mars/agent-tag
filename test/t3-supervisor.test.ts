@@ -194,6 +194,24 @@ describe("managed T3 supervisor", () => {
     expect(message).not.toContain(FAKE_PAIRING_TOKEN);
   });
 
+  for (const detached of [false, true]) {
+    test(`an early exit is reported promptly while a ${detached ? "detached" : "group"} descendant holds stderr`, async () => {
+      const h = await harness();
+      const descendantPidFile = join(h.root, "descendant.pid");
+      await h.control({ exitAtStartup: 3, descendantPidFile, descendantDetached: detached });
+      const started = Date.now();
+      const error = await h.runtime().start().catch((caught: unknown) => caught);
+      const descendant = Number(await readFile(descendantPidFile, "utf8"));
+      strays.push(descendant);
+      expect(error).toBeInstanceOf(T3StartupError);
+      expect((error as Error).message).toContain("exit code 3");
+      // Well inside the 10 s ready timeout and the descendant's 30 s sleep.
+      expect(Date.now() - started).toBeLessThan(6_000);
+      // A descendant in T3's group dies with it; one that left the group is out of reach and only bounded.
+      if (!detached) await eventually(() => !alive(descendant), 2_000);
+    });
+  }
+
   test("does not report ready until server-runtime.json names the spawned pid", async () => {
     const h = await harness();
     await h.control({ runtimePid: 1 });

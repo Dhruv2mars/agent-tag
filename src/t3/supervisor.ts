@@ -65,6 +65,7 @@ const DEFAULT_TIMING: T3RuntimeTiming = {
 const STDERR_LINE_BYTES = 2_048;
 const STDERR_LINES_PER_MINUTE = 30;
 const STDERR_TAIL_LINES = 10;
+const STDERR_DRAIN_MS = 1_000;
 const SUPERVISED_FILE = "supervised.json";
 
 export interface T3ManagedRuntimeOptions {
@@ -412,7 +413,9 @@ export class T3ManagedRuntime {
     for (;;) {
       if (this.#stop.signal.aborted) throw new T3StartupError("managed T3 start was cancelled");
       if (child.exit !== undefined) {
-        await child.stderrDone;
+        // A descendant left in the group may still hold stderr open; it belongs to a dead server.
+        signalProcessGroup(child.process.pid, "SIGKILL");
+        await this.#drainStderr(child);
         throw new T3StartupError(
           `managed T3 exited with ${describeExit(child.exit)} before becoming ready${this.#stderrSummary()}`,
         );
@@ -514,7 +517,12 @@ export class T3ManagedRuntime {
     for (let attempt = 0; attempt < 20 && signalProcessGroup(pid, 0); attempt += 1) await Bun.sleep(50);
     signalProcessGroup(pid, "SIGKILL");
     await child.process.exited;
-    await child.stderrDone;
+    await this.#drainStderr(child);
+  }
+
+  /** Waits for the stderr pump, bounded: a process that left T3's group can hold the pipe open forever. */
+  async #drainStderr(child: RunningChild): Promise<void> {
+    await Promise.race([child.stderrDone, Bun.sleep(STDERR_DRAIN_MS)]);
   }
 
   /**

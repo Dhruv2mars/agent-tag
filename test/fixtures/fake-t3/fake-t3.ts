@@ -19,6 +19,10 @@ interface Control {
   /** Where `serve` writes the environment it was started with. */
   readonly envFile?: string;
   readonly pairingCredential?: string;
+  /** Before exiting at startup, leave a `sleep` in our process group holding stderr; its pid goes here. */
+  readonly descendantPidFile?: string;
+  /** Start that descendant in its own process group (out of reach of a group signal). */
+  readonly descendantDetached?: boolean;
 }
 
 function control(): Control {
@@ -61,6 +65,13 @@ if (args[0] === "serve") {
   console.error(`pairing link http://127.0.0.1:${port}/pair#token=${FAKE_PAIRING_TOKEN}`);
   console.error(`{"token":"${FAKE_PAIRING_TOKEN}"}`);
   console.error("fake t3 serve starting");
+  if (initial.descendantPidFile !== undefined) {
+    const descendant = Bun.spawn(["sleep", "30"], {
+      stdio: ["ignore", "ignore", "inherit"],
+      detached: initial.descendantDetached === true,
+    });
+    writeFileSync(initial.descendantPidFile, String(descendant.pid));
+  }
   if (initial.exitAtStartup !== undefined) process.exit(initial.exitAtStartup);
   if (initial.ignoreSigterm === true) process.on("SIGTERM", () => {});
   Bun.serve({
