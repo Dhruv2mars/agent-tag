@@ -39,7 +39,8 @@ export function safeLinkUrl(url: string): string | undefined {
 
 function link(url: string, label: string): string {
   const href = safeLinkUrl(url);
-  return href === undefined ? escapeSlackText(label) : `<${href}|${escapeSlackText(label)}>`;
+  // Inside mrkdwn, `&` in the href must be an entity like every other `&` (render.ts escapeUrl parity).
+  return href === undefined ? escapeSlackText(label) : `<${href.replaceAll("&", "&amp;")}|${escapeSlackText(label)}>`;
 }
 
 function code(text: string): string {
