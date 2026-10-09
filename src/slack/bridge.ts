@@ -33,6 +33,41 @@ export const SLACK_CLIENT_OPTIONS = {
   timeout: 20_000,
 } as const;
 
+/**
+ * Options for the separate client that serves speaker lookups (`users.info`). Lookups never share
+ * the outbox client's request queue: a slow or hung lookup holds a slot in its own small queue, so
+ * it cannot delay a `chat.postMessage` past the outbox lease. The timeout matches the directory's,
+ * so an abandoned lookup frees its slot about when the caller stops waiting for it.
+ */
+export const SLACK_LOOKUP_CLIENT_OPTIONS = {
+  retryConfig: { retries: 0 },
+  rejectRateLimitedCalls: true,
+  maxRequestConcurrency: 4,
+  timeout: 5_000,
+} as const;
+
+/** Builds the speaker directory on its own Web API client (see SLACK_LOOKUP_CLIENT_OPTIONS). */
+export async function createSlackUserDirectory(input: {
+  readonly botToken: string;
+  readonly logger?: ServiceLogger;
+  /** Tests point this at a local fake. */
+  readonly slackApiUrl?: string;
+}): Promise<SlackUserDirectory> {
+  const { LogLevel, webApi } = await import("@slack/bolt");
+  const client = new webApi.WebClient(input.botToken, {
+    ...SLACK_LOOKUP_CLIENT_OPTIONS,
+    retryConfig: { ...SLACK_LOOKUP_CLIENT_OPTIONS.retryConfig },
+    logLevel: LogLevel.WARN,
+    ...(input.slackApiUrl === undefined ? {} : { slackApiUrl: input.slackApiUrl }),
+  });
+  return new SlackUserDirectory({
+    lookup: (userId) => client.users.info({ user: userId }),
+    lookupTimeoutMs: SLACK_LOOKUP_CLIENT_OPTIONS.timeout,
+    maxOutstandingLookups: SLACK_LOOKUP_CLIENT_OPTIONS.maxRequestConcurrency * 2,
+    ...(input.logger === undefined ? {} : { logger: input.logger }),
+  });
+}
+
 /** Delivery-time renderers for outbox refresh rows. None yet: PR-I I2 and PR-F register theirs here. */
 const REFRESH_RENDERERS: RefreshRenderers = {};
 
@@ -110,8 +145,8 @@ export class SlackSocketBridge {
         await ack();
       }
     });
-    const users = new SlackUserDirectory({
-      lookup: (userId) => app.client.users.info({ user: userId }),
+    const users = await createSlackUserDirectory({
+      botToken: botToken.exposeToBoundary(),
       ...(input.logger === undefined ? {} : { logger: input.logger }),
     });
     const contextSource: SlackContextSource = {

@@ -215,6 +215,49 @@ describe("SlackUserDirectory", () => {
     expect(calls).toHaveLength(4);
   });
 
+  test("caps outstanding lookups, counting timed-out ones, without caching the overflow", async () => {
+    const calls: string[] = [];
+    let release = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const directory = new SlackUserDirectory({
+      lookup: async (id) => {
+        calls.push(id);
+        await gate;
+        return userResponse(id, { profile: { display_name: `Name ${id}` } });
+      },
+      lookupTimeoutMs: 5,
+      maxOutstandingLookups: 2,
+      logger: () => {},
+    });
+    // Both time out for the caller but their requests are still outstanding.
+    expect((await directory.labels(["U1", "U2"])).get("U1")?.resolved).toBe(false);
+    expect(await directory.label("U3")).toEqual({ userId: "U3", label: "U3", resolved: false });
+    expect(calls).toEqual(["U1", "U2"]);
+    release();
+    await Bun.sleep(0);
+    // The overflow was not negatively cached, so U3 resolves once slots free up.
+    expect(await directory.label("U3")).toEqual({ userId: "U3", label: "Name U3", resolved: true });
+    expect(calls).toEqual(["U1", "U2", "U3"]);
+  });
+
+  test("a lookup that throws synchronously releases its outstanding slot", async () => {
+    let calls = 0;
+    const directory = new SlackUserDirectory({
+      lookup: (id) => {
+        calls += 1;
+        if (id === "U1") throw new TypeError("boom");
+        return Promise.resolve(userResponse(id, { profile: { display_name: id } }));
+      },
+      maxOutstandingLookups: 1,
+      logger: () => {},
+    });
+    expect((await directory.label("U1")).resolved).toBe(false);
+    expect((await directory.label("U2")).resolved).toBe(true);
+    expect(calls).toBe(2);
+  });
+
   test("evicts the least recently used entry beyond maxEntries", async () => {
     let calls = 0;
     const directory = new SlackUserDirectory({

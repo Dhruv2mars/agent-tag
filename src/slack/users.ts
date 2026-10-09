@@ -17,6 +17,12 @@ export interface SlackUserDirectoryOptions {
   readonly maxEntries?: number;
   /** A lookup slower than this falls back to the raw ID so it cannot eat the operation lease. */
   readonly lookupTimeoutMs?: number;
+  /**
+   * Cap on underlying lookups not yet settled, counting ones the caller already gave up on after
+   * the timeout. At the cap a new ID renders as its raw ID (not cached) instead of queueing more
+   * requests behind hung ones. Default 8.
+   */
+  readonly maxOutstandingLookups?: number;
   readonly now?: () => number;
   readonly logger?: ServiceLogger;
 }
@@ -135,6 +141,8 @@ export class SlackUserDirectory {
   readonly #negativeTtlMs: number;
   readonly #maxEntries: number;
   readonly #lookupTimeoutMs: number;
+  readonly #maxOutstanding: number;
+  #outstanding = 0;
   readonly #now: () => number;
   readonly #logger: ServiceLogger;
   readonly #cache = new Map<string, CacheEntry>();
@@ -147,6 +155,7 @@ export class SlackUserDirectory {
     this.#negativeTtlMs = options.negativeTtlMs ?? 300_000;
     this.#maxEntries = options.maxEntries ?? 2_000;
     this.#lookupTimeoutMs = options.lookupTimeoutMs ?? 5_000;
+    this.#maxOutstanding = options.maxOutstandingLookups ?? 8;
     this.#now = options.now ?? (() => Date.now());
     this.#logger = options.logger ?? ((record) => console.error(JSON.stringify(record)));
   }
@@ -170,6 +179,7 @@ export class SlackUserDirectory {
     }
     let pending = this.#inflight.get(userId);
     if (pending === undefined) {
+      if (this.#outstanding >= this.#maxOutstanding) return Promise.resolve(unresolvedSpeaker(userId));
       pending = this.#fetch(userId).finally(() => this.#inflight.delete(userId));
       this.#inflight.set(userId, pending);
     }
@@ -209,9 +219,25 @@ export class SlackUserDirectory {
     return new Map(unique.map((id) => [id, result.get(id) ?? unresolvedSpeaker(id)] as const));
   }
 
+  /** Starts the underlying lookup, holding an outstanding slot until it settles (not the timeout). */
+  #startLookup(userId: string): Promise<unknown> {
+    this.#outstanding++;
+    let request: Promise<unknown>;
+    try {
+      request = this.#lookup(userId);
+    } catch (error) {
+      request = Promise.reject(error);
+    }
+    request.then(
+      () => this.#outstanding--,
+      () => this.#outstanding--,
+    );
+    return request;
+  }
+
   async #fetch(userId: string): Promise<SpeakerIdentity> {
     try {
-      const response = await this.#withTimeout(this.#lookup(userId));
+      const response = await this.#withTimeout(this.#startLookup(userId));
       const failure = usersInfoErrorSchema.safeParse(response);
       if (failure.success) throw new SlackUserLookupError(failure.data.error);
       const parsed = usersInfoResponseSchema.safeParse(response);
