@@ -2,6 +2,8 @@ import { join } from "node:path";
 
 import type { AgentTagConfig } from "./config.ts";
 import { AgentTagCoordinator } from "./coordinator.ts";
+import { PrWorker, pullRequestsEnabled } from "./git/pr-worker.ts";
+import { createGitRunner } from "./git/runner.ts";
 import { InteractionWorker } from "./interaction-worker.ts";
 import { type AllowedModelReport, reportAllowedModels, validateConfiguredProviders } from "./policy/provider.ts";
 import { createScheduleWorkers } from "./scheduler.ts";
@@ -346,6 +348,8 @@ export async function createAgentTagService(input: {
     const bridge = await SlackSocketBridge.create({ config: input.config, store, logger });
     let nextMemoryExpiryAt = 0;
     let nextT3StatsAt = now().getTime() + 60_000;
+    // Draft PR workflow (PR-M §3.7): off unless github is configured and a profile has mode "auto".
+    const pullRequests = pullRequestsEnabled(input.config) ? { runner: createGitRunner() } : undefined;
     const coordinators = Array.from(
       { length: input.config.limits.maxConcurrentTasks },
       () =>
@@ -355,6 +359,7 @@ export async function createAgentTagService(input: {
           slackContext: bridge.contextSource,
           t3,
           ...(watcher === undefined ? {} : { watcher }),
+          ...(pullRequests === undefined ? {} : { pullRequests }),
         }),
     );
     const service = new AgentTagService({
@@ -389,6 +394,9 @@ export async function createAgentTagService(input: {
           },
         },
         createT3GateWorker({ gate, now }),
+        ...(pullRequests === undefined
+          ? []
+          : [new PrWorker({ config: input.config, store, runner: pullRequests.runner, now })]),
       ],
       resources: [{ close: closeT3 }],
       logger,

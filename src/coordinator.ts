@@ -1,4 +1,5 @@
 import type { AgentTagConfig, AgentTagProfile } from "./config.ts";
+import { preparePullRequestSync, pullRequestTurnNote, type PullRequestSyncOptions } from "./git/pr-sync.ts";
 import { ExecutionAuthorityDenied, requireExecutionAuthority } from "./policy/execution.ts";
 import { AgentTagMemory } from "./memory.ts";
 import type { SlackContextSource } from "./slack/context-source.ts";
@@ -6,7 +7,7 @@ import { fetchThreadWindow, SlackContextUnavailable, THREAD_CONTEXT_TIMEOUT_MS }
 import { collectMentionedUserIds, type SpeakerIdentity } from "./slack/markup.ts";
 import { escapeSlackText, markdownToMrkdwn, renderCodeBlock, splitForSlack, truncateBlockText } from "./slack/render.ts";
 import { slackErrorCode, unresolvedSpeaker } from "./slack/users.ts";
-import type { AgentTagStore, ClaimedOperation, SlackOutboxPayload, TaskExecutionBinding } from "./store/store.ts";
+import type { AgentTagStore, ClaimedOperation, PrSyncInput, SlackOutboxPayload, TaskExecutionBinding } from "./store/store.ts";
 import { composeTurnText, type TurnWindow } from "./turn-text.ts";
 import {
   awaitingT3AnswerContinuation,
@@ -74,6 +75,8 @@ export interface CoordinatorOptions {
   readonly stallMs?: number;
   /** Absolute ceiling on a turn's active polling time. Defaults to `stalledTurn.maxTurnSeconds`. */
   readonly maxTurnMs?: number;
+  /** Git for the draft PR snapshot (PR-M §3.7). Absent: completed turns never touch git. */
+  readonly pullRequests?: PullRequestSyncOptions;
   readonly now?: () => Date;
   readonly sleep?: (milliseconds: number) => Promise<void>;
 }
@@ -389,6 +392,7 @@ export class AgentTagCoordinator {
   readonly #maxTurnMs: number;
   readonly #now: () => Date;
   readonly #sleep: (milliseconds: number) => Promise<void>;
+  readonly #pullRequests: PullRequestSyncOptions | undefined;
 
   constructor(options: CoordinatorOptions) {
     this.#config = options.config;
@@ -408,6 +412,7 @@ export class AgentTagCoordinator {
     this.#maxTurnMs = options.maxTurnMs ?? options.config.limits.stalledTurn.maxTurnSeconds * 1_000;
     this.#now = options.now ?? (() => new Date());
     this.#sleep = options.sleep ?? ((milliseconds) => Bun.sleep(milliseconds));
+    this.#pullRequests = options.pullRequests;
   }
 
   /**
@@ -557,7 +562,7 @@ export class AgentTagCoordinator {
       names = await abortable(this.#slackContext.users.labels(ids, signal, deadline), signal);
       this.#store.renewOperationLease({ ...lease, now: this.#now().toISOString(), leaseMs: this.#leaseMs });
     }
-    const proposedText = composeTurnText({
+    const turnText = composeTurnText({
       // Claims derive origin for legacy rows; if it is still absent, fail safe to plain text.
       origin: origin ?? "schedule",
       speaker: names.get(actorUserId) ?? unresolvedSpeaker(actorUserId),
@@ -573,6 +578,8 @@ export class AgentTagCoordinator {
         },
       memories,
     });
+    const prNote = this.#pullRequests === undefined ? null : pullRequestTurnNote(profile, task.repositoryRoot, operation.taskId);
+    const proposedText = prNote === null ? turnText : `${turnText}\n\n${prNote}`;
     return this.#store.resolveOperationTurnText({
       ...lease,
       proposedText,
@@ -927,6 +934,7 @@ export class AgentTagCoordinator {
             !message.streaming,
         );
         if (assistant === undefined) throw new Error("completed T3 turn has no final assistant message");
+        const prSync = await this.#preparePullRequest(operation, task, profile, snapshot, assistant.text, turnActiveMs, signal);
         const outboxId = this.#store.completeOperationWithOutbox({
           operationId: operation.operationId,
           taskId: operation.taskId,
@@ -935,11 +943,65 @@ export class AgentTagCoordinator {
           conversationId: operation.payload.conversationId,
           threadTs: operation.payload.threadTs,
           text: splitForSlack(markdownToMrkdwn(assistant.text)),
+          ...(prSync === undefined ? {} : { prSync, actorUserId: operation.payload.actorUserId }),
           now: this.#now().toISOString(),
         });
         return { kind: "completed", operationId: operation.operationId, outboxId };
       }
       await this.#pollAgain(progressAt, signal, polling.watch, snapshot);
+    }
+  }
+
+  /**
+   * Snapshots the task worktree for the draft PR workflow, renewing the lease while git runs. Mode
+   * "off", an unmapped root or no `pullRequests` option return before any git process starts.
+   */
+  async #preparePullRequest(
+    operation: ClaimedOperation,
+    task: TaskExecutionBinding,
+    profile: AgentTagProfile,
+    snapshot: T3ThreadSnapshot,
+    summaryText: string,
+    turnActiveMs: () => number,
+    signal: AbortSignal | undefined,
+  ): Promise<PrSyncInput | undefined> {
+    if (this.#pullRequests === undefined || profile.pullRequests.mode !== "auto") return undefined;
+    const renew = () =>
+      this.#store.renewOperationLease({
+        operationId: operation.operationId,
+        workerId: this.#workerId,
+        now: this.#now().toISOString(),
+        leaseMs: this.#leaseMs,
+        turnActiveMs: turnActiveMs(),
+      });
+    renew();
+    const timer = setInterval(() => {
+      try {
+        renew();
+      } catch {
+        // A lost lease surfaces when the completion transaction checks it.
+      }
+    }, Math.max(1_000, Math.floor(this.#leaseMs / 3)));
+    try {
+      const prSync = await preparePullRequestSync({
+        config: this.#config,
+        store: this.#store,
+        options: this.#pullRequests,
+        profile,
+        taskId: operation.taskId,
+        repositoryRoot: task.repositoryRoot,
+        t3Thread: snapshot.thread,
+        requestText: operation.payload.text,
+        summaryText,
+        conversationId: operation.payload.conversationId,
+        threadTs: operation.payload.threadTs,
+        actorUserId: operation.payload.actorUserId,
+        ...(signal === undefined ? {} : { signal }),
+      });
+      if (signal?.aborted) throw new CoordinatorAborted();
+      return prSync;
+    } finally {
+      clearInterval(timer);
     }
   }
 

@@ -142,7 +142,7 @@ const enabledPullRequestsSchema = z
   })
   .strict();
 
-/** Draft PR workflow per profile. Off unless configured; not yet wired into the coordinator. */
+/** Draft PR workflow per profile. Off unless configured; "button" is reserved for M3 and rejected. */
 const pullRequestsSchema = z
   .discriminatedUnion("mode", [z.object({ mode: z.literal("off") }), enabledPullRequestsSchema])
   .default({ mode: "off" });
@@ -517,6 +517,13 @@ export const agentTagConfigSchema = z
       const path = ["profiles", index, "pullRequests"];
       if (config.github === undefined) {
         context.addIssue({ code: "custom", path: [...path, "mode"], message: "pull requests require the top-level github config" });
+      }
+      if (pullRequests.mode === "button") {
+        context.addIssue({
+          code: "custom",
+          path: [...path, "mode"],
+          message: 'mode "button" is not available yet (PR-M M3); use "auto" or "off"',
+        });
       }
       if (profile.externalWrites.mode === "deny") {
         context.addIssue({

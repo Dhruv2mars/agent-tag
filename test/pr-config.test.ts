@@ -101,8 +101,14 @@ describe("pull request config", () => {
     expect(issues(config({ profile: { pullRequests: autoMode } }))).toContain(
       "profiles.0.pullRequests.mode: pull requests require the top-level github config",
     );
-    expect(issues(config({ profile: { pullRequests: { ...autoMode, mode: "button" } } }))).toHaveLength(1);
+    expect(issues(config({ profile: { pullRequests: { ...autoMode, mode: "button" } } }))).toHaveLength(2);
     expect(issues(config({ github, profile: { pullRequests: autoMode } }))).toEqual([]);
+  });
+
+  test("button mode is rejected until M3", () => {
+    expect(issues(config({ github, profile: { pullRequests: { ...autoMode, mode: "button" } } }))).toEqual([
+      'profiles.0.pullRequests.mode: mode "button" is not available yet (PR-M M3); use "auto" or "off"',
+    ]);
   });
 
   test("repository roots must be in the profile's repositoryRoots and unique", () => {
