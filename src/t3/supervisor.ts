@@ -347,7 +347,6 @@ export class T3ManagedRuntime {
       await this.#assertNoDowngrade();
       await this.#reapOrphans();
       const descriptor = await this.#launch();
-      this.#setState("ready");
       this.#log("info", "t3.runtime.started", `T3 ${this.#installed.version} pid ${this.#child?.process.pid} on ${this.baseUrl}`);
       return descriptor;
     } catch (error) {
@@ -397,8 +396,14 @@ export class T3ManagedRuntime {
         startedAt: this.#now().toISOString(),
       });
       const descriptor = await this.#waitUntilReady(child);
-      this.#startedAt = this.#now().toISOString();
       await this.#recordVersionStarted();
+      // #onExit ignores exits before "ready", so re-check after the last await and flip to ready in the
+      // same tick: an exit up to here fails this launch, and any later one is a crash that #onExit recovers.
+      if (child.exit !== undefined) {
+        throw new T3StartupError(`managed T3 exited with ${describeExit(child.exit)} before becoming ready${this.#stderrSummary()}`);
+      }
+      this.#startedAt = this.#now().toISOString();
+      this.#setState("ready");
       return descriptor;
     } catch (error) {
       await this.#terminate(child, this.#timing.stopTimeoutMs);
@@ -454,9 +459,11 @@ export class T3ManagedRuntime {
     // Anything T3 left behind in its group belongs to a dead server.
     signalProcessGroup(child.process.pid, "SIGKILL");
     this.#child = undefined;
-    this.#recovering = this.#recover().finally(() => {
-      this.#recovering = undefined;
+    // A crash right after a restart's launch starts a new recovery before the old one settles.
+    const recovering: Promise<void> = this.#recover().finally(() => {
+      if (this.#recovering === recovering) this.#recovering = undefined;
     });
+    this.#recovering = recovering;
   }
 
   async #recover(): Promise<void> {
@@ -480,7 +487,6 @@ export class T3ManagedRuntime {
       this.#restarts += 1;
       try {
         await this.#launch();
-        this.#setState("ready");
         this.#log("info", "t3.runtime.restarted", `pid ${this.#child?.process.pid} after ${delay} ms backoff`, this.#restarts);
         return;
       } catch (error) {

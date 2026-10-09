@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import type { ServiceLogRecord } from "../src/service.ts";
-import { T3ProtocolMismatchError, T3ServerVersionMismatchError } from "../src/t3/protocol.ts";
+import { type EnvironmentFetch, T3ProtocolMismatchError, T3ServerVersionMismatchError } from "../src/t3/protocol.ts";
 import {
   defaultT3Spawn,
   isManagedServeCommand,
@@ -317,6 +317,52 @@ describe("managed T3 supervisor", () => {
     const late: Error[] = [];
     runtime.onFatal((error) => late.push(error));
     expect(late).toEqual([fatal[0] as Error]);
+  });
+
+  /** A real descriptor fetch that, while armed, SIGKILLs T3 once its answer is in hand (dies mid-readiness). */
+  function killingFetch(target: () => T3ManagedRuntime): { armed: boolean; readonly fetch: EnvironmentFetch } {
+    const control = {
+      armed: false,
+      fetch: (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+        const response = await fetch(input, init);
+        if (control.armed) {
+          control.armed = false;
+          const runtime = target();
+          const pid = runtime.status().pid ?? 0;
+          process.kill(pid, "SIGKILL");
+          await eventually(() => runtime.status().pid === undefined);
+        }
+        return response;
+      }) as unknown as EnvironmentFetch,
+    };
+    return control;
+  }
+
+  test("a child that dies while readiness is being confirmed fails start instead of reporting ready", async () => {
+    const h = await harness();
+    let runtime: T3ManagedRuntime | undefined;
+    const killer = killingFetch(() => runtime as T3ManagedRuntime);
+    killer.armed = true;
+    runtime = h.runtime({ fetch: killer.fetch });
+    const error = await runtime.start().catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(T3StartupError);
+    expect((error as Error).message).toContain("before becoming ready");
+    expect(runtime.status().state).toBe("stopped");
+  });
+
+  test("a replacement that dies while readiness is being confirmed is retried, not left as a dead ready", async () => {
+    const h = await harness();
+    let runtime: T3ManagedRuntime | undefined;
+    const killer = killingFetch(() => runtime as T3ManagedRuntime);
+    runtime = h.runtime({ fetch: killer.fetch, sleep: async () => Bun.sleep(1) });
+    await runtime.start();
+    killer.armed = true;
+    const first = runtime.status().pid ?? 0;
+    process.kill(first, "SIGKILL");
+    await eventually(() => runtime.status().state === "ready" && runtime.status().pid !== undefined && runtime.status().pid !== first);
+    expect(alive(runtime.status().pid ?? 0)).toBe(true);
+    expect(runtime.status().restarts).toBe(2);
+    expect(h.logs.map((record) => record.event)).toContain("t3.runtime.restart_failed");
   });
 
   test("a restart that hits a protocol change fails instead of looping", async () => {
