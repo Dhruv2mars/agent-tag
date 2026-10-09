@@ -64,6 +64,8 @@ const SESSION_EXPIRY_MARGIN_MS = 60_000;
 const TOKEN_STAT_INTERVAL_MS = 5_000;
 const RECONNECT_BASE_MS = 250;
 const RECONNECT_MAX_MS = 10_000;
+/** Deadline for shared work (session inspect, ticket and socket setup) that no single caller's signal bounds. */
+const SHARED_REQUEST_TIMEOUT_MS = 30_000;
 
 export class T3ConnectionClosedError extends Error {
   constructor() {
@@ -149,6 +151,7 @@ export class T3Connection {
   readonly #config: T3ConnectionConfig;
   readonly #logger: ServiceLogger | undefined;
   readonly #now: () => Date;
+  readonly #sharedTimeoutMs: number;
   #session: LoadedSession | null = null;
   #sessionCheck: Promise<LoadedSession> | null = null;
   #tokenCheckedAt = 0;
@@ -159,10 +162,22 @@ export class T3Connection {
   /** Aborted by close(), so a pending connect stops instead of opening a socket nobody will close. */
   readonly #closing = new AbortController();
 
-  constructor(input: { readonly config: T3ConnectionConfig; readonly logger?: ServiceLogger; readonly now?: () => Date }) {
+  constructor(input: {
+    readonly config: T3ConnectionConfig;
+    readonly logger?: ServiceLogger;
+    readonly now?: () => Date;
+    /** Test seam; defaults to 30 s. */
+    readonly sharedTimeoutMs?: number;
+  }) {
     this.#config = { baseUrl: input.config.baseUrl, tokenFile: input.config.tokenFile };
     this.#logger = input.logger;
     this.#now = input.now ?? (() => new Date());
+    this.#sharedTimeoutMs = input.sharedTimeoutMs ?? SHARED_REQUEST_TIMEOUT_MS;
+  }
+
+  /** Aborts on close() or when shared work outlives its deadline, so a hung T3 request cannot wedge every caller. */
+  #sharedSignal(): AbortSignal {
+    return AbortSignal.any([this.#closing.signal, AbortSignal.timeout(this.#sharedTimeoutMs)]);
   }
 
   /** The token and its checked restricted session; re-read and re-inspected only when stale. */
@@ -209,7 +224,7 @@ export class T3Connection {
     }
     if (this.#session === cached) this.#session = null;
     // The shared load is not tied to any one caller's signal; close() aborts it.
-    return this.#loadSession(this.#closing.signal);
+    return this.#loadSession(this.#sharedSignal());
   }
 
   async #loadSession(signal: AbortSignal | undefined) {
@@ -331,13 +346,13 @@ export class T3Connection {
     return raceAbort(this.#connecting, signal);
   }
 
-  /** Shared by every waiting caller, so only close() cancels it; each caller's signal ends its own wait. */
+  /** Shared by every waiting caller, so only close() or its deadline cancels it; each caller's signal ends its own wait. */
   async #connect(): Promise<Generation> {
-    const signal = this.#closing.signal;
     if (this.#failures > 0) {
       const ceiling = Math.min(RECONNECT_MAX_MS, RECONNECT_BASE_MS * 2 ** (this.#failures - 1));
-      await abortableDelay(Math.round(ceiling / 2 + Math.random() * (ceiling / 2)), signal);
+      await abortableDelay(Math.round(ceiling / 2 + Math.random() * (ceiling / 2)), this.#closing.signal);
     }
+    const signal = this.#sharedSignal();
     try {
       let ticketToken: SecretString | undefined;
       const url = await this.#withSession(signal, (token) => {
@@ -370,7 +385,7 @@ export class T3Connection {
       this.#log("info", this.stats.wsConnects === 1 ? "t3.connection.opened" : "t3.connection.reconnect");
       return generation;
     } catch (error) {
-      if (!signal?.aborted) this.#failures += 1;
+      if (!this.#closed) this.#failures += 1;
       throw error;
     }
   }

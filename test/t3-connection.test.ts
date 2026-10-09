@@ -201,6 +201,22 @@ describe("T3Connection", () => {
     }
   });
 
+  test("a hung ticket request times out instead of wedging every later caller", async () => {
+    const bounded = new T3Connection({ config: fake.config, now: () => new Date(clock), sharedTimeoutMs: 50 });
+    try {
+      let releaseTicket = () => {};
+      fake.ticketGate = new Promise((resolve) => {
+        releaseTicket = resolve;
+      });
+      await expect(bounded.dispatch(interrupt("command-1"))).rejects.toBeDefined();
+      fake.ticketGate = null;
+      releaseTicket();
+      expect(await bounded.dispatch(interrupt("command-2"))).toEqual({ sequence: 1 });
+    } finally {
+      await bounded.close();
+    }
+  });
+
   test("close() during a pending connect leaves no socket open", async () => {
     let releaseTicket = () => {};
     fake.ticketGate = new Promise((resolve) => {

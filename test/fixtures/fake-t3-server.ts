@@ -62,6 +62,8 @@ export async function startFakeT3(): Promise<FakeT3> {
   const authorized = (request: Request) => request.headers.get("authorization") === `Bearer ${fake.acceptedToken}`;
 
   const server = Bun.serve({
+    // Bound to loopback only: on macOS a wildcard bind lets another process take 127.0.0.1 on the same port.
+    hostname: "127.0.0.1",
     port: 0,
     async fetch(request, server) {
       const url = new URL(request.url);
