@@ -6,8 +6,10 @@ import { join } from "node:path";
 import { agentTagConfigSchema } from "../src/config.ts";
 import { AgentTagCoordinator, type T3CoordinatorGateway } from "../src/coordinator.ts";
 import { AgentTagStore } from "../src/store/store.ts";
+import { T3Connection } from "../src/t3/connection.ts";
 import type { T3ThreadSnapshot } from "../src/t3/gateway.ts";
 import {
+  protocolV1Source,
   ThreadWatcher,
   type NormalizedThreadItem,
   type ThreadEventSource,
@@ -15,6 +17,7 @@ import {
   type ThreadWatch,
   type ThreadWatchSource,
 } from "../src/t3/watcher.ts";
+import { startFakeT3, type FakeT3 } from "./fixtures/fake-t3-server.ts";
 
 const start = "2026-10-09T00:00:00.000Z";
 const config = agentTagConfigSchema.parse({
@@ -415,5 +418,78 @@ describe("coordinator wait loop with a thread watcher", () => {
       expect(await coordinator.processNext(controller.signal)).toMatchObject({ kind: "released" });
       expect(released).toBe(1);
     });
+  });
+
+  test("cuts per-turn T3 HTTP and WebSocket requests by more than 90% against the one-shot gateway (Done 8)", async () => {
+    // Done 8's 60 s turn with 500 ms polls and 15 s safety polls, run 50 times faster: 1.2 s, 10 ms, 300 ms.
+    const turnMs = 1_200;
+    async function runTurn(fake: FakeT3, watched: boolean): Promise<FakeT3["counts"]> {
+      let sequence = 10;
+      let startedAt = Number.POSITIVE_INFINITY;
+      let threadId = "";
+      let messageId = "";
+      const timers: Array<ReturnType<typeof setTimeout>> = [];
+      const push = (type: string, payload: unknown) => {
+        sequence += 1;
+        fake.push(threadId, {
+          kind: "event",
+          event: { sequence, eventId: `event-${sequence}`, type, occurredAt: start, commandId: null, correlationId: null, payload },
+        });
+      };
+      fake.dispatchSequence = () => {
+        const command = fake.dispatched.at(-1) as { type: string; threadId: string; message: { messageId: string } };
+        if (command.type === "thread.turn.start" && startedAt === Number.POSITIVE_INFINITY) {
+          startedAt = Date.now();
+          threadId = command.threadId;
+          messageId = command.message.messageId;
+          timers.push(setTimeout(() => push("thread.session-set", { session: { status: "running", activeTurnId: "turn-1" } }), 100));
+          for (let at = 200; at < turnMs; at += 100) timers.push(setTimeout(() => push("thread.message-sent", { streaming: true, turnId: "turn-1" }), at));
+          timers.push(setTimeout(() => push("thread.message-sent", { streaming: false, turnId: "turn-1" }), turnMs));
+        }
+        return sequence;
+      };
+      fake.snapshot = () =>
+        snapshot({ threadId, messageId, state: Date.now() - startedAt >= turnMs ? "completed" : "running", snapshotSequence: sequence });
+      const turnConfig = { ...config, t3: { ...config.t3, ...fake.config } };
+      const connection = watched ? new T3Connection({ config: turnConfig.t3 }) : null;
+      const watcher = connection === null ? null : new ThreadWatcher({ source: protocolV1Source(connection), lingerMs: 0 });
+      try {
+        await withStore(async (store) => {
+          const coordinator = new AgentTagCoordinator({
+            config: turnConfig,
+            store,
+            ...(connection === null ? {} : { t3: connection }),
+            ...(watcher === null ? {} : { watcher }),
+            pollMs: 10,
+            safetyPollMs: 300,
+            workerId: "worker-a",
+          });
+          expect(await coordinator.processNext()).toMatchObject({ kind: "completed" });
+        });
+      } finally {
+        for (const timer of timers) clearTimeout(timer);
+        await watcher?.close();
+        await connection?.close();
+      }
+      return structuredClone(fake.counts);
+    }
+
+    const total = (counts: FakeT3["counts"]) => counts.session + counts.tickets + counts.snapshots + counts.wsConnects;
+    const baselineFake = await startFakeT3();
+    const watchedFake = await startFakeT3();
+    try {
+      const baseline = await runTurn(baselineFake, false);
+      const watched = await runTurn(watchedFake, true);
+      // One-shot: a session inspect per snapshot read and per dispatch, a ticket and socket per dispatch.
+      expect(baseline.snapshots).toBeGreaterThan(50);
+      expect(baseline.session).toBeGreaterThan(baseline.snapshots);
+      expect(watched).toMatchObject({ session: 1, tickets: 1, wsConnects: 1 });
+      // The first read, the session-set wake, the final-message wake, and the 300 ms safety polls between.
+      expect(watched.snapshots).toBeLessThanOrEqual(8);
+      expect(total(watched)).toBeLessThan(total(baseline) * 0.1);
+    } finally {
+      await baselineFake.stop();
+      await watchedFake.stop();
+    }
   });
 });
