@@ -154,6 +154,8 @@ export class SlackEventRouter {
       text,
       receivedAt,
       sourceOrderKey: event.ts,
+      messageTs: event.ts,
+      origin: "slack",
     });
     return { kind: receipt.kind, receipt };
   }
