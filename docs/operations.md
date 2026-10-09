@@ -298,7 +298,7 @@ By default Agent Tag keeps Slack message text, outbox payloads, and audit rows f
 
 Every field is optional. A missing field keeps that data forever.
 
-- `messageDays` replaces the stored Slack event text with `[pruned]` once the event is older than the window. It does the same for the turn text (and resolved turn text) of operations that settled before the window. Pending and in-flight operations keep their text so they can still run. Schedules that ended (cancelled, auto-disabled or completed) before the window get the same treatment for their prompt; active schedules keep it.
+- `messageDays` replaces the stored Slack event text with `[pruned]` once the event is older than the window. It does the same for the turn text (and resolved turn text) of operations that settled before the window. Pending and in-flight operations keep their text so they can still run. Schedules that ended (cancelled, auto-disabled or completed) before the window get the same treatment for their prompt; active schedules keep it. Thread updates that a turn already consumed have their text replaced the same way; updates still pending past the window are deleted.
 - `outboxDays` replaces the payload of delivered or failed Slack replies with `{"text":"[pruned]"}` once they settled before the window. Rows quarantined as `delivery-outcome-unknown` keep their payload, because an operator must reconcile them first.
 - `auditDays` deletes audit rows older than the window.
 
