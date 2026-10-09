@@ -122,6 +122,43 @@ describe("T3Connection", () => {
     expect(fake.counts.rpc["orchestration.dispatchCommand"]).toBe(1);
   });
 
+  test("concurrent RPCs after a rotation to a rejected token all fail; none reaches the old socket", async () => {
+    await connection.dispatch(interrupt("command-1"));
+    fake.scopes = ["orchestration:read", "orchestration:operate", "access:write"];
+    await utimes(fake.tokenFile, new Date(clock + 10_000), new Date(clock + 10_000));
+    clock += 6_000;
+
+    const results = await Promise.allSettled(
+      Array.from({ length: 5 }, (_, index) => connection.dispatch(interrupt(`command-concurrent-${index}`))),
+    );
+    expect(results.map((result) => result.status)).toEqual(Array(5).fill("rejected"));
+    expect(fake.counts.rpc["orchestration.dispatchCommand"]).toBe(1);
+    expect(fake.counts.session).toBe(2);
+  });
+
+  test("concurrent RPCs after a valid rotation share one re-inspect and one new socket", async () => {
+    await connection.dispatch(interrupt("command-1"));
+    fake.acceptedToken = "rotated-token";
+    await fake.writeToken("rotated-token");
+    await utimes(fake.tokenFile, new Date(clock + 10_000), new Date(clock + 10_000));
+    clock += 6_000;
+
+    await Promise.all(Array.from({ length: 5 }, (_, index) => connection.dispatch(interrupt(`command-concurrent-${index}`))));
+    expect(fake.counts).toMatchObject({ session: 2, tickets: 2, wsConnects: 2 });
+    expect(fake.counts.rpc["orchestration.dispatchCommand"]).toBe(6);
+  });
+
+  test("an aborted caller does not abort a session check other callers share", async () => {
+    await connection.session();
+    clock += 6_000;
+    const controller = new AbortController();
+    const aborted = connection.session(controller.signal);
+    const shared = connection.session();
+    controller.abort();
+    await expect(aborted).rejects.toBeDefined();
+    await expect(shared).resolves.toBeDefined();
+  });
+
   test("close() during a pending connect leaves no socket open", async () => {
     let releaseTicket = () => {};
     fake.ticketGate = new Promise((resolve) => {

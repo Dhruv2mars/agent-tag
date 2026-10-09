@@ -43,6 +43,12 @@ interface Generation {
   readonly token: SecretString;
 }
 
+interface LoadedSession {
+  readonly token: SecretString;
+  readonly session: T3Session;
+  readonly mtimeMs: number;
+}
+
 /** Request counters since the connection was created; `t3.connection.stats` logs them. */
 export interface T3ConnectionStats {
   sessionInspects: number;
@@ -100,6 +106,26 @@ function abortableDelay(milliseconds: number, signal: AbortSignal | undefined): 
   });
 }
 
+/** Settles with `promise`, or rejects when `signal` aborts first; the shared work keeps running. */
+function raceAbort<A>(promise: Promise<A>, signal: AbortSignal | undefined): Promise<A> {
+  if (signal === undefined) return promise;
+  if (signal.aborted) return Promise.reject(signal.reason);
+  return new Promise<A>((resolve, reject) => {
+    const onAbort = () => reject(signal.reason);
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
+  });
+}
+
 function abortEffect(signal: AbortSignal): Effect.Effect<void> {
   return Effect.callback<void>((resume) => {
     if (signal.aborted) {
@@ -123,8 +149,8 @@ export class T3Connection {
   readonly #config: T3ConnectionConfig;
   readonly #logger: ServiceLogger | undefined;
   readonly #now: () => Date;
-  #session: { readonly token: SecretString; readonly session: T3Session; readonly mtimeMs: number } | null = null;
-  #sessionLoad: Promise<{ readonly token: SecretString; readonly session: T3Session; readonly mtimeMs: number }> | null = null;
+  #session: LoadedSession | null = null;
+  #sessionCheck: Promise<LoadedSession> | null = null;
   #tokenCheckedAt = 0;
   #generation: Generation | null = null;
   #connecting: Promise<Generation> | null = null;
@@ -144,25 +170,43 @@ export class T3Connection {
     this.#assertOpen();
     const cached = this.#session;
     const nowMs = this.#now().getTime();
-    if (cached !== null) {
-      let fresh = Date.parse(cached.session.expiresAt) - SESSION_EXPIRY_MARGIN_MS > nowMs;
-      if (fresh && nowMs - this.#tokenCheckedAt >= TOKEN_STAT_INTERVAL_MS) {
-        this.#tokenCheckedAt = nowMs;
-        const mtimeMs = await stat(this.#config.tokenFile).then((metadata) => metadata.mtimeMs, () => Number.NaN);
-        if (mtimeMs !== cached.mtimeMs) fresh = false;
-      }
-      if (fresh) return cached;
-      if (this.#session === cached) this.#session = null;
+    if (
+      cached !== null &&
+      this.#sessionCheck === null &&
+      Date.parse(cached.session.expiresAt) - SESSION_EXPIRY_MARGIN_MS > nowMs &&
+      nowMs - this.#tokenCheckedAt < TOKEN_STAT_INTERVAL_MS
+    ) {
+      return cached;
     }
-    this.#sessionLoad ??= this.#loadSession(signal).finally(() => {
-      this.#sessionLoad = null;
-    });
-    return this.#sessionLoad;
+    // Concurrent callers share one freshness check, so none returns the old session while a rotated
+    // token is still being validated.
+    if (this.#sessionCheck === null) {
+      const check: Promise<LoadedSession> = this.#checkSession().finally(() => {
+        if (this.#sessionCheck === check) this.#sessionCheck = null;
+      });
+      this.#sessionCheck = check;
+    }
+    return raceAbort(this.#sessionCheck, signal);
   }
 
   /** Drops the cached session so the next call re-reads the token file and re-inspects it. */
   invalidateSession(): void {
     this.#session = null;
+    this.#sessionCheck = null;
+  }
+
+  async #checkSession(): Promise<LoadedSession> {
+    const cached = this.#session;
+    if (cached !== null && Date.parse(cached.session.expiresAt) - SESSION_EXPIRY_MARGIN_MS > this.#now().getTime()) {
+      const mtimeMs = await stat(this.#config.tokenFile).then((metadata) => metadata.mtimeMs, () => Number.NaN);
+      if (mtimeMs === cached.mtimeMs) {
+        this.#tokenCheckedAt = this.#now().getTime();
+        return cached;
+      }
+    }
+    if (this.#session === cached) this.#session = null;
+    // The shared load is not tied to any one caller's signal; close() aborts it.
+    return this.#loadSession(this.#closing.signal);
   }
 
   async #loadSession(signal: AbortSignal | undefined) {
