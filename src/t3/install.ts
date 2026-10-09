@@ -119,7 +119,7 @@ async function exists(path: string): Promise<boolean> {
   );
 }
 
-async function ensurePrivateDirectory(path: string): Promise<void> {
+export async function ensurePrivateDirectory(path: string): Promise<void> {
   await mkdir(path, { recursive: true, mode: 0o700 });
   const metadata = await stat(path);
   if (!metadata.isDirectory()) throw new Error(`T3 runtime path is not a directory: ${path}`);
