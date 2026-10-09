@@ -38,6 +38,10 @@ export interface FakeT3 {
   scopes: string[];
   /** The only bearer token the server accepts. */
   acceptedToken: string;
+  /** When set, ticket responses wait for it, so tests can act while a connect is in flight. */
+  ticketGate: Promise<void> | null;
+  /** WebSockets currently open on the server side. */
+  readonly openSockets: number;
   /** Pushes a stream item to every open subscription of the thread. */
   push(threadId: string, item: unknown): void;
   /** Closes every WebSocket abruptly. */
@@ -59,7 +63,7 @@ export async function startFakeT3(): Promise<FakeT3> {
 
   const server = Bun.serve({
     port: 0,
-    fetch(request, server) {
+    async fetch(request, server) {
       const url = new URL(request.url);
       if (url.pathname === "/api/auth/session") {
         counts.session += 1;
@@ -74,6 +78,7 @@ export async function startFakeT3(): Promise<FakeT3> {
       if (url.pathname === "/api/auth/websocket-ticket") {
         counts.tickets += 1;
         if (!authorized(request)) return new Response("unauthorized", { status: 401 });
+        await fake.ticketGate;
         const ticket = `ticket-${counts.tickets}`;
         tickets.add(ticket);
         return Response.json({ ticket, expiresAt: "2099-01-01T00:00:00.000Z" });
@@ -154,6 +159,10 @@ export async function startFakeT3(): Promise<FakeT3> {
     dispatchSequence: () => 1,
     scopes: ["orchestration:read", "orchestration:operate"],
     acceptedToken: "fixture-token",
+    ticketGate: null,
+    get openSockets() {
+      return sockets.size;
+    },
     push(threadId, item) {
       for (const subscription of fake.subscriptions) {
         if (subscription.threadId !== threadId) continue;

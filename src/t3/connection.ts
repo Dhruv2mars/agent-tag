@@ -39,6 +39,8 @@ type Client = RpcClient.FromGroup<typeof rpcGroup, RpcClientError>;
 interface Generation {
   readonly client: Client;
   readonly scope: Scope.Closeable;
+  /** The token its ticket was minted with; a rotated token retires the socket. */
+  readonly token: SecretString;
 }
 
 /** Request counters since the connection was created; `t3.connection.stats` logs them. */
@@ -128,6 +130,8 @@ export class T3Connection {
   #connecting: Promise<Generation> | null = null;
   #failures = 0;
   #closed = false;
+  /** Aborted by close(), so a pending connect stops instead of opening a socket nobody will close. */
+  readonly #closing = new AbortController();
 
   constructor(input: { readonly config: T3ConnectionConfig; readonly logger?: ServiceLogger; readonly now?: () => Date }) {
     this.#config = { baseUrl: input.config.baseUrl, tokenFile: input.config.tokenFile };
@@ -233,6 +237,8 @@ export class T3Connection {
   async close(): Promise<void> {
     if (this.#closed) return;
     this.#closed = true;
+    this.#closing.abort();
+    await this.#connecting?.catch(() => undefined);
     const generation = this.#generation;
     this.#generation = null;
     this.#session = null;
@@ -243,7 +249,9 @@ export class T3Connection {
   }
 
   async #rpc<A, E>(signal: AbortSignal | undefined, call: (client: Client) => Effect.Effect<A, E>): Promise<A> {
-    const generation = await this.#client(signal);
+    // Checks the session first (expiry, token mtime), so a rotated token is validated before any command.
+    const { token } = await this.session(signal);
+    const generation = await this.#client(token, signal);
     this.stats.rpcCalls += 1;
     try {
       const result = await Effect.runPromise(call(generation.client), signalOption(signal));
@@ -256,25 +264,36 @@ export class T3Connection {
     }
   }
 
-  #client(signal: AbortSignal | undefined): Promise<Generation> {
+  #client(token: SecretString, signal: AbortSignal | undefined): Promise<Generation> {
     this.#assertOpen();
-    if (this.#generation !== null) return Promise.resolve(this.#generation);
+    const current = this.#generation;
+    if (current !== null && current.token.exposeToBoundary() !== token.exposeToBoundary()) {
+      this.#generation = null;
+      this.#log("info", "t3.connection.rotated");
+      void Effect.runPromise(Scope.close(current.scope, Exit.void)).catch(() => undefined);
+    } else if (current !== null) {
+      return Promise.resolve(current);
+    }
     this.#connecting ??= this.#connect(signal).finally(() => {
       this.#connecting = null;
     });
     return this.#connecting;
   }
 
-  async #connect(signal: AbortSignal | undefined): Promise<Generation> {
+  async #connect(callerSignal: AbortSignal | undefined): Promise<Generation> {
+    const signal = callerSignal === undefined ? this.#closing.signal : AbortSignal.any([callerSignal, this.#closing.signal]);
     if (this.#failures > 0) {
       const ceiling = Math.min(RECONNECT_MAX_MS, RECONNECT_BASE_MS * 2 ** (this.#failures - 1));
       await abortableDelay(Math.round(ceiling / 2 + Math.random() * (ceiling / 2)), signal);
     }
     try {
+      let ticketToken: SecretString | undefined;
       const url = await this.#withSession(signal, (token) => {
         this.stats.wsTickets += 1;
-        return issueT3WebSocketUrl({ baseUrl: this.#config.baseUrl, token, ...signalOption(signal) });
+        ticketToken = token;
+        return issueT3WebSocketUrl({ baseUrl: this.#config.baseUrl, token, signal });
       });
+      this.#assertOpen();
       const scope = await Effect.runPromise(Scope.make());
       const client = await Effect.runPromise(
         // The protocol layer is built into the generation's scope: `Effect.provide(layer)` alone would
@@ -283,12 +302,16 @@ export class T3Connection {
           Effect.flatMap((context) => RpcClient.make(rpcGroup).pipe(Effect.provide(context))),
           Scope.provide(scope),
         ),
+        { signal },
       ).catch(async (error: unknown) => {
         await Effect.runPromise(Scope.close(scope, Exit.void));
         throw error;
       });
-      this.#assertOpen();
-      const generation = { client, scope };
+      if (this.#closed || ticketToken === undefined) {
+        await Effect.runPromise(Scope.close(scope, Exit.void));
+        throw new T3ConnectionClosedError();
+      }
+      const generation = { client, scope, token: ticketToken };
       this.#generation = generation;
       this.stats.wsConnects += 1;
       // Never log the URL: it carries the single-use ticket.

@@ -106,7 +106,7 @@ With `t3.watch.enabled`, coordinators subscribe to each running T3 thread's even
 | `safetyPollMs` | `15000` (1000–60000) | Longest wait between snapshot reads while a turn runs, even if no event arrives. Also capped at half the lease and at the stall deadline. If the stream dies, turns still settle at this cadence. |
 | `lingerMs` | `30000` (0–600000) | How long a thread's subscription stays open after its turn ends, so a follow-up turn reuses it. |
 
-Every 60 s the service logs `t3.connection.stats` with the counters `sessionInspects`, `wsTickets`, `wsConnects`, `snapshotFetches`, `rpcCalls`, and `watchedThreads`. Other connection events are `t3.connection.opened`, `t3.connection.reconnect`, `t3.connection.lost`, and `t3.connection.closed`; watch events are `t3.watch.subscribed`, `t3.watch.ended`, `t3.watch.failed`, `t3.watch.resync`, and `t3.watch.released`. Logs never contain the token or the WebSocket ticket URL.
+Every 60 s the service logs `t3.connection.stats` with the counters `sessionInspects`, `wsTickets`, `wsConnects`, `snapshotFetches`, `rpcCalls`, and `watchedThreads`. Other connection events are `t3.connection.opened`, `t3.connection.reconnect`, `t3.connection.lost`, `t3.connection.rotated` (the token file changed, so the socket is replaced after the new token passes inspection), and `t3.connection.closed`; watch events are `t3.watch.subscribed`, `t3.watch.ended`, `t3.watch.failed`, `t3.watch.resync`, and `t3.watch.released`. Logs never contain the token or the WebSocket ticket URL.
 
 ## Background service
 

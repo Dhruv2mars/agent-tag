@@ -99,6 +99,46 @@ describe("T3Connection", () => {
     expect(fake.counts).toMatchObject({ session: 2, snapshots: 1 });
   });
 
+  test("a rotated token is re-inspected before the next RPC and retires the socket it opened", async () => {
+    await connection.dispatch(interrupt("command-1"));
+    fake.acceptedToken = "rotated-token";
+    await fake.writeToken("rotated-token");
+    await utimes(fake.tokenFile, new Date(clock + 10_000), new Date(clock + 10_000));
+    clock += 6_000;
+
+    expect(await connection.dispatch(interrupt("command-2"))).toEqual({ sequence: 1 });
+    expect(fake.counts).toMatchObject({ session: 2, tickets: 2, wsConnects: 2 });
+    expect(logs.map((record) => record.event)).toEqual(["t3.connection.opened", "t3.connection.rotated", "t3.connection.reconnect"]);
+    await eventually(() => fake.openSockets === 1);
+  });
+
+  test("a rotated token that fails inspection blocks RPCs on the already-open socket", async () => {
+    await connection.dispatch(interrupt("command-1"));
+    fake.scopes = ["orchestration:read", "orchestration:operate", "access:write"];
+    await utimes(fake.tokenFile, new Date(clock + 10_000), new Date(clock + 10_000));
+    clock += 6_000;
+
+    await expect(connection.dispatch(interrupt("command-2"))).rejects.toThrow("extra=access:write");
+    expect(fake.counts.rpc["orchestration.dispatchCommand"]).toBe(1);
+  });
+
+  test("close() during a pending connect leaves no socket open", async () => {
+    let releaseTicket = () => {};
+    fake.ticketGate = new Promise((resolve) => {
+      releaseTicket = resolve;
+    });
+    const dispatched = connection.dispatch(interrupt("command-1"));
+    await eventually(() => fake.counts.tickets === 1);
+
+    const closed = connection.close();
+    releaseTicket();
+    await closed;
+    await expect(dispatched).rejects.toBeDefined();
+    await Bun.sleep(50);
+    expect(fake.openSockets).toBe(0);
+    expect(fake.counts.rpc["orchestration.dispatchCommand"]).toBeUndefined();
+  });
+
   test("a session is re-inspected before it expires", async () => {
     await connection.session();
     clock = Date.parse("2099-01-01T00:00:00.000Z") - 30_000;
