@@ -166,6 +166,123 @@ describe("Agent Tag config", () => {
       }),
     ).toThrow("route conversation ids must be unique");
   });
+
+  describe("model policy", () => {
+    type Input = Record<string, any>;
+    const withModels = (profile: Input = {}, route: Input = {}): Input => {
+      const input: Input = structuredClone(baseConfig);
+      Object.assign(input.profiles[0], profile);
+      Object.assign(input.routes[0], route);
+      return input;
+    };
+    const issues = (input: Input): ReadonlyArray<{ readonly path: string; readonly message: string }> => {
+      const result = agentTagConfigSchema.safeParse(input);
+      if (result.success) return [];
+      return result.error.issues.map((issue) => ({ path: issue.path.join("."), message: issue.message }));
+    };
+    const opus = { instanceId: "claudeAgent", model: "claude-opus-5-5", label: "Opus 5.5", aliases: ["opus"] };
+    const mini = { instanceId: "codex", model: "gpt-5.6-mini", aliases: ["mini"] };
+
+    test("a config without the new keys parses with defaults that allow only the default model", () => {
+      const parsed = agentTagConfigSchema.parse(baseConfig);
+      expect(parsed.profiles[0]!.allowedModels).toEqual([]);
+      expect(parsed.profiles[0]!.modelSwitch).toEqual({ enabled: true, crossProvider: "before-first-turn" });
+      expect(parsed.routes[0]!.defaultModel).toBeUndefined();
+      // Defaults round-trip: parsing the parsed config is a fixed point.
+      expect(agentTagConfigSchema.parse(JSON.parse(JSON.stringify(parsed)))).toEqual(parsed);
+    });
+
+    test("the shipped example config parses with its codex and claudeAgent allowlist entries", async () => {
+      const example = await Bun.file(new URL("../config/agent-tag.example.json", import.meta.url)).json();
+      const parsed = agentTagConfigSchema.parse(example);
+      expect(parsed.profiles[0]!.allowedModels).toEqual([
+        { instanceId: "codex", model: "gpt-5.6-mini", label: "GPT-5.6 mini", aliases: ["mini"] },
+        { instanceId: "claudeAgent", model: "claude-opus-5-5", label: "Opus 5.5", aliases: ["opus"] },
+      ]);
+      expect(parsed.profiles[0]!.modelSwitch).toEqual({ enabled: true, crossProvider: "before-first-turn" });
+    });
+
+    test("accepts allowed models, aliases, labels and a route default from the allowed set", () => {
+      const parsed = agentTagConfigSchema.parse(
+        withModels(
+          { allowedModels: [opus, mini], modelSwitch: { crossProvider: "deny" } },
+          { defaultModel: { instanceId: "claudeAgent", model: "claude-opus-5-5" } },
+        ),
+      );
+      expect(parsed.profiles[0]!.allowedModels).toEqual([opus, { ...mini }]);
+      expect(parsed.profiles[0]!.modelSwitch).toEqual({ enabled: true, crossProvider: "deny" });
+      expect(parsed.routes[0]!.defaultModel).toEqual({ instanceId: "claudeAgent", model: "claude-opus-5-5" });
+      // The profile default may be listed to give it a label and aliases.
+      expect(issues(withModels({ allowedModels: [{ instanceId: "codex", model: "gpt-5.6-sol", label: "Sol", aliases: ["sol"] }] }))).toEqual([]);
+      // A route default may equal the profile default.
+      expect(issues(withModels({}, { defaultModel: { instanceId: "codex", model: "gpt-5.6-sol" } }))).toEqual([]);
+      // A label may repeat the entry's own alias.
+      expect(issues(withModels({ allowedModels: [{ ...opus, label: "OPUS" }] }))).toEqual([]);
+    });
+
+    test("rejects malformed entries", () => {
+      for (const entry of [
+        { instanceId: "claude agent", model: "x" },
+        { instanceId: "codex", model: "" },
+        { instanceId: "codex", model: "x", aliases: ["Upper"] },
+        { instanceId: "codex", model: "x", aliases: ["has space"] },
+        { instanceId: "codex", model: "x", label: " " },
+        { instanceId: "codex", model: "x", label: "x".repeat(41) },
+        { instanceId: "codex", model: "x", provider: "codex" },
+        { instanceId: "codex", model: "x", aliases: Array.from({ length: 9 }, (_, index) => `a${index}`) },
+      ]) {
+        expect(issues(withModels({ allowedModels: [entry] })).length).toBeGreaterThan(0);
+      }
+      const tooMany = Array.from({ length: 21 }, (_, index) => ({ instanceId: "codex", model: `m${index}` }));
+      expect(issues(withModels({ allowedModels: tooMany })).length).toBeGreaterThan(0);
+      expect(issues(withModels({ modelSwitch: { crossProvider: "restart-session" } })).length).toBeGreaterThan(0);
+      expect(issues(withModels({ modelSwitch: { enabled: true, extra: 1 } })).length).toBeGreaterThan(0);
+      expect(issues(withModels({}, { defaultModel: { instanceId: "codex" } })).length).toBeGreaterThan(0);
+    });
+
+    test("rejects duplicate entries, names and slug collisions with precise paths", () => {
+      expect(issues(withModels({ allowedModels: [mini, { ...mini, aliases: [] }] }))).toEqual([
+        { path: "profiles.0.allowedModels.1", message: "allowedModels entries must be unique" },
+      ]);
+      expect(issues(withModels({ allowedModels: [opus, { ...mini, label: " opus  5.5 " }] }))).toEqual([
+        { path: "profiles.0.allowedModels.1.label", message: "labels and aliases must be unique within a profile" },
+      ]);
+      expect(issues(withModels({ allowedModels: [opus, { ...mini, aliases: ["fast", "opus"] }] }))).toEqual([
+        { path: "profiles.0.allowedModels.1.aliases.1", message: "labels and aliases must be unique within a profile" },
+      ]);
+      // A label in one entry collides with an alias in another, case-insensitively.
+      expect(issues(withModels({ allowedModels: [opus, { ...mini, label: "Mini" }, { instanceId: "codex", model: "o4", label: "MINI" }] }))).toEqual([
+        { path: "profiles.0.allowedModels.2.label", message: "labels and aliases must be unique within a profile" },
+      ]);
+      expect(issues(withModels({ allowedModels: [{ ...mini, aliases: ["mini", "mini"] }] }))).toEqual([
+        { path: "profiles.0.allowedModels.0.aliases.1", message: "aliases must be unique" },
+      ]);
+      expect(issues(withModels({ allowedModels: [opus, { ...mini, aliases: ["claude-opus-5-5"] }] }))).toEqual([
+        { path: "profiles.0.allowedModels.1.aliases.0", message: "alias collides with another model's slug or instance/model" },
+      ]);
+      // The profile default's slug is reserved too.
+      expect(issues(withModels({ allowedModels: [{ ...opus, label: "GPT-5.6-SOL" }] }))).toEqual([
+        { path: "profiles.0.allowedModels.0.label", message: "label collides with another model's slug or instance/model" },
+      ]);
+      // A label equal to another model's `instance/model` would resolve to that model first.
+      expect(issues(withModels({ allowedModels: [{ ...opus, label: "Codex/GPT-5.6-sol" }] }))).toEqual([
+        { path: "profiles.0.allowedModels.0.label", message: "label collides with another model's slug or instance/model" },
+      ]);
+      // Its own qualified name is harmless.
+      expect(issues(withModels({ allowedModels: [{ ...opus, label: "claudeAgent/claude-opus-5-5" }] }))).toEqual([]);
+    });
+
+    test("rejects a route default outside the profile's allowed set, including a provider instance mismatch", () => {
+      const message = "route defaultModel must be the profile default or one of its allowedModels";
+      expect(issues(withModels({ allowedModels: [mini] }, { defaultModel: { instanceId: "claudeAgent", model: "claude-opus-5-5" } })))
+        .toEqual([{ path: "routes.0.defaultModel", message }]);
+      // Same slug on another provider instance is a different model.
+      expect(issues(withModels({ allowedModels: [mini] }, { defaultModel: { instanceId: "codex-work", model: "gpt-5.6-mini" } })))
+        .toEqual([{ path: "routes.0.defaultModel", message }]);
+      expect(issues(withModels({}, { defaultModel: { instanceId: "claudeAgent", model: "gpt-5.6-sol" } })))
+        .toEqual([{ path: "routes.0.defaultModel", message }]);
+    });
+  });
 });
 
 describe("t3 config", () => {

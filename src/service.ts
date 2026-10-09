@@ -3,13 +3,13 @@ import { join } from "node:path";
 import type { AgentTagConfig } from "./config.ts";
 import { AgentTagCoordinator } from "./coordinator.ts";
 import { InteractionWorker } from "./interaction-worker.ts";
-import { validateConfiguredProviders } from "./policy/provider.ts";
+import { type AllowedModelReport, reportAllowedModels, validateConfiguredProviders } from "./policy/provider.ts";
 import { createScheduleWorkers } from "./scheduler.ts";
 import { SlackSocketBridge } from "./slack/bridge.ts";
 import { createRetentionWorker } from "./store/retention.ts";
 import { AgentTagStore } from "./store/store.ts";
 import { createT3GateWorker, T3RuntimeGate } from "./t3/gate.ts";
-import { inspectT3 } from "./t3/gateway.ts";
+import { inspectT3, type T3ServerInfo } from "./t3/gateway.ts";
 import { PINNED_T3 } from "./t3/lock.ts";
 import { prepareManagedT3Binary, T3ManagedRuntime } from "./t3/supervisor.ts";
 
@@ -60,6 +60,9 @@ export interface ServiceLogRecord {
   readonly count?: number;
   /** Redacted, human-readable context (T3 runtime and gate events). */
   readonly detail?: string;
+  readonly profileId?: string;
+  readonly instanceId?: string;
+  readonly model?: string;
 }
 
 export type ServiceLogger = (record: ServiceLogRecord) => void;
@@ -257,6 +260,28 @@ export class AgentTagService {
   }
 }
 
+/**
+ * One warning per allowed model T3 cannot run now. These never block startup: only profile and route
+ * defaults are validated strictly.
+ */
+export function allowedModelLogRecords(
+  config: AgentTagConfig,
+  server: T3ServerInfo,
+  at: string,
+): ReadonlyArray<ServiceLogRecord> {
+  return reportAllowedModels(config, server)
+    .filter((entry) => entry.status !== "available")
+    .map((entry) => ({
+      level: "warn",
+      event: "provider.allowed-model",
+      errorCode: entry.status,
+      profileId: entry.profileId,
+      instanceId: entry.instanceId,
+      model: entry.model,
+      at,
+    }));
+}
+
 export async function createAgentTagService(input: {
   readonly config: AgentTagConfig;
   readonly logger?: ServiceLogger;
@@ -275,7 +300,9 @@ export async function createAgentTagService(input: {
       runtime = new T3ManagedRuntime({ settings: t3.managed, installed, logger, now });
       await runtime.start();
     }
-    validateConfiguredProviders(input.config, await inspectT3(t3));
+    const server = await inspectT3(t3);
+    validateConfiguredProviders(input.config, server);
+    for (const record of allowedModelLogRecords(input.config, server, now().toISOString())) logger(record);
     const gate = new T3RuntimeGate({
       baseUrl: t3.baseUrl,
       ...(runtime === undefined ? {} : { pinnedVersion: PINNED_T3.version }),
@@ -287,11 +314,11 @@ export async function createAgentTagService(input: {
     runtime?.onStateChange((state) => {
       if (state === "ready" || state === "restarting") void gate.check();
     });
-    const bridge = await SlackSocketBridge.create({ config: input.config, store });
+    const bridge = await SlackSocketBridge.create({ config: input.config, store, logger });
     let nextMemoryExpiryAt = 0;
     const coordinators = Array.from(
       { length: input.config.limits.maxConcurrentTasks },
-      () => new AgentTagCoordinator({ config: input.config, store }),
+      () => new AgentTagCoordinator({ config: input.config, store, slackContext: bridge.contextSource }),
     );
     const service = new AgentTagService({
       store,
@@ -343,6 +370,7 @@ export async function diagnoseAgentTag(config: AgentTagConfig): Promise<{
       readonly status: string;
       readonly authenticated: boolean;
     }>;
+    readonly models: ReadonlyArray<AllowedModelReport>;
   };
   readonly slack: { readonly authenticated: true };
 }> {
@@ -363,6 +391,7 @@ export async function diagnoseAgentTag(config: AgentTagConfig): Promise<{
           status: provider.status,
           authenticated: provider.auth.status === "authenticated",
         })),
+        models: reportAllowedModels(config, t3),
       },
       slack: { authenticated: true },
     };
