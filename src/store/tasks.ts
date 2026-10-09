@@ -3,6 +3,7 @@ import type { Database } from "bun:sqlite";
 
 import { z } from "zod";
 
+import { type T3ModelSelection, t3ModelSelectionSchema } from "../t3/gateway.ts";
 import { writeAudit } from "./audit.ts";
 import { type StoreContext, requiredId } from "./context.ts";
 import {
@@ -252,7 +253,8 @@ export function getTaskExecution(database: Database, taskIdInput: string): TaskE
     database
       .query(
         `SELECT task_id, workspace_id, conversation_id, profile_id, repository_root, t3_project_id, t3_thread_id,
-                t3_thread_started_at, conversation_type, owner_user_id, created_at
+                t3_thread_started_at, conversation_type, owner_user_id, created_at, model_selection_json,
+                t3_model_selection_json
          FROM tasks WHERE task_id = ? AND state = 'active'`,
       )
       .get(requiredId(taskIdInput, "taskId")),
@@ -279,7 +281,184 @@ export function getTaskExecution(database: Database, taskIdInput: string): TaskE
     conversationType: row.conversation_type,
     ownerUserId: row.owner_user_id,
     createdAt: row.created_at,
+    desiredModelSelection: storedModelSelection(row.model_selection_json),
+    appliedModelSelection: storedModelSelection(row.t3_model_selection_json),
   };
+}
+
+/**
+ * A stored selection column. Unparseable or invalid JSON reads as NULL (the default) rather than
+ * failing the task; the coordinator re-records the applied selection on the next turn.
+ */
+function storedModelSelection(json: string | null): T3ModelSelection | null {
+  if (json === null) return null;
+  try {
+    const parsed = t3ModelSelectionSchema.safeParse(JSON.parse(json));
+    if (parsed.success) return { instanceId: parsed.data.instanceId, model: parsed.data.model };
+  } catch {
+    // Not JSON: treated as unset.
+  }
+  return null;
+}
+
+function selectionJson(selection: T3ModelSelection | null): string | null {
+  if (selection === null) return null;
+  const parsed = t3ModelSelectionSchema.parse(selection);
+  return JSON.stringify({ instanceId: parsed.instanceId, model: parsed.model });
+}
+
+function selectionMetadata(
+  selection: T3ModelSelection | null,
+  previous: T3ModelSelection | null,
+  code?: string,
+): Record<string, string | null> {
+  return {
+    instanceId: selection?.instanceId ?? null,
+    model: selection?.model ?? null,
+    ...(previous === null ? {} : { previousInstanceId: previous.instanceId, previousModel: previous.model }),
+    ...(code === undefined ? {} : { code }),
+  };
+}
+
+function taskModelRow(database: Database, taskId: string): {
+  readonly desired: T3ModelSelection | null;
+  readonly applied: T3ModelSelection | null;
+  readonly threadId: string;
+} {
+  const row = z.object({
+    model_selection_json: z.string().nullable(),
+    t3_model_selection_json: z.string().nullable(),
+    t3_thread_id: nonEmpty,
+  }).nullable().parse(
+    database
+      .query(
+        `SELECT model_selection_json, t3_model_selection_json, t3_thread_id FROM tasks
+         WHERE task_id = ? AND state = 'active'`,
+      )
+      .get(taskId),
+  );
+  if (row === null) throw new Error("active task not found");
+  return {
+    desired: storedModelSelection(row.model_selection_json),
+    applied: storedModelSelection(row.t3_model_selection_json),
+    threadId: row.t3_thread_id,
+  };
+}
+
+export interface SetTaskModelSelectionInput {
+  readonly taskId: string;
+  /** The selection the user chose; null returns the task to the route or profile default. */
+  readonly selection: T3ModelSelection | null;
+  readonly selectedBy: string;
+  readonly now: string;
+}
+
+/** Records a user's model choice for a task's next turns, audited as `task.model.selected`. */
+export function setTaskModelSelection(database: Database, input: SetTaskModelSelectionInput): void {
+  const taskId = requiredId(input.taskId, "taskId");
+  const selectedBy = requiredId(input.selectedBy, "selectedBy");
+  const now = isoDateTime.parse(input.now);
+  const json = selectionJson(input.selection);
+  database.transaction(() => {
+    const current = taskModelRow(database, taskId);
+    database
+      .query(
+        `UPDATE tasks SET model_selection_json = ?, model_selected_by = ?, model_selected_at = ?, updated_at = ?
+         WHERE task_id = ? AND state = 'active'`,
+      )
+      .run(json, selectedBy, now, now, taskId);
+    writeAudit(database, {
+      actorType: "slack-user",
+      actorId: selectedBy,
+      authority: "task-model",
+      source: "slack",
+      target: taskId,
+      action: "task.model.selected",
+      result: "accepted",
+      correlationId: taskId,
+      metadata: selectionMetadata(input.selection, current.desired),
+      createdAt: now,
+    });
+  }).immediate();
+}
+
+export interface RecordAppliedModelSelectionInput {
+  readonly taskId: string;
+  /** The T3 thread the selection was sent to; a task since moved to another thread is left alone. */
+  readonly threadId: string;
+  readonly selection: T3ModelSelection;
+  readonly now: string;
+}
+
+/** Records the selection T3 accepted for the task's current thread. Returns whether it was written. */
+export function recordAppliedModelSelection(database: Database, input: RecordAppliedModelSelectionInput): boolean {
+  const now = isoDateTime.parse(input.now);
+  const result = database
+    .query(
+      `UPDATE tasks SET t3_model_selection_json = ?, updated_at = ?
+       WHERE task_id = ? AND t3_thread_id = ? AND state = 'active'
+         AND t3_model_selection_json IS NOT ?`,
+    )
+    .run(
+      selectionJson(input.selection),
+      now,
+      requiredId(input.taskId, "taskId"),
+      requiredId(input.threadId, "threadId"),
+      selectionJson(input.selection),
+    );
+  return result.changes === 1;
+}
+
+export type ModelRevertReason = "revoked" | "refused" | "t3-rejected";
+
+export interface RevertDesiredModelSelectionInput {
+  readonly taskId: string;
+  /**
+   * `revoked`: config no longer allows the desired model, so the task returns to its default (NULL).
+   * `refused` / `t3-rejected`: T3 cannot move the thread there, so the desired model becomes the
+   * applied one and the thread keeps what it has.
+   */
+  readonly reason: ModelRevertReason;
+  /** A stable refusal code (`SwitchRefusalCode` or a failure code) for the audit row. */
+  readonly code: string;
+  readonly correlationId: string;
+  readonly now: string;
+}
+
+/**
+ * Drops a desired selection that cannot be honoured, audited as `task.model.reverted`. Returns the
+ * selection it dropped, or null when there was nothing to revert (already reverted, or no choice made).
+ */
+export function revertDesiredModelSelection(
+  database: Database,
+  input: RevertDesiredModelSelectionInput,
+): T3ModelSelection | null {
+  const taskId = requiredId(input.taskId, "taskId");
+  const now = isoDateTime.parse(input.now);
+  return database.transaction(() => {
+    const current = taskModelRow(database, taskId);
+    if (current.desired === null) return null;
+    const next = input.reason === "revoked" ? null : current.applied;
+    if (next !== null && next.instanceId === current.desired.instanceId && next.model === current.desired.model) {
+      return null;
+    }
+    database
+      .query("UPDATE tasks SET model_selection_json = ?, updated_at = ? WHERE task_id = ? AND state = 'active'")
+      .run(selectionJson(next), now, taskId);
+    writeAudit(database, {
+      actorType: "service",
+      actorId: "agent-tag",
+      authority: "task-model",
+      source: input.reason,
+      target: taskId,
+      action: "task.model.reverted",
+      result: input.reason,
+      correlationId: requiredId(input.correlationId, "correlationId"),
+      metadata: selectionMetadata(next, current.desired, requiredId(input.code, "code")),
+      createdAt: now,
+    });
+    return current.desired;
+  }).immediate();
 }
 
 export interface MarkT3ThreadStartedInput {

@@ -121,6 +121,8 @@ export const taskExecutionSchema = z.object({
   conversation_type: z.enum(["channel", "dm"]),
   owner_user_id: nonEmpty.nullable(),
   created_at: isoDateTime,
+  model_selection_json: z.string().nullable(),
+  t3_model_selection_json: z.string().nullable(),
 });
 export const interactionIdentitySchema = z.object({ interaction_id: nonEmpty });
 export const interactionRowSchema = z.object({
@@ -225,6 +227,9 @@ export const AUDIT_ACTIONS = [
   "slack.outbox.retry-exhausted",
   "slack.outbox.retry-scheduled",
   "task.cancellation.requested",
+  "task.model.denied",
+  "task.model.reverted",
+  "task.model.selected",
   "task.t3-bound",
   "thread-context.loaded",
   "thread-context.unavailable",

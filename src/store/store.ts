@@ -16,6 +16,7 @@
 import type { Database } from "bun:sqlite";
 
 import type { StoreContext } from "./context.ts";
+import type { T3ModelSelection } from "../t3/gateway.ts";
 import type {
   ActiveTaskBinding,
   AmbientDecision,
@@ -394,6 +395,18 @@ export class AgentTagStore {
 
   markT3ThreadStarted(input: tasks.MarkT3ThreadStartedInput): void {
     tasks.markT3ThreadStarted(this.#database, input);
+  }
+
+  setTaskModelSelection(input: tasks.SetTaskModelSelectionInput): void {
+    tasks.setTaskModelSelection(this.#database, input);
+  }
+
+  recordAppliedModelSelection(input: tasks.RecordAppliedModelSelectionInput): boolean {
+    return tasks.recordAppliedModelSelection(this.#database, input);
+  }
+
+  revertDesiredModelSelection(input: tasks.RevertDesiredModelSelectionInput): T3ModelSelection | null {
+    return tasks.revertDesiredModelSelection(this.#database, input);
   }
 
   recordPendingInteraction(

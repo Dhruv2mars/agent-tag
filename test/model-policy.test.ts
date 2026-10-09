@@ -307,12 +307,13 @@ describe("no runtime change for existing configs", () => {
     expect(validateConfiguredProviders(legacy, catalog)).toEqual([{ profileId: "engineering", ...selection }]);
   });
 
-  test("P2a policy keys alone do not change what the coordinator sends", async () => {
-    // Not yet wired: a route default and allowlist are accepted and reported, but turns keep the profile default.
-    const selection = { instanceId: "codex", model: "gpt-5.6-sol" };
+  test("a route default model starts new threads, while the shared project keeps the profile default", async () => {
+    const profileDefault = { instanceId: "codex", model: "gpt-5.6-sol" };
+    const routeDefault = { instanceId: "codex", model: "gpt-5.6-mini" };
+    expect(policyConfig.routes[0]!.defaultModel).toEqual(routeDefault);
     expect(await dispatchedSelections(policyConfig)).toEqual([
-      ["project.create", selection],
-      ["thread.turn.start", selection, selection],
+      ["project.create", profileDefault],
+      ["thread.turn.start", routeDefault, routeDefault],
     ]);
   });
 });
