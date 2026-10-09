@@ -13,7 +13,7 @@ export interface RetentionPolicy {
   readonly auditDays?: number | undefined;
   /** Replace payloads of settled Slack outbox rows older than this many days. */
   readonly outboxDays?: number | undefined;
-  /** Replace stored Slack message text and settled operation text older than this many days. */
+  /** Replace stored Slack message text, settled operation text and ended schedule prompts older than this many days. */
   readonly messageDays?: number | undefined;
 }
 
@@ -30,6 +30,8 @@ export interface PruneResult {
   readonly outboxRedacted: number;
   readonly eventsRedacted: number;
   readonly operationsRedacted: number;
+  /** Prompts of ended (cancelled, auto-disabled or completed) schedules. */
+  readonly schedulesRedacted: number;
 }
 
 export function retentionEnabled(policy: RetentionPolicy): boolean {
@@ -65,6 +67,10 @@ const OPERATION_WHERE = `status IN ('succeeded', 'failed')
   AND julianday(updated_at) < julianday(?)
   AND (json_extract(payload_json, '$.text') IS NOT '${PRUNED_TEXT}'
     OR (resolved_text IS NOT NULL AND resolved_text <> '${PRUNED_TEXT}'))`;
+// Only ended schedules: an active schedule still needs its prompt for the next run.
+const SCHEDULE_WHERE = `state <> 'active'
+  AND julianday(COALESCE(ended_at, updated_at)) < julianday(?)
+  AND prompt <> '${PRUNED_TEXT}'`;
 
 function count(database: Database, table: string, where: string, cutoff: string): number {
   const row = database
@@ -91,6 +97,7 @@ export function pruneRetainedData(
     let outboxRedacted = 0;
     let eventsRedacted = 0;
     let operationsRedacted = 0;
+    let schedulesRedacted = 0;
     if (cutoffs.audit !== null) {
       auditDeleted = dryRun
         ? count(database, "audit_log", AUDIT_WHERE, cutoffs.audit)
@@ -119,15 +126,26 @@ export function pruneRetainedData(
                WHERE ${OPERATION_WHERE}`,
             )
             .run(PRUNED_TEXT, PRUNED_TEXT, cutoffs.message).changes;
+      schedulesRedacted = dryRun
+        ? count(database, "schedules", SCHEDULE_WHERE, cutoffs.message)
+        : database
+            .query(`UPDATE schedules SET prompt = ? WHERE ${SCHEDULE_WHERE}`)
+            .run(PRUNED_TEXT, cutoffs.message).changes;
     }
-    return { dryRun, cutoffs, auditDeleted, outboxRedacted, eventsRedacted, operationsRedacted };
+    return { dryRun, cutoffs, auditDeleted, outboxRedacted, eventsRedacted, operationsRedacted, schedulesRedacted };
   });
   // A dry run only reads, so it takes no write lock and works on a read-only connection.
   return dryRun ? run.deferred() : run.immediate();
 }
 
 export function prunedRowCount(result: PruneResult): number {
-  return result.auditDeleted + result.outboxRedacted + result.eventsRedacted + result.operationsRedacted;
+  return (
+    result.auditDeleted +
+    result.outboxRedacted +
+    result.eventsRedacted +
+    result.operationsRedacted +
+    result.schedulesRedacted
+  );
 }
 
 /**

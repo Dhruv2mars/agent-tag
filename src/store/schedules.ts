@@ -17,6 +17,85 @@ import {
 } from "./schema.ts";
 import type { ClaimedSchedule, ScheduleSummary } from "./types.ts";
 
+const scheduleSummaryRowSchema = z.object({
+  schedule_id: nonEmpty,
+  task_id: nonEmpty,
+  workspace_id: nonEmpty,
+  conversation_id: nonEmpty,
+  thread_ts: nonEmpty,
+  profile_id: nonEmpty,
+  actor_user_id: nonEmpty,
+  kind: z.enum(["agent", "reminder"]),
+  prompt: schedulePrompt,
+  state: z.enum(["active", "cancelled", "completed"]),
+  next_run_at: isoDateTime,
+  cadence_seconds: z.number().int().min(60).nullable(),
+  recurrence_json: recurrenceJson,
+  missed_run_policy: z.enum(["run-once", "skip"]),
+  overlap_policy: z.enum(["skip", "queue"]),
+  time_zone: nonEmpty.nullable(),
+  human_readable: nonEmpty.nullable(),
+  notify_user_id: nonEmpty.nullable(),
+  consecutive_failures: z.number().int().nonnegative(),
+  failure_streak_started_at: isoDateTime.nullable(),
+  ended_reason: z.enum(["user-cancelled", "auto-disabled", "authority-revoked", "completed"]).nullable(),
+  ended_at: isoDateTime.nullable(),
+  created_at: isoDateTime,
+});
+
+const SCHEDULE_SUMMARY_COLUMNS = `schedule_id, task_id, workspace_id, conversation_id, thread_ts, profile_id,
+  actor_user_id, kind, prompt, state, next_run_at, cadence_seconds, recurrence_json, missed_run_policy,
+  overlap_policy, time_zone, human_readable, notify_user_id, consecutive_failures, failure_streak_started_at,
+  ended_reason, ended_at, created_at`;
+
+function toScheduleSummary(raw: unknown): ScheduleSummary {
+  const row = scheduleSummaryRowSchema.parse(raw);
+  return {
+    scheduleId: row.schedule_id,
+    taskId: row.task_id,
+    kind: row.kind,
+    prompt: row.prompt,
+    state: row.state,
+    nextRunAt: row.next_run_at,
+    cadenceSeconds: row.cadence_seconds,
+    recurrence: row.recurrence_json,
+    missedRunPolicy: row.missed_run_policy,
+    overlapPolicy: row.overlap_policy,
+    workspaceId: row.workspace_id,
+    conversationId: row.conversation_id,
+    threadTs: row.thread_ts,
+    profileId: row.profile_id,
+    actorUserId: row.actor_user_id,
+    timeZone: row.time_zone,
+    humanReadable: row.human_readable,
+    notifyUserId: row.notify_user_id,
+    consecutiveFailures: row.consecutive_failures,
+    failureStreakStartedAt: row.failure_streak_started_at,
+    endedReason: row.ended_reason,
+    endedAt: row.ended_at,
+    createdAt: row.created_at,
+  };
+}
+
+/** One schedule by id, or null. */
+export function getSchedule(database: Database, scheduleId: string): ScheduleSummary | null {
+  const raw = database
+    .query(`SELECT ${SCHEDULE_SUMMARY_COLUMNS} FROM schedules WHERE schedule_id = ?`)
+    .get(requiredId(scheduleId, "scheduleId"));
+  return raw === null ? null : toScheduleSummary(raw);
+}
+
+/** The schedule created from one Slack request (`<channel>:<ts>`), or null. */
+export function findScheduleBySourceEvent(
+  database: Database,
+  input: { readonly workspaceId: string; readonly sourceEventKey: string },
+): ScheduleSummary | null {
+  const raw = database
+    .query(`SELECT ${SCHEDULE_SUMMARY_COLUMNS} FROM schedules WHERE workspace_id = ? AND source_event_key = ?`)
+    .get(requiredId(input.workspaceId, "workspaceId"), requiredId(input.sourceEventKey, "sourceEventKey"));
+  return raw === null ? null : toScheduleSummary(raw);
+}
+
 export function countActiveSchedules(database: Database, workspaceId: string): number {
   const row = database
     .query<{ count: number }, [string]>(
@@ -39,7 +118,20 @@ export interface CreateScheduleInput {
   readonly misfireGraceSeconds: number;
   readonly overlapPolicy: "skip" | "queue";
   readonly now: string;
+  /** Where the request came from. A repeated `eventKey` returns the existing schedule instead. */
+  readonly source?: ScheduleSourceInput;
 }
+
+export interface ScheduleSourceInput {
+  /** "<channel>:<ts>" of the Slack request. */
+  readonly eventKey?: string;
+  readonly timeZone?: string;
+  readonly humanReadable?: string;
+  readonly notifyUserId?: string;
+}
+
+const optionalText = (value: string | undefined, name: string): string | null =>
+  value === undefined ? null : requiredId(value.trim(), name);
 
 export function createSchedule(database: Database, input: CreateScheduleInput): ScheduleSummary {
   const now = isoDateTime.parse(input.now);
@@ -62,6 +154,10 @@ export function createSchedule(database: Database, input: CreateScheduleInput): 
   ) {
     throw new Error("schedule misfire grace must be between 0 and 86400 seconds");
   }
+  const sourceEventKey = optionalText(input.source?.eventKey, "source.eventKey");
+  const timeZone = optionalText(input.source?.timeZone, "source.timeZone");
+  const humanReadable = optionalText(input.source?.humanReadable, "source.humanReadable");
+  const notifyUserId = optionalText(input.source?.notifyUserId, "source.notifyUserId");
   const create = database.transaction((): ScheduleSummary => {
     const taskId = requiredId(input.taskId, "taskId");
     const target = scheduleTargetSchema.parse(
@@ -72,14 +168,22 @@ export function createSchedule(database: Database, input: CreateScheduleInput): 
         )
         .get(taskId),
     );
+    if (sourceEventKey !== null) {
+      const existing = findScheduleBySourceEvent(database, {
+        workspaceId: target.workspace_id,
+        sourceEventKey,
+      });
+      if (existing !== null) return existing;
+    }
     const scheduleId = crypto.randomUUID();
     database
       .query(
         `INSERT INTO schedules (
           schedule_id, task_id, workspace_id, conversation_id, thread_ts, actor_user_id,
           profile_id, repository_root, kind, prompt, cadence_seconds, recurrence_json, missed_run_policy,
-          misfire_grace_seconds, overlap_policy, state, next_run_at, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)`,
+          misfire_grace_seconds, overlap_policy, state, next_run_at, created_at, updated_at,
+          time_zone, human_readable, source_event_key, notify_user_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         scheduleId,
@@ -100,6 +204,10 @@ export function createSchedule(database: Database, input: CreateScheduleInput): 
         runAt,
         now,
         now,
+        timeZone,
+        humanReadable,
+        sourceEventKey,
+        notifyUserId,
       );
     writeAudit(database, {
       actorType: "slack-user",
@@ -115,60 +223,55 @@ export function createSchedule(database: Database, input: CreateScheduleInput): 
         recurring: input.cadenceSeconds !== undefined || recurrence !== null,
         missedRunPolicy: input.missedRunPolicy,
         overlapPolicy: input.overlapPolicy,
+        source: sourceEventKey === null ? "cli" : "slack",
       },
       createdAt: now,
     });
-    return {
-      scheduleId,
-      taskId,
-      kind: input.kind,
-      prompt: input.prompt.trim(),
-      state: "active",
-      nextRunAt: runAt,
-      cadenceSeconds: input.cadenceSeconds ?? null,
-      recurrence,
-      missedRunPolicy: input.missedRunPolicy,
-      overlapPolicy: input.overlapPolicy,
-    };
+    const created = getSchedule(database, scheduleId);
+    if (created === null) throw new Error("created schedule is missing");
+    return created;
   });
   return create.immediate();
 }
 
 export function listSchedules(database: Database, taskId: string): ReadonlyArray<ScheduleSummary> {
-  const schema = z.object({
-    schedule_id: nonEmpty,
-    task_id: nonEmpty,
-    kind: z.enum(["agent", "reminder"]),
-    prompt: schedulePrompt,
-    state: z.enum(["active", "cancelled", "completed"]),
-    next_run_at: isoDateTime,
-    cadence_seconds: z.number().int().min(60).nullable(),
-    recurrence_json: recurrenceJson,
-    missed_run_policy: z.enum(["run-once", "skip"]),
-    overlap_policy: z.enum(["skip", "queue"]),
-  });
+  return database
+    .query(`SELECT ${SCHEDULE_SUMMARY_COLUMNS} FROM schedules WHERE task_id = ? ORDER BY created_at, schedule_id`)
+    .all(requiredId(taskId, "taskId"))
+    .map(toScheduleSummary);
+}
+
+export interface ListConversationSchedulesInput {
+  readonly workspaceId: string;
+  readonly conversationId: string;
+  readonly limit?: number;
+  /** Also include schedules auto-disabled at or after this instant (listed after the active ones). */
+  readonly autoDisabledSince?: string;
+}
+
+/** Active schedules of one conversation in creation order, optionally followed by recently auto-disabled ones. */
+export function listActiveSchedulesForConversation(
+  database: Database,
+  input: ListConversationSchedulesInput,
+): ReadonlyArray<ScheduleSummary> {
+  const limit = input.limit ?? 100;
+  if (!Number.isSafeInteger(limit) || limit <= 0 || limit > 1_000) {
+    throw new Error("schedule list limit must be between 1 and 1000");
+  }
+  const workspaceId = requiredId(input.workspaceId, "workspaceId");
+  const conversationId = requiredId(input.conversationId, "conversationId");
+  const since = input.autoDisabledSince === undefined ? null : isoDateTime.parse(input.autoDisabledSince);
   return database
     .query(
-      `SELECT schedule_id, task_id, kind, prompt, state, next_run_at, cadence_seconds, recurrence_json,
-              missed_run_policy, overlap_policy
-       FROM schedules WHERE task_id = ? ORDER BY created_at, schedule_id`,
+      `SELECT ${SCHEDULE_SUMMARY_COLUMNS} FROM schedules
+       WHERE workspace_id = ? AND conversation_id = ?
+         AND (state = 'active' OR (? IS NOT NULL AND state = 'cancelled'
+           AND ended_reason = 'auto-disabled' AND julianday(ended_at) >= julianday(?)))
+       ORDER BY CASE state WHEN 'active' THEN 0 ELSE 1 END, created_at, schedule_id
+       LIMIT ?`,
     )
-    .all(requiredId(taskId, "taskId"))
-    .map((raw) => {
-      const row = schema.parse(raw);
-      return {
-        scheduleId: row.schedule_id,
-        taskId: row.task_id,
-        kind: row.kind,
-        prompt: row.prompt,
-        state: row.state,
-        nextRunAt: row.next_run_at,
-        cadenceSeconds: row.cadence_seconds,
-        recurrence: row.recurrence_json,
-        missedRunPolicy: row.missed_run_policy,
-        overlapPolicy: row.overlap_policy,
-      };
-    });
+    .all(workspaceId, conversationId, since, since, limit)
+    .map(toScheduleSummary);
 }
 
 export interface CancelScheduleInput {
@@ -183,10 +286,12 @@ export function cancelSchedule(database: Database, input: CancelScheduleInput): 
   const cancel = database.transaction(() => {
     const result = database
       .query(
-        `UPDATE schedules SET state = 'cancelled', lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+        `UPDATE schedules SET state = 'cancelled', ended_reason = 'user-cancelled', ended_at = ?,
+           lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
          WHERE schedule_id = ? AND task_id = ? AND state = 'active'`,
       )
       .run(
+        now,
         now,
         requiredId(input.scheduleId, "scheduleId"),
         requiredId(input.taskId, "taskId"),
@@ -219,9 +324,10 @@ export function revokeClaimedSchedule(database: Database, input: RevokeClaimedSc
   const now = isoDateTime.parse(input.now);
   const revoke = database.transaction(() => {
     const result = database.query(
-      `UPDATE schedules SET state = 'cancelled', lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+      `UPDATE schedules SET state = 'cancelled', ended_reason = 'authority-revoked', ended_at = ?,
+         lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
        WHERE schedule_id = ? AND state = 'active' AND lease_owner = ? AND lease_expires_at > ?`,
-    ).run(now, requiredId(input.scheduleId, "scheduleId"), requiredId(input.workerId, "workerId"), now);
+    ).run(now, now, requiredId(input.scheduleId, "scheduleId"), requiredId(input.workerId, "workerId"), now);
     requireLeaseHeld(result, "schedule");
     writeAudit(database, {
       actorType: "worker", actorId: input.workerId, authority: "schedule-dispatch",
@@ -334,11 +440,13 @@ export function settleScheduleRun(database: Database, input: SettleScheduleRunIn
   const now = isoDateTime.parse(input.now);
   const dueAt = isoDateTime.parse(input.dueAt);
   const nextRunAt = input.nextRunAt === undefined ? null : isoDateTime.parse(input.nextRunAt);
+  const skipped = input.disposition !== "dispatched";
   const settle = database.transaction(() => {
     database
       .query(
-        `INSERT INTO schedule_runs (run_id, schedule_id, due_at, disposition, operation_id, created_at)
-         VALUES (?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO schedule_runs (
+          run_id, schedule_id, due_at, disposition, operation_id, created_at, outcome, outcome_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         `${input.scheduleId}:${dueAt}`,
@@ -347,22 +455,41 @@ export function settleScheduleRun(database: Database, input: SettleScheduleRunIn
         input.disposition,
         input.operationId ?? null,
         now,
+        skipped ? "skipped" : null,
+        skipped ? now : null,
       );
+    const completed = nextRunAt === null;
     const result = database
       .query(
         `UPDATE schedules SET state = ?, next_run_at = COALESCE(?, next_run_at),
+           ended_reason = CASE WHEN ? THEN 'completed' ELSE ended_reason END,
+           ended_at = CASE WHEN ? THEN ? ELSE ended_at END,
            lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
          WHERE schedule_id = ? AND state = 'active' AND lease_owner = ? AND lease_expires_at > ?`,
       )
       .run(
-        nextRunAt === null ? "completed" : "active",
+        completed ? "completed" : "active",
         nextRunAt,
+        completed ? 1 : 0,
+        completed ? 1 : 0,
+        now,
         now,
         input.scheduleId,
         requiredId(input.workerId, "workerId"),
         now,
       );
-    requireLeaseHeld(result, "schedule");
+    const cancelledDuringRun = result.changes !== 1;
+    if (cancelledDuringRun) {
+      // A user cancel while the run was claimed clears the lease. The run was already handed off (the
+      // agent turn ingested or the reminder queued), so keep the run row for outcome tracking.
+      const cancelled = database
+        .query<{ count: number }, [string]>(
+          `SELECT COUNT(*) AS count FROM schedules
+           WHERE schedule_id = ? AND state = 'cancelled' AND lease_owner IS NULL`,
+        )
+        .get(input.scheduleId);
+      if ((cancelled?.count ?? 0) !== 1) requireLeaseHeld(result, "schedule");
+    }
     writeAudit(database, {
       actorType: "worker",
       actorId: input.workerId,
@@ -372,7 +499,7 @@ export function settleScheduleRun(database: Database, input: SettleScheduleRunIn
       action: "schedule.run.settled",
       result: input.disposition,
       correlationId: input.scheduleId,
-      metadata: { dueAt, recurring: nextRunAt !== null },
+      metadata: { dueAt, recurring: nextRunAt !== null, cancelledDuringRun },
       createdAt: now,
     });
   });

@@ -49,6 +49,24 @@ describe("Agent Tag config", () => {
     ).toThrow();
   });
 
+  test("defaults and validates the routine auto-disable policy", () => {
+    expect(agentTagConfigSchema.parse(baseConfig).routines).toEqual({
+      autoDisable: { consecutiveFailures: 3, minFailureSpanSeconds: 3_600 },
+    });
+    expect(
+      agentTagConfigSchema.parse({ ...baseConfig, routines: { autoDisable: { consecutiveFailures: 5 } } }).routines,
+    ).toEqual({ autoDisable: { consecutiveFailures: 5, minFailureSpanSeconds: 3_600 } });
+    for (const autoDisable of [
+      { consecutiveFailures: 0 },
+      { consecutiveFailures: 51 },
+      { minFailureSpanSeconds: -1 },
+      { minFailureSpanSeconds: 604_801 },
+      { unknown: true },
+    ]) {
+      expect(() => agentTagConfigSchema.parse({ ...baseConfig, routines: { autoDisable } })).toThrow();
+    }
+  });
+
   test("defaults and validates the turn ceiling and interaction expiry", () => {
     const parsed = agentTagConfigSchema.parse(baseConfig);
     expect(parsed.limits.interactionExpirySeconds).toBe(86_400);
