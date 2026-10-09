@@ -317,6 +317,22 @@ describe("fetchThreadWindow", () => {
     expect(timestamps(window)).toEqual([ROOT_TS, ts(1), ts(2)]);
   });
 
+  test("has_more without a cursor is reported as truncated", async () => {
+    const { replies, calls } = recorder(() => ({ ...page([ROOT, human(1)]), has_more: true }));
+
+    const window = await fetchThreadWindow(fetchInput(replies));
+
+    expect(calls).toHaveLength(1);
+    expect(window.truncated).toBe(true);
+    expect(timestamps(window)).toEqual([ROOT_TS, ts(1)]);
+  });
+
+  test("has_more false on the last page is complete", async () => {
+    const { replies } = recorder(() => ({ ...page([ROOT, human(1)]), has_more: false }));
+
+    expect((await fetchThreadWindow(fetchInput(replies))).truncated).toBe(false);
+  });
+
   test("a Slack error object rejects with its error code and is not retried", async () => {
     const { replies, calls } = recorder(() => ({ ok: false, error: "channel_not_found" }));
 

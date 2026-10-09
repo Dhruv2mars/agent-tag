@@ -40,6 +40,8 @@ export interface ThreadWindow {
    * replies closest to the mention were never read and the window ends early.
    */
   readonly truncated: boolean;
+  /** The policy's character limits, enforced again on the rendered text at compose time. */
+  readonly limits: { readonly maxChars: number; readonly maxMessageChars: number };
 }
 
 /** Wraps `client.conversations.replies(args)`. May resolve `{ ok: false, error }` or throw a Web API error. */
@@ -105,13 +107,13 @@ export interface ThreadWindowContext {
   readonly policy: ThreadContextPolicy;
 }
 
-function capText(text: string, maxCodePoints: number): string {
+export function capText(text: string, maxCodePoints: number): string {
   const codePoints = Array.from(text);
   if (codePoints.length <= maxCodePoints) return text;
   return codePoints.slice(0, Math.max(0, maxCodePoints - 1)).join("") + ELLIPSIS;
 }
 
-function codePointLength(text: string): number {
+export function codePointLength(text: string): number {
   let length = 0;
   for (const _ of text) length += 1;
   return length;
@@ -188,6 +190,7 @@ function budgetWindow(
     messages: root === null ? kept : [root, ...kept],
     omitted: droppedEarlier + (replies.length - kept.length),
     truncated,
+    limits: { maxChars: policy.maxChars, maxMessageChars: policy.maxMessageChars },
   };
 }
 
@@ -353,7 +356,8 @@ export async function fetchThreadWindow(input: FetchThreadWindowInput): Promise<
       for (const message of parsed.data.messages) accumulator.add(message);
       page += 1;
       const next = parsed.data.response_metadata?.next_cursor;
-      if (next === undefined || next === "") return accumulator.window(false);
+      // has_more without a cursor means Slack holds more replies we cannot page to: say so.
+      if (next === undefined || next === "") return accumulator.window(parsed.data.has_more === true);
       cursor = next;
     }
     return accumulator.window(true);
