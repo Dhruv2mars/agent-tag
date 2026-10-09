@@ -44,6 +44,9 @@
         "keywords": [],
         "cooldownSeconds": 300,
         "maxTurnsPerHour": 4
+      },
+      "pullRequests": {
+        "mode": "off"
       }
     }
   ],
@@ -65,6 +68,14 @@
       "maxTurnSeconds": 21600
     },
     "interactionExpirySeconds": 86400
+  },
+  "github": {
+    "apiBaseUrl": "https://api.github.com",
+    "webBaseUrl": "https://github.com",
+    "auth": {
+      "type": "token",
+      "tokenFile": "/var/lib/agent-tag/secrets/github-token"
+    }
   },
   "retention": {
     "messageDays": 30,
