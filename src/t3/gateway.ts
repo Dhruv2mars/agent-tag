@@ -21,6 +21,8 @@ import { assertSupportedT3Protocol } from "./protocol.ts";
 const id = z.string().trim().min(1);
 const isoDateTime = z.iso.datetime();
 const modelSelection = z.object({ instanceId: id, model: id });
+export const t3ModelSelectionSchema = modelSelection;
+export type T3ModelSelection = z.infer<typeof modelSelection>;
 const runtimeMode = z.enum(["approval-required", "auto-accept-edits", "auto", "full-access"]);
 const interactionMode = z.enum(["default", "plan"]);
 
@@ -136,7 +138,19 @@ const userInputDismissCommand = z.object({
   createdAt: isoDateTime,
 });
 
+/**
+ * T3 0.0.45 `thread.meta.update` (contracts orchestration.ts ThreadMetaUpdateCommand). Only the
+ * `modelSelection` field is used; it is what updates the projected `thread.modelSelection`.
+ */
+const threadMetaUpdateCommand = z.object({
+  type: z.literal("thread.meta.update"),
+  commandId: id,
+  threadId: id,
+  modelSelection,
+});
+
 export const t3CommandSchema = z.discriminatedUnion("type", [
+  threadMetaUpdateCommand,
   projectCreateCommand,
   projectDeleteCommand,
   turnStartCommand,
@@ -147,9 +161,15 @@ export const t3CommandSchema = z.discriminatedUnion("type", [
 ]);
 export type T3Command = z.infer<typeof t3CommandSchema>;
 
+// Optional fields added for the model policy fall back to undefined when malformed, so a T3 payload
+// this client does not understand never fails the whole catalog.
 const providerSchema = z.object({
   instanceId: id,
   driver: id,
+  displayName: id.optional().catch(undefined),
+  /** T3 refuses a started thread's switch between instances whose group keys differ. */
+  continuation: z.object({ groupKey: id }).optional().catch(undefined),
+  requiresNewThreadForModelChange: z.boolean().optional().catch(undefined),
   enabled: z.boolean(),
   installed: z.boolean(),
   status: z.enum(["ready", "warning", "error", "disabled"]),
@@ -158,13 +178,15 @@ const providerSchema = z.object({
     z.object({
       slug: id,
       name: id,
+      shortName: id.optional().catch(undefined),
+      aliases: z.array(id).optional().catch(undefined),
       isDefault: z.boolean().optional(),
       capabilities: z.unknown().nullable(),
     }),
   ),
 });
 
-export const serverConfigSchema = z.object({
+export const t3ServerConfigSchema = z.object({
   environment: z.object({
     environmentId: id,
     capabilities: z.record(z.string(), z.unknown()),
@@ -172,7 +194,8 @@ export const serverConfigSchema = z.object({
   providers: z.array(providerSchema),
 });
 
-export type T3ServerInfo = z.infer<typeof serverConfigSchema>;
+export type T3ServerInfo = z.infer<typeof t3ServerConfigSchema>;
+export type T3Provider = T3ServerInfo["providers"][number];
 
 export const dispatchResultSchema = z.object({ sequence: z.number().int().nonnegative() });
 export type T3DispatchResult = z.infer<typeof dispatchResultSchema>;
@@ -510,7 +533,7 @@ export async function inspectT3(
     const client = yield* RpcClient.make(rpcGroup);
     yield* client["server.probe"]({});
     const raw = yield* client["server.getConfig"]({});
-    return serverConfigSchema.parse(raw);
+    return t3ServerConfigSchema.parse(raw);
   }).pipe(Effect.provide(protocolLayer(url)), Effect.scoped);
   return { ...(await runRpc(program, signal)), orchestrationProtocol };
 }
@@ -533,6 +556,38 @@ export async function dispatchT3Command(input: {
     return dispatchResultSchema.parse(raw);
   }).pipe(Effect.provide(protocolLayer(url)), Effect.scoped);
   return runRpc(program, input.signal);
+}
+
+/**
+ * Moves a thread's projected model selection (the snapshot's `thread.modelSelection`). T3 only checks
+ * the switch on the next turn start, so callers must have planned it first. `commandId` must be stable
+ * per intended switch so a replay deduplicates.
+ */
+export function threadModelSelectionCommand(input: {
+  readonly commandId: string;
+  readonly threadId: string;
+  readonly modelSelection: T3ModelSelection;
+}): T3Command {
+  return t3CommandSchema.parse({
+    type: "thread.meta.update",
+    commandId: input.commandId,
+    threadId: input.threadId,
+    modelSelection: { instanceId: input.modelSelection.instanceId, model: input.modelSelection.model },
+  });
+}
+
+export async function updateT3ThreadModelSelection(input: {
+  readonly config: T3ConnectionConfig;
+  readonly commandId: string;
+  readonly threadId: string;
+  readonly modelSelection: T3ModelSelection;
+  readonly signal?: AbortSignal;
+}): Promise<T3DispatchResult> {
+  return dispatchT3Command({
+    config: input.config,
+    command: threadModelSelectionCommand(input),
+    ...signalOption(input.signal),
+  });
 }
 
 /** T3 answered the snapshot request with HTTP 404: the thread does not exist. */

@@ -176,6 +176,7 @@ describe("agent-tag onboard (non-interactive)", () => {
     expect(config.dataDir).toBe(join(harness.home, "data"));
     expect(config.slack.workspaceId).toBe("T0FIXTURE");
     expect(config.t3).toEqual({
+      mode: "external",
       baseUrl: "http://127.0.0.1:3774",
       tokenFile: join(harness.home, "secrets", "t3-token"),
       watch: { enabled: true, safetyPollMs: 15_000, lingerMs: 30_000 },

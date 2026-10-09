@@ -7,11 +7,13 @@ import { agentTagConfigSchema } from "../src/config.ts";
 import { AgentTagCoordinator } from "../src/coordinator.ts";
 import {
   AgentTagService,
+  allowedModelLogRecords,
   type ServiceLogRecord,
   type ServiceSlackBridge,
   type ServiceWorker,
 } from "../src/service.ts";
 import { AgentTagStore } from "../src/store/store.ts";
+import { t3ServerConfigSchema } from "../src/t3/gateway.ts";
 
 async function eventually(assertion: () => boolean): Promise<void> {
   for (let attempt = 0; attempt < 100; attempt += 1) {
@@ -334,5 +336,54 @@ describe("Agent Tag service", () => {
       await expect(service.start()).rejects.toThrow("slack down");
       expect(closed).toBe(1);
     });
+  });
+});
+
+describe("startup model report", () => {
+  test("logs one warning per allowed model T3 cannot run, and nothing when all are available", async () => {
+    const config = agentTagConfigSchema.parse({
+      version: 1,
+      dataDir: "/var/lib/agent-tag",
+      t3: { baseUrl: "http://127.0.0.1:37841", tokenFile: "/var/lib/agent-tag/t3-token" },
+      slack: {
+        workspaceId: "T1",
+        appTokenFile: "/var/lib/agent-tag/slack-app-token",
+        botTokenFile: "/var/lib/agent-tag/slack-bot-token",
+      },
+      access: { allowedUserIds: ["U1"], allowedChannelIds: ["C1"] },
+      profiles: [
+        {
+          id: "engineering",
+          repositoryRoots: ["/srv/repos/example"],
+          defaultProviderInstanceId: "codex",
+          defaultModel: "gpt-5.6-sol",
+          runtimeMode: "approval-required",
+          isolation: { mode: "trusted-same-user", acknowledgedSharedMachineAccess: true },
+          externalWrites: { mode: "deny" },
+          memory: { shared: true, privateDm: false, retentionDays: 180 },
+          allowedModels: [
+            { instanceId: "codex", model: "gpt-5.6-mini" },
+            { instanceId: "grok", model: "grok-5" },
+          ],
+        },
+      ],
+      routes: [{ conversationId: "C1", profileId: "engineering" }],
+      limits: { maxConcurrentTasks: 1 },
+    });
+    const server = t3ServerConfigSchema.parse(
+      await Bun.file(new URL("./fixtures/t3-0.0.45-server-config.json", import.meta.url)).json(),
+    );
+    const at = "2026-10-08T00:00:00.000Z";
+    expect(allowedModelLogRecords(config, server, at)).toEqual([]);
+    const withoutGrok = { ...server, providers: server.providers.filter((provider) => provider.instanceId !== "grok") };
+    expect(allowedModelLogRecords(config, withoutGrok, at)).toEqual([{
+      level: "warn",
+      event: "provider.allowed-model",
+      errorCode: "provider-missing",
+      profileId: "engineering",
+      instanceId: "grok",
+      model: "grok-5",
+      at,
+    }]);
   });
 });

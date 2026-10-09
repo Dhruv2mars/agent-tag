@@ -234,6 +234,7 @@ describe("agent-tag doctor", () => {
       ["t3-version", "pass"],
       ["t3-session", "pass"],
       ["t3-providers", "pass"],
+      ["t3-models", "pass"],
       ["slack-bot-auth", "pass"],
       ["slack-app-auth", "pass"],
       ["service", "pass"],
@@ -241,7 +242,38 @@ describe("agent-tag doctor", () => {
     expect(world.seenAuthorization).toEqual([`Bearer ${BOT_TOKEN}`, `Bearer ${APP_TOKEN}`]);
     const output = `${formatDoctorReport(report)}\n${JSON.stringify(report)}`;
     for (const secret of [APP_TOKEN, BOT_TOKEN, T3_TOKEN]) expect(output).not.toContain(secret);
-    expect(formatDoctorReport(report)).toContain("14 passed, 0 warning(s), 0 failed, 0 skipped");
+    expect(formatDoctorReport(report)).toContain("15 passed, 0 warning(s), 0 failed, 0 skipped");
+  });
+
+  test("reports every allowed model, and warns without failing when one is unavailable", async () => {
+    await rewriteConfig((config) => {
+      config.profiles[0].allowedModels = [
+        { instanceId: "codex", model: "gpt-5.6-mini", label: "Mini" },
+        { instanceId: "claudeAgent", model: "claude-opus-5-5" },
+      ];
+    });
+    world.server = {
+      ...readyServer,
+      providers: [{ ...readyServer.providers[0]!, models: [...readyServer.providers[0]!.models, { slug: "gpt-5.6-mini", name: "Mini", capabilities: null }] }],
+    };
+    const report = await run();
+    expect(report.models).toEqual([
+      { profileId: "default", instanceId: "codex", model: "gpt-5.6-sol", label: "gpt-5.6-sol", source: "profile-default", status: "available" },
+      { profileId: "default", instanceId: "codex", model: "gpt-5.6-mini", label: "Mini", source: "allowed", status: "available" },
+      { profileId: "default", instanceId: "claudeAgent", model: "claude-opus-5-5", label: "claude-opus-5-5", source: "allowed", status: "provider-missing" },
+    ]);
+    expect(check(report, "t3-providers").status).toBe("pass");
+    expect(check(report, "t3-models").status).toBe("warn");
+    expect(check(report, "t3-models").summary).toContain("default: claudeAgent/claude-opus-5-5 (provider-missing)");
+    expect(report.ok).toBe(true);
+    expect(JSON.parse(JSON.stringify(report)).models).toHaveLength(3);
+  });
+
+  test("reports models as unchecked and skips the model check when T3 is unreachable", async () => {
+    world.environment = new Error("connect ECONNREFUSED");
+    const report = await run();
+    expect(report.models.map((model) => model.status)).toEqual(["unchecked"]);
+    expect(check(report, "t3-models").status).toBe("skip");
   });
 
   test("stops after an invalid config", async () => {
@@ -308,9 +340,10 @@ describe("agent-tag doctor", () => {
   function expectCompleteReport(report: DoctorReport): void {
     expect(report.checks.map((item) => item.id)).toEqual([
       "bun-version", "config", "data-dir", "secret:slack-app-token", "secret:slack-bot-token", "secret:t3-token",
-      "store", "t3-environment", "t3-version", "t3-session", "t3-providers", "slack-bot-auth", "slack-app-auth", "service",
+      "store", "t3-environment", "t3-version", "t3-session", "t3-providers", "t3-models", "slack-bot-auth", "slack-app-auth",
+      "service",
     ]);
-    expect(JSON.parse(JSON.stringify(report)).checks).toHaveLength(14);
+    expect(JSON.parse(JSON.stringify(report)).checks).toHaveLength(15);
   }
 
   test.skipIf(process.getuid?.() === 0)("reports a data dir without owner search permission as a failed check instead of aborting", async () => {

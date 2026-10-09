@@ -22,8 +22,8 @@ import {
   protocolLayer,
   requestT3ThreadSnapshot,
   rpcGroup,
-  serverConfigSchema,
   t3CommandSchema,
+  t3ServerConfigSchema,
   threadStreamItemSchema,
   type T3Command,
   type T3ConnectionConfig,
@@ -203,7 +203,7 @@ export class T3Connection {
   async inspect(signal?: AbortSignal): Promise<T3ServerInfo> {
     await this.#rpc(signal, (client) => client["server.probe"]({}));
     const raw = await this.#rpc(signal, (client) => client["server.getConfig"]({}));
-    return serverConfigSchema.parse(raw);
+    return t3ServerConfigSchema.parse(raw);
   }
 
   /**
