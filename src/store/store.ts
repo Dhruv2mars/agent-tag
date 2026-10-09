@@ -417,6 +417,10 @@ export class AgentTagStore {
     return tasks.revertDesiredModelSelection(this.#database, input);
   }
 
+  recordModelRejection(input: tasks.RecordModelRejectionInput): boolean {
+    return tasks.recordModelRejection(this.#database, input);
+  }
+
   clearInvalidModelSelection(input: tasks.ClearInvalidModelSelectionInput): readonly tasks.TaskModelColumn[] {
     return tasks.clearInvalidModelSelection(this.#database, input);
   }

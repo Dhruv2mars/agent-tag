@@ -57,10 +57,16 @@ class FakeT3 {
   failNextTurnDispatch = false;
   /** Fail the next `fetchThread` with a transport error (after a turn T3 accepted). */
   failNextFetch = false;
+  /** Fail the next `project.create` dispatch with a transport error. */
+  failNextProjectCreate = false;
 
   readonly gateway = {
     dispatch: async (command: T3Command) => {
       this.commands.push(command);
+      if (command.type === "project.create" && this.failNextProjectCreate) {
+        this.failNextProjectCreate = false;
+        throw new Error("socket closed");
+      }
       if (command.type === "thread.meta.update") {
         this.threadModel = command.modelSelection;
       }
@@ -455,30 +461,53 @@ describe("per-task model selection (P2b)", () => {
     expect(h.audits("task.model.reverted")).toMatchObject([{ result: "t3-rejected", metadata: { code: "T3ModelSwitchRejected" } }]);
   });
 
-  test("6: T3 refusing a default change pins the accepted model so later turns stop retrying it", async () => {
-    const h = await harness();
+  test.each([
+    ["with an allowlist", ALLOWED],
+    ["when the accepted model left the allowlist", []],
+  ])("6: T3 refusing a default change is not retried (%s)", async (_name, allowedModels) => {
+    const h = await harness(configWith({ allowedModels }));
     const first = h.send();
     await h.process();
-    h.reconfigure(configWith({ defaultModel: MINI.model, allowedModels: ALLOWED }));
+    h.reconfigure(configWith({ defaultModel: MINI.model, allowedModels }));
     h.t3.rejectNextTurn =
       "Thread 'thread-1' cannot switch from instance 'codex' to 'codex' because their provider resume state is incompatible.";
     h.send();
     expect(await h.process()).toMatchObject({ kind: "failed", errorCode: "T3ModelSwitchRejected" });
 
     const task = h.store.getTaskExecution(first.taskId);
-    expect(task.desiredModelSelection).toEqual(SOL);
+    expect(task.desiredModelSelection).toBeNull();
     expect(task.appliedModelSelection).toEqual(SOL);
+    expect(task.rejectedModelSelection).toEqual(MINI);
     expect(h.audits("task.model.reverted")).toEqual([{
       result: "t3-rejected",
-      metadata: { ...SOL, code: "T3ModelSwitchRejected" },
+      metadata: { ...SOL, previousInstanceId: MINI.instanceId, previousModel: MINI.model, code: "T3ModelSwitchRejected" },
     }]);
 
     const updates = h.t3.metaUpdates().length;
-    h.send();
-    expect(await h.process()).toMatchObject({ kind: "completed" });
+    for (let turn = 0; turn < 2; turn += 1) {
+      h.send();
+      expect(await h.process()).toMatchObject({ kind: "completed" });
+    }
     expect(h.t3.metaUpdates()).toHaveLength(updates);
     expect(h.t3.turnStarts().at(-1)!.modelSelection).toEqual(SOL);
     expect(h.audits("task.model.reverted")).toHaveLength(1);
+  });
+
+  test("a model revoked after a failed project.create is re-planned on retry, not frozen", async () => {
+    const h = await harness();
+    const first = h.send();
+    await h.process();
+    h.choose(first.taskId, MINI);
+    h.t3.failNextProjectCreate = true;
+    h.send();
+    expect(await h.process()).toMatchObject({ kind: "retry-scheduled" });
+    h.reconfigure(configWith({ allowedModels: ALLOWED.filter((entry) => entry.model !== MINI.model) }));
+    h.advance(60_000);
+    expect(await h.process()).toMatchObject({ kind: "completed" });
+
+    expect(h.t3.metaUpdates()).toEqual([]);
+    expect(h.t3.turnStarts().map((command) => command.modelSelection)).toEqual([SOL, SOL]);
+    expect(h.audits("task.model.reverted")).toMatchObject([{ result: "revoked" }]);
   });
 
   test("a replay keeps the model frozen for the operation even if the choice changed in between", async () => {

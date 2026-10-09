@@ -243,21 +243,45 @@ describe("per-task model selection store", () => {
     });
   });
 
-  test("a T3 rejection with no desired selection pins the applied one, audited once", async () => {
+  test("a T3 rejection keeps the default unset, records the rejected target, and audits once", async () => {
     await withTask(({ store, taskId, threadId }) => {
       store.recordAppliedModelSelection({ taskId, threadId, selection: selectionA, now: setAt });
       const input = {
         taskId,
-        reason: "t3-rejected" as const,
+        threadId,
+        rejected: selectionB,
         code: "T3ModelSwitchRejected",
-        correlationId: "corr-pin",
+        correlationId: "corr-reject",
         now: revertAt,
       };
 
-      expect(store.revertDesiredModelSelection(input)).toEqual({ previous: null, next: selectionA });
-      expect(store.getTaskExecution(taskId).desiredModelSelection).toEqual(selectionA);
-      expect(store.revertDesiredModelSelection(input)).toBeNull();
+      expect(store.recordModelRejection({ ...input, threadId: "other-thread" })).toBe(false);
+      expect(store.recordModelRejection(input)).toBe(true);
+      const task = store.getTaskExecution(taskId);
+      expect(task.desiredModelSelection).toBeNull();
+      expect(task.rejectedModelSelection).toEqual(selectionB);
+      expect(store.recordModelRejection(input)).toBe(false);
       expect(modelAuditRows(store, "task.model.reverted", taskId)).toHaveLength(1);
+
+      // A new applied selection clears the rejection, which was relative to the old one.
+      store.recordAppliedModelSelection({ taskId, threadId, selection: selectionB, now: "2026-09-21T00:05:00.000Z" });
+      expect(store.getTaskExecution(taskId).rejectedModelSelection).toBeNull();
+    });
+  });
+
+  test("a T3 rejection of a desired selection reverts it to the applied one", async () => {
+    await withTask(({ store, taskId, threadId }) => {
+      store.recordAppliedModelSelection({ taskId, threadId, selection: selectionA, now: setAt });
+      store.setTaskModelSelection({ taskId, selection: selectionB, selectedBy: "U1", now: secondSetAt });
+      expect(store.recordModelRejection({
+        taskId,
+        threadId,
+        rejected: selectionB,
+        code: "T3ModelSwitchRejected",
+        correlationId: "corr-reject",
+        now: revertAt,
+      })).toBe(true);
+      expect(store.getTaskExecution(taskId).desiredModelSelection).toEqual(selectionA);
     });
   });
 

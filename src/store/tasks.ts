@@ -254,7 +254,7 @@ export function getTaskExecution(database: Database, taskIdInput: string): TaskE
       .query(
         `SELECT task_id, workspace_id, conversation_id, profile_id, repository_root, t3_project_id, t3_thread_id,
                 t3_thread_started_at, conversation_type, owner_user_id, created_at, model_selection_json,
-                t3_model_selection_json
+                t3_model_selection_json, t3_rejected_model_selection_json
          FROM tasks WHERE task_id = ? AND state = 'active'`,
       )
       .get(requiredId(taskIdInput, "taskId")),
@@ -283,8 +283,8 @@ export function getTaskExecution(database: Database, taskIdInput: string): TaskE
     createdAt: row.created_at,
     desiredModelSelection: storedModelSelection(row.model_selection_json),
     appliedModelSelection: storedModelSelection(row.t3_model_selection_json),
-    invalidModelSelection: (row.model_selection_json !== null && storedModelSelection(row.model_selection_json) === null)
-      || (row.t3_model_selection_json !== null && storedModelSelection(row.t3_model_selection_json) === null),
+    rejectedModelSelection: storedModelSelection(row.t3_rejected_model_selection_json),
+    invalidModelSelection: TASK_MODEL_COLUMNS.some((column) => row[column] !== null && storedModelSelection(row[column]) === null),
   };
 }
 
@@ -323,20 +323,27 @@ function selectionMetadata(
   };
 }
 
+function sameStoredSelection(left: T3ModelSelection | null, right: T3ModelSelection | null): boolean {
+  return left === right
+    || (left !== null && right !== null && left.instanceId === right.instanceId && left.model === right.model);
+}
+
 function taskModelRow(database: Database, taskId: string): {
   readonly desired: T3ModelSelection | null;
   readonly applied: T3ModelSelection | null;
+  readonly rejected: T3ModelSelection | null;
   readonly threadId: string;
 } {
   const row = z.object({
     model_selection_json: z.string().nullable(),
     t3_model_selection_json: z.string().nullable(),
+    t3_rejected_model_selection_json: z.string().nullable(),
     t3_thread_id: nonEmpty,
   }).nullable().parse(
     database
       .query(
-        `SELECT model_selection_json, t3_model_selection_json, t3_thread_id FROM tasks
-         WHERE task_id = ? AND state = 'active'`,
+        `SELECT model_selection_json, t3_model_selection_json, t3_rejected_model_selection_json, t3_thread_id
+         FROM tasks WHERE task_id = ? AND state = 'active'`,
       )
       .get(taskId),
   );
@@ -344,6 +351,7 @@ function taskModelRow(database: Database, taskId: string): {
   return {
     desired: storedModelSelection(row.model_selection_json),
     applied: storedModelSelection(row.t3_model_selection_json),
+    rejected: storedModelSelection(row.t3_rejected_model_selection_json),
     threadId: row.t3_thread_id,
   };
 }
@@ -393,12 +401,15 @@ export interface RecordAppliedModelSelectionInput {
   readonly now: string;
 }
 
-/** Records the selection T3 accepted for the task's current thread. Returns whether it was written. */
+/**
+ * Records the selection T3 accepted for the task's current thread. Returns whether it was written.
+ * A changed applied selection clears the recorded rejection, which was relative to the old one.
+ */
 export function recordAppliedModelSelection(database: Database, input: RecordAppliedModelSelectionInput): boolean {
   const now = isoDateTime.parse(input.now);
   const result = database
     .query(
-      `UPDATE tasks SET t3_model_selection_json = ?, updated_at = ?
+      `UPDATE tasks SET t3_model_selection_json = ?, t3_rejected_model_selection_json = NULL, updated_at = ?
        WHERE task_id = ? AND t3_thread_id = ? AND state = 'active'
          AND t3_model_selection_json IS NOT ?`,
     )
@@ -412,7 +423,7 @@ export function recordAppliedModelSelection(database: Database, input: RecordApp
   return result.changes === 1;
 }
 
-export type ModelRevertReason = "revoked" | "refused" | "t3-rejected";
+export type ModelRevertReason = "revoked" | "refused";
 
 /** A reverted desired selection: what it was and what it is now (null = route or profile default). */
 export interface ModelRevert {
@@ -424,8 +435,8 @@ export interface RevertDesiredModelSelectionInput {
   readonly taskId: string;
   /**
    * `revoked`: config no longer allows the desired model, so the task returns to its default (NULL).
-   * `refused` / `t3-rejected`: T3 cannot move the thread there, so the desired model becomes the
-   * applied one and the thread keeps what it has.
+   * `refused`: T3 cannot move the thread there, so the desired model becomes the applied one and
+   * the thread keeps what it has. (A switch T3 itself rejected goes through `recordModelRejection`.)
    */
   readonly reason: ModelRevertReason;
   /** A stable refusal code (`SwitchRefusalCode` or a failure code) for the audit row. */
@@ -435,10 +446,8 @@ export interface RevertDesiredModelSelectionInput {
 }
 
 /**
- * Drops a desired selection that cannot be honoured, audited as `task.model.reverted`. When T3
- * rejects a switch to a route or profile default (no desired selection), the applied selection is
- * pinned as the desired one so later turns stop retrying it. Returns the change, or null when there
- * was nothing to revert (already reverted, or nothing to pin).
+ * Drops a desired selection that cannot be honoured, audited as `task.model.reverted`. Returns the
+ * change, or null when there was nothing to revert (already reverted, or no choice made).
  */
 export function revertDesiredModelSelection(
   database: Database,
@@ -448,12 +457,9 @@ export function revertDesiredModelSelection(
   const now = isoDateTime.parse(input.now);
   return database.transaction(() => {
     const current = taskModelRow(database, taskId);
-    if (current.desired === null && (input.reason !== "t3-rejected" || current.applied === null)) return null;
+    if (current.desired === null) return null;
     const next = input.reason === "revoked" ? null : current.applied;
-    if (next !== null && current.desired !== null && next.instanceId === current.desired.instanceId
-      && next.model === current.desired.model) {
-      return null;
-    }
+    if (sameStoredSelection(next, current.desired)) return null;
     database
       .query("UPDATE tasks SET model_selection_json = ?, updated_at = ? WHERE task_id = ? AND state = 'active'")
       .run(selectionJson(next), now, taskId);
@@ -473,7 +479,58 @@ export function revertDesiredModelSelection(
   }).immediate();
 }
 
-export type TaskModelColumn = "model_selection_json" | "t3_model_selection_json";
+export interface RecordModelRejectionInput {
+  readonly taskId: string;
+  /** The thread T3 refused to move; a task since moved to another thread is left alone. */
+  readonly threadId: string;
+  /** The selection T3 refused for the thread. */
+  readonly rejected: T3ModelSelection;
+  readonly code: string;
+  readonly correlationId: string;
+  readonly now: string;
+}
+
+/**
+ * Records a switch T3 refused for the task's thread, audited once as `task.model.reverted`
+ * (`t3-rejected`). The thread keeps its applied selection: a desired selection reverts to it, and a
+ * route or profile default equal to the rejected one is not retried until the default or the applied
+ * selection changes (the coordinator reads `rejectedModelSelection`). Returns whether it was written.
+ */
+export function recordModelRejection(database: Database, input: RecordModelRejectionInput): boolean {
+  const taskId = requiredId(input.taskId, "taskId");
+  const now = isoDateTime.parse(input.now);
+  return database.transaction(() => {
+    const current = taskModelRow(database, taskId);
+    if (current.threadId !== requiredId(input.threadId, "threadId")) return false;
+    const desired = current.desired === null ? null : current.applied;
+    if (sameStoredSelection(current.rejected, input.rejected) && sameStoredSelection(desired, current.desired)) {
+      return false;
+    }
+    database
+      .query(
+        `UPDATE tasks SET t3_rejected_model_selection_json = ?, model_selection_json = ?, updated_at = ?
+         WHERE task_id = ? AND state = 'active'`,
+      )
+      .run(selectionJson(input.rejected), selectionJson(desired), now, taskId);
+    writeAudit(database, {
+      actorType: "service",
+      actorId: "agent-tag",
+      authority: "task-model",
+      source: "t3-rejected",
+      target: taskId,
+      action: "task.model.reverted",
+      result: "t3-rejected",
+      correlationId: requiredId(input.correlationId, "correlationId"),
+      metadata: selectionMetadata(current.applied, input.rejected, requiredId(input.code, "code")),
+      createdAt: now,
+    });
+    return true;
+  }).immediate();
+}
+
+const TASK_MODEL_COLUMNS = ["model_selection_json", "t3_model_selection_json", "t3_rejected_model_selection_json"] as const;
+
+export type TaskModelColumn = (typeof TASK_MODEL_COLUMNS)[number];
 
 export interface ClearInvalidModelSelectionInput {
   readonly taskId: string;
@@ -495,13 +552,14 @@ export function clearInvalidModelSelection(
     const row = z.object({
       model_selection_json: z.string().nullable(),
       t3_model_selection_json: z.string().nullable(),
+      t3_rejected_model_selection_json: z.string().nullable(),
     }).nullable().parse(
       database
-        .query("SELECT model_selection_json, t3_model_selection_json FROM tasks WHERE task_id = ? AND state = 'active'")
+        .query(`SELECT ${TASK_MODEL_COLUMNS.join(", ")} FROM tasks WHERE task_id = ? AND state = 'active'`)
         .get(taskId),
     );
     if (row === null) return [];
-    const columns = (["model_selection_json", "t3_model_selection_json"] as const).filter(
+    const columns = TASK_MODEL_COLUMNS.filter(
       (column) => row[column] !== null && storedModelSelection(row[column]) === null,
     );
     if (columns.length === 0) return [];

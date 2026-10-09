@@ -123,6 +123,7 @@ export const taskExecutionSchema = z.object({
   created_at: isoDateTime,
   model_selection_json: z.string().nullable(),
   t3_model_selection_json: z.string().nullable(),
+  t3_rejected_model_selection_json: z.string().nullable(),
 });
 export const interactionIdentitySchema = z.object({ interaction_id: nonEmpty });
 export const interactionRowSchema = z.object({

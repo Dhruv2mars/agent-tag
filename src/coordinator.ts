@@ -729,8 +729,6 @@ export class AgentTagCoordinator {
     });
     const route = this.#config.routes.find((candidate) => candidate.conversationId === task.conversationId);
     const turnText = await this.#composeTurn(operation, task, profile, signal);
-    const model = await this.#turnModel(operation, task, profile, route, signal);
-    const modelSelection = model.selection;
     // Shutdown aborts these dispatches (the gateway interrupts the RPC and closes its socket). Both
     // commands use stable ids, so T3 deduplicates the replay when the released operation resumes.
     await abortable(this.#t3.dispatch({
@@ -743,6 +741,10 @@ export class AgentTagCoordinator {
       defaultModelSelection: { instanceId: profile.defaultProviderInstanceId, model: profile.defaultModel },
       createdAt: task.projectCreatedAt,
     }, signal), signal);
+    // Chosen after the project exists: until the model is frozen here no model-bearing command has
+    // gone out, so a retry before this point re-plans against the current config.
+    const model = await this.#turnModel(operation, task, profile, route, signal);
+    const modelSelection = model.selection;
 
     // Recorded first: if the receipt is lost, T3 may still run the turn, so cancellation has to wait
     // for the replay below to confirm it instead of dropping the operation locally.
@@ -1104,13 +1106,16 @@ export class AgentTagCoordinator {
       route,
       catalog: this.#catalog?.current() ?? null,
     });
+    // T3 already refused this default for the thread: stay on what it accepted until either changes.
+    const stuck = effective.reason !== "desired" && task.threadStarted && applied !== null
+      && task.rejectedModelSelection !== null && sameSelection(effective.selection, task.rejectedModelSelection);
     if (effective.revoked && task.desiredModelSelection !== null) {
       const dropped = task.desiredModelSelection;
       const allowed = allowedChoices(profile, route).map((choice) => `*${escapeSlackText(choice.label)}*`).join(", ");
       const droppedLabel = escapeSlackText(dropped.model);
       this.#modelNotice(
         operation,
-        effective.reason === "sticky-applied"
+        effective.reason === "sticky-applied" || stuck
           ? `*${droppedLabel}* is no longer allowed here, but T3 can't move a started thread to another provider, so this thread stays on it. Start a new thread to use an allowed model: ${allowed}.`
           : `*${droppedLabel}* is no longer allowed here, so this thread uses *${escapeSlackText(modelLabel(profile, route, effective.selection))}*. Allowed: ${allowed}.`,
       );
@@ -1126,6 +1131,7 @@ export class AgentTagCoordinator {
     if (!task.threadStarted || applied === null || sameSelection(target, applied)) {
       return { selection: target, previous: applied, movedThread: false };
     }
+    if (stuck) return { selection: applied, previous: applied, movedThread: false };
 
     const catalog = await this.#freshCatalog(signal);
     const plan = planSwitch({
@@ -1180,8 +1186,9 @@ export class AgentTagCoordinator {
   }
 
   /**
-   * Classifies a T3 turn failure. When T3 refused the model switch, the desired model reverts to the
-   * one T3 last accepted and the thread's projected selection is moved back (best effort).
+   * Classifies a T3 turn failure. When T3 refused the model switch, the rejection is recorded (a
+   * desired model reverts to the one T3 last accepted; a default is not retried) and the thread's
+   * projected selection is moved back (best effort).
    */
   async #turnFailure(
     lastError: string | null | undefined,
@@ -1195,10 +1202,11 @@ export class AgentTagCoordinator {
     const failure = classifyT3TurnFailure(lastError, {
       currentModel: modelLabel(profile, route, model.previous ?? model.selection),
     });
-    if (failure.code === "T3ModelSwitchRejected") {
-      this.#store.revertDesiredModelSelection({
+    if (failure.code === "T3ModelSwitchRejected" && model.previous !== null && !sameSelection(model.selection, model.previous)) {
+      this.#store.recordModelRejection({
         taskId: task.taskId,
-        reason: "t3-rejected",
+        threadId: task.threadId,
+        rejected: model.selection,
         code: failure.code,
         correlationId: operation.operationId,
         now: this.#now().toISOString(),
