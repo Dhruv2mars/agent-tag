@@ -236,7 +236,19 @@ export class SlackActionRouter {
         threadTs,
         actorUserId: body.user.id,
       });
-      if (question === null) return { kind: "ignored", reason: "interaction-denied" };
+      if (question === null) {
+        // A stale button on a form that was already handled gets feedback; anything else stays silent.
+        const handledCommandId = this.#store.handledUserInputCommandId({
+          interactionId: value.interactionId,
+          workspaceId: body.team.id,
+          conversationId: body.channel.id,
+          threadTs,
+          actorUserId: body.user.id,
+        });
+        return handledCommandId !== null
+          ? this.#duplicate(value.interactionId, handledCommandId)
+          : { kind: "ignored", reason: "interaction-denied" };
+      }
       return {
         kind: "open-modal",
         triggerId: body.trigger_id,

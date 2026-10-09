@@ -439,6 +439,68 @@ describe("a second click on a handled request (I2 Done 3)", () => {
     });
   });
 
+  test("a stale modal button on a handled form answers with one ephemeral instead of opening a modal", async () => {
+    await withHarness(async (harness) => {
+      const single: T3PendingUserInput = { ...question, questions: [{ id: "q1", header: "Target", question: "Which one?", options: [], multiSelect: false }] };
+      const { interactionId } = harness.store.recordPendingInteraction({
+        ...harness.seeded,
+        requestId: single.requestId,
+        kind: "user-input",
+        prompt: single,
+        conversationId: "C1",
+        threadTs: "1000.000001",
+        message: (id) => questionMessage(id, single),
+        now: harness.clock,
+      });
+      const open = (actionTs: string, userId = "U1") => ({
+        ...click(harness, interactionId, actionTs, "agent-tag.user-input.open", userId),
+        actions: [{
+          action_id: "agent-tag.user-input.open",
+          action_ts: actionTs,
+          value: JSON.stringify({ interactionId, questionId: "q1" }),
+        }],
+      });
+      const responses: string[] = [];
+      const views: unknown[] = [];
+      const input = {
+        actions: harness.router,
+        openView: async (_trigger: string, view: unknown) => {
+          views.push(view);
+        },
+        respond: async (message: Parameters<SlackRespond>[0]) => {
+          responses.push(message.text);
+        },
+      };
+      expect((await handleBlockAction(input, open("2000.000002"))).kind).toBe("open-modal");
+      expect(harness.store.submitUserInputAnswer({
+        interactionId,
+        questionId: "q1",
+        selection: { optionIndexes: [], text: "staging" },
+        workspaceId: "T1",
+        conversationId: "C1",
+        threadTs: "1000.000001",
+        actorUserId: "U1",
+        sourceActionId: "modal-1",
+        expirySeconds: 3_600,
+        now: harness.clock,
+      }).kind).toBe("accepted");
+      // response-pending, then resolved: both are handled, and the click itself enqueues nothing.
+      const staleClick = async (actionTs: string) => {
+        const outboxBefore = outboxCount(harness.path);
+        expect(await handleBlockAction(input, open(actionTs, "U2"))).toMatchObject({ kind: "duplicate" });
+        expect(outboxCount(harness.path)).toBe(outboxBefore);
+      };
+      await staleClick("2000.000003");
+      expect((await successfulWorker(harness).processNext()).kind).toBe("resolved");
+      await harness.drain();
+      await staleClick("2000.000004");
+      expect(views).toHaveLength(1);
+      expect(responses).toHaveLength(2);
+      expect(responses[0]).toContain("Sending to the agent");
+      expect(responses[1]).toContain("Answered by <@U1>");
+    });
+  });
+
   test("a redelivered click on a still-pending form gets no ephemeral", async () => {
     await withHarness(async (harness) => {
       const { interactionId } = harness.store.recordPendingInteraction({

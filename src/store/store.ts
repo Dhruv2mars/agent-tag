@@ -426,6 +426,11 @@ export class AgentTagStore {
     return interactions.submitInteractionResponse(this.#database, input);
   }
 
+  /** The response command id when the actor's user-input form in this thread is no longer pending. */
+  handledUserInputCommandId(input: Omit<userInput.GetPendingUserInputQuestionInput, "questionId">): string | null {
+    return userInput.handledUserInputCommandId(this.#database, input);
+  }
+
   /** Returns one question of a still-pending user-input request when the actor may answer it. */
   getPendingUserInputQuestion(
     input: userInput.GetPendingUserInputQuestionInput,

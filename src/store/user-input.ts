@@ -82,6 +82,33 @@ export function getPendingUserInputQuestion(
   return prompt.data.questions.find((question) => question.id === input.questionId) ?? null;
 }
 
+/**
+ * The response command id when the form, visible to this actor in this thread, is no longer pending
+ * (answered, dismissed, failed or expired), so a click on its modal button only needs "already handled"
+ * feedback; null otherwise.
+ */
+export function handledUserInputCommandId(
+  database: Database,
+  input: Omit<GetPendingUserInputQuestionInput, "questionId">,
+): string | null {
+  const row = z.object({ response_command_id: nonEmpty }).nullable().parse(database
+    .query(
+      `SELECT i.response_command_id
+       FROM interactions i JOIN tasks t ON t.task_id = i.task_id
+       WHERE i.interaction_id = ? AND i.kind = 'user-input' AND i.state <> 'pending'
+         AND t.workspace_id = ? AND t.conversation_id = ? AND t.thread_ts = ?
+         AND (t.conversation_type = 'channel' OR t.owner_user_id = ?)`,
+    )
+    .get(
+      requiredId(input.interactionId, "interactionId"),
+      requiredId(input.workspaceId, "workspaceId"),
+      requiredId(input.conversationId, "conversationId"),
+      requiredId(input.threadTs, "threadTs"),
+      requiredId(input.actorUserId, "actorUserId"),
+    ));
+  return row?.response_command_id ?? null;
+}
+
 export interface SubmitUserInputAnswerInput {
   readonly interactionId: string;
   readonly questionId: string;
