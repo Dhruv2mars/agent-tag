@@ -1,5 +1,7 @@
 import { z } from "zod";
 
+import type { CommandIngress } from "../commands/context.ts";
+import { IMPLEMENTED_COMMANDS, isCommandUsage, parseAgentCommand } from "../commands/parse.ts";
 import type { AgentTagConfig } from "../config.ts";
 import { AgentTagStore, type ActiveTaskBinding, type IngestReceipt } from "../store/store.ts";
 
@@ -55,6 +57,8 @@ const BOT_NOTE_SUBTYPES = new Set([undefined, "bot_message", "thread_broadcast"]
 export type SlackIngressResult =
   | { readonly kind: "accepted" | "duplicate"; readonly receipt: IngestReceipt }
   | { readonly kind: "noted"; readonly noteId: string; readonly duplicate: boolean }
+  /** An `@bot !command`: no ingest, no task, no operation. The bridge runs it (commands/handler.ts). */
+  | CommandIngress
   | {
       readonly kind: "ignored";
       readonly reason:
@@ -73,7 +77,8 @@ export type SlackIngressResult =
         | "ambient-quiet"
         | "dm-owner-denied"
         | "task-route-denied"
-        | "edit-irrelevant";
+        | "edit-irrelevant"
+        | "thread-muted";
     };
 type IgnoredReason = Extract<SlackIngressResult, { kind: "ignored" }>["reason"];
 
@@ -142,6 +147,22 @@ export class SlackEventRouter {
   /** One place decides who may steer, so a later access mode swaps a single function. */
   #isSteeringAllowed(userId: string): boolean {
     return this.#config.access.allowedUserIds.includes(userId);
+  }
+
+  /** `<@BOT>` or `<@BOT|label>` anywhere in the text. */
+  #mentionsBot(text: string): boolean {
+    return text.includes(`<@${this.#botUserId}>`) || text.includes(`<@${this.#botUserId}|`);
+  }
+
+  /**
+   * An implemented `!command`, or null for an ordinary prompt. In a DM the bare form (no mention) also
+   * counts, since nobody mentions a bot in a 1:1 DM. Commands not implemented yet stay prompts.
+   */
+  #parseCommand(text: string, route: Route): CommandIngress["command"] | null {
+    if (!this.#config.commands.enabled) return null;
+    const command = parseAgentCommand(text, { botUserId: this.#botUserId, allowBare: route.conversationType === "dm" });
+    if (command === null || isCommandUsage(command)) return null;
+    return (IMPLEMENTED_COMMANDS as ReadonlyArray<string>).includes(command.name) ? command : null;
   }
 
   #findBinding(workspaceId: string, conversationId: string, threadTs: string): ActiveTaskBinding | null {
@@ -286,7 +307,31 @@ export class SlackEventRouter {
     if (route.conversationType === "dm" && actorUserId !== route.ownerUserId) return ignored("dm-owner-denied");
     const selectedRoot = route.repositoryRoot ?? profile.repositoryRoots[0];
     if (selectedRoot === undefined) throw new Error(`validated profile ${profile.id} has no repository root`);
+    // Commands run after every access check, so a user who may not message the bot stays unanswered.
+    const command = this.#parseCommand(event.text, route);
+    if (command !== null) {
+      const commandThreadTs = event.thread_ts ?? null;
+      return {
+        kind: "command",
+        command,
+        context: {
+          deliveryId,
+          eventKey,
+          workspaceId,
+          conversationId: event.channel,
+          conversationType: route.conversationType,
+          threadTs: commandThreadTs,
+          messageTs: event.ts,
+          actorUserId,
+          profileId: route.profileId,
+          repositoryRoot: selectedRoot,
+          binding: commandThreadTs === null ? null : this.#findBinding(workspaceId, event.channel, commandThreadTs),
+          receivedAt,
+        },
+      };
+    }
     const binding = this.#findBinding(workspaceId, event.channel, threadTs);
+    const explicitMention = this.#mentionsBot(event.text);
     let profileId: string;
     let repositoryRoot: string;
     if (binding !== null) {
@@ -298,10 +343,13 @@ export class SlackEventRouter {
       ) {
         return ignored("task-route-denied");
       }
+      // A muted thread only takes requests that mention the bot; such a mention unmutes it (below).
+      if (!explicitMention && this.#store.isThreadMuted({ workspaceId, conversationId: event.channel, threadTs })) {
+        return ignored("thread-muted");
+      }
       profileId = binding.profileId;
       repositoryRoot = binding.repositoryRoot;
     } else {
-      const explicitMention = event.text.includes(`<@${this.#botUserId}>`);
       if (event.type === "message" && event.thread_ts !== undefined) return ignored("unbound-thread");
       if (event.type === "message" && !explicitMention && route.conversationType === "channel") {
         if (!profile.ambient.enabled) return ignored("ambient-disabled");
@@ -348,6 +396,7 @@ export class SlackEventRouter {
       messageTs: event.ts,
       origin: "slack",
       ...(threadContext === undefined ? {} : { threadContext }),
+      ...(binding !== null && explicitMention ? { unmuteThread: true } : {}),
     });
     return { kind: receipt.kind, receipt };
   }

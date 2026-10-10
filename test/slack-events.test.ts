@@ -121,7 +121,7 @@ describe("Slack event ingress", () => {
         eventBody({ eventId: "EvDM1", type: "message", channel: "D1", text: "private request" }),
       );
       if (accepted.kind === "ignored") throw new Error(`DM event was ignored: ${accepted.reason}`);
-      if (accepted.kind === "noted") throw new Error("DM event became a note");
+      if (accepted.kind === "noted" || accepted.kind === "command") throw new Error(`DM event became ${accepted.kind}`);
       expect(store.getTaskExecution(accepted.receipt.taskId)).toMatchObject({
         conversationType: "dm",
         ownerUserId: "U1",

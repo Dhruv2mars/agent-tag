@@ -5,6 +5,7 @@ import { z } from "zod";
 
 import { type T3ModelSelection, t3ModelSelectionSchema } from "../t3/gateway.ts";
 import { writeAudit } from "./audit.ts";
+import { unmuteThreadForMention } from "./commands.ts";
 import { type StoreContext, requiredId } from "./context.ts";
 import {
   canonicalEventSchema,
@@ -134,6 +135,17 @@ export function ingestSlackEvent(context: StoreContext, input: SlackEventInput):
         event.receivedAt,
       );
     insertDelivery(database, event, operationId, "accepted");
+    if (input.unmuteThread === true) {
+      unmuteThreadForMention(database, {
+        workspaceId: event.workspaceId,
+        conversationId: event.conversationId,
+        threadTs: event.threadTs,
+        actorUserId: event.actorUserId,
+        profileId: event.profileId,
+        eventKey: event.eventKey,
+        now: event.receivedAt,
+      });
+    }
     writeAudit(database, {
       actorType: "slack-user",
       actorId: event.actorUserId,

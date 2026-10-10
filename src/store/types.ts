@@ -42,6 +42,8 @@ export interface SlackEventInput {
   readonly origin?: "slack" | "schedule";
   /** Thread window seed (first mention in an existing thread); copied into the operation payload. */
   readonly threadContext?: { readonly rootTs: string; readonly beforeTs: string };
+  /** A direct mention in a bound thread: clears its mute on the accepted path (PR-H). */
+  readonly unmuteThread?: boolean;
 }
 
 export interface ActiveTaskBinding {

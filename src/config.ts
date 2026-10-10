@@ -3,6 +3,7 @@ import { isAbsolute, join, resolve } from "node:path";
 
 import { z } from "zod";
 
+import { AGENT_COMMANDS } from "./commands/parse.ts";
 import { parseT3DownloadBaseUrl } from "./t3/install.ts";
 
 const absolutePath = z.string().min(1).refine(isAbsolute, "must be an absolute path");
@@ -421,6 +422,19 @@ const routinesSchema = z
   .strict()
   .prefault({});
 
+/** `@bot !command` settings (PR-H). Every key defaults, so existing configs stay valid. */
+const commandsSchema = z
+  .object({
+    /** false: `!words` are ordinary prompts. */
+    enabled: z.boolean().default(true),
+    /** `!help` cannot be disabled: it is how users find out what is enabled. */
+    disabled: z.array(z.enum(AGENT_COMMANDS).exclude(["help"])).default([]),
+    /** Commands only `access.adminUserIds` may run. `!help` and `!status` are read-only and stay open. */
+    adminOnly: z.array(z.enum(AGENT_COMMANDS).exclude(["help", "status"])).default([]),
+  })
+  .strict()
+  .prefault({});
+
 export const agentTagConfigSchema = z
   .object({
     version: z.literal(1),
@@ -434,7 +448,10 @@ export const agentTagConfigSchema = z
     access: z.object({
       allowedUserIds: z.array(slackId).min(1),
       allowedChannelIds: z.array(slackId).min(1),
+      /** Users who may run `commands.adminOnly` commands. Must be allowed users. */
+      adminUserIds: z.array(slackId).default([]),
     }),
+    commands: commandsSchema,
     profiles: z.array(profileSchema).min(1),
     routes: z.array(routeSchema),
     limits: z.object({
@@ -454,6 +471,15 @@ export const agentTagConfigSchema = z
     }
     for (const [index, profile] of config.profiles.entries()) {
       checkAllowedModels(profile, ["profiles", index, "allowedModels"], context);
+    }
+    for (const [index, userId] of config.access.adminUserIds.entries()) {
+      if (!config.access.allowedUserIds.includes(userId)) {
+        context.addIssue({
+          code: "custom",
+          path: ["access", "adminUserIds", index],
+          message: "admin user is not in access.allowedUserIds",
+        });
+      }
     }
     const routeConversationIds = new Set(config.routes.map((route) => route.conversationId));
     if (routeConversationIds.size !== config.routes.length) {
