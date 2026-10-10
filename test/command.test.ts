@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { type CommandResult, requireSuccess } from "../src/command.ts";
+import { type CommandResult, requireSuccess, runCommand } from "../src/command.ts";
 
 const runner = (result: CommandResult) => async (): Promise<CommandResult> => result;
 
@@ -21,5 +21,21 @@ describe("requireSuccess", () => {
     await expect(
       requireSuccess(runner({ exitCode: 2, stdout: "details", stderr: "boom" }), ["x"], "x"),
     ).rejects.toThrow("x failed with exit code 2: boom\ndetails");
+  });
+});
+
+describe("runCommand", () => {
+  test("kills the command when its signal aborts", async () => {
+    const controller = new AbortController();
+    const started = Date.now();
+    setTimeout(() => controller.abort(), 50);
+    const result = await runCommand(["sleep", "30"], { signal: controller.signal });
+    expect(result.exitCode).not.toBe(0);
+    expect(Date.now() - started).toBeLessThan(5_000);
+  });
+
+  test("does not start a command whose signal already aborted", async () => {
+    const result = await runCommand(["sleep", "30"], { signal: AbortSignal.abort() });
+    expect(result.exitCode).toBe(130);
   });
 });

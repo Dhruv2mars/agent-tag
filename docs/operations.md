@@ -111,14 +111,15 @@ Every 60 s the service logs `t3.connection.stats` with the counters `sessionInsp
 
 ## T3 token rotation
 
-The restricted T3 token (scopes `orchestration:read orchestration:operate`) lasts 30 days. Each token Agent Tag mints is labeled `agent-tag-orchestration-YYYYMMDDTHHMMSSZ` (UTC).
+The restricted T3 token (scopes `orchestration:read orchestration:operate`) lasts 30 days. Each token Agent Tag mints is labeled `agent-tag-orchestration-YYYYMMDDTHHMMSSZ-xxxxxx` (UTC time plus 6 random hex characters, so two rotations in the same second get distinct labels).
 
 With `t3.mode: "managed"` the service owns the token:
 
 - At startup, after the managed runtime is ready, it mints a token when the token file is missing or T3 rejects it.
 - Every 6 h it checks expiry and rotates when fewer than `t3.managed.rotation.rotateBeforeDays` days are left. When the T3 connection reports a 401/403 (or a revoked token), it checks at once and rotates, at most once per 5 minutes.
 - A rotation issues a 10-minute admin session with `t3 auth session issue`, mints the new token, verifies its scopes and that it cannot reach admin endpoints, writes it atomically over the token file (`0600`), and revokes the admin session in `finally`. Admin tokens are held in memory only.
-- The replaced token is recorded in `<runtimeDir>/credential-state.json` and revoked after `revokeGraceMinutes`, so turns already running keep working. Only that token is revoked: by label, or, for a token minted outside Agent Tag, by its exact expiry and restricted scopes. Other clients, including other `agent-tag-orchestration-*` tokens, are never touched.
+- The replaced token is recorded in `<runtimeDir>/credential-state.json` and revoked after `revokeGraceMinutes`, so turns already running keep working. Only that token is revoked, matched by its exact label; other clients, including other `agent-tag-orchestration-*` tokens and the current one, are never touched. A token without an Agent Tag label (for example one from `bun run enroll:t3`) is never revoked: the service logs `t3.token.revoke_skipped` and it expires on its own.
+- A revoke that T3 does not confirm is retried with backoff (1, 2, 4, 8, 16 minutes). After 6 attempts the service gives up, logs it, and leaves the token to expire.
 - Nothing is sent to a T3 that failed the version or protocol gate, and an unreachable T3 never causes a rotation.
 
 | Key | Default | Meaning |
@@ -138,7 +139,7 @@ agent-tag t3 rotate CONFIG --t3-base-dir DIR [--t3-bin BIN]  # external: issue a
 
 It prints `{mode, tokenFile, label, expiresAt, daysRemaining, previousToken}`. In managed mode the running service revokes the old token after the grace period. In external mode the old token is not revoked; it expires on its own. A running service picks up the new token file within 5 s. `agent-tag t3 status CONFIG` reports `token.expiresAt`, `token.daysRemaining`, `token.label`, `token.rotatedAt` and `token.pendingRevocations`.
 
-Log events: `t3.token.rotated`, `t3.token.rotate_failed`, `t3.token.expiring`, `t3.token.revoked`, `t3.token.revoke_skipped` (the client list was unreadable or T3 failed; the token expires on its own), and `t3.token.admin_revoke_failed` (the admin session expires within 10 minutes). None contains a token.
+Log events: `t3.token.rotated`, `t3.token.rotate_failed`, `t3.token.expiring`, `t3.token.revoked`, `t3.token.revoke_skipped` (the token has no Agent Tag label, the client list was unreadable, T3 failed, or retries ran out; the token expires on its own), and `t3.token.admin_revoke_failed` (the admin session expires within 10 minutes). None contains a token.
 
 ## Background service
 

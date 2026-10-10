@@ -53,10 +53,11 @@ function firstStderrLine(stderr: string): string {
 }
 
 export async function issueT3AdminSession(
-  input: T3AdminSessionTarget & { readonly label: string; readonly run: CommandRunner },
+  input: T3AdminSessionTarget & { readonly label: string; readonly run: CommandRunner; readonly signal?: AbortSignal },
 ): Promise<IssuedT3AdminSession> {
   const command = t3AdminSessionIssueCommand(input);
-  const result = await input.run(command);
+  const result = await input.run(command, input.signal === undefined ? undefined : { signal: input.signal });
+  input.signal?.throwIfAborted();
   if (result.exitCode !== 0) {
     throw new Error(`\`${command.slice(0, 4).join(" ")}\` failed with exit code ${result.exitCode}${firstStderrLine(result.stderr)}`);
   }
@@ -70,9 +71,9 @@ export async function issueT3AdminSession(
 }
 
 export async function revokeT3AdminSession(
-  input: T3AdminSessionTarget & { readonly sessionId: string; readonly run: CommandRunner },
+  input: T3AdminSessionTarget & { readonly sessionId: string; readonly run: CommandRunner; readonly signal?: AbortSignal },
 ): Promise<void> {
-  const result = await input.run(t3AdminSessionRevokeCommand(input));
+  const result = await input.run(t3AdminSessionRevokeCommand(input), input.signal === undefined ? undefined : { signal: input.signal });
   if (result.exitCode !== 0) {
     throw new Error(`t3 auth session revoke failed with exit code ${result.exitCode}${firstStderrLine(result.stderr)}`);
   }

@@ -26,6 +26,7 @@ import { runT3Rotate } from "../src/t3/operator.ts";
 import type { EnvironmentFetch } from "../src/t3/protocol.ts";
 
 const DAY_MS = 86_400_000;
+const LABEL_AT_START = /^agent-tag-orchestration-20261010T120000Z-[0-9a-f]{6}$/;
 const START = Date.parse("2026-10-10T12:00:00.000Z");
 const ADMIN_SCOPES = [
   "orchestration:read", "orchestration:operate", "terminal:operate", "review:write",
@@ -69,7 +70,13 @@ function fakeT3(clock: { now: number }) {
     clients: "ok" as "ok" | "unparseable" | "error",
     adminRevoke: false,
     issue: false,
+    /** `{revoked:false}` for every client revoke. */
+    revokeUnconfirmed: false,
+    /** `t3 auth session issue` never exits unless its abort signal fires. */
+    hangIssue: false,
   };
+  /** Admin sessions issued and not yet revoked, and the most that were ever open at once. */
+  const admins = { open: 0, maxOpen: 0 };
   let counter = 0;
   const secret = (kind: string) => `${kind}-secret-${++counter}-${crypto.randomUUID()}`;
 
@@ -152,7 +159,7 @@ function fakeT3(clock: { now: number }) {
         if (!isAdmin(caller)) return new Response("forbidden", { status: 403 });
         const { sessionId } = await request.json() as { sessionId: string };
         const target = sessions.find((session) => session.sessionId === sessionId);
-        if (target === undefined) return Response.json({ revoked: false });
+        if (target === undefined || failures.revokeUnconfirmed) return Response.json({ revoked: false });
         target.revoked = true;
         return Response.json({ revoked: true });
       }
@@ -161,11 +168,19 @@ function fakeT3(clock: { now: number }) {
   });
   servers.push(server);
 
-  const run: CommandRunner = async (command) => {
+  const run: CommandRunner = async (command, options) => {
     commands.push([...command]);
     const action = command.slice(1, 4).join(" ");
     if (action === "auth session issue") {
+      if (failures.hangIssue) {
+        await new Promise<void>((resolve) => options?.signal?.addEventListener("abort", () => resolve(), { once: true }));
+        return { exitCode: 137, stdout: "", stderr: "killed" };
+      }
       if (failures.issue) return { exitCode: 1, stdout: "", stderr: "issue failed" };
+      // Yield so overlapping lock holders would interleave here.
+      await Bun.sleep(5);
+      admins.open += 1;
+      admins.maxOpen = Math.max(admins.maxOpen, admins.open);
       const label = command[command.indexOf("--label") + 1];
       const admin = add({ scopes: ADMIN_SCOPES, expiresAt: new Date(clock.now + 600_000).toISOString(), ...(label === undefined ? {} : { label }) });
       return { exitCode: 0, stdout: JSON.stringify({ sessionId: admin.sessionId, token: admin.token, scopes: ADMIN_SCOPES }), stderr: "" };
@@ -174,6 +189,7 @@ function fakeT3(clock: { now: number }) {
       if (failures.adminRevoke) return { exitCode: 1, stdout: "", stderr: "revoke failed" };
       const target = sessions.find((session) => session.sessionId === command.at(-1));
       if (target !== undefined) target.revoked = true;
+      admins.open -= 1;
       return { exitCode: 0, stdout: "", stderr: "" };
     }
     return { exitCode: 2, stdout: "", stderr: "unknown command" };
@@ -184,6 +200,7 @@ function fakeT3(clock: { now: number }) {
     sessions,
     commands,
     failures,
+    admins,
     run,
     add,
     issued: () => commands.filter((command) => command[3] === "issue").length,
@@ -218,11 +235,21 @@ async function setup(input: { mode?: "managed" | "external"; admin?: boolean; st
     await mkdir(join(dir, "secrets"), { recursive: true, mode: 0o700 });
     await writeFile(tokenFile, session.token, { mode: 0o600 });
   }
+  /** Seeds a token minted by Agent Tag: the token file plus its label recorded as current in state. */
+  async function seedCurrent(daysLeft: number, label = `agent-tag-orchestration-20261001T000000Z-${crypto.randomUUID().slice(0, 6)}`): Promise<FakeSession> {
+    const session = restrictedSession(t3, daysLeft, clock.now, label);
+    await seedToken(session);
+    await mkdir(join(dir, "runtime"), { recursive: true, mode: 0o700 });
+    await writeFile(stateFile, JSON.stringify({
+      version: 1, currentLabel: label, rotatedAt: new Date(clock.now - DAY_MS).toISOString(), rotationReason: "missing", retired: [],
+    }), { mode: 0o600 });
+    return session;
+  }
   function expectNoSecrets(...extra: unknown[]): void {
     const text = JSON.stringify([logs, ...extra.map((item) => item instanceof Error ? `${item.name} ${item.message} ${item.stack}` : item)]);
     for (const value of t3.secrets()) expect(text).not.toContain(value);
   }
-  return { dir, clock, t3, logs, tokenFile, stateFile, lifecycle, seedToken, expectNoSecrets };
+  return { dir, clock, t3, logs, tokenFile, stateFile, lifecycle, seedToken, seedCurrent, expectNoSecrets };
 }
 
 const events = (logs: readonly ServiceLogRecord[]) => logs.map((record) => record.event);
@@ -233,7 +260,10 @@ function restrictedSession(t3: Fake, daysLeft: number, now: number, label?: stri
 
 describe("labels and expiry", () => {
   test("labels are agent-tag-orchestration- plus a UTC timestamp to the second", () => {
-    expect(t3OrchestrationLabel(new Date("2026-10-10T03:05:12.345Z"))).toBe("agent-tag-orchestration-20261010T030512Z");
+    expect(t3OrchestrationLabel(new Date("2026-10-10T03:05:12.345Z"), "1a2b3c")).toBe("agent-tag-orchestration-20261010T030512Z-1a2b3c");
+    const now = new Date(START);
+    expect(t3OrchestrationLabel(now)).toMatch(/^agent-tag-orchestration-20261010T120000Z-[0-9a-f]{6}$/);
+    expect(t3OrchestrationLabel(now)).not.toBe(t3OrchestrationLabel(now));
   });
 
   test("daysRemaining is rounded to one decimal", () => {
@@ -249,7 +279,7 @@ describe("ensureToken", () => {
     const world = await setup();
     expect(await world.lifecycle().ensureToken()).toBe("enrolled");
     const [minted] = world.t3.restricted();
-    expect(minted?.label).toBe("agent-tag-orchestration-20261010T120000Z");
+    expect(minted?.label).toMatch(LABEL_AT_START);
     expect((await readFile(world.tokenFile, "utf8")).trim()).toBe(minted?.token ?? "");
     expect((await stat(world.tokenFile)).mode & 0o777).toBe(0o600);
     expect(world.t3.adminSessions().every((session) => session.revoked)).toBe(true);
@@ -392,6 +422,19 @@ describe("maintain", () => {
     expect(world.t3.issued()).toBe(0);
   });
 
+  test("a hung admin command is killed when the service stops, so maintain returns promptly", async () => {
+    const world = await setup();
+    world.t3.failures.hangIssue = true;
+    const controller = new AbortController();
+    const worker = createT3CredentialWorker({ credentials: world.lifecycle() });
+    const started = Date.now();
+    setTimeout(() => controller.abort(), 50);
+    expect(await worker.processNext(controller.signal)).toEqual({ kind: "t3-token-rotate-failed" });
+    expect(Date.now() - started).toBeLessThan(5_000);
+    expect(world.t3.admins.open).toBe(0);
+    expect(await stat(`${world.stateFile}.lock`).catch(() => null)).toBeNull();
+  });
+
   test("the worker requires the T3 gate and reports the maintenance outcome", async () => {
     const world = await setup();
     await world.seedToken(restrictedSession(world.t3, 20, START));
@@ -436,10 +479,11 @@ describe("revocation after the grace period", () => {
     world.expectNoSecrets();
   });
 
-  test("an unlabeled legacy token is matched by its expiry and exact restricted scopes", async () => {
+  test("an unlabeled legacy token is never revoked: it is logged as revoke_skipped and left to expire", async () => {
     const world = await setup();
     const legacy = restrictedSession(world.t3, 20, START);
-    const sameExpiryAdmin = world.t3.add({ scopes: ADMIN_SCOPES, expiresAt: legacy.expiresAt });
+    // Another bot whose token has the same expiry and restricted scopes must not be mistaken for it.
+    const lookalike = world.t3.add({ scopes: REQUIRED_T3_SCOPES, expiresAt: legacy.expiresAt, label: "other-bot" });
     await world.seedToken(legacy);
     const lifecycle = world.lifecycle();
     await lifecycle.rotate("manual");
@@ -447,14 +491,92 @@ describe("revocation after the grace period", () => {
       { expiresAt: legacy.expiresAt, retiredAt: new Date(START).toISOString() },
     ]);
     world.clock.now = START + 16 * 60_000;
+    const issuedBefore = world.t3.issued();
+    expect(await lifecycle.revokeRetired()).toBe(0);
+    expect(legacy.revoked).toBe(false);
+    expect(lookalike.revoked).toBe(false);
+    expect(world.t3.issued()).toBe(issuedBefore);
+    expect(world.logs.at(-1)).toMatchObject({ level: "warn", event: "t3.token.revoke_skipped", count: 1 });
+    expect(world.logs.at(-1)?.detail).toContain(`expires on its own at ${legacy.expiresAt}`);
+    expect((await readT3CredentialState(world.stateFile)).retired).toEqual([]);
+  });
+
+  test("two rotations in the same second get distinct labels and the first replacement is still revoked", async () => {
+    const world = await setup();
+    const original = restrictedSession(world.t3, 20, START, "agent-tag-orchestration-20261001T000000Z-aaaaaa");
+    await world.seedToken(original);
+    await mkdir(join(world.dir, "runtime"), { recursive: true, mode: 0o700 });
+    await writeFile(world.stateFile, JSON.stringify({
+      version: 1, currentLabel: original.label, rotatedAt: new Date(START - DAY_MS).toISOString(), rotationReason: "missing", retired: [],
+    }), { mode: 0o600 });
+    const lifecycle = world.lifecycle();
+    const first = await lifecycle.rotate("manual");
+    const second = await lifecycle.rotate("manual");
+    expect(first.label).not.toBe(second.label);
+    const [middle, latest] = world.t3.restricted().slice(-2);
+    world.clock.now = START + 15 * 60_000;
+    expect(await lifecycle.revokeRetired()).toBe(2);
+    expect(original.revoked).toBe(true);
+    expect(middle?.revoked).toBe(true);
+    expect(latest?.revoked).toBe(false);
+  });
+
+  test("an unconfirmed revoke ({revoked:false}) keeps the entry, retries with backoff, then gives up", async () => {
+    const world = await setup();
+    const old = restrictedSession(world.t3, 20, START, "agent-tag-orchestration-20261001T000000Z-bbbbbb");
+    await world.seedToken(old);
+    await mkdir(join(world.dir, "runtime"), { recursive: true, mode: 0o700 });
+    await writeFile(world.stateFile, JSON.stringify({
+      version: 1, currentLabel: old.label, rotatedAt: new Date(START - DAY_MS).toISOString(), rotationReason: "missing", retired: [],
+    }), { mode: 0o600 });
+    const lifecycle = world.lifecycle();
+    await lifecycle.rotate("manual");
+    world.t3.failures.revokeUnconfirmed = true;
+    const grace = START + 15 * 60_000;
+    world.clock.now = grace;
+    expect(await lifecycle.revokeRetired()).toBe(0);
+    expect(world.logs.at(-1)).toMatchObject({ event: "t3.token.revoke_skipped", count: 1 });
+    expect((await readT3CredentialState(world.stateFile)).retired).toMatchObject([{ label: old.label, attempts: 1 }]);
+    // Backoff: not due again until a minute later.
+    const issued = world.t3.issued();
+    world.clock.now = grace + 30_000;
+    expect(await lifecycle.revokeRetired()).toBe(0);
+    expect(world.t3.issued()).toBe(issued);
+    // Attempts 2..6 at +1, +2, +4, +8, +16 minutes after the grace period.
+    let offset = 0;
+    for (const step of [1, 2, 4, 8, 16]) {
+      offset = step;
+      world.clock.now = grace + offset * 60_000;
+      await lifecycle.revokeRetired();
+    }
+    expect(world.logs.at(-1)?.detail).toContain("after 6 attempts; they expire on their own");
+    expect((await readT3CredentialState(world.stateFile)).retired).toEqual([]);
+    expect(old.revoked).toBe(false);
+  });
+
+  test("a revoke confirmed on a later attempt clears the entry", async () => {
+    const world = await setup();
+    const old = restrictedSession(world.t3, 20, START, "agent-tag-orchestration-20261001T000000Z-cccccc");
+    await world.seedToken(old);
+    await mkdir(join(world.dir, "runtime"), { recursive: true, mode: 0o700 });
+    await writeFile(world.stateFile, JSON.stringify({
+      version: 1, currentLabel: old.label, rotatedAt: new Date(START - DAY_MS).toISOString(), rotationReason: "missing", retired: [],
+    }), { mode: 0o600 });
+    const lifecycle = world.lifecycle();
+    await lifecycle.rotate("manual");
+    world.t3.failures.revokeUnconfirmed = true;
+    world.clock.now = START + 15 * 60_000;
+    await lifecycle.revokeRetired();
+    world.t3.failures.revokeUnconfirmed = false;
+    world.clock.now = START + 16 * 60_000;
     expect(await lifecycle.revokeRetired()).toBe(1);
-    expect(legacy.revoked).toBe(true);
-    expect(sameExpiryAdmin.revoked).toBe(false);
+    expect(old.revoked).toBe(true);
+    expect((await readT3CredentialState(world.stateFile)).retired).toEqual([]);
   });
 
   test("an unparseable /clients answer logs revoke_skipped and drops the entries", async () => {
     const world = await setup();
-    await world.seedToken(restrictedSession(world.t3, 20, START, "agent-tag-orchestration-old"));
+    await world.seedCurrent(20);
     const lifecycle = world.lifecycle();
     await lifecycle.rotate("manual");
     world.t3.failures.clients = "unparseable";
@@ -468,8 +590,7 @@ describe("revocation after the grace period", () => {
 
   test("a failing /clients call logs revoke_skipped and keeps the entries for a later pass", async () => {
     const world = await setup();
-    const old = restrictedSession(world.t3, 20, START, "agent-tag-orchestration-old");
-    await world.seedToken(old);
+    const old = await world.seedCurrent(20);
     const lifecycle = world.lifecycle();
     await lifecycle.rotate("manual");
     world.t3.failures.clients = "error";
@@ -478,13 +599,14 @@ describe("revocation after the grace period", () => {
     expect(world.logs.at(-1)).toMatchObject({ event: "t3.token.revoke_skipped", errorCode: "T3HttpError" });
     expect((await readT3CredentialState(world.stateFile)).retired).toHaveLength(1);
     world.t3.failures.clients = "ok";
+    world.clock.now = START + 21 * 60_000;
     expect(await lifecycle.revokeRetired()).toBe(1);
     expect(old.revoked).toBe(true);
   });
 
   test("maintain revokes at most once a minute", async () => {
     const world = await setup();
-    await world.seedToken(restrictedSession(world.t3, 20, START, "agent-tag-orchestration-old"));
+    await world.seedCurrent(20);
     const lifecycle = world.lifecycle();
     await lifecycle.rotate("manual");
     world.clock.now = START + 60_000;
@@ -508,7 +630,7 @@ describe("revocation after the grace period", () => {
 describe("credential state", () => {
   test("concurrent rotations are serialized by the lock and both replaced tokens are recorded", async () => {
     const world = await setup();
-    await world.seedToken(restrictedSession(world.t3, 20, START, "agent-tag-orchestration-old"));
+    await world.seedCurrent(20);
     const [a, b] = await Promise.all([
       world.lifecycle(() => new Date(START)).rotate("manual"),
       world.lifecycle(() => new Date(START + 1_000)).rotate("manual"),
@@ -521,6 +643,39 @@ describe("credential state", () => {
     expect(state.retired).toHaveLength(2);
     expect(await stat(`${world.stateFile}.lock`).catch(() => null)).toBeNull();
     expect((await stat(world.stateFile)).mode & 0o777).toBe(0o600);
+  });
+
+  test("six concurrent rotations never overlap: one admin session at a time, every replacement recorded", async () => {
+    const world = await setup();
+    await world.seedCurrent(20);
+    const results = await Promise.all(Array.from({ length: 6 }, () => world.lifecycle().rotate("manual")));
+    expect(new Set(results.map((result) => result.label)).size).toBe(6);
+    expect(world.t3.admins.maxOpen).toBe(1);
+    const state = await readT3CredentialState(world.stateFile);
+    expect(state.retired).toHaveLength(6);
+    expect(new Set(state.retired.map((entry) => entry.label)).size).toBe(6);
+    const token = (await readFile(world.tokenFile, "utf8")).trim();
+    expect(state.currentLabel).toBe(world.t3.restricted().find((session) => session.token === token)?.label ?? "");
+  });
+
+  test("a lock held by a live owner is never removed by a waiter, and the wait honours abort", async () => {
+    const world = await setup();
+    await mkdir(join(world.dir, "runtime"), { recursive: true, mode: 0o700 });
+    const held = `${process.pid}:someone-else`;
+    await writeFile(`${world.stateFile}.lock`, held);
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(), 250);
+    await expect(world.lifecycle().rotate("manual", controller.signal)).rejects.toThrow();
+    expect(await readFile(`${world.stateFile}.lock`, "utf8")).toBe(held);
+    expect(world.t3.issued()).toBe(0);
+  });
+
+  test("an empty or garbage lock file (no live owner) is reclaimed", async () => {
+    const world = await setup();
+    await mkdir(join(world.dir, "runtime"), { recursive: true, mode: 0o700 });
+    await writeFile(`${world.stateFile}.lock`, "");
+    expect(await world.lifecycle().ensureToken()).toBe("enrolled");
+    expect(await stat(`${world.stateFile}.lock`).catch(() => null)).toBeNull();
   });
 
   test("a stale lock left by a dead process is taken over", async () => {
@@ -541,7 +696,7 @@ describe("credential state", () => {
 describe("inspectT3TokenStatus", () => {
   test("reports expiry, label, last rotation and pending revocations without the token", async () => {
     const world = await setup();
-    await world.seedToken(restrictedSession(world.t3, 20, START, "agent-tag-orchestration-old"));
+    await world.seedCurrent(20);
     await world.lifecycle().rotate("manual");
     world.clock.now = START + DAY_MS;
     const status = await inspectT3TokenStatus({
@@ -553,7 +708,7 @@ describe("inspectT3TokenStatus", () => {
     expect(status).toEqual({
       expiresAt: new Date(START + 30 * DAY_MS).toISOString(),
       daysRemaining: 29,
-      label: "agent-tag-orchestration-20261010T120000Z",
+      label: expect.stringMatching(LABEL_AT_START),
       rotatedAt: new Date(START).toISOString(),
       pendingRevocations: 1,
       problem: null,
@@ -608,7 +763,7 @@ describe("runT3Rotate", () => {
     expect(JSON.parse(printed.join("\n"))).toEqual({
       mode: "external",
       tokenFile: world.tokenFile,
-      label: "agent-tag-orchestration-20261010T120000Z",
+      label: expect.stringMatching(LABEL_AT_START),
       expiresAt: new Date(START + 30 * DAY_MS).toISOString(),
       daysRemaining: 30,
       previousToken: "not revoked; it expires on its own",

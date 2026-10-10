@@ -120,11 +120,14 @@ export async function mintRestrictedT3Token(input: {
   readonly baseUrl: string;
   readonly administrativeToken: SecretString;
   readonly label: string;
+  readonly signal?: AbortSignal;
 }): Promise<SecretString> {
+  const signal = input.signal === undefined ? {} : { signal: input.signal };
   const pairingResponse = await fetch(new URL("/api/auth/pairing-token", input.baseUrl), {
     method: "POST",
     headers: { ...bearerHeaders(input.administrativeToken), "content-type": "application/json" },
     body: JSON.stringify({ label: input.label, scopes: REQUIRED_T3_SCOPES }),
+    ...signal,
   });
   if (!pairingResponse.ok) {
     throw new Error(`T3 pairing endpoint returned HTTP ${pairingResponse.status}`);
@@ -144,6 +147,7 @@ export async function mintRestrictedT3Token(input: {
     method: "POST",
     headers: { "content-type": "application/x-www-form-urlencoded" },
     body: form,
+    ...signal,
   });
   if (!tokenResponse.ok) throw new Error(`T3 token endpoint returned HTTP ${tokenResponse.status}`);
   const token = accessTokenSchema.parse(await parseJson(tokenResponse));
@@ -181,9 +185,11 @@ export async function issueT3WebSocketUrl(input: {
 export async function expectAdministrativeAccessDenied(input: {
   readonly baseUrl: string;
   readonly token: SecretString;
+  readonly signal?: AbortSignal;
 }): Promise<void> {
   const response = await fetch(new URL("/api/auth/clients", input.baseUrl), {
     headers: bearerHeaders(input.token),
+    ...(input.signal === undefined ? {} : { signal: input.signal }),
   });
   if (response.status !== 403) {
     throw new Error(`expected T3 administrative endpoint to deny access, received ${response.status}`);
