@@ -129,6 +129,11 @@ export interface ReactionFailureInput extends SettleReactionInput {
   readonly errorCode: string;
 }
 
+export interface FailReactionInput extends ReactionFailureInput {
+  /** Slack rate limited reactions.add on the last attempt: no reaction is claimable before this instant. */
+  readonly rateLimitedUntil?: string;
+}
+
 export interface RetryReactionInput extends ReactionFailureInput {
   /** The reaction is not claimable before this instant. */
   readonly blockedUntil: string;
@@ -197,11 +202,12 @@ export function markReactionDelivered(database: Database, input: SettleReactionI
 }
 
 /** Terminal: Slack rejected it for good (missing scope, message gone), or authority was revoked. */
-export function failReaction(database: Database, input: ReactionFailureInput): void {
+export function failReaction(database: Database, input: FailReactionInput): void {
   settleLeasedReaction(database, input, {
     status: "failed",
     errorCode: requiredId(input.errorCode, "errorCode"),
     blockedUntil: null,
+    ...(input.rateLimitedUntil === undefined ? {} : { rateLimitedUntil: input.rateLimitedUntil }),
     audit: { action: "slack.reaction.failed", result: "failed" },
   });
 }

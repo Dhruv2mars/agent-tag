@@ -67,8 +67,13 @@ export async function deliverNextSlackReaction(input: DeliverReactionInput): Pro
   if (claimed === null) return { kind: "idle" };
   const policy = input.retryPolicy ?? REACTION_RETRY_POLICY;
   const settle = { reactionKey: claimed.reactionKey, workerId: input.workerId };
-  const fail = (errorCode: string): SlackReactionOutcome => {
-    input.store.failReaction({ ...settle, errorCode, now: now() });
+  const fail = (errorCode: string, rateLimitedUntil?: string): SlackReactionOutcome => {
+    input.store.failReaction({
+      ...settle,
+      errorCode,
+      now: now(),
+      ...(rateLimitedUntil === undefined ? {} : { rateLimitedUntil }),
+    });
     return { kind: "reaction-failed", reactionKey: claimed.reactionKey, errorCode };
   };
   try {
@@ -93,7 +98,6 @@ export async function deliverNextSlackReaction(input: DeliverReactionInput): Pro
     if (platformError !== undefined && REACTION_TERMINAL_ERRORS.has(platformError)) return fail(platformError);
     const failure = classifySlackDeliveryError(error);
     if (failure.kind === "terminal") return fail(failure.errorCode);
-    if (claimed.attempt >= policy.maxAttempts) return fail(failure.errorCode);
     const retryAfterMs = failure.kind === "retryable" ? failure.retryAfterMs : undefined;
     const delayMs = outboxRetryDelayMs({
       attempt: claimed.attempt,
@@ -103,13 +107,16 @@ export async function deliverNextSlackReaction(input: DeliverReactionInput): Pro
     });
     const at = now();
     const after = (ms: number): string => new Date(new Date(at).getTime() + ms).toISOString();
+    // Slack's cooldown binds every reaction, so it is kept even when this one runs out of attempts.
+    const rateLimitedUntil = isRateLimitFailure(failure) ? after(retryAfterMs ?? delayMs) : undefined;
+    if (claimed.attempt >= policy.maxAttempts) return fail(failure.errorCode, rateLimitedUntil);
     const blockedUntil = after(delayMs);
     input.store.retryReaction({
       ...settle,
       errorCode: failure.errorCode,
       now: at,
       blockedUntil,
-      ...(isRateLimitFailure(failure) ? { rateLimitedUntil: after(retryAfterMs ?? delayMs) } : {}),
+      ...(rateLimitedUntil === undefined ? {} : { rateLimitedUntil }),
     });
     return { kind: "reaction-retry-scheduled", reactionKey: claimed.reactionKey, errorCode: failure.errorCode, blockedUntil };
   }

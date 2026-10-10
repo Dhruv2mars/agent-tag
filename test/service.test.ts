@@ -466,7 +466,9 @@ describe("instant ack", () => {
           { channel: "C1", timestamp: "1000.000002", name: "eyes" },
         ]);
         expect((added[1]?.at ?? Infinity) - deliveredAt).toBeLessThan(2_000);
-        expect(logs.filter((record) => record.event === "slack.reaction.added")).toHaveLength(2);
+        const addedLogs = logs.filter((record) => record.event === "slack.reaction.added");
+        expect(addedLogs.map((record) => record.reactionKey)).toEqual([`${first}:ack`, expect.stringMatching(/:ack$/)]);
+        expect(new Set(addedLogs.map((record) => record.reactionKey)).size).toBe(2);
       } finally {
         release();
         await service.stop();

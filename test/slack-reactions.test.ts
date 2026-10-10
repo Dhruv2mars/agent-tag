@@ -510,6 +510,25 @@ describe("Slack reaction delivery", () => {
     });
   });
 
+  test("a 429 on the last attempt fails the reaction but still pauses reactions.add for Retry-After", async () => {
+    await withStore(async (store, path) => {
+      const first = ackKey(ackEvent(store, 1, start));
+      const second = ackKey(ackEvent(store, 2, at(1)));
+      const policy = { baseDelayMs: 1, maxDelayMs: 1, maxAttempts: 1 };
+      await withFakeSlack([{ status: 429, headers: { "retry-after": "60" } }, ok], async ({ client, requests }) => {
+        const add = addVia(client, []);
+        expect(await deliver(store, at(10), add, { retryPolicy: policy })).toEqual({
+          kind: "reaction-failed", reactionKey: first, errorCode: "rate_limited",
+        });
+        expect(rateLimitRows(path)).toEqual([{ scope: "reactions.add", blocked_until: at(60_010), error_code: "rate_limited" }]);
+        expect(await deliver(store, at(60_009), add, { retryPolicy: policy })).toEqual({ kind: "idle" });
+        expect(requests).toHaveLength(1);
+        expect(await deliver(store, at(60_010), add, { retryPolicy: policy })).toEqual({ kind: "reaction-added", reactionKey: second });
+      });
+      expect(reactionRow(path, first)).toMatchObject({ status: "failed", last_error_code: "rate_limited" });
+    });
+  });
+
   test("a revoked channel fails the reaction with ExecutionAuthorityDenied and never calls Slack", async () => {
     await withStore(async (store, path) => {
       const key = ackKey(ackEvent(store, 1));

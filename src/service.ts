@@ -49,6 +49,8 @@ export interface ServiceOutboxOutcome {
   /** "idle" when nothing is claimable (empty, or every pending row is waiting out a retry backoff). */
   readonly kind: string;
   readonly errorCode?: string;
+  /** Set for reaction outcomes: `<operationId>:ack`, which ties the log line to its mention. */
+  readonly reactionKey?: string;
 }
 
 export interface ServiceSlackBridge {
@@ -71,6 +73,7 @@ export interface ServiceLogRecord {
   readonly profileId?: string;
   readonly instanceId?: string;
   readonly model?: string;
+  readonly reactionKey?: string;
 }
 
 export type ServiceLogger = (record: ServiceLogRecord) => void;
@@ -286,6 +289,7 @@ export class AgentTagService {
       level: quiet ? "info" : "warn",
       event,
       worker: "outbox",
+      ...(outcome.reactionKey === undefined ? {} : { reactionKey: outcome.reactionKey }),
       ...(outcome.errorCode === undefined ? {} : { errorCode: outcome.errorCode }),
     });
   }

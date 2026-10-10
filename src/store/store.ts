@@ -180,6 +180,7 @@ export { REFRESH_KINDS } from "./message-edits.ts";
 export type {
   ClaimedReaction,
   ClaimNextReactionInput,
+  FailReactionInput,
   ReactionFailureInput,
   RetryReactionInput,
   SettleReactionInput,
@@ -586,7 +587,7 @@ export class AgentTagStore {
     reactions.markReactionDelivered(this.#database, input);
   }
 
-  failReaction(input: reactions.ReactionFailureInput): void {
+  failReaction(input: reactions.FailReactionInput): void {
     reactions.failReaction(this.#database, input);
   }
 
