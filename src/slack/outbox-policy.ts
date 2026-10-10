@@ -202,6 +202,12 @@ function classifyPlatformError(errorName: string, retryAfterMs: number | undefin
   return { kind: "ambiguous", errorCode };
 }
 
+/** The Slack platform error name (`missing_scope`, `already_reacted`) of a WebClient error, if it is one. */
+export function slackPlatformErrorName(error: unknown): string | undefined {
+  if (stringField(error, "code") !== "slack_webapi_platform_error") return undefined;
+  return stringField(field(error, "data"), "error");
+}
+
 /** Classify an error thrown by `chat.postMessage` or `chat.update` (Slack WebClient or network errors). */
 export function classifySlackDeliveryError(error: unknown): SlackDeliveryFailure {
   const code = stringField(error, "code");

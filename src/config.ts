@@ -27,6 +27,19 @@ const modelSwitchSchema = z
   .strict()
   .default({ enabled: true, crossProvider: "before-first-turn" });
 
+/** Slack presentation. Every key is optional, so configs written before a key existed still parse. */
+const slackUiSchema = z
+  .object({
+    /** Emoji reacted onto each accepted mention as an instant ack (needs reactions:write); null turns it off. */
+    ackReaction: z
+      .string()
+      .regex(/^[a-z0-9_+'-]{1,100}(::skin-tone-[2-6])?$/, "an emoji name without colons, e.g. eyes")
+      .nullable()
+      .default("eyes"),
+  })
+  .strict()
+  .default({ ackReaction: "eyes" });
+
 const isolationSchema = z.discriminatedUnion("mode", [
   z.object({
     mode: z.literal("trusted-same-user"),
@@ -430,6 +443,7 @@ export const agentTagConfigSchema = z
       workspaceId: slackId,
       appTokenFile: absolutePath,
       botTokenFile: absolutePath,
+      ui: slackUiSchema,
     }),
     access: z.object({
       allowedUserIds: z.array(slackId).min(1),

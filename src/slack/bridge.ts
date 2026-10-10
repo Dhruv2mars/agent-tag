@@ -11,6 +11,7 @@ import type { SlackContextSource } from "./context-source.ts";
 import { THREAD_CONTEXT_TIMEOUT_MS, type SlackRepliesPage } from "./context.ts";
 import { SlackEventRouter } from "./events.ts";
 import { deliverNextSlackOutbox, type RefreshRenderers, type SlackOutboxOutcome } from "./outbox.ts";
+import { deliverNextSlackReaction, type SlackReactionOutcome } from "./reactions.ts";
 import { installUndiciWebSocketCompat } from "./undici-compat.ts";
 import { SlackUserDirectory, slackErrorCode } from "./users.ts";
 
@@ -286,7 +287,16 @@ export class SlackSocketBridge {
     return typeof permalink === "string" && permalink.startsWith("https://") ? permalink : undefined;
   }
 
-  async deliverNextOutbox(): Promise<SlackOutboxOutcome> {
+  /** Queued ack reactions go first, so an ack never waits behind a backlog of replies. */
+  async deliverNextOutbox(): Promise<SlackOutboxOutcome | SlackReactionOutcome> {
+    const reaction = await deliverNextSlackReaction({
+      config: this.#config,
+      store: this.#store,
+      workerId: this.#workerId,
+      // reactions:write; without it every ack fails with missing_scope and the task is unaffected.
+      addReaction: (input) => this.#app.client.reactions.add(input),
+    });
+    if (reaction.kind !== "idle") return reaction;
     return deliverNextSlackOutbox({
       config: this.#config,
       store: this.#store,

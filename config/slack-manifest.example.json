@@ -23,6 +23,7 @@
         "chat:write",
         "groups:history",
         "im:history",
+        "reactions:write",
         "users:read"
       ]
     }

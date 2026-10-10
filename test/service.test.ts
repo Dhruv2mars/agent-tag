@@ -12,6 +12,7 @@ import {
   type ServiceSlackBridge,
   type ServiceWorker,
 } from "../src/service.ts";
+import { deliverNextSlackReaction, type SlackReactionAdd } from "../src/slack/reactions.ts";
 import { AgentTagStore } from "../src/store/store.ts";
 import { t3ServerConfigSchema } from "../src/t3/gateway.ts";
 
@@ -385,5 +386,124 @@ describe("startup model report", () => {
       model: "grok-5",
       at,
     }]);
+  });
+});
+
+const ackConfig = agentTagConfigSchema.parse({
+  ...(await Bun.file(new URL("../config/agent-tag.example.json", import.meta.url)).json()),
+  slack: { workspaceId: "T1", appTokenFile: "/secrets/app", botTokenFile: "/secrets/bot" },
+  access: { allowedUserIds: ["U1"], allowedChannelIds: ["C1"] },
+  routes: [{ conversationId: "C1", profileId: "engineering" }],
+  limits: { maxConcurrentTasks: 1 },
+});
+
+describe("instant ack", () => {
+
+  function mention(store: AgentTagStore, ts: string): string {
+    const root = ackConfig.profiles[0]?.repositoryRoots[0];
+    if (root === undefined) throw new Error("fixture profile has no repository root");
+    return store.ingestSlackEvent({
+      deliveryId: `delivery-${ts}`, eventKey: `C1:${ts}`, workspaceId: "T1", conversationId: "C1", threadTs: ts,
+      actorUserId: "U1", conversationType: "channel", profileId: "engineering", repositoryRoot: root,
+      text: "request", receivedAt: new Date().toISOString(), messageTs: ts, origin: "slack", ackReaction: "eyes",
+    }).operationId;
+  }
+
+  function serviceWith(
+    store: AgentTagStore,
+    coordinator: ServiceWorker,
+    addReaction: (reaction: SlackReactionAdd) => Promise<unknown>,
+    logs: ServiceLogRecord[],
+  ): AgentTagService {
+    const idle: ServiceWorker = { processNext: async () => ({ kind: "idle" }) };
+    return new AgentTagService({
+      store,
+      bridge: {
+        start: async () => {},
+        stop: async () => {},
+        deliverNextOutbox: () =>
+          deliverNextSlackReaction({ config: ackConfig, store, workerId: "outbox-worker", addReaction }),
+      },
+      coordinators: [coordinator],
+      interactionWorkers: [idle],
+      scheduleWorkers: [idle],
+      maintenanceWorkers: [idle],
+      idleMs: 1,
+      logger: (record) => logs.push(record),
+    });
+  }
+
+  test("acks a new mention while the only coordinator is blocked on a running turn", async () => {
+    await withStore(async (store) => {
+      const first = mention(store, "1000.000001");
+      // maxConcurrentTasks = 1: the single coordinator claims the first operation and never returns.
+      let release = (): void => {};
+      const blocked = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const claimed: string[] = [];
+      const coordinator: ServiceWorker = {
+        processNext: async () => {
+          const operation = store.claimNextOperation({ workerId: "coordinator-1", now: new Date().toISOString(), leaseMs: 60_000, maxConcurrentTasks: 1 });
+          if (operation === null) return { kind: "idle" };
+          claimed.push(operation.operationId);
+          await blocked;
+          return { kind: "completed" };
+        },
+      };
+      const added: Array<SlackReactionAdd & { readonly at: number }> = [];
+      const logs: ServiceLogRecord[] = [];
+      const service = serviceWith(store, coordinator, async (reaction) => added.push({ ...reaction, at: Date.now() }), logs);
+      await service.start();
+      try {
+        await eventually(() => claimed.length === 1 && added.length === 1);
+        const deliveredAt = Date.now();
+        mention(store, "1000.000002");
+        await eventually(() => added.length === 2);
+        expect(claimed).toEqual([first]);
+        expect(added.map(({ channel, timestamp, name }) => ({ channel, timestamp, name }))).toEqual([
+          { channel: "C1", timestamp: "1000.000001", name: "eyes" },
+          { channel: "C1", timestamp: "1000.000002", name: "eyes" },
+        ]);
+        expect((added[1]?.at ?? Infinity) - deliveredAt).toBeLessThan(2_000);
+        const addedLogs = logs.filter((record) => record.event === "slack.reaction.added");
+        expect(addedLogs.map((record) => record.reactionKey)).toEqual([`${first}:ack`, expect.stringMatching(/:ack$/)]);
+        expect(new Set(addedLogs.map((record) => record.reactionKey)).size).toBe(2);
+      } finally {
+        release();
+        await service.stop();
+      }
+    });
+  });
+
+  test("a missing reactions:write scope warns once and leaves the task's operation untouched", async () => {
+    await withStore(async (store) => {
+      const operations = [mention(store, "1000.000001"), mention(store, "1000.000002")];
+      const missingScope = Object.assign(new Error("An API error occurred: missing_scope"), {
+        code: "slack_webapi_platform_error",
+        data: { ok: false, error: "missing_scope" },
+      });
+      let calls = 0;
+      const logs: ServiceLogRecord[] = [];
+      const idle: ServiceWorker = { processNext: async () => ({ kind: "idle" }) };
+      const service = serviceWith(store, idle, async () => {
+        calls += 1;
+        throw missingScope;
+      }, logs);
+      await service.start();
+      await eventually(() => calls === 2 && logs.filter((record) => record.event === "slack.reaction.failed").length === 2);
+      // The operations are still queued for a coordinator (stop closes the store, so check first).
+      for (const operationId of operations) {
+        expect(store.claimNextOperation({ workerId: "w", now: new Date().toISOString(), leaseMs: 1_000, maxConcurrentTasks: 2 })?.operationId)
+          .toBe(operationId);
+      }
+      await service.stop();
+      const failures = logs.filter((record) => record.event === "slack.reaction.failed");
+      expect(failures.map((record) => [record.level, record.errorCode])).toEqual([
+        ["warn", "missing_scope"],
+        ["info", "missing_scope"],
+      ]);
+      expect(calls).toBe(2);
+    });
   });
 });

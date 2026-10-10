@@ -11,6 +11,7 @@ import {
   type DoctorReport,
   formatDoctorReport,
   runDoctor,
+  SLACK_BOT_SCOPES,
 } from "../src/doctor.ts";
 import type { CommandResult } from "../src/command.ts";
 import { AGENT_TAG_LAUNCHD_LABEL } from "../src/launchd.ts";
@@ -133,6 +134,8 @@ interface FakeWorld {
   environment: Response | Error;
   session: T3Session | Error;
   slackAuth: unknown;
+  /** Sent as the x-oauth-scopes header on auth.test; undefined omits the header. */
+  slackScopes?: string | undefined;
   slackApp: unknown;
   server: T3ServerInfo;
   readonly seenAuthorization: string[];
@@ -154,7 +157,11 @@ function dependencies(world: FakeWorld, service: ServiceManager | undefined): Do
         if (world.environment instanceof Error) throw world.environment;
         return world.environment.clone();
       }
-      if (url === "https://slack.com/api/auth.test") return json(world.slackAuth);
+      if (url === "https://slack.com/api/auth.test") {
+        const headers: Record<string, string> = { "content-type": "application/json" };
+        if (world.slackScopes !== undefined) headers["x-oauth-scopes"] = world.slackScopes;
+        return new Response(JSON.stringify(world.slackAuth), { headers });
+      }
       if (url === "https://slack.com/api/apps.connections.open") return json(world.slackApp);
       throw new Error(`unexpected fetch ${url}`);
     },
@@ -188,6 +195,7 @@ function healthyWorld(): FakeWorld {
       expiresAt: "2026-12-01T00:00:00.000Z",
     },
     slackAuth: { ok: true, team_id: "T0FIXTURE", user_id: "U0BOT" },
+    slackScopes: SLACK_BOT_SCOPES.join(","),
     slackApp: { ok: true, url: "wss://example.invalid" },
     server: readyServer,
     seenAuthorization: [],
@@ -520,6 +528,28 @@ describe("agent-tag doctor", () => {
     world.slackAuth = { ok: true, team_id: "T0OTHER", user_id: "U0BOT" };
     report = await run();
     expect(check(report, "slack-bot-auth").summary).toContain("T0OTHER");
+  });
+
+  test("slack-bot-auth passes when the granted scopes include every required bot scope", async () => {
+    world.slackScopes = ["users:read", ...SLACK_BOT_SCOPES].join(",");
+    const report = await run();
+    expect(check(report, "slack-bot-auth")).toMatchObject({ status: "pass" });
+  });
+
+  test("slack-bot-auth warns, without failing, when reactions:write is missing", async () => {
+    world.slackScopes = SLACK_BOT_SCOPES.filter((scope) => scope !== "reactions:write").join(",");
+    const report = await run();
+    expect(report.ok).toBe(true);
+    const bot = check(report, "slack-bot-auth");
+    expect(bot.status).toBe("warn");
+    expect(bot.summary).toBe("Slack bot U0BOT authenticated in T0FIXTURE; missing scopes: reactions:write");
+    expect(bot.hint).toBe("reinstall the Slack app from config/slack-manifest.example.json to grant the new scopes");
+  });
+
+  test("slack-bot-auth passes without a scope header, since there is nothing to compare", async () => {
+    world.slackScopes = undefined;
+    const report = await run();
+    expect(check(report, "slack-bot-auth")).toMatchObject({ status: "pass" });
   });
 
   test("service: warns when missing, repairs stale units and stopped services with --fix", async () => {
