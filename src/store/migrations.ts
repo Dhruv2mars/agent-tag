@@ -443,4 +443,56 @@ export const STORE_MIGRATIONS: readonly StoreMigration[] = [
       ALTER TABLE tasks ADD COLUMN t3_rejected_model_selection_json TEXT;
     `,
   },
+  {
+    // Draft PR workflow (PR-M2): one pull request per task and the push/PR jobs that keep it current.
+    // github_repo, head_branch and base_branch come from config (never from a repository's git config).
+    // A job is keyed by the operation whose completed turn recorded it, so a replay inserts nothing.
+    version: 19,
+    sql: `
+      CREATE TABLE task_pull_requests (
+        task_id TEXT PRIMARY KEY REFERENCES tasks(task_id),
+        github_repo TEXT NOT NULL,
+        head_branch TEXT NOT NULL,
+        base_branch TEXT NOT NULL,
+        pr_number INTEGER CHECK (pr_number IS NULL OR pr_number > 0),
+        pr_url TEXT,
+        state TEXT NOT NULL CHECK (state IN ('pending', 'open', 'closed', 'merged')),
+        draft INTEGER NOT NULL DEFAULT 1 CHECK (draft IN (0, 1)),
+        last_pushed_sha TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        CHECK ((state = 'pending') = (pr_number IS NULL))
+      );
+      CREATE TABLE pr_sync_jobs (
+        job_id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL REFERENCES tasks(task_id),
+        operation_id TEXT NOT NULL UNIQUE REFERENCES operations(operation_id),
+        conversation_id TEXT NOT NULL,
+        thread_ts TEXT NOT NULL,
+        actor_user_id TEXT NOT NULL,
+        github_repo TEXT NOT NULL,
+        base_branch TEXT NOT NULL,
+        branch TEXT,
+        sha TEXT,
+        mirror_ref TEXT,
+        ahead_count INTEGER CHECK (ahead_count IS NULL OR ahead_count >= 0),
+        request_text TEXT,
+        summary_text TEXT,
+        head_moved INTEGER NOT NULL DEFAULT 0 CHECK (head_moved IN (0, 1)),
+        status TEXT NOT NULL CHECK (status IN
+          ('awaiting-approval', 'pending', 'inflight', 'succeeded', 'skipped', 'blocked', 'failed')),
+        result_code TEXT,
+        attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+        lease_owner TEXT,
+        lease_expires_at TEXT,
+        blocked_until TEXT,
+        approved_by TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        CHECK (status <> 'inflight' OR (lease_owner IS NOT NULL AND lease_expires_at IS NOT NULL))
+      );
+      CREATE INDEX pr_sync_jobs_claim_idx ON pr_sync_jobs(status, blocked_until, created_at);
+      CREATE INDEX pr_sync_jobs_task_idx ON pr_sync_jobs(task_id, status, created_at);
+    `,
+  },
 ];

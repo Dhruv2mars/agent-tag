@@ -9,6 +9,7 @@ import { type StoreContext, requiredId, parseStoredJson } from "./context.ts";
 import { OPERATION_SETTLED, closeOperationInteractions } from "./interactions.ts";
 import { leaseExpiry, requireLeaseHeld } from "./lease.ts";
 import { insertOutboxMessage } from "./outbox.ts";
+import { type PrSyncInput, recordPrSync } from "./pull-requests.ts";
 import { consumeThreadNotes } from "./thread-notes.ts";
 import {
   isoDateTime,
@@ -451,6 +452,10 @@ export interface CompleteOperationWithOutboxInput {
   readonly threadTs: string;
   /** One reply, or ordered Slack-sized chunks of one reply (see splitForSlack). */
   readonly text: string | readonly string[];
+  /** Draft PR workflow: the snapshot outcome, recorded with the reply (pull-requests.ts). */
+  readonly prSync?: PrSyncInput;
+  /** The requesting user, recorded on a PR job. Required with `prSync`. */
+  readonly actorUserId?: string;
   readonly now: string;
 }
 
@@ -523,6 +528,19 @@ export function completeOperationWithOutbox(
     const first = outboxIds[0];
     if (first === undefined) throw new Error("final reply must have at least one chunk");
     const outboxId = first.outboxId;
+    if (input.prSync !== undefined) {
+      recordPrSync(database, {
+        operationId,
+        taskId,
+        workerId: input.workerId,
+        conversationId: input.conversationId,
+        threadTs: input.threadTs,
+        actorUserId: requiredId(input.actorUserId ?? "", "actorUserId"),
+        prSync: input.prSync,
+        now,
+        noticeAt: new Date(new Date(now).getTime() + texts.length).toISOString(),
+      });
+    }
     writeAudit(database, {
       actorType: "worker",
       actorId: input.workerId,

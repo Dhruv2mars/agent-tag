@@ -14,6 +14,8 @@ const slackActionIdSchema = z.enum([
   "agent-tag.user-input.open",
   "agent-tag.user-input.dismiss",
   "agent-tag.turn.cancel",
+  // Link button on the draft PR card: Slack opens the URL and still sends block_actions, which is acked only.
+  "agent-tag.pr.view",
 ]);
 export const SLACK_ACTION_IDS = slackActionIdSchema.options;
 /** Callback id of the modal that collects a free-text or multi-select answer to one question. */
@@ -77,7 +79,8 @@ type IgnoredReason =
   | "channel-denied"
   | "user-denied"
   | "interaction-denied"
-  | "interaction-expired";
+  | "interaction-expired"
+  | "link-button";
 
 export type SlackActionResult =
   | { readonly kind: "accepted"; readonly commandId: string }
@@ -205,6 +208,7 @@ export class SlackActionRouter {
     const body = parsed.data;
     const action = body.actions[0];
     if (action === undefined) return { kind: "ignored", reason: "invalid-action" };
+    if (action.action_id === "agent-tag.pr.view") return { kind: "ignored", reason: "link-button" };
     const denied = this.#accessDenied(body.team.id, body.channel.id, body.user.id);
     if (denied !== null) return { kind: "ignored", reason: denied };
     const threadTs = body.message.thread_ts ?? body.message.ts;

@@ -279,6 +279,13 @@ export class SlackSocketBridge {
     await this.#app.stop();
   }
 
+  /** `chat.getPermalink` for a thread root (no extra scope); undefined unless Slack returns an https URL. */
+  async threadPermalink(conversationId: string, threadTs: string): Promise<string | undefined> {
+    const result = await this.#app.client.chat.getPermalink({ channel: conversationId, message_ts: threadTs });
+    const permalink = result.permalink;
+    return typeof permalink === "string" && permalink.startsWith("https://") ? permalink : undefined;
+  }
+
   async deliverNextOutbox(): Promise<SlackOutboxOutcome> {
     return deliverNextSlackOutbox({
       config: this.#config,

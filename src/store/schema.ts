@@ -26,6 +26,8 @@ export const buttonElementSchema = z.object({
   text: plainTextObjectSchema,
   action_id: nonEmpty,
   value: nonEmpty,
+  /** Link buttons open this URL; Slack still sends `block_actions`, which must be acked. */
+  url: z.url({ protocol: /^https?$/ }).max(3_000).optional(),
   style: z.enum(["primary", "danger"]).optional(),
   confirm: z
     .object({
@@ -210,6 +212,18 @@ export const AUDIT_ACTIONS = [
   "operation.failed",
   "operation.released",
   "operation.turn-text.resolved",
+  "pr.approved",
+  "pr.blocked",
+  "pr.closed",
+  "pr.created",
+  "pr.failed",
+  "pr.job.claimed",
+  "pr.job.retry-scheduled",
+  "pr.push.rejected",
+  "pr.pushed",
+  "pr.skipped.authority",
+  "pr.snapshot.failed",
+  "pr.sync.recorded",
   "schedule.cancelled",
   "schedule.authority-revoked",
   "schedule.auto-disabled",

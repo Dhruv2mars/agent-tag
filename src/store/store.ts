@@ -12,6 +12,7 @@
  *   diagnostics.ts  counts and operational status          lease.ts        shared lease helpers
  *   waits.ts        human waits, expiry, abandoned turns   schedule-outcomes.ts run outcomes, auto-disable
  *   thread-notes.ts thread context notes (bot, edit, non-allowlisted updates)
+ *   pull-requests.ts  task pull requests and draft PR jobs
  *   schema.ts       zod schemas                            types.ts        public types (re-exported)
  */
 import type { Database } from "bun:sqlite";
@@ -54,8 +55,16 @@ import * as outbox from "./outbox.ts";
 import * as messageEdits from "./message-edits.ts";
 import * as waits from "./waits.ts";
 import * as threadNotes from "./thread-notes.ts";
+import * as pullRequests from "./pull-requests.ts";
 
 export { AUDIT_ACTIONS, type AuditAction } from "./schema.ts";
+export type {
+  ClaimedPrSyncJob,
+  PrSyncInput,
+  PrSyncJobRecord,
+  SettlePrSyncJobInput,
+  TaskPullRequest,
+} from "./pull-requests.ts";
 export type {
   ActiveTaskBinding,
   AmbientDecision,
@@ -344,6 +353,38 @@ export class AgentTagStore {
 
   completeOperationWithOutbox(input: operations.CompleteOperationWithOutboxInput): string {
     return operations.completeOperationWithOutbox(this.#database, input);
+  }
+
+  getTaskPullRequest(taskId: string): pullRequests.TaskPullRequest | null {
+    return pullRequests.getTaskPullRequest(this.#database, taskId);
+  }
+
+  listPrSyncJobs(taskId: string): readonly pullRequests.PrSyncJobRecord[] {
+    return pullRequests.listPrSyncJobs(this.#database, taskId);
+  }
+
+  claimNextPrSyncJob(input: Parameters<typeof pullRequests.claimNextPrSyncJob>[1]): pullRequests.ClaimedPrSyncJob | null {
+    return pullRequests.claimNextPrSyncJob(this.#database, input);
+  }
+
+  renewPrSyncJobLease(input: Parameters<typeof pullRequests.renewPrSyncJobLease>[1]): void {
+    pullRequests.renewPrSyncJobLease(this.#database, input);
+  }
+
+  recordPrSyncPushed(input: Parameters<typeof pullRequests.recordPrSyncPushed>[1]): void {
+    pullRequests.recordPrSyncPushed(this.#database, input);
+  }
+
+  settlePrSyncJob(input: pullRequests.SettlePrSyncJobInput): string | null {
+    return pullRequests.settlePrSyncJob(this.#database, input);
+  }
+
+  retryPrSyncJob(input: Parameters<typeof pullRequests.retryPrSyncJob>[1]): void {
+    pullRequests.retryPrSyncJob(this.#database, input);
+  }
+
+  releasePrSyncJob(input: Parameters<typeof pullRequests.releasePrSyncJob>[1]): void {
+    pullRequests.releasePrSyncJob(this.#database, input);
   }
 
   cancelOperationWithOutbox(input: operations.CancelOperationWithOutboxInput): string {
