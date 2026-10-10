@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -1037,5 +1038,81 @@ describe("self bot ID resolution", () => {
       store.close();
       await rm(directory, { recursive: true, force: true });
     }
+  });
+});
+
+describe("instant ack", () => {
+  async function withAckRouter(
+    ackReaction: string | null,
+    run: (input: {
+      readonly store: AgentTagStore;
+      readonly router: SlackEventRouter;
+      readonly reactions: () => ReadonlyArray<{ reaction_key: string; message_ts: string; name: string; status: string }>;
+    }) => void,
+  ): Promise<void> {
+    const directory = await mkdtemp(join(tmpdir(), "agent-tag-slack-events-"));
+    const path = join(directory, "agent-tag.sqlite");
+    const store = await AgentTagStore.open(path);
+    const ackConfig = agentTagConfigSchema.parse({ ...config, slack: { ...config.slack, ui: { ackReaction } } });
+    const router = new SlackEventRouter({ config: ackConfig, store, botUserId: "U0BOT", now: () => receivedAt });
+    const reader = new Database(path, { readonly: true });
+    try {
+      run({
+        store,
+        router,
+        reactions: () =>
+          reader
+            .query<{ reaction_key: string; message_ts: string; name: string; status: string }, []>(
+              "SELECT reaction_key, message_ts, name, status FROM slack_reactions ORDER BY created_at, message_ts",
+            )
+            .all(),
+      });
+    } finally {
+      reader.close();
+      store.close();
+      if (!directory.startsWith(`${tmpdir()}/agent-tag-slack-events-`)) {
+        throw new Error(`refusing to remove unexpected fixture path ${directory}`);
+      }
+      await rm(directory, { recursive: true });
+    }
+  }
+
+  test("queues one ack reaction per accepted message, on that message, in the ingest transaction", async () => {
+    await withAckRouter("eyes", ({ router, reactions }) => {
+      const mention = router.ingest(eventBody({ eventId: "Ev1", type: "app_mention" }));
+      if (mention.kind !== "accepted") throw new Error(`mention was ${mention.kind}`);
+      // Slack sends both app_mention and message for one mention, and may redeliver an event.
+      expect(router.ingest(eventBody({ eventId: "Ev1", type: "app_mention" })).kind).toBe("duplicate");
+      expect(router.ingest(eventBody({ eventId: "Ev2", type: "message" })).kind).toBe("duplicate");
+      const followUp = router.ingest(
+        eventBody({ eventId: "Ev3", type: "message", ts: "1000.000002", threadTs: "1000.000001", text: "and this" }),
+      );
+      if (followUp.kind !== "accepted") throw new Error(`follow-up was ${followUp.kind}`);
+      expect(reactions()).toEqual([
+        { reaction_key: `${mention.receipt.operationId}:ack`, message_ts: "1000.000001", name: "eyes", status: "pending" },
+        { reaction_key: `${followUp.receipt.operationId}:ack`, message_ts: "1000.000002", name: "eyes", status: "pending" },
+      ]);
+    });
+  });
+
+  test("never acks ignored traffic, context notes, or anything when the reaction is turned off", async () => {
+    await withAckRouter("eyes", ({ router, reactions }) => {
+      expect(router.ingest(eventBody({ eventId: "Ev1", type: "app_mention", user: "U3" })).kind).toBe("ignored");
+      expect(router.ingest(eventBody({ eventId: "Ev2", type: "message", user: "U9", botId: "B9" })).kind).toBe("ignored");
+      expect(router.ingest(eventBody({ eventId: "Ev3", type: "message", ts: "1000.000003", text: "no mention" })).kind)
+        .toBe("ignored");
+      expect(router.ingest(eventBody({ eventId: "Ev4", type: "app_mention" })).kind).toBe("accepted");
+      // A non-allowlisted human in the bound thread becomes a context note: no operation, so no ack.
+      expect(
+        router.ingest(
+          eventBody({ eventId: "Ev5", type: "message", user: "U3", ts: "1000.000005", threadTs: "1000.000001", text: "fyi" }),
+        ).kind,
+      ).toBe("noted");
+      expect(reactions()).toHaveLength(1);
+    });
+    await withAckRouter(null, ({ router, reactions }) => {
+      expect(router.ingest(eventBody({ eventId: "Ev1", type: "app_mention" })).kind).toBe("accepted");
+      expect(reactions()).toEqual([]);
+    });
   });
 });
