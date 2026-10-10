@@ -9,7 +9,8 @@
   "slack": {
     "workspaceId": "T0EXAMPLE",
     "appTokenFile": "/var/lib/agent-tag/secrets/slack-app-token",
-    "botTokenFile": "/var/lib/agent-tag/secrets/slack-bot-token"
+    "botTokenFile": "/var/lib/agent-tag/secrets/slack-bot-token",
+    "ui": { "ackReaction": "eyes" }
   },
   "access": {
     "allowedUserIds": ["U0EXAMPLE"],

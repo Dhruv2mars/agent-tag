@@ -79,6 +79,7 @@ test("the checked-in Agent Tag config parses without hidden defaults", async () 
     },
   ]);
   expect(config.profiles[0]?.ambient.enabled).toBe(false);
+  expect(config.slack.ui).toEqual({ ackReaction: "eyes" });
   expect(config.limits.stalledTurn).toEqual({
     timeoutSeconds: 300,
     retryDelaySeconds: 30,
