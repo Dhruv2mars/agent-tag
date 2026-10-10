@@ -34,6 +34,29 @@ const baseConfig = {
 };
 
 describe("Agent Tag config", () => {
+  test("defaults and validates the !command settings", () => {
+    const parsed = agentTagConfigSchema.parse(baseConfig);
+    expect(parsed.commands).toEqual({ enabled: true, disabled: [], adminOnly: [] });
+    expect(parsed.access.adminUserIds).toEqual([]);
+    expect(
+      agentTagConfigSchema.parse({
+        ...baseConfig,
+        access: { ...baseConfig.access, adminUserIds: ["U123"] },
+        commands: { disabled: ["mute"], adminOnly: ["unmute"] },
+      }).commands,
+    ).toEqual({ enabled: true, disabled: ["mute"], adminOnly: ["unmute"] });
+    // Admins must be allowed users.
+    expect(() =>
+      agentTagConfigSchema.parse({ ...baseConfig, access: { ...baseConfig.access, adminUserIds: ["U999"] } }),
+    ).toThrow();
+    // !help cannot be disabled; !help and !status cannot be admin-only.
+    expect(() => agentTagConfigSchema.parse({ ...baseConfig, commands: { disabled: ["help"] } })).toThrow();
+    expect(() => agentTagConfigSchema.parse({ ...baseConfig, commands: { adminOnly: ["status"] } })).toThrow();
+    expect(() => agentTagConfigSchema.parse({ ...baseConfig, commands: { adminOnly: ["help"] } })).toThrow();
+    expect(() => agentTagConfigSchema.parse({ ...baseConfig, commands: { disabled: ["nope"] } })).toThrow();
+    expect(() => agentTagConfigSchema.parse({ ...baseConfig, commands: { extra: true } })).toThrow();
+  });
+
   test("defaults and validates the stalled-turn policy", () => {
     expect(agentTagConfigSchema.parse(baseConfig).limits.stalledTurn).toEqual({
       timeoutSeconds: 300,

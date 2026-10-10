@@ -5,6 +5,7 @@ import { z } from "zod";
 
 import { type T3ModelSelection, t3ModelSelectionSchema } from "../t3/gateway.ts";
 import { writeAudit } from "./audit.ts";
+import { unmuteThreadForMention } from "./commands.ts";
 import { type StoreContext, requiredId } from "./context.ts";
 import { insertAckReaction } from "./reactions.ts";
 import {
@@ -146,6 +147,17 @@ export function ingestSlackEvent(context: StoreContext, input: SlackEventInput):
         messageTs: event.messageTs,
         name: event.ackReaction,
         createdAt: event.receivedAt,
+      });
+    }
+    if (input.unmuteThread === true) {
+      unmuteThreadForMention(database, {
+        workspaceId: event.workspaceId,
+        conversationId: event.conversationId,
+        threadTs: event.threadTs,
+        actorUserId: event.actorUserId,
+        profileId: event.profileId,
+        eventKey: event.eventKey,
+        now: event.receivedAt,
       });
     }
     writeAudit(database, {
