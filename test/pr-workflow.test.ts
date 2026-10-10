@@ -636,6 +636,26 @@ describe("draft PR workflow", () => {
     });
   });
 
+  test("a PR closed without merging stops pushing with one notice", async () => {
+    await withHarness(async (h) => {
+      await Bun.write(join(h.repo.worktree, "feature.txt"), "feature\n");
+      await h.turn("add a feature file");
+      const worker = h.worker();
+      expect(await worker.processNext()).toMatchObject({ kind: "created" });
+      h.drain();
+      const pushed = h.remoteHead(h.repo.branch);
+      h.github.update(1, { state: "closed", merged: false });
+
+      await Bun.write(join(h.repo.worktree, "more.txt"), "more\n");
+      const second = await h.turn("add more");
+      h.drain();
+      expect(await worker.processNext()).toMatchObject({ kind: "skipped", code: "pr.closed" });
+      expect(h.remoteHead(h.repo.branch)).toBe(pushed);
+      expect(h.store.getTaskPullRequest(h.taskId())?.state).toBe("closed");
+      expect(h.drain().map((message) => message.clientMessageId)).toEqual([`${second}:pr-closed`]);
+    });
+  });
+
   test("someone else's push is never overwritten", async () => {
     await withHarness(async (h) => {
       await Bun.write(join(h.repo.worktree, "feature.txt"), "feature\n");
