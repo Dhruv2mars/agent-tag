@@ -808,6 +808,18 @@ function noticesFor(path: string, interactionId: string): ReadonlyArray<string> 
   ).map((row) => z.object({ text: z.string() }).parse(JSON.parse(row.payload_json)).text);
 }
 
+/** Pending card refreshes (chat.update of the prompt post) for an interaction. */
+function cardRefreshesFor(path: string, interactionId: string): ReadonlyArray<{ readonly correlation_id: string }> {
+  return readRows<{ correlation_id: string }>(
+    path,
+    `SELECT update_row.correlation_id FROM slack_outbox AS update_row
+     JOIN slack_outbox AS target ON target.outbox_id = update_row.target_outbox_id
+     WHERE update_row.method = 'update' AND update_row.refresh_kind = 'interaction-card'
+       AND update_row.status = 'pending' AND target.client_message_id = ?`,
+    `${interactionId}:prompt`,
+  );
+}
+
 function claimRunningOperation(store: AgentTagStore, operationId: string): void {
   const claimed = store.claimNextOperation({
     workerId: "coordinator-a",
@@ -850,7 +862,9 @@ describe("interaction retries and cancellation", () => {
       expect(dispatches).toBe(1);
       expect(outcomes[0]).toBe("failed");
       expect(outcomes.slice(1).every((kind) => kind === "idle")).toBe(true);
-      expect(noticesFor(path, interactionId)).toEqual([NO_LONGER_PENDING_NOTICE]);
+      // The approval's card shows "Not applied"; no separate thread notice.
+      expect(noticesFor(path, interactionId)).toEqual([]);
+      expect(cardRefreshesFor(path, interactionId)).toEqual([{ correlation_id: interactionId }]);
       expect(
         readRows<{ state: string; last_error_code: string }>(
           path,
@@ -905,10 +919,12 @@ describe("interaction retries and cancellation", () => {
       expect(last).toMatchObject({ kind: "failed", errorCode: "Error" });
       expect(dispatches).toBe(retry.maxAttempts);
       expect(delays).toEqual([1_000, 2_000, 4_000, 4_000]);
-      expect(noticesFor(path, interactionId)).toEqual([RETRIES_EXHAUSTED_NOTICE]);
-      // Each attempt writes a claim and a failure audit row, plus one for the notice: bounded by N.
+      expect(noticesFor(path, interactionId)).toEqual([]);
+      expect(cardRefreshesFor(path, interactionId)).toEqual([{ correlation_id: interactionId }]);
+      // Each attempt writes a claim and a failure audit row, plus the card refresh on submit and on the
+      // final failure (coalesced into one row): bounded by N.
       const audit = store.listAuditRecords({ limit: 10_000 }).filter((record) => record.source === interactionId);
-      expect(audit).toHaveLength(2 * retry.maxAttempts + 1);
+      expect(audit).toHaveLength(2 * retry.maxAttempts + 2);
       expect((await worker.processNext()).kind).toBe("idle");
     });
   });

@@ -7,6 +7,7 @@ import { z } from "zod";
 import { writeAudit } from "./audit.ts";
 import { requiredId, parseStoredJson } from "./context.ts";
 import { leaseExpiry, requireLeaseHeld } from "./lease.ts";
+import { enqueueInteractionCardRefresh } from "./interaction-cards.ts";
 import { insertOutboxMessage } from "./outbox.ts";
 import {
   interactionIdentitySchema,
@@ -236,6 +237,7 @@ export function submitInteractionResponse(
       metadata: {},
       createdAt: now,
     });
+    enqueueInteractionCardRefresh(database, row.interaction_id, now);
     return { kind: "accepted" as const, commandId: row.response_command_id };
   });
   return submit.immediate();
@@ -833,6 +835,7 @@ export function completeInteractionResponse(
       metadata: {},
       createdAt: now,
     });
+    enqueueInteractionCardRefresh(database, input.interactionId, now);
   });
   complete.immediate();
 }
@@ -845,7 +848,11 @@ export interface FailInteractionResponseInput {
   readonly retryable: boolean;
   /** For a retryable failure: the row is not claimable again before this time (backoff). */
   readonly blockedUntil?: string;
-  /** For a terminal failure: one Slack notice posted to the task thread, at most once per interaction. */
+  /**
+   * For a terminal failure of an interaction without a card (cancel, or a card that was never
+   * posted): one Slack notice posted to the task thread, at most once per interaction. Approvals and
+   * questions show the failure on their card instead.
+   */
   readonly notice?: string;
   /** A terminal failure caused only by transient errors exhausting the retry budget. */
   readonly retriesExhausted?: boolean;
@@ -895,6 +902,10 @@ export function failInteractionResponse(database: Database, input: FailInteracti
       metadata: { errorCode: input.errorCode, retryable: input.retryable, blockedUntil },
       createdAt: now,
     });
+    if (input.retryable) return;
+    // An approval or question shows the outcome on its card ("Not applied"); the thread notice is
+    // only for interactions without one (cancels, or a card whose post failed).
+    if (enqueueInteractionCardRefresh(database, interactionId, now)) return;
     if (notice === undefined) return;
     const clientMessageId = `${interactionId}:failed`;
     const prior = outboxIdentitySchema.nullable().parse(
@@ -1086,5 +1097,6 @@ function settleInteraction(
     metadata: { errorCode: input.errorCode, previousState: input.fromState },
     createdAt: input.now,
   });
+  enqueueInteractionCardRefresh(database, input.interactionId, input.now);
   return true;
 }

@@ -1,17 +1,18 @@
-import type { App as SlackApp } from "@slack/bolt";
+import type { App as SlackApp, types as SlackTypes } from "@slack/bolt";
 import { z } from "zod";
 
 import type { AgentTagConfig } from "../config.ts";
 import { readSecretFile } from "../security/secret-file.ts";
 import type { ServiceLogger } from "../service.ts";
 import type { AgentTagStore } from "../store/store.ts";
-import { SLACK_ACTION_IDS, SlackActionRouter, USER_INPUT_MODAL_CALLBACK_ID } from "./actions.ts";
+import { SLACK_ACTION_IDS, SlackActionRouter, USER_INPUT_MODAL_CALLBACK_ID, type SlackActionResult } from "./actions.ts";
+import { renderInteractionCard } from "./cards.ts";
 import type { SlackContextSource } from "./context-source.ts";
 import { THREAD_CONTEXT_TIMEOUT_MS, type SlackRepliesPage } from "./context.ts";
 import { SlackEventRouter } from "./events.ts";
 import { deliverNextSlackOutbox, type RefreshRenderers, type SlackOutboxOutcome } from "./outbox.ts";
 import { installUndiciWebSocketCompat } from "./undici-compat.ts";
-import { SlackUserDirectory } from "./users.ts";
+import { SlackUserDirectory, slackErrorCode } from "./users.ts";
 
 const authTestSchema = z.object({
   ok: z.literal(true),
@@ -120,14 +121,69 @@ export async function createSlackUserDirectory(input: {
   });
 }
 
-/** Delivery-time renderers for outbox refresh rows. None yet: PR-I I2 and PR-F register theirs here. */
-const REFRESH_RENDERERS: RefreshRenderers = {};
+/** Delivery-time renderers for outbox refresh rows, by refresh kind. PR-F adds "status-message". */
+export function refreshRenderers(store: AgentTagStore, config: AgentTagConfig): RefreshRenderers {
+  return {
+    "interaction-card": (interactionId) => {
+      const view = store.getInteractionCardView(interactionId);
+      return view === null ? null : renderInteractionCard(view, { expirySeconds: config.limits.interactionExpirySeconds });
+    },
+  };
+}
+
+/** Bolt's `respond` for an action: posts to the action's response_url. */
+export type SlackRespond = (message: {
+  readonly response_type: "ephemeral";
+  readonly replace_original: false;
+  readonly text: string;
+}) => Promise<unknown>;
+
+/**
+ * Handles one acked block action. A click on a request that is no longer pending changes nothing and
+ * gets one ephemeral saying how it was handled; a click on an expired one says so. Feedback is best
+ * effort: a failed `respond` is logged, never retried.
+ */
+export async function handleBlockAction(
+  input: {
+    readonly actions: Pick<SlackActionRouter, "ingest">;
+    readonly openView: (triggerId: string, view: SlackTypes.ModalView) => Promise<unknown>;
+    readonly respond: SlackRespond;
+    readonly logger?: ServiceLogger;
+  },
+  body: unknown,
+): Promise<SlackActionResult> {
+  const result = input.actions.ingest(body);
+  // Free-text and multi-select answers are collected in a modal; trigger ids expire in 3 seconds.
+  if (result.kind === "open-modal") {
+    await input.openView(result.triggerId, result.view);
+    return result;
+  }
+  const feedback = result.kind === "duplicate"
+    ? result.resolution
+    : result.kind === "ignored" && result.reason === "interaction-expired"
+    ? "This request has expired and can no longer be answered."
+    : null;
+  if (feedback !== null) {
+    try {
+      await input.respond({ response_type: "ephemeral", replace_original: false, text: feedback });
+    } catch (error) {
+      input.logger?.({
+        level: "warn",
+        event: "slack.action.feedback_failed",
+        at: new Date().toISOString(),
+        errorCode: slackErrorCode(error),
+      });
+    }
+  }
+  return result;
+}
 
 export class SlackSocketBridge {
   readonly #app: SlackApp;
   readonly #store: AgentTagStore;
   readonly #config: AgentTagConfig;
   readonly #workerId = `slack-outbox-${crypto.randomUUID()}`;
+  readonly #refreshRenderers: RefreshRenderers;
   /** Read-only Slack lookups for turn composition (speaker labels, thread window). */
   readonly contextSource: SlackContextSource;
 
@@ -140,6 +196,7 @@ export class SlackSocketBridge {
     this.#app = app;
     this.#store = store;
     this.#config = config;
+    this.#refreshRenderers = refreshRenderers(store, config);
     this.contextSource = contextSource;
   }
 
@@ -182,13 +239,14 @@ export class SlackSocketBridge {
       router.ingest(body);
     });
     for (const actionId of SLACK_ACTION_IDS) {
-      app.action(actionId, async ({ ack, body, client }) => {
+      app.action(actionId, async ({ ack, body, client, respond }) => {
         await ack();
-        const result = actions.ingest(body);
-        // Free-text and multi-select answers are collected in a modal; trigger ids expire in 3 seconds.
-        if (result.kind === "open-modal") {
-          await client.views.open({ trigger_id: result.triggerId, view: result.view });
-        }
+        await handleBlockAction({
+          actions,
+          openView: (triggerId, view) => client.views.open({ trigger_id: triggerId, view }),
+          respond,
+          ...(input.logger === undefined ? {} : { logger: input.logger }),
+        }, body);
       });
     }
     app.view(USER_INPUT_MODAL_CALLBACK_ID, async ({ ack, body }) => {
@@ -229,7 +287,7 @@ export class SlackSocketBridge {
       postMessage: (message) => this.#app.client.chat.postMessage(message),
       // Needs only chat:write (a bot may edit its own messages), so no scope or manifest change.
       updateMessage: (message) => this.#app.client.chat.update(message),
-      refreshRenderers: REFRESH_RENDERERS,
+      refreshRenderers: this.#refreshRenderers,
     });
   }
 }
