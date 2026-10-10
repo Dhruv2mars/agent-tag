@@ -42,6 +42,8 @@ export interface SlackEventInput {
   readonly origin?: "slack" | "schedule";
   /** Thread window seed (first mention in an existing thread); copied into the operation payload. */
   readonly threadContext?: { readonly rootTs: string; readonly beforeTs: string };
+  /** Emoji name to react with on `messageTs` once the event is accepted (instant ack); none when absent. */
+  readonly ackReaction?: string;
   /** A direct mention in a bound thread: clears its mute on the accepted path (PR-H). */
   readonly unmuteThread?: boolean;
 }

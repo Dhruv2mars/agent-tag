@@ -496,12 +496,40 @@ export const STORE_MIGRATIONS: readonly StoreMigration[] = [
     `,
   },
   {
+    // Instant ack (PR-F2): emoji reactions on the triggering message, queued in the ingest transaction.
+    // A queue of its own rather than an outbox method: a reaction is idempotent (already_reacted), so
+    // it is retried rather than quarantined, never orders against a thread's posts, and a reactions
+    // rate limit pauses only reactions. Independent table, so it applies in any order relative to
+    // other new versions.
+    version: 20,
+    sql: `
+      CREATE TABLE slack_reactions (
+        reaction_key TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL REFERENCES tasks(task_id),
+        operation_id TEXT NOT NULL REFERENCES operations(operation_id),
+        conversation_id TEXT NOT NULL,
+        message_ts TEXT NOT NULL,
+        name TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('pending', 'inflight', 'delivered', 'failed')),
+        attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+        lease_owner TEXT,
+        lease_expires_at TEXT,
+        blocked_until TEXT,
+        last_error_code TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        CHECK (status <> 'inflight' OR (lease_owner IS NOT NULL AND lease_expires_at IS NOT NULL))
+      );
+      CREATE INDEX slack_reactions_claim_idx ON slack_reactions(status, created_at);
+    `,
+  },
+  {
     // `@bot !commands` (PR-H1): the command ledger and per-thread mute. Independent of earlier
-    // versions (new tables only). `slack_command_events` is shared with PR-K2's memory commands, so
+    // versions (new tables only); renumbered from 20 after F2 took it. `slack_command_events` is shared with PR-K2's memory commands, so
     // `command_kind` and `outcome` have no CHECK: their values are validated in zod (schema.ts) and
     // later lanes add kinds without a table rebuild. The ledger never stores message text.
     // Mute is keyed by Slack thread, not task, so it survives task close/reopen and restart.
-    version: 20,
+    version: 21,
     sql: `
       CREATE TABLE slack_command_events (
         workspace_id TEXT NOT NULL,

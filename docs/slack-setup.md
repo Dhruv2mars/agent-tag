@@ -13,7 +13,10 @@ In Slack's app dashboard, create an app from [`config/slack-manifest.example.jso
 - `chat:write`
 - `groups:history`
 - `im:history`
+- `reactions:write`
 - `users:read`
+
+`reactions:write` lets Agent Tag react with :eyes: to a mention as soon as it is accepted, before any work starts, even when all coordinators are busy. Set `slack.ui.ackReaction` to another emoji name, or to `null` to turn the reaction off. An app installed before this scope existed must be reinstalled from the updated manifest. Until then Agent Tag logs one `slack.reaction.failed` warning with `errorCode: "missing_scope"` per process and otherwise keeps working. `agent-tag doctor` warns about the missing scope in the same way.
 
 `users:read` lets Agent Tag call `users.info` to show the model who is speaking, as `Alice Chen (U0A1)`, and to render `<@U0A1>` mentions as names. `users:read.email` is not requested, and no email address is read. Names are cached in memory for one hour and are never written to the database, except inside the frozen text of a turn already sent to T3.
 

@@ -14,6 +14,7 @@
  *   thread-notes.ts thread context notes (bot, edit, non-allowlisted updates)
  *   pull-requests.ts  task pull requests and draft PR jobs
  *   commands.ts     `!command` ledger, thread mute, `!status` summaries
+ *   reactions.ts    Slack reaction queue (instant ack)
  *   schema.ts       zod schemas                            types.ts        public types (re-exported)
  */
 import type { Database } from "bun:sqlite";
@@ -58,6 +59,7 @@ import * as waits from "./waits.ts";
 import * as threadNotes from "./thread-notes.ts";
 import * as pullRequests from "./pull-requests.ts";
 import * as commands from "./commands.ts";
+import * as reactions from "./reactions.ts";
 
 export { AUDIT_ACTIONS, type AuditAction } from "./schema.ts";
 export type {
@@ -177,6 +179,14 @@ export type {
   ExhaustOutboxRetriesInput,
 } from "./outbox.ts";
 export { REFRESH_KINDS } from "./message-edits.ts";
+export type {
+  ClaimedReaction,
+  ClaimNextReactionInput,
+  FailReactionInput,
+  ReactionFailureInput,
+  RetryReactionInput,
+  SettleReactionInput,
+} from "./reactions.ts";
 export type { EnqueueMessageEditInput, EnqueueMessageRefreshInput, MessageEditResult } from "./message-edits.ts";
 
 export class AgentTagStore {
@@ -597,6 +607,22 @@ export class AgentTagStore {
 
   claimNextOutbox(input: outbox.ClaimNextOutboxInput): ClaimedOutboxMessage | null {
     return outbox.claimNextOutbox(this.#context, input);
+  }
+
+  claimNextReaction(input: reactions.ClaimNextReactionInput): reactions.ClaimedReaction | null {
+    return reactions.claimNextReaction(this.#context, input);
+  }
+
+  markReactionDelivered(input: reactions.SettleReactionInput & { readonly errorCode?: string }): void {
+    reactions.markReactionDelivered(this.#database, input);
+  }
+
+  failReaction(input: reactions.FailReactionInput): void {
+    reactions.failReaction(this.#database, input);
+  }
+
+  retryReaction(input: reactions.RetryReactionInput): void {
+    reactions.retryReaction(this.#database, input);
   }
 
   markOutboxDelivered(input: outbox.MarkOutboxDeliveredInput): void {

@@ -90,7 +90,7 @@ function seedVersionOne(database: Database): void {
 
 test("upgrades every historical SQLite schema while preserving existing work", async () => {
   const versions = STORE_MIGRATIONS.map((migration) => migration.version);
-  expect(versions).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]);
+  expect(versions).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21]);
   // Each historical prefix, plus a store that applied 14 (from main) before 13 existed: applied
   // versions are tracked as a set, so 13 must still apply on top of it.
   const startingSets: ReadonlyArray<{ readonly label: string; readonly applied: ReadonlyArray<number> }> = [
@@ -638,7 +638,7 @@ test("D12: an operation payload written before messageTs, origin and threadConte
   }
 });
 
-test("H1: migration 20 adds the command ledger without a command_kind CHECK and the thread controls", async () => {
+test("H1: migration 21 adds the command ledger without a command_kind CHECK and the thread controls", async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-tag-migration-commands-"));
   const path = join(directory, "agent-tag.sqlite");
   try {
@@ -648,7 +648,7 @@ test("H1: migration 20 adds the command ledger without a command_kind CHECK and 
 
     const database = new Database(path, { strict: true });
     expect(
-      database.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM schema_migrations WHERE version = 20").get(),
+      database.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM schema_migrations WHERE version = 21").get(),
     ).toEqual({ count: 1 });
     const insertCommand = database.query(
       `INSERT INTO slack_command_events (workspace_id, event_key, delivery_id, conversation_id, thread_ts, actor_user_id,

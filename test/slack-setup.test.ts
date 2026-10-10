@@ -3,6 +3,7 @@ import { join } from "node:path";
 
 import { z } from "zod";
 
+import { SLACK_BOT_SCOPES } from "../src/doctor.ts";
 import { agentTagConfigSchema } from "../src/config.ts";
 import { SLACK_ACTION_IDS } from "../src/slack/actions.ts";
 
@@ -40,6 +41,7 @@ test("the checked-in Slack manifest is the least-privilege runtime contract", as
     "chat:write",
     "groups:history",
     "im:history",
+    "reactions:write",
     "users:read",
   ]);
   // Least privilege: names only, never email addresses.
@@ -53,6 +55,14 @@ test("the checked-in Slack manifest is the least-privilege runtime contract", as
   expect(manifest.settings.socket_mode_enabled).toBe(true);
   expect(manifest.settings.interactivity.is_enabled).toBe(true);
   expect(SLACK_ACTION_IDS).toHaveLength(8);
+});
+
+test("doctor's required bot scopes match the checked-in manifest", async () => {
+  const raw: unknown = await Bun.file(
+    join(import.meta.dir, "..", "config", "slack-manifest.example.json"),
+  ).json();
+  const manifest = manifestSchema.parse(raw);
+  expect([...SLACK_BOT_SCOPES]).toEqual(manifest.oauth_config.scopes.bot);
 });
 
 test("the checked-in Agent Tag config parses without hidden defaults", async () => {
@@ -69,6 +79,7 @@ test("the checked-in Agent Tag config parses without hidden defaults", async () 
     },
   ]);
   expect(config.profiles[0]?.ambient.enabled).toBe(false);
+  expect(config.slack.ui).toEqual({ ackReaction: "eyes" });
   expect(config.limits.stalledTurn).toEqual({
     timeoutSeconds: 300,
     retryDelaySeconds: 30,

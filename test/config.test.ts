@@ -123,6 +123,21 @@ describe("Agent Tag config", () => {
       .toBe(3_600);
   });
 
+  test("defaults and validates the ack reaction", () => {
+    expect(agentTagConfigSchema.parse(baseConfig).slack.ui).toEqual({ ackReaction: "eyes" });
+    const withAck = (ackReaction: unknown) =>
+      agentTagConfigSchema.safeParse({ ...baseConfig, slack: { ...baseConfig.slack, ui: { ackReaction } } });
+    expect(withAck(null).data?.slack.ui.ackReaction).toBeNull();
+    expect(withAck("white_check_mark").data?.slack.ui.ackReaction).toBe("white_check_mark");
+    expect(withAck("thumbsup::skin-tone-3").success).toBe(true);
+    for (const invalid of [":eyes:", "", "Eyes", "eyes and more", "x".repeat(101)]) {
+      expect(withAck(invalid).success).toBe(false);
+    }
+    expect(
+      agentTagConfigSchema.safeParse({ ...baseConfig, slack: { ...baseConfig.slack, ui: { unknownKey: true } } }).success,
+    ).toBe(false);
+  });
+
   test("rejects a remote T3 endpoint", () => {
     const input = structuredClone(baseConfig);
     input.t3.baseUrl = "https://t3.example.com";

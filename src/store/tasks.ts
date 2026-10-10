@@ -7,6 +7,7 @@ import { type T3ModelSelection, t3ModelSelectionSchema } from "../t3/gateway.ts"
 import { writeAudit } from "./audit.ts";
 import { unmuteThreadForMention } from "./commands.ts";
 import { type StoreContext, requiredId } from "./context.ts";
+import { insertAckReaction } from "./reactions.ts";
 import {
   canonicalEventSchema,
   deliveryLookupSchema,
@@ -14,6 +15,7 @@ import {
   nonEmpty,
   operationIdentitySchema,
   operationPayloadSchema,
+  slackReactionName,
   taskExecutionSchema,
   taskLookupSchema,
 } from "./schema.ts";
@@ -41,6 +43,7 @@ export function ingestSlackEvent(context: StoreContext, input: SlackEventInput):
     sourceOrderKey: requiredId(input.sourceOrderKey ?? input.receivedAt, "sourceOrderKey"),
     messageTs: input.messageTs === undefined ? undefined : requiredId(input.messageTs, "messageTs"),
     origin: input.origin === undefined ? undefined : z.enum(["slack", "schedule"]).parse(input.origin),
+    ackReaction: input.ackReaction === undefined ? undefined : slackReactionName.parse(input.ackReaction),
     threadContext:
       input.threadContext === undefined
         ? undefined
@@ -135,6 +138,17 @@ export function ingestSlackEvent(context: StoreContext, input: SlackEventInput):
         event.receivedAt,
       );
     insertDelivery(database, event, operationId, "accepted");
+    // Instant ack: queued with the operation, so the outbox loop reacts even while every coordinator is busy.
+    if (event.ackReaction !== undefined && event.messageTs !== undefined) {
+      insertAckReaction(database, {
+        operationId,
+        taskId,
+        conversationId: event.conversationId,
+        messageTs: event.messageTs,
+        name: event.ackReaction,
+        createdAt: event.receivedAt,
+      });
+    }
     if (input.unmuteThread === true) {
       unmuteThreadForMention(database, {
         workspaceId: event.workspaceId,
