@@ -523,4 +523,28 @@ export const STORE_MIGRATIONS: readonly StoreMigration[] = [
       CREATE INDEX slack_reactions_claim_idx ON slack_reactions(status, created_at);
     `,
   },
+  {
+    // Live status message (PR-F3): one Slack message per turn, posted as `${operationId}:status` and
+    // edited in place through outbox refresh rows (refresh_kind 'status-message', see message-edits.ts).
+    // view_json holds the progress view only (plan steps, recent tool titles), never tool payloads.
+    // Terminal states are sticky. next_refresh_at throttles non-terminal edits per message; the
+    // partial index serves the global edit budget. Independent table, so it applies in any order.
+    version: 21,
+    sql: `
+      CREATE TABLE status_messages (
+        operation_id TEXT PRIMARY KEY REFERENCES operations(operation_id),
+        task_id TEXT NOT NULL REFERENCES tasks(task_id),
+        state TEXT NOT NULL CHECK (state IN ('running', 'waiting', 'stopping', 'done', 'stopped', 'failed', 'expired')),
+        view_json TEXT NOT NULL,
+        actor_user_id TEXT,
+        started_at TEXT NOT NULL,
+        settled_at TEXT,
+        next_refresh_at TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX status_messages_task_idx ON status_messages(task_id, state);
+      CREATE INDEX slack_outbox_status_refresh_idx ON slack_outbox(updated_at) WHERE refresh_kind = 'status-message';
+    `,
+  },
 ];

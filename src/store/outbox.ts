@@ -25,6 +25,8 @@ export interface OutboxMessageRow {
   readonly createdAt: string;
   /** Makes the row a chat.update of the message its target post row posted (see message-edits.ts). */
   readonly edit?: { readonly targetOutboxId: string; readonly refreshKind: RefreshKind | null };
+  /** Not claimable before this instant (an edit throttle); null or absent means due now. */
+  readonly blockedUntil?: string | null;
 }
 
 /**
@@ -37,8 +39,8 @@ export function insertOutboxMessage(database: Database, row: OutboxMessageRow): 
       `INSERT INTO slack_outbox (
         outbox_id, task_id, correlation_id, conversation_id, thread_ts,
         client_message_id, payload_json, status, created_at, updated_at,
-        method, target_outbox_id, refresh_kind
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)`,
+        method, target_outbox_id, refresh_kind, blocked_until
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)`,
     )
     .run(
       row.outboxId,
@@ -53,6 +55,7 @@ export function insertOutboxMessage(database: Database, row: OutboxMessageRow): 
       row.edit === undefined ? "post" : "update",
       row.edit?.targetOutboxId ?? null,
       row.edit?.refreshKind ?? null,
+      row.blockedUntil ?? null,
     );
 }
 

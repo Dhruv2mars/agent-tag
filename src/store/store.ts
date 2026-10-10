@@ -14,6 +14,7 @@
  *   thread-notes.ts thread context notes (bot, edit, non-allowlisted updates)
  *   pull-requests.ts  task pull requests and draft PR jobs
  *   reactions.ts    Slack reaction queue (instant ack)
+ *   status.ts       live status message per turn (state, progress, throttled edits)
  *   schema.ts       zod schemas                            types.ts        public types (re-exported)
  */
 import type { Database } from "bun:sqlite";
@@ -58,6 +59,7 @@ import * as waits from "./waits.ts";
 import * as threadNotes from "./thread-notes.ts";
 import * as pullRequests from "./pull-requests.ts";
 import * as reactions from "./reactions.ts";
+import * as status from "./status.ts";
 
 export { AUDIT_ACTIONS, type AuditAction } from "./schema.ts";
 export type {
@@ -177,6 +179,16 @@ export type {
   ExhaustOutboxRetriesInput,
 } from "./outbox.ts";
 export { REFRESH_KINDS } from "./message-edits.ts";
+export { isTerminalStatus, STATUS_STATES, statusPostId } from "./status.ts";
+export type {
+  OpenStatusMessageInput,
+  OpenStatusMessageResult,
+  StatusMessageView,
+  StatusPlanStep,
+  StatusProgress,
+  StatusState,
+  UpdateStatusProgressInput,
+} from "./status.ts";
 export type {
   ClaimedReaction,
   ClaimNextReactionInput,
@@ -568,6 +580,20 @@ export class AgentTagStore {
   /** Ensures one pending delivery-time re-render of a posted message (see message-edits.ts). */
   enqueueMessageRefresh(input: messageEdits.EnqueueMessageRefreshInput): messageEdits.MessageEditResult {
     return this.#database.transaction(() => messageEdits.enqueueMessageRefresh(this.#database, input)).immediate();
+  }
+
+  /** Posts the operation's live status message once; a resumed claim re-attaches (see status.ts). */
+  openStatusMessage(input: status.OpenStatusMessageInput): status.OpenStatusMessageResult {
+    return status.openStatusMessage(this.#database, input);
+  }
+
+  /** Stores the turn's progress and queues one throttled, coalesced status edit. */
+  updateStatusProgress(input: status.UpdateStatusProgressInput): boolean {
+    return status.updateStatusProgress(this.#database, input);
+  }
+
+  getStatusMessageView(operationId: string): status.StatusMessageView | null {
+    return status.getStatusMessageView(this.#database, operationId);
   }
 
   /** Ensures the posted message is edited to `payload`; coalesces with a pending edit of it. */
