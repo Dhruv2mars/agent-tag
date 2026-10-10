@@ -124,6 +124,7 @@ export class AgentTagService {
   readonly #maintenanceWorkers: ReadonlyArray<ServiceWorker>;
   readonly #resources: ReadonlyArray<{ readonly close: () => Promise<void> }>;
   readonly #idleMs: number;
+  #reactionScopeWarned = false;
   readonly #logger: ServiceLogger;
   readonly #now: () => Date;
   readonly #gate: ServiceT3Gate | undefined;
@@ -254,6 +255,8 @@ export class AgentTagService {
         const outcome = await this.#bridge.deliverNextOutbox();
         if (outcome.kind === "idle") {
           await waitUntilWorkOrStop(this.#idleMs, signal);
+        } else if (outcome.kind.startsWith("reaction-")) {
+          this.#logReaction(outcome);
         } else {
           this.#log({
             level: outcome.kind === "delivered" ? "info" : "warn",
@@ -268,6 +271,23 @@ export class AgentTagService {
         await waitUntilWorkOrStop(this.#idleMs, signal);
       }
     }
+  }
+
+  /**
+   * `slack.reaction.added|retry-scheduled|failed`. A missing reactions:write scope fails every ack, so
+   * it warns once per process; later acks dropped for the same reason log at info.
+   */
+  #logReaction(outcome: ServiceOutboxOutcome): void {
+    const event = `slack.reaction.${outcome.kind.slice("reaction-".length)}`;
+    const missingScope = outcome.errorCode === "missing_scope";
+    const quiet = outcome.kind === "reaction-added" || (missingScope && this.#reactionScopeWarned);
+    if (missingScope) this.#reactionScopeWarned = true;
+    this.#log({
+      level: quiet ? "info" : "warn",
+      event,
+      worker: "outbox",
+      ...(outcome.errorCode === undefined ? {} : { errorCode: outcome.errorCode }),
+    });
   }
 
   async #closeResources(): Promise<void> {

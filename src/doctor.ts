@@ -78,6 +78,17 @@ const slackConnectionSchema = z.union([
   z.object({ ok: z.literal(false), error: z.string().min(1) }),
 ]);
 
+/** Bot token scopes the checked-in manifest grants. Keep sorted and equal to config/slack-manifest.example.json. */
+export const SLACK_BOT_SCOPES: readonly string[] = [
+  "app_mentions:read",
+  "channels:history",
+  "chat:write",
+  "groups:history",
+  "im:history",
+  "reactions:write",
+  "users:read",
+];
+
 /** Compares dotted numeric versions, ignoring any prerelease suffix. */
 export function compareVersions(left: string, right: string): number {
   const parse = (value: string): number[] =>
@@ -561,17 +572,21 @@ export function checkAllowedModels(models: readonly AllowedModelReport[]): Docto
   };
 }
 
-async function slackCall(
+async function slackCallWithHeaders(
   dependencies: DoctorDependencies,
   method: string,
   token: SecretString,
-): Promise<unknown> {
+): Promise<{ readonly body: unknown; readonly headers: Headers }> {
   const response = await fetchWithTimeout(dependencies, `https://slack.com/api/${method}`, {
     method: "POST",
     headers: { authorization: `Bearer ${token.exposeToBoundary()}`, "content-type": "application/x-www-form-urlencoded" },
   });
   if (!response.ok) throw new Error(`Slack ${method} returned HTTP ${response.status}`);
-  return response.json();
+  return { body: await response.json(), headers: response.headers };
+}
+
+async function slackCall(dependencies: DoctorDependencies, method: string, token: SecretString): Promise<unknown> {
+  return (await slackCallWithHeaders(dependencies, method, token)).body;
 }
 
 export async function checkSlackBot(
@@ -581,10 +596,25 @@ export async function checkSlackBot(
 ): Promise<DoctorCheck> {
   const id = "slack-bot-auth";
   try {
-    const auth = slackAuthSchema.parse(await slackCall(dependencies, "auth.test", token));
+    const { body, headers } = await slackCallWithHeaders(dependencies, "auth.test", token);
+    const auth = slackAuthSchema.parse(body);
     if (!auth.ok) return { id, status: "fail", summary: `Slack auth.test failed: ${auth.error}`, hint: "reinstall the Slack app and replace the bot token" };
     if (auth.team_id !== config.slack.workspaceId) {
       return { id, status: "fail", summary: `Slack bot belongs to workspace ${auth.team_id}, expected ${config.slack.workspaceId}` };
+    }
+    // Slack reports the token's granted scopes in this header. Absent means nothing to compare against.
+    const granted = headers.get("x-oauth-scopes");
+    if (granted !== null) {
+      const grantedSet = new Set(granted.split(",").map((scope) => scope.trim()).filter((scope) => scope !== ""));
+      const missing = SLACK_BOT_SCOPES.filter((scope) => !grantedSet.has(scope));
+      if (missing.length > 0) {
+        return {
+          id,
+          status: "warn",
+          summary: `Slack bot ${auth.user_id} authenticated in ${auth.team_id}; missing scopes: ${missing.join(", ")}`,
+          hint: "reinstall the Slack app from config/slack-manifest.example.json to grant the new scopes",
+        };
+      }
     }
     return { id, status: "pass", summary: `Slack bot ${auth.user_id} authenticated in ${auth.team_id}` };
   } catch (error) {

@@ -347,6 +347,7 @@ export class SlackEventRouter {
       sourceOrderKey: event.ts,
       messageTs: event.ts,
       origin: "slack",
+      ...(this.#config.slack.ui.ackReaction === null ? {} : { ackReaction: this.#config.slack.ui.ackReaction }),
       ...(threadContext === undefined ? {} : { threadContext }),
     });
     return { kind: receipt.kind, receipt };

@@ -44,6 +44,9 @@ export const slackBlockSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("actions"), block_id: nonEmpty.optional(), elements: z.array(buttonElementSchema).min(1) }),
   z.object({ type: z.literal("context"), elements: z.array(z.union([plainTextObjectSchema, mrkdwnObjectSchema])).min(1) }),
 ]);
+/** A Slack emoji name as reactions.add takes it (no colons), optionally with a skin tone. */
+export const slackReactionName = z.string().regex(/^[a-z0-9_+'-]{1,100}(::skin-tone-[2-6])?$/);
+
 export const outboxPayloadSchema = z.object({
   text: z.string(),
   blocks: z.array(slackBlockSchema).optional(),
@@ -242,6 +245,8 @@ export const AUDIT_ACTIONS = [
   "slack.outbox.quarantined",
   "slack.outbox.retry-exhausted",
   "slack.outbox.retry-scheduled",
+  "slack.reaction.added",
+  "slack.reaction.failed",
   "task.cancellation.requested",
   "task.model.denied",
   "task.model.reverted",
