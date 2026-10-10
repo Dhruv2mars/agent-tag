@@ -10,6 +10,7 @@ import { createScheduleWorkers } from "./scheduler.ts";
 import { SlackSocketBridge } from "./slack/bridge.ts";
 import { createRetentionWorker } from "./store/retention.ts";
 import { AgentTagStore } from "./store/store.ts";
+import { isT3CredentialRejection } from "./t3/auth.ts";
 import { T3Connection } from "./t3/connection.ts";
 import { createT3CredentialWorker, managedT3Credentials, T3CredentialLifecycle } from "./t3/credentials.ts";
 import { createT3GateWorker, T3RuntimeGate } from "./t3/gate.ts";
@@ -283,6 +284,26 @@ export class AgentTagService {
 }
 
 /**
+ * Logs a failed catalog refresh. The catalog probes T3 outside `T3Connection`, so a rejected token is
+ * reported to the credential lifecycle here too; otherwise rotation could wait for the next 6 h check.
+ */
+export function catalogRefreshFailed(input: {
+  readonly logger: ServiceLogger;
+  readonly now: () => Date;
+  readonly onCredentialRejected: () => void;
+}): (error: unknown) => void {
+  return (error) => {
+    input.logger({
+      level: "warn",
+      event: "t3.catalog.refresh.failed",
+      errorCode: error instanceof Error && error.name ? error.name : "T3CatalogError",
+      at: input.now().toISOString(),
+    });
+    if (isT3CredentialRejection(error)) input.onCredentialRejected();
+  };
+}
+
+/**
  * One warning per allowed model T3 cannot run now. These never block startup: only profile and route
  * defaults are validated strictly.
  */
@@ -358,13 +379,7 @@ export async function createAgentTagService(input: {
     const catalog = new ProviderCatalog({
       inspect: (signal) => inspectT3(t3Config, signal),
       now,
-      onRefreshFailed: (error) =>
-        logger({
-          level: "warn",
-          event: "t3.catalog.refresh.failed",
-          errorCode: error instanceof Error && error.name ? error.name : "T3CatalogError",
-          at: now().toISOString(),
-        }),
+      onRefreshFailed: catalogRefreshFailed({ logger, now, onCredentialRejected: () => credentials?.noteRejected() }),
     });
     catalog.seed(server);
     const gate = new T3RuntimeGate({
