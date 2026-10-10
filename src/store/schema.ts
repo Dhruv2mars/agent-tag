@@ -26,6 +26,8 @@ export const buttonElementSchema = z.object({
   text: plainTextObjectSchema,
   action_id: nonEmpty,
   value: nonEmpty,
+  /** Link buttons open this URL; Slack still sends `block_actions`, which must be acked. */
+  url: z.url({ protocol: /^https?$/ }).max(3_000).optional(),
   style: z.enum(["primary", "danger"]).optional(),
   confirm: z
     .object({
@@ -121,6 +123,9 @@ export const taskExecutionSchema = z.object({
   conversation_type: z.enum(["channel", "dm"]),
   owner_user_id: nonEmpty.nullable(),
   created_at: isoDateTime,
+  model_selection_json: z.string().nullable(),
+  t3_model_selection_json: z.string().nullable(),
+  t3_rejected_model_selection_json: z.string().nullable(),
 });
 export const interactionIdentitySchema = z.object({ interaction_id: nonEmpty });
 export const interactionRowSchema = z.object({
@@ -192,6 +197,7 @@ export const AUDIT_ACTIONS = [
   "interaction.response.completed",
   "interaction.response.failed",
   "interaction.response.submitted",
+  "interaction.resolved-elsewhere",
   "interaction.user-input.answer-recorded",
   "interaction.user-input.requested",
   "memory.created",
@@ -206,6 +212,18 @@ export const AUDIT_ACTIONS = [
   "operation.failed",
   "operation.released",
   "operation.turn-text.resolved",
+  "pr.approved",
+  "pr.blocked",
+  "pr.closed",
+  "pr.created",
+  "pr.failed",
+  "pr.job.claimed",
+  "pr.job.retry-scheduled",
+  "pr.push.rejected",
+  "pr.pushed",
+  "pr.skipped.authority",
+  "pr.snapshot.failed",
+  "pr.sync.recorded",
   "schedule.cancelled",
   "schedule.authority-revoked",
   "schedule.auto-disabled",
@@ -225,6 +243,9 @@ export const AUDIT_ACTIONS = [
   "slack.outbox.retry-exhausted",
   "slack.outbox.retry-scheduled",
   "task.cancellation.requested",
+  "task.model.denied",
+  "task.model.reverted",
+  "task.model.selected",
   "task.t3-bound",
   "thread-context.loaded",
   "thread-context.unavailable",

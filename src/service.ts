@@ -2,6 +2,8 @@ import { join } from "node:path";
 
 import type { AgentTagConfig } from "./config.ts";
 import { AgentTagCoordinator } from "./coordinator.ts";
+import { PrWorker, pullRequestsEnabled } from "./git/pr-worker.ts";
+import { createGitRunner } from "./git/runner.ts";
 import { InteractionWorker } from "./interaction-worker.ts";
 import { type AllowedModelReport, reportAllowedModels, validateConfiguredProviders } from "./policy/provider.ts";
 import { createScheduleWorkers } from "./scheduler.ts";
@@ -13,6 +15,7 @@ import { createT3CredentialWorker, managedT3Credentials, T3CredentialLifecycle }
 import { createT3GateWorker, T3RuntimeGate } from "./t3/gate.ts";
 import { inspectT3, type T3ServerInfo } from "./t3/gateway.ts";
 import { PINNED_T3 } from "./t3/lock.ts";
+import { createProviderCatalogWorker, ProviderCatalog } from "./t3/provider-catalog.ts";
 import { prepareManagedT3Binary, T3ManagedRuntime } from "./t3/supervisor.ts";
 import { protocolV1Source, ThreadWatcher } from "./t3/watcher.ts";
 
@@ -351,6 +354,19 @@ export async function createAgentTagService(input: {
     const server = await inspectT3(t3Config);
     validateConfiguredProviders(input.config, server);
     for (const record of allowedModelLogRecords(input.config, server, now().toISOString())) logger(record);
+    // Model switches are planned against this catalog; a failed refresh keeps the last good snapshot.
+    const catalog = new ProviderCatalog({
+      inspect: (signal) => inspectT3(t3Config, signal),
+      now,
+      onRefreshFailed: (error) =>
+        logger({
+          level: "warn",
+          event: "t3.catalog.refresh.failed",
+          errorCode: error instanceof Error && error.name ? error.name : "T3CatalogError",
+          at: now().toISOString(),
+        }),
+    });
+    catalog.seed(server);
     const gate = new T3RuntimeGate({
       baseUrl: t3Config.baseUrl,
       ...(runtime === undefined ? {} : { pinnedVersion: PINNED_T3.version }),
@@ -365,6 +381,8 @@ export async function createAgentTagService(input: {
     const bridge = await SlackSocketBridge.create({ config: input.config, store, logger });
     let nextMemoryExpiryAt = 0;
     let nextT3StatsAt = now().getTime() + 60_000;
+    // Draft PR workflow (PR-M §3.7): off unless github is configured and a profile has mode "auto".
+    const pullRequests = pullRequestsEnabled(input.config) ? { runner: createGitRunner() } : undefined;
     const coordinators = Array.from(
       { length: input.config.limits.maxConcurrentTasks },
       () =>
@@ -373,7 +391,9 @@ export async function createAgentTagService(input: {
           store,
           slackContext: bridge.contextSource,
           t3,
+          catalog,
           ...(watcher === undefined ? {} : { watcher }),
+          ...(pullRequests === undefined ? {} : { pullRequests }),
         }),
     );
     const service = new AgentTagService({
@@ -409,6 +429,18 @@ export async function createAgentTagService(input: {
         },
         createT3GateWorker({ gate, now }),
         createT3CredentialWorker({ credentials }),
+        createProviderCatalogWorker({ catalog, now }),
+        ...(pullRequests === undefined
+          ? []
+          : [
+              new PrWorker({
+                config: input.config,
+                store,
+                runner: pullRequests.runner,
+                threadLink: (conversationId, threadTs) => bridge.threadPermalink(conversationId, threadTs),
+                now,
+              }),
+            ]),
       ],
       resources: [{ close: closeT3 }],
       logger,

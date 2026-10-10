@@ -3,6 +3,7 @@ import { z } from "zod";
 
 import type { AgentTagConfig } from "../config.ts";
 import type { AgentTagStore, UserInputQuestionPrompt, UserInputSelection } from "../store/store.ts";
+import { alreadyHandledText } from "./cards.ts";
 
 const slackId = z.string().regex(/^[A-Z][A-Z0-9]+$/);
 const slackActionIdSchema = z.enum([
@@ -13,6 +14,8 @@ const slackActionIdSchema = z.enum([
   "agent-tag.user-input.open",
   "agent-tag.user-input.dismiss",
   "agent-tag.turn.cancel",
+  // Link button on the draft PR card: Slack opens the URL and still sends block_actions, which is acked only.
+  "agent-tag.pr.view",
 ]);
 export const SLACK_ACTION_IDS = slackActionIdSchema.options;
 /** Callback id of the modal that collects a free-text or multi-select answer to one question. */
@@ -76,10 +79,16 @@ type IgnoredReason =
   | "channel-denied"
   | "user-denied"
   | "interaction-denied"
-  | "interaction-expired";
+  | "interaction-expired"
+  | "link-button";
 
 export type SlackActionResult =
-  | { readonly kind: "accepted" | "duplicate"; readonly commandId: string }
+  | { readonly kind: "accepted"; readonly commandId: string }
+  /**
+   * A repeat click. `resolution` says how the request was already handled when it is no longer pending
+   * (sent to the clicker as an ephemeral); null for a redelivered click on a still-pending request.
+   */
+  | { readonly kind: "duplicate"; readonly commandId: string; readonly resolution: string | null }
   | { readonly kind: "partial"; readonly commandId: string; readonly answered: number; readonly total: number }
   | { readonly kind: "open-modal"; readonly triggerId: string; readonly view: SlackTypes.ModalView }
   | { readonly kind: "ignored"; readonly reason: IgnoredReason };
@@ -199,6 +208,7 @@ export class SlackActionRouter {
     const body = parsed.data;
     const action = body.actions[0];
     if (action === undefined) return { kind: "ignored", reason: "invalid-action" };
+    if (action.action_id === "agent-tag.pr.view") return { kind: "ignored", reason: "link-button" };
     const denied = this.#accessDenied(body.team.id, body.channel.id, body.user.id);
     if (denied !== null) return { kind: "ignored", reason: denied };
     const threadTs = body.message.thread_ts ?? body.message.ts;
@@ -214,7 +224,9 @@ export class SlackActionRouter {
         now: this.#now(),
       });
       if (result.kind === "denied") return { kind: "ignored", reason: "interaction-denied" };
-      return { kind: result.kind, commandId: result.commandId };
+      return result.kind === "duplicate"
+        ? { kind: "duplicate", commandId: result.commandId, resolution: null }
+        : { kind: "accepted", commandId: result.commandId };
     }
 
     if (action.action_id === "agent-tag.user-input.open") {
@@ -228,7 +240,19 @@ export class SlackActionRouter {
         threadTs,
         actorUserId: body.user.id,
       });
-      if (question === null) return { kind: "ignored", reason: "interaction-denied" };
+      if (question === null) {
+        // A stale button on a form that was already handled gets feedback; anything else stays silent.
+        const handledCommandId = this.#store.handledUserInputCommandId({
+          interactionId: value.interactionId,
+          workspaceId: body.team.id,
+          conversationId: body.channel.id,
+          threadTs,
+          actorUserId: body.user.id,
+        });
+        return handledCommandId !== null
+          ? this.#duplicate(value.interactionId, handledCommandId)
+          : { kind: "ignored", reason: "interaction-denied" };
+      }
       return {
         kind: "open-modal",
         triggerId: body.trigger_id,
@@ -263,7 +287,9 @@ export class SlackActionRouter {
       if (result.kind === "denied") return { kind: "ignored", reason: "interaction-denied" };
       if (result.kind === "expired") return { kind: "ignored", reason: "interaction-expired" };
       if (result.kind === "invalid") return { kind: "ignored", reason: "invalid-action" };
-      return result;
+      if (result.kind === "duplicate") return this.#duplicate(value.interactionId, result.commandId);
+      if (result.kind === "partial") return result;
+      return { kind: "accepted", commandId: result.commandId };
     }
 
     let response: unknown;
@@ -294,7 +320,16 @@ export class SlackActionRouter {
     });
     if (result.kind === "denied") return { kind: "ignored", reason: "interaction-denied" };
     if (result.kind === "expired") return { kind: "ignored", reason: "interaction-expired" };
-    return { kind: result.kind, commandId: result.commandId };
+    if (result.kind === "duplicate") return this.#duplicate(action.value, result.commandId);
+    return { kind: "accepted", commandId: result.commandId };
+  }
+
+  /** A click on a request that was already answered, failed or expired: no state change, only feedback. */
+  #duplicate(interactionId: string, commandId: string): SlackActionResult {
+    const resolution = alreadyHandledText(this.#store.getInteractionCardView(interactionId), {
+      expirySeconds: this.#config.limits.interactionExpirySeconds,
+    });
+    return { kind: "duplicate", commandId, resolution };
   }
 
   /** Handles a submitted answer modal. `invalid-input` results should be acked with `response_action: "errors"`. */

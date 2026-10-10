@@ -9,6 +9,7 @@ import packageJson from "../package.json" with { type: "json" };
 import t3Lock from "../t3.lock.json" with { type: "json" };
 
 import { type AgentTagConfig, agentTagConfigSchema } from "./config.ts";
+import { checkGitHubAccess, checkGitVersion, defaultGitVersion } from "./github/doctor-check.ts";
 import { type AllowedModelReport, reportAllowedModels, validateConfiguredProviders } from "./policy/provider.ts";
 import { SecretString } from "./security/secret-file.ts";
 import type { ServiceManager } from "./service-manager.ts";
@@ -59,6 +60,8 @@ export interface DoctorDependencies {
   readonly inspectT3: (config: AgentTagConfig["t3"]) => Promise<T3ServerInfo>;
   readonly storeDiagnostics: (config: AgentTagConfig) => Promise<{ readonly tasks?: number; readonly operations?: number }>;
   readonly service: ServiceManager | undefined;
+  /** `git --version` output, or undefined when git cannot run. Defaults to spawning git. */
+  readonly gitVersion?: () => Promise<string | undefined>;
 }
 
 export const T3_ORCHESTRATION_PROTOCOL_VERSION = SUPPORTED_T3_ORCHESTRATION_PROTOCOL;
@@ -270,6 +273,13 @@ export function secretFileSpecs(config: AgentTagConfig): readonly SecretFileSpec
         ? "start Agent Tag (managed mode mints the token) or run `agent-tag t3 rotate CONFIG`"
         : "rerun `agent-tag onboard` or `agent-tag t3 rotate CONFIG --admin-token-file FILE` (or `bun run enroll:t3`) to mint a restricted T3 token",
     },
+    ...(config.github === undefined
+      ? []
+      : [{
+          id: "secret:github-token",
+          path: config.github.auth.tokenFile,
+          missingHint: "create a fine-grained GitHub token (Contents and Pull requests read/write) and save it here",
+        }]),
   ];
 }
 
@@ -766,6 +776,13 @@ export async function runDoctor(input: {
       ? skipped("slack-app-auth", "Slack app token is not usable")
       : await checkSlackApp(appToken, dependencies),
   );
+
+  if (config.github !== undefined) {
+    checks.push(checkGitVersion(await (dependencies.gitVersion ?? defaultGitVersion)()));
+    const githubToken = secrets.get("secret:github-token");
+    if (githubToken === undefined) checks.push(skipped("github-access", "GitHub token is not usable"));
+    else checks.push(...(await checkGitHubAccess({ config, token: githubToken, fetch: dependencies.fetch })));
+  }
 
   // Service repair reruns the doctor inside the installer, so only attempt it once everything else passes.
   const blocked = checks.some((check) => check.status === "fail");

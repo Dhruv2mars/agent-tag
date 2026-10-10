@@ -13,6 +13,7 @@ const LEASE_LOST_MESSAGES = {
   interaction: "interaction lease is missing, expired, or owned by another worker",
   outbox: "outbox lease is missing, expired, or owned by another worker",
   schedule: "schedule lease is missing, expired, or cancelled",
+  prSync: "pull request job lease is missing, expired, or owned by another worker",
 } as const;
 
 export type LeasedQueue = keyof typeof LEASE_LOST_MESSAGES;

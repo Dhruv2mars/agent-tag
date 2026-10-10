@@ -6,16 +6,19 @@
  *   operations.ts   operation leases and outcomes          interactions.ts approvals, cancel, responses
  *   user-input.ts   multi-question user-input answers      outbox.ts       Slack outbox queue
  *   message-edits.ts  chat.update edit/refresh rows (outbox)
+ *   interaction-cards.ts  interaction card view, refresh hooks, reconcile
  *   schedules.ts    schedules and runs                     memory.ts       memory entries
  *   ambient.ts      ambient trigger decisions              audit.ts        audit log write/export
  *   diagnostics.ts  counts and operational status          lease.ts        shared lease helpers
  *   waits.ts        human waits, expiry, abandoned turns   schedule-outcomes.ts run outcomes, auto-disable
  *   thread-notes.ts thread context notes (bot, edit, non-allowlisted updates)
+ *   pull-requests.ts  task pull requests and draft PR jobs
  *   schema.ts       zod schemas                            types.ts        public types (re-exported)
  */
 import type { Database } from "bun:sqlite";
 
 import type { StoreContext } from "./context.ts";
+import type { T3ModelSelection } from "../t3/gateway.ts";
 import type {
   ActiveTaskBinding,
   AmbientDecision,
@@ -46,13 +49,22 @@ import * as diagnostics from "./diagnostics.ts";
 import * as tasks from "./tasks.ts";
 import * as operations from "./operations.ts";
 import * as interactions from "./interactions.ts";
+import * as interactionCards from "./interaction-cards.ts";
 import * as userInput from "./user-input.ts";
 import * as outbox from "./outbox.ts";
 import * as messageEdits from "./message-edits.ts";
 import * as waits from "./waits.ts";
 import * as threadNotes from "./thread-notes.ts";
+import * as pullRequests from "./pull-requests.ts";
 
 export { AUDIT_ACTIONS, type AuditAction } from "./schema.ts";
+export type {
+  ClaimedPrSyncJob,
+  PrSyncInput,
+  PrSyncJobRecord,
+  SettlePrSyncJobInput,
+  TaskPullRequest,
+} from "./pull-requests.ts";
 export type {
   ActiveTaskBinding,
   AmbientDecision,
@@ -148,6 +160,12 @@ export type {
   PendingInteractionRequest,
 } from "./waits.ts";
 export type { GetPendingUserInputQuestionInput, SubmitUserInputAnswerInput } from "./user-input.ts";
+export { RESOLVED_ELSEWHERE } from "./interaction-cards.ts";
+export type {
+  InteractionCardState,
+  InteractionCardView,
+  ReconcileThreadInteractionsInput,
+} from "./interaction-cards.ts";
 export type {
   EnqueueOutboxResult,
   ClaimNextOutboxInput,
@@ -222,6 +240,14 @@ export class AgentTagStore {
 
   peekResolvedTurnText(input: operations.PeekResolvedTurnTextInput): string | null {
     return operations.peekResolvedTurnText(this.#database, input);
+  }
+
+  peekOperationTurnModel(input: operations.PeekResolvedTurnTextInput): operations.OperationTurnModel | null {
+    return operations.peekOperationTurnModel(this.#database, input);
+  }
+
+  resolveOperationTurnModel(input: operations.ResolveOperationTurnModelInput): operations.OperationTurnModel {
+    return operations.resolveOperationTurnModel(this.#database, input);
   }
 
   resolveOperationTurnText(input: operations.ResolveOperationTurnTextInput): string {
@@ -329,6 +355,38 @@ export class AgentTagStore {
     return operations.completeOperationWithOutbox(this.#database, input);
   }
 
+  getTaskPullRequest(taskId: string): pullRequests.TaskPullRequest | null {
+    return pullRequests.getTaskPullRequest(this.#database, taskId);
+  }
+
+  listPrSyncJobs(taskId: string): readonly pullRequests.PrSyncJobRecord[] {
+    return pullRequests.listPrSyncJobs(this.#database, taskId);
+  }
+
+  claimNextPrSyncJob(input: Parameters<typeof pullRequests.claimNextPrSyncJob>[1]): pullRequests.ClaimedPrSyncJob | null {
+    return pullRequests.claimNextPrSyncJob(this.#database, input);
+  }
+
+  renewPrSyncJobLease(input: Parameters<typeof pullRequests.renewPrSyncJobLease>[1]): void {
+    pullRequests.renewPrSyncJobLease(this.#database, input);
+  }
+
+  recordPrSyncPushed(input: Parameters<typeof pullRequests.recordPrSyncPushed>[1]): void {
+    pullRequests.recordPrSyncPushed(this.#database, input);
+  }
+
+  settlePrSyncJob(input: pullRequests.SettlePrSyncJobInput): string | null {
+    return pullRequests.settlePrSyncJob(this.#database, input);
+  }
+
+  retryPrSyncJob(input: Parameters<typeof pullRequests.retryPrSyncJob>[1]): void {
+    pullRequests.retryPrSyncJob(this.#database, input);
+  }
+
+  releasePrSyncJob(input: Parameters<typeof pullRequests.releasePrSyncJob>[1]): void {
+    pullRequests.releasePrSyncJob(this.#database, input);
+  }
+
   cancelOperationWithOutbox(input: operations.CancelOperationWithOutboxInput): string {
     return operations.cancelOperationWithOutbox(this.#database, input);
   }
@@ -396,16 +454,51 @@ export class AgentTagStore {
     tasks.markT3ThreadStarted(this.#database, input);
   }
 
+  setTaskModelSelection(input: tasks.SetTaskModelSelectionInput): void {
+    tasks.setTaskModelSelection(this.#database, input);
+  }
+
+  recordAppliedModelSelection(input: tasks.RecordAppliedModelSelectionInput): boolean {
+    return tasks.recordAppliedModelSelection(this.#database, input);
+  }
+
+  revertDesiredModelSelection(input: tasks.RevertDesiredModelSelectionInput): tasks.ModelRevert | null {
+    return tasks.revertDesiredModelSelection(this.#database, input);
+  }
+
+  recordModelRejection(input: tasks.RecordModelRejectionInput): boolean {
+    return tasks.recordModelRejection(this.#database, input);
+  }
+
+  clearInvalidModelSelection(input: tasks.ClearInvalidModelSelectionInput): readonly tasks.TaskModelColumn[] {
+    return tasks.clearInvalidModelSelection(this.#database, input);
+  }
+
   recordPendingInteraction(
     input: interactions.RecordPendingInteractionInput,
   ): interactions.RecordPendingInteractionResult {
     return interactions.recordPendingInteraction(this.#database, input);
   }
 
+  /** The interaction card's current state (null for cancels and unknown ids); read at delivery time. */
+  getInteractionCardView(interactionId: string): interactionCards.InteractionCardView | null {
+    return interactionCards.getInteractionCardView(this.#database, interactionId);
+  }
+
+  /** Closes pending approvals/questions of the thread that T3 no longer reports (resolved outside Slack). */
+  reconcileThreadInteractions(input: interactionCards.ReconcileThreadInteractionsInput): number {
+    return interactionCards.reconcileThreadInteractions(this.#database, input);
+  }
+
   submitInteractionResponse(
     input: interactions.SubmitInteractionResponseInput,
   ): interactions.SubmitInteractionResponseResult {
     return interactions.submitInteractionResponse(this.#database, input);
+  }
+
+  /** The response command id when the actor's user-input form in this thread is no longer pending. */
+  handledUserInputCommandId(input: Omit<userInput.GetPendingUserInputQuestionInput, "questionId">): string | null {
+    return userInput.handledUserInputCommandId(this.#database, input);
   }
 
   /** Returns one question of a still-pending user-input request when the actor may answer it. */

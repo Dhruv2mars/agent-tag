@@ -220,14 +220,15 @@ function ingest(store: AgentTagStore, index: number, text = `request ${index}`) 
 function drainOutboxTexts(store: AgentTagStore, at: number): string[] {
   const texts: string[] = [];
   const now = new Date(at).toISOString();
-  for (;;) {
+  for (let delivered = 1; ; delivered += 1) {
     const message = store.claimNextOutbox({ workerId: "slack-a", now, leaseMs: 10_000 });
     if (message === null) return texts;
-    texts.push(message.payload.text);
+    // Card refreshes edit an earlier post and render at delivery time: not a new thread message.
+    if (message.refreshKind === null) texts.push(message.payload.text);
     store.markOutboxDelivered({
       outboxId: message.outboxId,
       workerId: "slack-a",
-      slackMessageTs: `1000.${String(texts.length).padStart(6, "0")}`,
+      slackMessageTs: `1000.${String(delivered).padStart(6, "0")}`,
       now,
     });
   }
@@ -909,7 +910,15 @@ describe("interactions of an abandoned turn (B7)", () => {
   async function abandonAtCeiling(harness: Harness, config: AgentTagConfig) {
     let activityCount = 0;
     const coordinator = coordinatorFor(harness, config, () => snapshot({ ...harness.turn, activityCount: ++activityCount }));
-    expect(await coordinator.processNext()).toMatchObject({ kind: "failed", errorCode: "T3TurnCeiling" });
+    // The fake T3 never reports the requests these tests record. Hold off the coordinator's reconcile,
+    // which would close them as answered elsewhere, so abandonment's own close is what is tested.
+    const store = harness.store as { reconcileThreadInteractions: AgentTagStore["reconcileThreadInteractions"] };
+    store.reconcileThreadInteractions = () => 0;
+    try {
+      expect(await coordinator.processNext()).toMatchObject({ kind: "failed", errorCode: "T3TurnCeiling" });
+    } finally {
+      delete (store as Partial<typeof store>).reconcileThreadInteractions;
+    }
   }
 
   function deliverAll(harness: Harness, config: AgentTagConfig): Promise<T3Command[]> {

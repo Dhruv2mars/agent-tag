@@ -52,7 +52,7 @@ test("the checked-in Slack manifest is the least-privilege runtime contract", as
   ]);
   expect(manifest.settings.socket_mode_enabled).toBe(true);
   expect(manifest.settings.interactivity.is_enabled).toBe(true);
-  expect(SLACK_ACTION_IDS).toHaveLength(7);
+  expect(SLACK_ACTION_IDS).toHaveLength(8);
 });
 
 test("the checked-in Agent Tag config parses without hidden defaults", async () => {
