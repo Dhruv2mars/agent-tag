@@ -51,6 +51,8 @@ export interface ClaimedReaction {
   readonly messageTs: string;
   readonly name: string;
   readonly attempt: number;
+  /** The error from the previous attempt, if any. */
+  readonly lastErrorCode: string | null;
 }
 
 const claimedRowSchema = z.object({
@@ -61,6 +63,7 @@ const claimedRowSchema = z.object({
   message_ts: nonEmpty,
   name: nonEmpty,
   attempts: z.number().int().positive(),
+  last_error_code: nonEmpty.nullable(),
 });
 
 export interface ClaimNextReactionInput {
@@ -96,7 +99,7 @@ export function claimNextReaction(context: StoreContext, input: ClaimNextReactio
                 OR (status = 'inflight' AND lease_expires_at <= ?)
              ORDER BY created_at, reaction_key LIMIT 1
            )
-           RETURNING reaction_key, task_id, operation_id, conversation_id, message_ts, name, attempts`,
+           RETURNING reaction_key, task_id, operation_id, conversation_id, message_ts, name, attempts, last_error_code`,
         )
         .get(workerId, expiresAt, now, now, now),
     );
@@ -109,6 +112,7 @@ export function claimNextReaction(context: StoreContext, input: ClaimNextReactio
       messageTs: row.message_ts,
       name: row.name,
       attempt: row.attempts,
+      lastErrorCode: row.last_error_code,
     };
   });
   return claim.immediate();
@@ -147,7 +151,7 @@ function settleLeasedReaction(database: Database, input: SettleReactionInput, se
   const settle = database.transaction(() => {
     const result = database
       .query(
-        `UPDATE slack_reactions SET status = ?, last_error_code = COALESCE(?, last_error_code), blocked_until = ?,
+        `UPDATE slack_reactions SET status = ?, last_error_code = ?, blocked_until = ?,
            lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
          WHERE reaction_key = ? AND status = 'inflight' AND lease_owner = ? AND lease_expires_at > ?`,
       )

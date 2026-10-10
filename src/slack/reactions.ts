@@ -65,6 +65,7 @@ export async function deliverNextSlackReaction(input: DeliverReactionInput): Pro
   const now = input.now ?? (() => new Date().toISOString());
   const claimed = input.store.claimNextReaction({ workerId: input.workerId, now: now(), leaseMs: REACTION_LEASE_MS });
   if (claimed === null) return { kind: "idle" };
+  const policy = input.retryPolicy ?? REACTION_RETRY_POLICY;
   const settle = { reactionKey: claimed.reactionKey, workerId: input.workerId };
   const fail = (errorCode: string): SlackReactionOutcome => {
     input.store.failReaction({ ...settle, errorCode, now: now() });
@@ -79,6 +80,8 @@ export async function deliverNextSlackReaction(input: DeliverReactionInput): Pro
     if (error instanceof ExecutionAuthorityDenied) return outcome;
     throw error;
   }
+  // A row reclaimed after its worker died mid-call still counts its attempts: never resend without bound.
+  if (claimed.attempt > policy.maxAttempts) return fail(claimed.lastErrorCode ?? "attempts_exhausted");
   try {
     await input.addReaction({ channel: claimed.conversationId, timestamp: claimed.messageTs, name: claimed.name });
   } catch (error) {
@@ -90,7 +93,6 @@ export async function deliverNextSlackReaction(input: DeliverReactionInput): Pro
     if (platformError !== undefined && REACTION_TERMINAL_ERRORS.has(platformError)) return fail(platformError);
     const failure = classifySlackDeliveryError(error);
     if (failure.kind === "terminal") return fail(failure.errorCode);
-    const policy = input.retryPolicy ?? REACTION_RETRY_POLICY;
     if (claimed.attempt >= policy.maxAttempts) return fail(failure.errorCode);
     const retryAfterMs = failure.kind === "retryable" ? failure.retryAfterMs : undefined;
     const delayMs = outboxRetryDelayMs({
