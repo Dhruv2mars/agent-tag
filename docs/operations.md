@@ -389,9 +389,19 @@ bun run schedule:cancel -- CONFIG TASK_ID USER_ID PROFILE_ID SCHEDULE_ID
 
 An overdue `run-once` schedule coalesces missed intervals into one run; `skip` records the miss without dispatch. `overlapPolicy: skip` suppresses a recurring agent run while an earlier run from the same schedule is pending or in flight. `queue` preserves every due run behind normal per-task serialization.
 
-## GitHub pull requests (preview: config only)
+## GitHub pull requests (draft PRs, `auto` mode)
 
-This release adds the config keys and the git and GitHub libraries for the draft PR workflow. Nothing acts on them yet: the coordinator does not commit, push, or open PRs until the worker lands in a later release. Configs without these keys stay valid, and `pullRequests` defaults to `{ "mode": "off" }`.
+With `pullRequests.mode: "auto"` on a profile, every completed turn on a configured repository root ends with a snapshot of the task worktree. Leftover changes are committed on `agent-tag/<taskId>`, the branch is pushed with Agent Tag's own token, and the thread gets one draft PR card. Later turns in the same thread push to the same PR and post a one-line "Pushed N commits" update. A turn that changed nothing posts nothing. Configs without these keys stay valid, and `pullRequests` defaults to `{ "mode": "off" }`; with `off` no git process runs at all.
+
+How it runs:
+
+- The snapshot runs in the coordinator after the agent's final reply and before the reply is queued. The PR job is recorded in the same transaction as the reply, keyed by the operation, so a crash or replay never makes two jobs.
+- A separate PR worker claims jobs one task at a time, re-checks that the requester is still authorized and the profile still maps the root to the same repository, pushes, then finds the PR by head branch before creating one. A lost response from GitHub therefore never opens a second PR.
+- GitHub rate limits and transient failures retry with backoff (30 s doubling, six attempts). A rejected token, a missing repository, or exhausted retries post one notice in the thread.
+- Blocked pushes (a credential in the diff, or a diff over `maxChangedFiles`/`maxDiffBytes`) post one notice with the reply and never push. A snapshot failure posts the reply, then a short context line.
+- If the PR was merged or closed, the next job posts one notice and stops; later jobs in that thread stop quietly. Start a new thread for new work. A non-fast-forward push (someone else pushed to the branch) posts a notice and is never forced.
+- The agent is told in its turn text that Agent Tag pushes for it and that it has no GitHub write credentials.
+- `agent-tag doctor` checks the token file, `git --version` (2.38 or newer), and push access to every configured repository. Fine-grained tokens do not report permissions, so for them push access is confirmed on the first push.
 
 ```jsonc
 "github": {                                   // top-level, optional
@@ -401,7 +411,7 @@ This release adds the config keys and the git and GitHub libraries for the draft
 },
 "profiles": [{
   "pullRequests": {
-    "mode": "auto",                           // "off" (default) | "auto" | "button"
+    "mode": "auto",                           // "off" (default) | "auto"; "button" is reserved and rejected
     "repositories": [{ "root": "/abs/repo", "repo": "owner/name", "baseBranch": "main" }],
     "draft": true,
     "commitAuthor": { "name": "Agent Tag", "email": "agent-tag@users.noreply.github.com" },
@@ -418,6 +428,7 @@ Validation rules:
 - Every `repositories[].root` must be in the profile's `repositoryRoots`, and each root can appear only once.
 - `repo` must be `owner/name`. `baseBranch` defaults to the profile's `baseBranch`.
 - A profile with `externalWrites.mode: "deny"` must keep `pullRequests.mode` set to `off`.
+- `mode: "button"` (a human approves each PR in Slack) is not available yet and is rejected.
 - `apiBaseUrl` and `webBaseUrl` must be `https` URLs without credentials. Only `auth.type: "token"` is supported for now. GitHub App auth comes in a later release.
 
 ### Creating the token
