@@ -4,8 +4,9 @@ import { ExecutionAuthorityDenied, requireExecutionAuthority } from "./policy/ex
 import { AgentTagMemory } from "./memory.ts";
 import type { SlackContextSource } from "./slack/context-source.ts";
 import { fetchThreadWindow, SlackContextUnavailable, THREAD_CONTEXT_TIMEOUT_MS } from "./slack/context.ts";
+import { approvalMessage, describeDuration, questionMessage } from "./slack/cards.ts";
 import { collectMentionedUserIds, type SpeakerIdentity } from "./slack/markup.ts";
-import { escapeSlackText, markdownToMrkdwn, renderCodeBlock, splitForSlack, truncateBlockText } from "./slack/render.ts";
+import { markdownToMrkdwn, splitForSlack } from "./slack/render.ts";
 import { slackErrorCode, unresolvedSpeaker } from "./slack/users.ts";
 import type { AgentTagStore, ClaimedOperation, PrSyncInput, SlackOutboxPayload, TaskExecutionBinding } from "./store/store.ts";
 import { composeTurnText, type TurnWindow } from "./turn-text.ts";
@@ -18,8 +19,6 @@ import {
   type T3Command,
   type T3ConnectionConfig,
   type T3DispatchResult,
-  type T3PendingApproval,
-  type T3PendingUserInput,
   type T3ThreadSnapshot,
 } from "./t3/gateway.ts";
 import type { ThreadWatch, ThreadWatchSource } from "./t3/watcher.ts";
@@ -177,14 +176,6 @@ export function t3ProgressMarker(snapshot: T3ThreadSnapshot): string {
   ]);
 }
 
-/** Renders a configured duration for Slack, e.g. 86400 -> "24 hours". */
-export function describeDuration(seconds: number): string {
-  const unit = (value: number, name: string) => `${value} ${name}${value === 1 ? "" : "s"}`;
-  if (seconds % 3_600 === 0) return unit(seconds / 3_600, "hour");
-  if (seconds % 60 === 0) return unit(seconds / 60, "minute");
-  return unit(seconds, "second");
-}
-
 /**
  * Maps T3's free-text `session.lastError` to a stable failure code and a sanitized Slack message.
  * Provider diagnostic text never reaches Slack; operators read the code in audit and status output.
@@ -225,6 +216,7 @@ export function classifyT3TurnFailure(lastError: string | null | undefined): {
 }
 
 export { T3_TURN_ENDED_FAILURE_CODES } from "./store/interactions.ts";
+export { approvalMessage, describeDuration, questionMessage };
 
 function t3TurnFailure(snapshot: T3ThreadSnapshot): CoordinatorFailure {
   const failure = classifyT3TurnFailure(snapshot.thread.session?.lastError);
@@ -236,143 +228,6 @@ function snapshotHasCurrentTurn(snapshot: T3ThreadSnapshot, messageId: string): 
   const latestTurn = snapshot.thread.latestTurn;
   return userMessage !== undefined && latestTurn !== null &&
     new Date(latestTurn.requestedAt).getTime() >= new Date(userMessage.createdAt).getTime();
-}
-
-export function approvalMessage(interactionId: string, approval: T3PendingApproval): SlackOutboxPayload {
-  const detail = approval.detail === undefined
-    ? "The agent requested permission."
-    : approval.detail.includes("\n")
-    ? renderCodeBlock(approval.detail)
-    : escapeSlackText(approval.detail);
-  return {
-    text: truncateBlockText(`Approval required: ${escapeSlackText(approval.requestKind)}`),
-    blocks: [
-      {
-        type: "section",
-        text: {
-          type: "mrkdwn",
-          text: truncateBlockText(`*Approval required* · ${escapeSlackText(approval.requestKind)}\n${detail}`),
-        },
-      },
-      {
-        type: "actions",
-        block_id: `agent-tag:${interactionId}`,
-        elements: [
-          {
-            type: "button",
-            text: { type: "plain_text", text: "Approve" },
-            style: "primary",
-            action_id: "agent-tag.approval.accept",
-            value: interactionId,
-          },
-          {
-            type: "button",
-            text: { type: "plain_text", text: "Reject" },
-            style: "danger",
-            action_id: "agent-tag.approval.decline",
-            value: interactionId,
-          },
-          {
-            type: "button",
-            text: { type: "plain_text", text: "Cancel request" },
-            action_id: "agent-tag.approval.cancel",
-            value: interactionId,
-          },
-        ],
-      },
-    ],
-  };
-}
-
-function truncateText(text: string, max: number): string {
-  const chars = Array.from(text);
-  return chars.length <= max ? text : `${chars.slice(0, max - 1).join("")}…`;
-}
-
-/**
- * Renders every question of a T3 user-input request. Single-select options are buttons; multi-select
- * and free-text answers open a modal. Answers are collected per question and sent to T3 once complete.
- */
-export function questionMessage(interactionId: string, request: T3PendingUserInput): SlackOutboxPayload {
-  if (request.questions.length === 0) throw new Error("T3 user-input request has no questions");
-  type SlackBlock = NonNullable<SlackOutboxPayload["blocks"]>[number];
-  type SlackActionsBlock = Extract<SlackBlock, { readonly type: "actions" }>;
-  const total = request.questions.length;
-  const blocks: SlackBlock[] = [];
-  if (total > 1) {
-    blocks.push({
-      type: "section",
-      text: {
-        type: "mrkdwn",
-        text: `*The agent has ${total} questions.* Answer each one; the replies are sent together once all are answered.`,
-      },
-    });
-  }
-  request.questions.forEach((question, index) => {
-    const customAllowed = question.options.length === 0 || question.allowCustomAnswer !== false;
-    const optionLines =
-      question.multiSelect || question.options.some((option) => option.description !== undefined)
-        ? question.options.map((option) =>
-            `• ${escapeSlackText(option.label)}${option.description === undefined ? "" : ` — ${escapeSlackText(option.description)}`}`,
-          )
-        : [];
-    const prefix = total > 1 ? `${index + 1}/${total} · ` : "";
-    blocks.push({
-      type: "section",
-      text: {
-        type: "mrkdwn",
-        text: truncateBlockText(
-          [`*${prefix}${escapeSlackText(question.header)}*`, escapeSlackText(question.question), ...optionLines].join("\n"),
-        ),
-      },
-    });
-    const elements: SlackActionsBlock["elements"] = question.multiSelect
-      ? []
-      : question.options.slice(0, 24).map((option, optionIndex) => ({
-          type: "button" as const,
-          text: { type: "plain_text" as const, text: truncateText(option.label, 75) },
-          action_id: "agent-tag.user-input.answer",
-          value: JSON.stringify({ interactionId, questionId: question.id, optionIndex }),
-        }));
-    const needsModal = (question.multiSelect && question.options.length > 0) || customAllowed;
-    if (needsModal) {
-      elements.push({
-        type: "button",
-        text: {
-          type: "plain_text",
-          text: question.multiSelect && question.options.length > 0
-            ? "Choose options"
-            : question.options.length > 0 ? "Other answer" : "Type answer",
-        },
-        action_id: "agent-tag.user-input.open",
-        value: JSON.stringify({ interactionId, questionId: question.id }),
-      });
-    }
-    if (elements.length > 0) {
-      blocks.push({ type: "actions", block_id: `agent-tag:${interactionId}:q${index}`, elements });
-    }
-  });
-  if (request.dismissible) {
-    blocks.push({
-      type: "actions",
-      block_id: `agent-tag:${interactionId}:dismiss`,
-      elements: [
-        {
-          type: "button",
-          text: { type: "plain_text", text: "Dismiss" },
-          action_id: "agent-tag.user-input.dismiss",
-          value: interactionId,
-        },
-      ],
-    });
-  }
-  const first = request.questions[0];
-  return {
-    text: total === 1 && first !== undefined
-      ? truncateBlockText(`Question from the agent: ${escapeSlackText(first.question)}`)
-      : truncateBlockText(`The agent has ${total} questions: ${request.questions.map((question) => escapeSlackText(question.question)).join(" / ")}`),
-    blocks,
-  };
 }
 
 export class AgentTagCoordinator {
@@ -831,6 +686,15 @@ export class AgentTagCoordinator {
       }
       const approvals = pendingT3Approvals(snapshot);
       const userInputs = pendingT3UserInputs(snapshot);
+      // A request T3 stopped reporting while nobody answered in Slack was answered elsewhere: close its card.
+      this.#store.reconcileThreadInteractions({
+        threadId: task.threadId,
+        pending: [
+          ...approvals.map((approval) => ({ requestId: approval.requestId, kind: "approval" as const })),
+          ...userInputs.map((userInput) => ({ requestId: userInput.requestId, kind: "user-input" as const })),
+        ],
+        now: this.#now().toISOString(),
+      });
       if (approvals.length > 0 || userInputs.length > 0) {
         const interactionNow = this.#now();
         for (const approval of approvals) {

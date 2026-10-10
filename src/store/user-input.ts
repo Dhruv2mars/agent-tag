@@ -6,11 +6,10 @@ import { z } from "zod";
 import { writeAudit } from "./audit.ts";
 import { requiredId, parseStoredJson } from "./context.ts";
 import { interactionResponseExpired, operationAcceptsResponses } from "./interactions.ts";
-import { insertOutboxMessage } from "./outbox.ts";
+import { enqueueInteractionCardRefresh } from "./interaction-cards.ts";
 import {
   isoDateTime,
   nonEmpty,
-  outboxPayloadSchema,
   partialUserInputSchema,
   userInputPromptSchema,
 } from "./schema.ts";
@@ -44,10 +43,6 @@ function resolveUserInputAnswer(
   if (unique.length === 0) return null;
   if (question.multiSelect) return unique;
   return unique.length === 1 ? (unique[0] ?? null) : null;
-}
-
-function escapeSlackText(text: string): string {
-  return text.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
 }
 
 export interface GetPendingUserInputQuestionInput {
@@ -87,6 +82,33 @@ export function getPendingUserInputQuestion(
   return prompt.data.questions.find((question) => question.id === input.questionId) ?? null;
 }
 
+/**
+ * The response command id when the form, visible to this actor in this thread, is no longer pending
+ * (answered, dismissed, failed or expired), so a click on its modal button only needs "already handled"
+ * feedback; null otherwise.
+ */
+export function handledUserInputCommandId(
+  database: Database,
+  input: Omit<GetPendingUserInputQuestionInput, "questionId">,
+): string | null {
+  const row = z.object({ response_command_id: nonEmpty }).nullable().parse(database
+    .query(
+      `SELECT i.response_command_id
+       FROM interactions i JOIN tasks t ON t.task_id = i.task_id
+       WHERE i.interaction_id = ? AND i.kind = 'user-input' AND i.state <> 'pending'
+         AND t.workspace_id = ? AND t.conversation_id = ? AND t.thread_ts = ?
+         AND (t.conversation_type = 'channel' OR t.owner_user_id = ?)`,
+    )
+    .get(
+      requiredId(input.interactionId, "interactionId"),
+      requiredId(input.workspaceId, "workspaceId"),
+      requiredId(input.conversationId, "conversationId"),
+      requiredId(input.threadTs, "threadTs"),
+      requiredId(input.actorUserId, "actorUserId"),
+    ));
+  return row?.response_command_id ?? null;
+}
+
 export interface SubmitUserInputAnswerInput {
   readonly interactionId: string;
   readonly questionId: string;
@@ -104,7 +126,7 @@ export interface SubmitUserInputAnswerInput {
 /**
  * Durably records the answer to one question of a multi-question user-input request. The full
  * response is queued for T3 only once every question has an answer; until then each answer is kept
- * in `partial_response_json` and acknowledged in the Slack thread.
+ * in `partial_response_json` and shown on the request's card.
  */
 export function submitUserInputAnswer(
   database: Database,
@@ -185,21 +207,8 @@ export function submitUserInputAnswer(
            WHERE interaction_id = ? AND state = 'pending'`,
         )
         .run(JSON.stringify(next), now, row.interaction_id);
-      const remaining = unanswered.map((candidate) => candidate.header || candidate.question).join(", ");
-      insertOutboxMessage(database, {
-        outboxId: crypto.randomUUID(),
-        taskId: row.task_id,
-        correlationId: row.interaction_id,
-        conversationId: input.conversationId,
-        threadTs: input.threadTs,
-        clientMessageId: `${row.interaction_id}:answer:${sourceActionId}`,
-        payload: outboxPayloadSchema.parse({
-          text: escapeSlackText(
-            `Answer recorded for "${question.header || question.question}" (${answered} of ${total}). Still needed: ${remaining}.`,
-          ),
-        }),
-        createdAt: now,
-      });
+      // The card shows the answer in place of the question's buttons; no new thread message.
+      enqueueInteractionCardRefresh(database, row.interaction_id, now);
       writeAudit(database, {
         actorType: "slack-user",
         actorId: actorUserId,
@@ -249,6 +258,7 @@ export function submitUserInputAnswer(
       metadata: { questionCount: total },
       createdAt: now,
     });
+    enqueueInteractionCardRefresh(database, row.interaction_id, now);
     return { kind: "accepted", commandId: row.response_command_id };
   });
   return submit.immediate();
