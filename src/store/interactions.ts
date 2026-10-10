@@ -253,6 +253,7 @@ export const T3_TURN_ENDED_FAILURE_CODES: ReadonlySet<string> = new Set([
   "T3ProviderAuthPolicy",
   "T3ProviderAuth",
   "T3ProviderLimit",
+  "T3ModelSwitchRejected",
   "T3TurnError",
   "user-cancelled",
 ]);
