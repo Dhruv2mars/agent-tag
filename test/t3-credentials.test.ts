@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, link, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -15,6 +15,7 @@ import {
   isRetiredT3Client,
   managedT3Credentials,
   readT3CredentialState,
+  reclaimStaleLock,
   T3_CREDENTIAL_STATE_FILE,
   T3CredentialLifecycle,
   t3OrchestrationLabel,
@@ -542,16 +543,33 @@ describe("revocation after the grace period", () => {
     world.clock.now = grace + 30_000;
     expect(await lifecycle.revokeRetired()).toBe(0);
     expect(world.t3.issued()).toBe(issued);
-    // Attempts 2..6 at +1, +2, +4, +8, +16 minutes after the grace period.
-    let offset = 0;
+    // Attempts 2..6 each wait 1, 2, 4, 8, 16 minutes after the previous attempt.
+    let attemptAt = grace;
     for (const step of [1, 2, 4, 8, 16]) {
-      offset = step;
-      world.clock.now = grace + offset * 60_000;
+      const before = world.t3.issued();
+      world.clock.now = attemptAt + step * 60_000 - 1_000;
       await lifecycle.revokeRetired();
+      expect(world.t3.issued()).toBe(before);
+      attemptAt += step * 60_000;
+      world.clock.now = attemptAt;
+      await lifecycle.revokeRetired();
+      expect(world.t3.issued()).toBeGreaterThan(before);
     }
     expect(world.logs.at(-1)?.detail).toContain("after 6 attempts; they expire on their own");
     expect((await readT3CredentialState(world.stateFile)).retired).toEqual([]);
     expect(old.revoked).toBe(false);
+  });
+
+  test("a pass that runs long after the grace period makes one attempt, not all six", async () => {
+    const world = await setup();
+    await world.seedCurrent(20);
+    const lifecycle = world.lifecycle();
+    await lifecycle.rotate("manual");
+    world.t3.failures.revokeUnconfirmed = true;
+    world.clock.now = START + 2 * 60 * 60_000;
+    for (let pass = 0; pass < 6; pass += 1) await lifecycle.revokeRetired();
+    const state = await readT3CredentialState(world.stateFile);
+    expect(state.retired).toMatchObject([{ attempts: 1, nextAttemptAt: new Date(world.clock.now + 60_000).toISOString() }]);
   });
 
   test("a revoke confirmed on a later attempt clears the entry", async () => {
@@ -683,6 +701,50 @@ describe("credential state", () => {
     await mkdir(join(world.dir, "runtime"), { recursive: true, mode: 0o700 });
     await writeFile(`${world.stateFile}.lock`, "999999999");
     expect(await world.lifecycle().ensureToken()).toBe("enrolled");
+  });
+
+  test("waiters racing to reclaim the same stale lock never let two rotations overlap", async () => {
+    const world = await setup();
+    await world.seedCurrent(20);
+    await writeFile(`${world.stateFile}.lock`, "999999999:dead");
+    const results = await Promise.all(Array.from({ length: 8 }, () => world.lifecycle().rotate("manual")));
+    expect(new Set(results.map((result) => result.label)).size).toBe(8);
+    expect(world.t3.admins.maxOpen).toBe(1);
+    expect((await readT3CredentialState(world.stateFile)).retired).toHaveLength(8);
+    expect(await stat(`${world.stateFile}.lock`).catch(() => null)).toBeNull();
+  });
+
+  test("a waiter reclaiming a stale lock that another waiter already replaced never frees the live lock", async () => {
+    const world = await setup();
+    const lock = join(world.dir, "race.lock");
+    const live = `${process.pid}:live`;
+    await writeFile(lock, live);
+    await writeFile(join(world.dir, "late.tmp"), `${process.pid}:late`);
+    await writeFile(join(world.dir, "thief.tmp"), `${process.pid}:thief`);
+    let stolen = false;
+    let done = false;
+    const thief = (async () => {
+      while (!done && !stolen) {
+        stolen = await link(join(world.dir, "thief.tmp"), lock).then(() => true, () => false);
+      }
+    })();
+    // The late waiter still holds its snapshot of the dead owner's lock.
+    for (let round = 0; round < 50 && !stolen; round += 1) {
+      await reclaimStaleLock(lock, "999999999:dead", join(world.dir, "late.tmp"));
+    }
+    done = true;
+    await thief;
+    expect(stolen).toBe(false);
+    expect(await readFile(lock, "utf8")).toBe(live);
+  });
+
+  test("a reclaim slot left by a reclaimer that died does not wedge the lock", async () => {
+    const world = await setup();
+    await mkdir(join(world.dir, "runtime"), { recursive: true, mode: 0o700 });
+    await writeFile(`${world.stateFile}.lock`, "999999999:dead");
+    await writeFile(`${world.stateFile}.lock.reclaim-999999999_dead`, "999999998:alsodead");
+    expect(await world.lifecycle().ensureToken()).toBe("enrolled");
+    expect(await stat(`${world.stateFile}.lock`).catch(() => null)).toBeNull();
   });
 
   test("a corrupt state file is an actionable error", async () => {

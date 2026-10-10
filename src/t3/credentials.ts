@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { link, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { link, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
 import { z } from "zod";
@@ -60,6 +60,8 @@ const retiredSchema = z.object({
   retiredAt: z.iso.datetime(),
   /** Revocation passes that could not confirm the revoke; retried with backoff up to `MAX_REVOKE_ATTEMPTS`. */
   attempts: z.number().int().min(0).optional(),
+  /** When the next attempt is due: the last unconfirmed attempt plus its backoff. */
+  nextAttemptAt: z.iso.datetime().optional(),
 });
 
 const stateSchema = z.object({
@@ -130,11 +132,13 @@ function deadline(signal?: AbortSignal, ms: number = REQUEST_TIMEOUT_MS): AbortS
   return signal === undefined ? timeout : AbortSignal.any([signal, timeout]);
 }
 
-/** When a replaced token is next due for a revocation attempt. */
+/** When a replaced token is next due for a revocation attempt: after its grace period, then per its backoff. */
 function revokeDueAt(entry: Retired, graceMs: number): number {
-  const attempts = entry.attempts ?? 0;
-  return Date.parse(entry.retiredAt) + graceMs + (attempts === 0 ? 0 : 2 ** (attempts - 1) * 60_000);
+  return entry.nextAttemptAt === undefined ? Date.parse(entry.retiredAt) + graceMs : Date.parse(entry.nextAttemptAt);
 }
+
+/** Backoff after the `attempts`-th unconfirmed revoke: 1, 2, 4, 8, 16 minutes. */
+const revokeBackoffMs = (attempts: number) => 2 ** (attempts - 1) * 60_000;
 
 const sameRetired = (a: Retired, b: Retired) => a.retiredAt === b.retiredAt && a.label === b.label && a.expiresAt === b.expiresAt;
 
@@ -390,7 +394,12 @@ export class T3CredentialLifecycle {
             this.#log({ level: "warn", event: "t3.token.revoke_skipped", errorCode: errorName(error), detail: errorMessage(error) });
           }
         }
-        const retried = retry.map((entry) => ({ ...entry, attempts: (entry.attempts ?? 0) + 1 }));
+        // Backoff counts from this attempt, not from retirement, so a late pass cannot burn every retry at once.
+        const failedAtMs = this.#now().getTime();
+        const retried = retry.map((entry) => {
+          const attempts = (entry.attempts ?? 0) + 1;
+          return { ...entry, attempts, nextAttemptAt: new Date(failedAtMs + revokeBackoffMs(attempts)).toISOString() };
+        });
         const exhausted = retried.filter((entry) => entry.attempts >= MAX_REVOKE_ATTEMPTS);
         // A failure was already logged above; repeat only when giving up.
         if (retry.length > 0 && (!failed || exhausted.length > 0)) {
@@ -515,14 +524,10 @@ export class T3CredentialLifecycle {
         }
         const content = await readFile(lockPath, "utf8").catch(() => undefined);
         if (content === undefined) continue;
-        const holder = Number(content.split(":")[0]);
-        if (!Number.isSafeInteger(holder) || holder <= 0 || !processAlive(holder)) {
-          await reclaimStaleLock(lockPath, content);
-          continue;
-        }
         signal?.throwIfAborted();
-        if (Date.now() >= deadlineAt) throw new Error(`another Agent Tag process (pid ${holder}) is rotating the T3 token`);
-        await Bun.sleep(100);
+        if (Date.now() >= deadlineAt) throw new Error(`another Agent Tag process (pid ${content.split(":")[0]}) is rotating the T3 token`);
+        if (lockOwnerAlive(content)) await Bun.sleep(100);
+        else await reclaimStaleLock(lockPath, content, draft);
       }
     } finally {
       await rm(draft, { force: true });
@@ -539,24 +544,37 @@ export class T3CredentialLifecycle {
   }
 }
 
+/** Whether a lock file's `pid:nonce` owner is a running process. */
+function lockOwnerAlive(content: string): boolean {
+  const pid = Number(content.split(":")[0]);
+  return Number.isSafeInteger(pid) && pid > 0 && processAlive(pid);
+}
+
 /**
- * Moves a dead owner's lock aside atomically. If what was moved is not the stale lock that was read
- * (another process reclaimed it and took the lock in between), it is put back.
+ * Removes `path` only while it still holds `content`, whose owner is dead. Removal is guarded by an
+ * exclusive slot keyed on that content: owners are unique (`pid:nonce`), so of several waiters that
+ * read the same stale lock exactly one may remove it, and a lock taken since is never touched. A slot
+ * left by a reclaimer that died is reclaimed the same way. Exported for tests.
  */
-async function reclaimStaleLock(lockPath: string, staleContent: string): Promise<void> {
-  const aside = `${lockPath}.${randomBytes(8).toString("hex")}.stale`;
-  try {
-    await rename(lockPath, aside);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
-    throw error;
+export async function reclaimStaleLock(path: string, content: string, draft: string, depth = 0): Promise<void> {
+  const slot = `${path}.reclaim-${content.replace(/[^A-Za-z0-9]/g, "_")}`;
+  while (true) {
+    try {
+      await link(draft, slot);
+      break;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    }
+    const holder = await readFile(slot, "utf8").catch(() => undefined);
+    if (holder === undefined) continue;
+    // A live waiter is reclaiming it already; the caller retries the lock.
+    if (lockOwnerAlive(holder) || depth >= 4) return;
+    await reclaimStaleLock(slot, holder, draft, depth + 1);
   }
   try {
-    if ((await readFile(aside, "utf8").catch(() => undefined)) !== staleContent) {
-      await link(aside, lockPath).catch(() => undefined);
-    }
+    if ((await readFile(path, "utf8").catch(() => undefined)) === content) await rm(path, { force: true });
   } finally {
-    await rm(aside, { force: true });
+    await rm(slot, { force: true });
   }
 }
 

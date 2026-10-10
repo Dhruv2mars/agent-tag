@@ -34,6 +34,27 @@ describe("runCommand", () => {
     expect(Date.now() - started).toBeLessThan(5_000);
   });
 
+  test("kills descendants that inherited the output pipes when its signal aborts", async () => {
+    const controller = new AbortController();
+    const marker = `/tmp/agent-tag-command-test-${process.pid}-${Date.now()}`;
+    const started = Date.now();
+    setTimeout(() => controller.abort(), 100);
+    const result = await runCommand(["sh", "-c", `(sleep 2; touch ${marker}) & wait`], { signal: controller.signal });
+    expect(result.exitCode).not.toBe(0);
+    expect(Date.now() - started).toBeLessThan(1_500);
+    await Bun.sleep(2_500);
+    expect(await Bun.file(marker).exists()).toBe(false);
+  });
+
+  test("returns promptly after abort even when a descendant left the process group and holds the pipes", async () => {
+    const controller = new AbortController();
+    const started = Date.now();
+    setTimeout(() => controller.abort(), 100);
+    const result = await runCommand(["sh", "-c", `perl -e 'setpgrp(0, 0); sleep 3' & wait`], { signal: controller.signal });
+    expect(result.exitCode).not.toBe(0);
+    expect(Date.now() - started).toBeLessThan(1_500);
+  });
+
   test("does not start a command whose signal already aborted", async () => {
     const result = await runCommand(["sleep", "30"], { signal: AbortSignal.abort() });
     expect(result.exitCode).toBe(130);

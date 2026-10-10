@@ -5,32 +5,46 @@ export interface CommandResult {
 }
 
 export interface CommandOptions {
-  /** Kills the command (SIGKILL) when aborted; the result then has the signal's exit code. */
+  /**
+   * Kills the command and everything it started (SIGKILL to its process group) when aborted; the
+   * result then has the signal's exit code. With a signal the command runs in its own process group.
+   */
   readonly signal?: AbortSignal;
 }
 
 export type CommandRunner = (command: readonly string[], options?: CommandOptions) => Promise<CommandResult>;
 
+/** How long output pipes may stay open after an abort (a descendant outside the group can hold them). */
+const ABORT_PIPE_GRACE_MS = 250;
+
 /** Runs a command without a shell and captures trimmed output. A missing binary is exit code 127. */
 export const runCommand: CommandRunner = async (command, options) => {
-  if (options?.signal?.aborted) return { exitCode: 130, stdout: "", stderr: "aborted before start" };
+  const signal = options?.signal;
+  if (signal?.aborted) return { exitCode: 130, stdout: "", stderr: "aborted before start" };
   let child;
   try {
-    child = Bun.spawn([...command], { stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+    child = Bun.spawn([...command], { stdin: "ignore", stdout: "pipe", stderr: "pipe", detached: signal !== undefined });
   } catch {
     return { exitCode: 127, stdout: "", stderr: `command not found: ${command[0] ?? ""}` };
   }
-  const kill = () => child.kill("SIGKILL");
-  options?.signal?.addEventListener("abort", kill, { once: true });
+  const output = Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text()]);
+  let onAbort = () => {};
+  const abandoned = new Promise<readonly [string, string]>((resolve) => {
+    onAbort = () => {
+      try {
+        process.kill(-child.pid, "SIGKILL");
+      } catch {
+        child.kill("SIGKILL");
+      }
+      setTimeout(() => resolve(["", "aborted"]), ABORT_PIPE_GRACE_MS);
+    };
+  });
+  signal?.addEventListener("abort", onAbort, { once: true });
   try {
-    const [exitCode, stdout, stderr] = await Promise.all([
-      child.exited,
-      new Response(child.stdout).text(),
-      new Response(child.stderr).text(),
-    ]);
+    const [exitCode, [stdout, stderr]] = await Promise.all([child.exited, signal === undefined ? output : Promise.race([output, abandoned])]);
     return { exitCode, stdout: stdout.trim(), stderr: stderr.trim() };
   } finally {
-    options?.signal?.removeEventListener("abort", kill);
+    signal?.removeEventListener("abort", onAbort);
   }
 };
 
