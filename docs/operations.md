@@ -371,6 +371,34 @@ Direct messages are off until an operator adds the DM conversation ID to `access
 
 The app manifest includes the `im:history` bot scope and `message.im` subscription. Reinstall the Slack app after changing scopes. Agent Tag accepts unmentioned messages only for the named owner in that exact DM. It does not support group DMs as private single-owner conversations.
 
+## Commands
+
+A message that starts with `@Agent Tag !<command>` runs a command instead of a request. In a DM route the owner can drop the mention and send `!status` directly. The command word must come right after the mention; `@Agent Tag please !help` is an ordinary request.
+
+| Command | Where | What it does |
+| --- | --- | --- |
+| `!help` | anywhere | Lists the commands enabled here. Only the sender sees it. |
+| `!status` | anywhere | In a thread: whether the agent is working, waiting on an approval or question, or has requests queued, plus the thread's model and mute state. At the top level: a count across the channel's threads. Only the sender sees it. |
+| `!mute` | a thread the agent is part of | Stops the agent answering unmentioned replies in that thread. Posts a public notice. |
+| `!unmute` | a thread the agent is part of | Reverses `!mute`. Any message that mentions the agent in a muted thread also unmutes it. |
+
+Commands never create a T3 turn and never store the message text. Each run is recorded once per Slack message in `slack_command_events` and audited as `slack.command.executed` or `slack.command.denied`; mute changes are audited as `thread.muted` and `thread.unmuted`. Other `!words` (for example `!model`) are still treated as ordinary requests until their commands ship.
+
+Configure commands under `commands`:
+
+```json
+{
+  "access": { "allowedUserIds": ["U0EXAMPLE"], "allowedChannelIds": ["C0EXAMPLE"], "adminUserIds": ["U0EXAMPLE"] },
+  "commands": { "enabled": true, "disabled": [], "adminOnly": ["mute", "unmute"] }
+}
+```
+
+- `enabled: false` turns every `!word` back into an ordinary request.
+- `disabled` answers with an only-you "not enabled" note. `!help` cannot be disabled.
+- `adminOnly` limits a command to `access.adminUserIds`, which must also be in `access.allowedUserIds`. `!help` and `!status` cannot be admin-only.
+
+Only-you replies use `chat.postEphemeral` (covered by the existing `chat:write` scope). They are sent at most once, with one retry after a rate limit.
+
 ## Access changes and live verification
 
 Restart or upgrade the service after changing access configuration. Before each queued T3 turn, interaction response, or schedule, Agent Tag rechecks the stored task against the loaded workspace, user, channel, route, profile, repository, and DM-owner policy. Denied turns and interaction responses fail durably; revoked recurring schedules stop with an audit record. Queued Slack replies also recheck the task route and DM owner before sending. A sanitized failure notice may still reach an authorized shared channel after its requesting user is removed.
