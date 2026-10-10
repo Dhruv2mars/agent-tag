@@ -1,5 +1,8 @@
 // Operation queue: claim, lease renewal, and every terminal or retry transition.
 import type { Database } from "bun:sqlite";
+import { z } from "zod";
+
+import { type T3ModelSelection, t3ModelSelectionSchema } from "../t3/gateway.ts";
 
 import { writeAudit } from "./audit.ts";
 import { type StoreContext, requiredId, parseStoredJson } from "./context.ts";
@@ -253,6 +256,84 @@ export function recordThreadContextAudit(database: Database, input: RecordThread
       : { code: outcome.code },
     createdAt: isoDateTime.parse(input.now),
   });
+}
+
+/** The model a turn runs on, frozen per operation so a replay sends and records the same one. */
+export interface OperationTurnModel {
+  readonly selection: T3ModelSelection;
+  /** The selection T3 had accepted for the thread before this turn; null before the first turn. */
+  readonly previous: T3ModelSelection | null;
+  /** Whether the turn moves the thread with `thread.meta.update` before starting. */
+  readonly movedThread: boolean;
+}
+
+const operationTurnModelSchema = z.object({
+  selection: t3ModelSelectionSchema,
+  previous: t3ModelSelectionSchema.nullable(),
+  movedThread: z.boolean(),
+});
+
+function storedTurnModel(json: string | null): OperationTurnModel | null {
+  if (json === null) return null;
+  const parsed = operationTurnModelSchema.parse(JSON.parse(json));
+  const selection = (value: T3ModelSelection) => ({ instanceId: value.instanceId, model: value.model });
+  return {
+    selection: selection(parsed.selection),
+    previous: parsed.previous === null ? null : selection(parsed.previous),
+    movedThread: parsed.movedThread,
+  };
+}
+
+function leasedTurnModel(database: Database, operationId: string, workerId: string, now: string): {
+  readonly model: OperationTurnModel | null;
+} | null {
+  const row = z.object({ turn_model_json: z.string().nullable() }).nullable().parse(
+    database
+      .query(
+        `SELECT turn_model_json FROM operations
+         WHERE operation_id = ? AND status = 'inflight' AND lease_owner = ? AND lease_expires_at > ?`,
+      )
+      .get(operationId, workerId, now),
+  );
+  return row === null ? null : { model: storedTurnModel(row.turn_model_json) };
+}
+
+/** The frozen turn model, or null before it is resolved. Same lease predicate as the turn text. */
+export function peekOperationTurnModel(database: Database, input: PeekResolvedTurnTextInput): OperationTurnModel | null {
+  const now = isoDateTime.parse(input.now);
+  return leasedTurnModel(
+    database,
+    requiredId(input.operationId, "operationId"),
+    requiredId(input.workerId, "workerId"),
+    now,
+  )?.model ?? null;
+}
+
+export interface ResolveOperationTurnModelInput {
+  readonly operationId: string;
+  readonly workerId: string;
+  readonly proposed: OperationTurnModel;
+  readonly now: string;
+}
+
+/** Freezes the turn model on first call; every later call (a replay) returns the frozen one. */
+export function resolveOperationTurnModel(
+  database: Database,
+  input: ResolveOperationTurnModelInput,
+): OperationTurnModel {
+  const now = isoDateTime.parse(input.now);
+  const operationId = requiredId(input.operationId, "operationId");
+  const workerId = requiredId(input.workerId, "workerId");
+  return database.transaction(() => {
+    const prior = leasedTurnModel(database, operationId, workerId, now);
+    if (prior === null) throw new Error("operation turn model could not be resolved");
+    if (prior.model !== null) return prior.model;
+    const json = JSON.stringify(operationTurnModelSchema.parse(input.proposed));
+    database
+      .query("UPDATE operations SET turn_model_json = ?, updated_at = ? WHERE operation_id = ?")
+      .run(json, now, operationId);
+    return storedTurnModel(json) as OperationTurnModel;
+  }).immediate();
 }
 
 export function resolveOperationTurnText(database: Database, input: ResolveOperationTurnTextInput): string {

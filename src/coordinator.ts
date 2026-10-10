@@ -1,12 +1,13 @@
-import type { AgentTagConfig, AgentTagProfile } from "./config.ts";
+import type { AgentTagConfig, AgentTagProfile, AgentTagRoute } from "./config.ts";
 import { preparePullRequestSync, pullRequestTurnNote, type PullRequestSyncOptions } from "./git/pr-sync.ts";
 import { ExecutionAuthorityDenied, requireExecutionAuthority } from "./policy/execution.ts";
+import { allowedChoices, effectiveSelection, planSwitch, type ModelChoice } from "./policy/models.ts";
 import { AgentTagMemory } from "./memory.ts";
 import type { SlackContextSource } from "./slack/context-source.ts";
 import { fetchThreadWindow, SlackContextUnavailable, THREAD_CONTEXT_TIMEOUT_MS } from "./slack/context.ts";
 import { approvalMessage, describeDuration, questionMessage } from "./slack/cards.ts";
 import { collectMentionedUserIds, type SpeakerIdentity } from "./slack/markup.ts";
-import { markdownToMrkdwn, splitForSlack } from "./slack/render.ts";
+import { escapeSlackText, markdownToMrkdwn, splitForSlack } from "./slack/render.ts";
 import { slackErrorCode, unresolvedSpeaker } from "./slack/users.ts";
 import type { AgentTagStore, ClaimedOperation, PrSyncInput, SlackOutboxPayload, TaskExecutionBinding } from "./store/store.ts";
 import { composeTurnText, type TurnWindow } from "./turn-text.ts";
@@ -19,7 +20,10 @@ import {
   type T3Command,
   type T3ConnectionConfig,
   type T3DispatchResult,
+  type T3ModelSelection,
+  type T3ServerInfo,
   type T3ThreadSnapshot,
+  threadModelSelectionCommand,
 } from "./t3/gateway.ts";
 import type { ThreadWatch, ThreadWatchSource } from "./t3/watcher.ts";
 
@@ -51,11 +55,26 @@ interface TurnPolling {
   watch: ThreadWatch | null;
 }
 
+/** The T3 provider catalog as the coordinator needs it (`ProviderCatalog` in production). */
+export interface CoordinatorProviderCatalog {
+  /** The snapshot, or null when there is none or it is stale. */
+  readonly current: () => T3ServerInfo | null;
+  /** Re-reads the catalog; resolves false on failure. */
+  readonly refresh: (signal?: AbortSignal) => Promise<boolean>;
+}
+
+/** Budget for refreshing a stale catalog before planning a model switch. */
+const CATALOG_REFRESH_BUDGET_MS = 3_000;
+
 export interface CoordinatorOptions {
   readonly config: AgentTagConfig;
   readonly store: AgentTagStore;
   readonly t3?: T3CoordinatorGateway;
   readonly memory?: AgentTagMemory;
+  /** Provider catalog for planning model switches on started threads. Absent means unknown (fail closed). */
+  readonly catalog?: CoordinatorProviderCatalog;
+  /** Wall-clock budget for refreshing a stale catalog before planning a switch. Defaults to 3s. */
+  readonly catalogRefreshBudgetMs?: number;
   /** Slack reads for speaker labels. Absent (tests, legacy) means speakers render as raw IDs. */
   readonly slackContext?: SlackContextSource;
   /** Turn-wide wall-clock budget for speaker lookups. Defaults to min(5s, lease / 4). */
@@ -180,11 +199,31 @@ export function t3ProgressMarker(snapshot: T3ThreadSnapshot): string {
  * Maps T3's free-text `session.lastError` to a stable failure code and a sanitized Slack message.
  * Provider diagnostic text never reaches Slack; operators read the code in audit and status output.
  */
-export function classifyT3TurnFailure(lastError: string | null | undefined): {
+export function classifyT3TurnFailure(
+  lastError: string | null | undefined,
+  context: { readonly currentModel?: string } = {},
+): {
   readonly code: string;
   readonly userMessage: string;
 } {
   const detail = lastError?.toLowerCase() ?? "";
+  // T3 0.0.45 refusing to move a started thread to another model (ProviderCommandReactor). Not
+  // retryable: the same selection would be refused again.
+  if (
+    [
+      "cannot switch models after the conversation has started",
+      "cannot switch to '",
+      "is bound to driver",
+      "provider resume state is incompatible",
+    ].some((term) => detail.includes(term))
+  ) {
+    const current = context.currentModel === undefined ? "its current model" : `*${escapeSlackText(context.currentModel)}*`;
+    return {
+      code: "T3ModelSwitchRejected",
+      userMessage:
+        `T3 refused to move this thread to the requested model; it stays on ${current}. Start a new thread to use a different provider.`,
+    };
+  }
   // Claude subscription (OAuth) login blocked by the Anthropic organization's policy: HTTP 403
   // `oauth_not_allowed_for_organization`. Retrying cannot help; the operator must switch credentials.
   if (["oauth_not_allowed_for_organization", "oauth authentication is currently not allowed"].some((term) => detail.includes(term))) {
@@ -218,9 +257,47 @@ export function classifyT3TurnFailure(lastError: string | null | undefined): {
 export { T3_TURN_ENDED_FAILURE_CODES } from "./store/interactions.ts";
 export { approvalMessage, describeDuration, questionMessage };
 
-function t3TurnFailure(snapshot: T3ThreadSnapshot): CoordinatorFailure {
-  const failure = classifyT3TurnFailure(snapshot.thread.session?.lastError);
-  return new CoordinatorFailure(failure.code, failure.userMessage);
+/**
+ * T3 reports a turn start it refused (a model switch, an unknown provider) asynchronously: the
+ * dispatch succeeds, then a `provider.turn.start.failed` activity names the message. Returns its
+ * detail, or null when this message's start has not failed.
+ */
+function turnStartFailureDetail(snapshot: T3ThreadSnapshot, messageId: string): string | null {
+  for (const activity of snapshot.thread.activities) {
+    if (activity.kind !== "provider.turn.start.failed") continue;
+    const payload = activity.payload;
+    if (typeof payload !== "object" || payload === null) continue;
+    const { requestId, detail } = payload as { readonly requestId?: unknown; readonly detail?: unknown };
+    if (requestId === messageId) return typeof detail === "string" ? detail : "";
+  }
+  return null;
+}
+
+function sameSelection(left: T3ModelSelection, right: T3ModelSelection): boolean {
+  return left.instanceId === right.instanceId && left.model === right.model;
+}
+
+function modelChoice(profile: AgentTagProfile, route: AgentTagRoute | undefined, selection: T3ModelSelection): ModelChoice {
+  return allowedChoices(profile, route).find((choice) => sameSelection(choice, selection)) ?? {
+    instanceId: selection.instanceId,
+    model: selection.model,
+    label: selection.model,
+    aliases: [],
+    source: "allowed",
+  };
+}
+
+function modelLabel(profile: AgentTagProfile, route: AgentTagRoute | undefined, selection: T3ModelSelection): string {
+  return modelChoice(profile, route, selection).label;
+}
+
+/** The selection a turn carries, and what the coordinator must do once T3 accepts or rejects it. */
+interface TurnModel {
+  readonly selection: T3ModelSelection;
+  /** What T3 had accepted before this turn (null for a new thread). */
+  readonly previous: T3ModelSelection | null;
+  /** A `thread.meta.update` moved the thread's projected selection for this turn. */
+  readonly movedThread: boolean;
 }
 
 function snapshotHasCurrentTurn(snapshot: T3ThreadSnapshot, messageId: string): boolean {
@@ -235,6 +312,8 @@ export class AgentTagCoordinator {
   readonly #store: AgentTagStore;
   readonly #t3: T3CoordinatorGateway;
   readonly #memory: AgentTagMemory;
+  readonly #catalog: CoordinatorProviderCatalog | null;
+  readonly #catalogRefreshBudgetMs: number;
   readonly #slackContext: SlackContextSource | undefined;
   readonly #speakerLookupBudgetMs: number;
   readonly #threadContextBudgetMs: number;
@@ -254,6 +333,8 @@ export class AgentTagCoordinator {
     this.#store = options.store;
     this.#t3 = options.t3 ?? defaultT3Gateway(options.config.t3);
     this.#memory = options.memory ?? new AgentTagMemory({ config: options.config, store: options.store });
+    this.#catalog = options.catalog ?? null;
+    this.#catalogRefreshBudgetMs = options.catalogRefreshBudgetMs ?? CATALOG_REFRESH_BUDGET_MS;
     this.#slackContext = options.slackContext;
     this.#workerId = options.workerId ?? `t3-worker-${crypto.randomUUID()}`;
     this.#leaseMs = options.leaseMs ?? 30_000;
@@ -512,10 +593,7 @@ export class AgentTagCoordinator {
       task,
       actorUserId: operation.payload.actorUserId,
     });
-    const modelSelection = {
-      instanceId: profile.defaultProviderInstanceId,
-      model: profile.defaultModel,
-    };
+    const route = this.#config.routes.find((candidate) => candidate.conversationId === task.conversationId);
     const turnText = await this.#composeTurn(operation, task, profile, signal);
     // Shutdown aborts these dispatches (the gateway interrupts the RPC and closes its socket). Both
     // commands use stable ids, so T3 deduplicates the replay when the released operation resumes.
@@ -525,9 +603,14 @@ export class AgentTagCoordinator {
       projectId: task.projectId,
       title: `Agent Tag ${profile.id}`,
       workspaceRoot: task.repositoryRoot,
-      defaultModelSelection: modelSelection,
+      // Projects are shared across tasks, so they keep the profile default.
+      defaultModelSelection: { instanceId: profile.defaultProviderInstanceId, model: profile.defaultModel },
       createdAt: task.projectCreatedAt,
     }, signal), signal);
+    // Chosen after the project exists: until the model is frozen here no model-bearing command has
+    // gone out, so a retry before this point re-plans against the current config.
+    const model = await this.#turnModel(operation, task, profile, route, signal);
+    const modelSelection = model.selection;
 
     // Recorded first: if the receipt is lost, T3 may still run the turn, so cancellation has to wait
     // for the replay below to confirm it instead of dropping the operation locally.
@@ -670,6 +753,10 @@ export class AgentTagCoordinator {
         progressMarker = marker;
         progressAt = this.#now().getTime();
       }
+      const startFailure = turnStartFailureDetail(snapshot, operation.messageId);
+      if (startFailure !== null) {
+        throw await this.#turnFailure(startFailure, operation, task, profile, route, model, signal);
+      }
       if (task.threadStarted && !snapshotHasCurrentTurn(snapshot, operation.messageId)) {
         await this.#pollAgain(progressAt, signal, polling.watch, snapshot);
         continue;
@@ -683,6 +770,13 @@ export class AgentTagCoordinator {
           now: this.#now().toISOString(),
         });
         turnIdRecorded = true;
+        // T3 started this turn, so it accepted the selection: later turns are planned against it.
+        this.#store.recordAppliedModelSelection({
+          taskId: task.taskId,
+          threadId: task.threadId,
+          selection: modelSelection,
+          now: this.#now().toISOString(),
+        });
       }
       const approvals = pendingT3Approvals(snapshot);
       const userInputs = pendingT3UserInputs(snapshot);
@@ -778,7 +872,9 @@ export class AgentTagCoordinator {
         continue;
       }
       const latestTurn = snapshot.thread.latestTurn;
-      if (latestTurn?.state === "error") throw t3TurnFailure(snapshot);
+      if (latestTurn?.state === "error") {
+        throw await this.#turnFailure(snapshot.thread.session?.lastError, operation, task, profile, route, model, signal);
+      }
       if (latestTurn?.state === "interrupted") {
         const outboxId = this.#store.cancelOperationWithOutbox({
           operationId: operation.operationId,
@@ -867,6 +963,209 @@ export class AgentTagCoordinator {
     } finally {
       clearInterval(timer);
     }
+  }
+
+  /**
+   * The model this operation's turn runs on, chosen once and frozen on the operation: a replay sends
+   * (and later records as applied) the same selection T3 deduplicated, even if the task's desired
+   * model or the config changed in between. A thread move is re-sent under its stable command id.
+   */
+  async #turnModel(
+    operation: ClaimedOperation,
+    task: TaskExecutionBinding,
+    profile: AgentTagProfile,
+    route: AgentTagRoute | undefined,
+    signal: AbortSignal | undefined,
+  ): Promise<TurnModel> {
+    const lease = { operationId: operation.operationId, workerId: this.#workerId };
+    const model = this.#store.peekOperationTurnModel({ ...lease, now: this.#now().toISOString() })
+      ?? this.#store.resolveOperationTurnModel({
+        ...lease,
+        proposed: await this.#chooseModel(operation, task, profile, route, signal),
+        now: this.#now().toISOString(),
+      });
+    if (model.movedThread) {
+      // A stable id per operation: a replay after a lost receipt deduplicates in T3.
+      await abortable(this.#t3.dispatch(threadModelSelectionCommand({
+        commandId: `${operation.operationId}:model`,
+        threadId: task.threadId,
+        modelSelection: model.selection,
+      }), signal), signal);
+    }
+    return model;
+  }
+
+  /**
+   * Picks the selection for this turn (P2 §3.7): the task's desired model while config allows it, else
+   * the route or profile default. A started thread only moves where T3 0.0.45 would follow (same
+   * driver and resume state), via `thread.meta.update` so the snapshot names the model in use;
+   * otherwise it stays on what T3 last accepted (sticky), which keeps a profile default moved to
+   * another driver from breaking started threads. A desired model that cannot be honoured is reverted
+   * with a one-line notice in the thread.
+   */
+  async #chooseModel(
+    operation: ClaimedOperation,
+    task: TaskExecutionBinding,
+    profile: AgentTagProfile,
+    route: AgentTagRoute | undefined,
+    signal: AbortSignal | undefined,
+  ): Promise<TurnModel> {
+    if (task.invalidModelSelection) {
+      // Unreadable columns already read as unset; clearing them leaves an audit trail without the value.
+      this.#store.clearInvalidModelSelection({
+        taskId: task.taskId,
+        correlationId: operation.operationId,
+        now: this.#now().toISOString(),
+      });
+    }
+    let applied = task.appliedModelSelection;
+    if (task.threadStarted && applied === null) {
+      // A thread started before selections were recorded: T3's projected selection is what it runs.
+      const snapshot = await abortable(this.#t3.fetchThread(task.threadId, signal), signal);
+      applied = { instanceId: snapshot.thread.modelSelection.instanceId, model: snapshot.thread.modelSelection.model };
+      this.#store.recordAppliedModelSelection({
+        taskId: task.taskId,
+        threadId: task.threadId,
+        selection: applied,
+        now: this.#now().toISOString(),
+      });
+    }
+    const effective = effectiveSelection({
+      task: { desired: task.desiredModelSelection, applied },
+      profile,
+      route,
+      catalog: this.#catalog?.current() ?? null,
+    });
+    // T3 already refused this default for the thread: stay on what it accepted until either changes.
+    const stuck = effective.reason !== "desired" && task.threadStarted && applied !== null
+      && task.rejectedModelSelection !== null && sameSelection(effective.selection, task.rejectedModelSelection);
+    if (effective.revoked && task.desiredModelSelection !== null) {
+      const dropped = task.desiredModelSelection;
+      const allowed = allowedChoices(profile, route).map((choice) => `*${escapeSlackText(choice.label)}*`).join(", ");
+      const droppedLabel = escapeSlackText(dropped.model);
+      this.#modelNotice(
+        operation,
+        effective.reason === "sticky-applied" || stuck
+          ? `*${droppedLabel}* is no longer allowed here, but T3 can't move a started thread to another provider, so this thread stays on it. Start a new thread to use an allowed model: ${allowed}.`
+          : `*${droppedLabel}* is no longer allowed here, so this thread uses *${escapeSlackText(modelLabel(profile, route, effective.selection))}*. Allowed: ${allowed}.`,
+      );
+      this.#store.revertDesiredModelSelection({
+        taskId: task.taskId,
+        reason: "revoked",
+        expected: dropped,
+        code: "not-allowed",
+        correlationId: operation.operationId,
+        now: this.#now().toISOString(),
+      });
+    }
+    const target = effective.selection;
+    if (!task.threadStarted || applied === null || sameSelection(target, applied)) {
+      return { selection: target, previous: applied, movedThread: false };
+    }
+    if (stuck) return { selection: applied, previous: applied, movedThread: false };
+
+    const catalog = await this.#freshCatalog(signal);
+    const plan = planSwitch({
+      current: applied,
+      target: modelChoice(profile, route, target),
+      threadStarted: true,
+      catalog,
+      // Disabling user switches does not pin a thread off a changed default.
+      policy: effective.reason === "desired" ? profile.modelSwitch : { ...profile.modelSwitch, enabled: true },
+    });
+    if (plan.kind === "in-place" || plan.kind === "pre-start" || plan.kind === "noop") {
+      return { selection: target, previous: applied, movedThread: true };
+    }
+    if (effective.reason === "desired") {
+      const appliedLabel = escapeSlackText(modelLabel(profile, route, applied));
+      this.#modelNotice(
+        operation,
+        `This thread already started on *${appliedLabel}*; T3 can't move it to *${escapeSlackText(modelLabel(profile, route, target))}* (${plan.code}). It stays on *${appliedLabel}*; start a new thread to use another provider.`,
+      );
+      // Guarded by the choice planned with: one made during the catalog refresh is kept for the next turn.
+      this.#store.revertDesiredModelSelection({
+        taskId: task.taskId,
+        reason: "refused",
+        expected: target,
+        code: plan.code,
+        correlationId: operation.operationId,
+        now: this.#now().toISOString(),
+      });
+    }
+    return { selection: applied, previous: applied, movedThread: false };
+  }
+
+  /** The catalog, refreshed first (within a short budget) when it is missing or stale. */
+  async #freshCatalog(signal: AbortSignal | undefined): Promise<T3ServerInfo | null> {
+    if (this.#catalog === null) return null;
+    const current = this.#catalog.current();
+    if (current !== null) return current;
+    // The budget bounds this wait, not the refresh: a read shared with the maintenance worker ignores
+    // our signal, so past the budget the plan proceeds without a catalog and the read carries on.
+    const budget = AbortSignal.timeout(this.#catalogRefreshBudgetMs);
+    const deadline = signal === undefined ? budget : AbortSignal.any([signal, budget]);
+    try {
+      await abortable(this.#catalog.refresh(deadline), deadline);
+    } catch (error) {
+      if (signal?.aborted === true) throw new CoordinatorAborted();
+      if (!(error instanceof CoordinatorAborted)) throw error;
+    }
+    return this.#catalog.current();
+  }
+
+  /** A one-line model notice in the task's Slack thread, at most once per operation. */
+  #modelNotice(operation: ClaimedOperation, text: string): void {
+    this.#store.enqueueOutbox({
+      taskId: operation.taskId,
+      correlationId: operation.operationId,
+      conversationId: operation.payload.conversationId,
+      threadTs: operation.payload.threadTs,
+      clientMessageId: `${operation.operationId}:model-notice`,
+      payload: { text, blocks: [{ type: "section", text: { type: "mrkdwn", text } }] },
+      createdAt: this.#now().toISOString(),
+    });
+  }
+
+  /**
+   * Classifies a T3 turn failure. When T3 refused the model switch, the rejection is recorded (a
+   * desired model reverts to the one T3 last accepted; a default is not retried) and the thread's
+   * projected selection is moved back (best effort).
+   */
+  async #turnFailure(
+    lastError: string | null | undefined,
+    operation: ClaimedOperation,
+    task: TaskExecutionBinding,
+    profile: AgentTagProfile,
+    route: AgentTagRoute | undefined,
+    model: TurnModel,
+    signal: AbortSignal | undefined,
+  ): Promise<CoordinatorFailure> {
+    const failure = classifyT3TurnFailure(lastError, {
+      currentModel: modelLabel(profile, route, model.previous ?? model.selection),
+    });
+    if (failure.code === "T3ModelSwitchRejected" && model.previous !== null && !sameSelection(model.selection, model.previous)) {
+      this.#store.recordModelRejection({
+        taskId: task.taskId,
+        threadId: task.threadId,
+        rejected: model.selection,
+        code: failure.code,
+        correlationId: operation.operationId,
+        now: this.#now().toISOString(),
+      });
+      if (model.movedThread && model.previous !== null) {
+        try {
+          await abortable(this.#t3.dispatch(threadModelSelectionCommand({
+            commandId: `${operation.operationId}:model-restore`,
+            threadId: task.threadId,
+            modelSelection: model.previous,
+          }), signal), signal);
+        } catch (error) {
+          if (error instanceof CoordinatorAborted || signal?.aborted === true) throw new CoordinatorAborted();
+          // The next turn re-plans from the applied selection, so a stale projection only misnames the model.
+        }
+      }
+    }
+    return new CoordinatorFailure(failure.code, failure.userMessage);
   }
 
   /**

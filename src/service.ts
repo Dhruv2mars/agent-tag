@@ -14,6 +14,7 @@ import { T3Connection } from "./t3/connection.ts";
 import { createT3GateWorker, T3RuntimeGate } from "./t3/gate.ts";
 import { inspectT3, type T3ServerInfo } from "./t3/gateway.ts";
 import { PINNED_T3 } from "./t3/lock.ts";
+import { createProviderCatalogWorker, ProviderCatalog } from "./t3/provider-catalog.ts";
 import { prepareManagedT3Binary, T3ManagedRuntime } from "./t3/supervisor.ts";
 import { protocolV1Source, ThreadWatcher } from "./t3/watcher.ts";
 
@@ -334,6 +335,19 @@ export async function createAgentTagService(input: {
     const server = await inspectT3(t3Config);
     validateConfiguredProviders(input.config, server);
     for (const record of allowedModelLogRecords(input.config, server, now().toISOString())) logger(record);
+    // Model switches are planned against this catalog; a failed refresh keeps the last good snapshot.
+    const catalog = new ProviderCatalog({
+      inspect: (signal) => inspectT3(t3Config, signal),
+      now,
+      onRefreshFailed: (error) =>
+        logger({
+          level: "warn",
+          event: "t3.catalog.refresh.failed",
+          errorCode: error instanceof Error && error.name ? error.name : "T3CatalogError",
+          at: now().toISOString(),
+        }),
+    });
+    catalog.seed(server);
     const gate = new T3RuntimeGate({
       baseUrl: t3Config.baseUrl,
       ...(runtime === undefined ? {} : { pinnedVersion: PINNED_T3.version }),
@@ -358,6 +372,7 @@ export async function createAgentTagService(input: {
           store,
           slackContext: bridge.contextSource,
           t3,
+          catalog,
           ...(watcher === undefined ? {} : { watcher }),
           ...(pullRequests === undefined ? {} : { pullRequests }),
         }),
@@ -394,6 +409,7 @@ export async function createAgentTagService(input: {
           },
         },
         createT3GateWorker({ gate, now }),
+        createProviderCatalogWorker({ catalog, now }),
         ...(pullRequests === undefined
           ? []
           : [

@@ -1,6 +1,7 @@
 import type { z } from "zod";
 
 import type { ScheduleRecurrence } from "../routines/cron.ts";
+import type { T3ModelSelection } from "../t3/gateway.ts";
 import type {
   AuditAction,
   operationPayloadSchema,
@@ -65,6 +66,14 @@ export interface TaskExecutionBinding {
   readonly conversationType: "channel" | "dm";
   readonly ownerUserId: string | null;
   readonly createdAt: string;
+  /** The model a user chose for this task; null means the route or profile default. */
+  readonly desiredModelSelection: T3ModelSelection | null;
+  /** The last selection T3 accepted for `threadId`; null before the first turn (or for older tasks). */
+  readonly appliedModelSelection: T3ModelSelection | null;
+  /** A switch T3 refused for `threadId` since `appliedModelSelection` was recorded; not retried as a default. */
+  readonly rejectedModelSelection: T3ModelSelection | null;
+  /** A selection column held an unreadable value (read as null); see `clearInvalidModelSelection`. */
+  readonly invalidModelSelection: boolean;
 }
 
 export interface IngestReceipt {

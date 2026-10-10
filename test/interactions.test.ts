@@ -1626,8 +1626,8 @@ describe("interaction retries and cancellation", () => {
     }
   });
 
-  test("a fresh cancel does not requeue an exhausted cancellation whose T3 turn is confirmed ended", async () => {
-    const { fresh, outcome, commands } = await exhaustCancelThenFailOperation("T3TurnError");
+  test.each(["T3TurnError", "T3ModelSwitchRejected"])("a fresh cancel does not requeue an exhausted cancellation whose T3 turn is confirmed ended (%s)", async (errorCode) => {
+    const { fresh, outcome, commands } = await exhaustCancelThenFailOperation(errorCode);
     expect(fresh).toMatchObject({ kind: "ignored", reason: "interaction-denied" });
     expect(outcome).toBe("idle");
     expect(commands).toHaveLength(2);
@@ -1763,7 +1763,7 @@ describe("interaction retries and cancellation", () => {
     });
   });
 
-  test("a cancel whose operation already finished settles without T3 and says so once", async () => {
+  test.each(["T3TurnError", "T3ModelSwitchRejected"])("a cancel whose operation already finished settles without T3 and says so once (%s)", async (errorCode) => {
     await withStore(async ({ store, path }) => {
       const seeded = seedOperation(store);
       claimRunningOperation(store, seeded.operationId);
@@ -1781,7 +1781,7 @@ describe("interaction retries and cancellation", () => {
       store.failOperation({
         operationId: seeded.operationId,
         workerId: "coordinator-a",
-        errorCode: "T3TurnError",
+        errorCode,
         retryable: false,
         now,
       });

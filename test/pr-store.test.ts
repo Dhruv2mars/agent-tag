@@ -143,7 +143,7 @@ function insertJobRow(
     );
 }
 
-describe("migration 18 table constraints", () => {
+describe("migration 19 table constraints", () => {
   test("task_pull_requests rejects an open PR without a number and a pending PR with one", async () => {
     await withStore(({ store, database }) => {
       const insertPr = (taskId: string, state: string, prNumber: number | null) =>
