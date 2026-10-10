@@ -637,3 +637,47 @@ test("D12: an operation payload written before messageTs, origin and threadConte
     await rm(directory, { recursive: true });
   }
 });
+
+test("H1: migration 20 adds the command ledger without a command_kind CHECK and the thread controls", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-tag-migration-commands-"));
+  const path = join(directory, "agent-tag.sqlite");
+  try {
+    (await AgentTagStore.open(path)).close();
+    // Reopening re-runs nothing.
+    (await AgentTagStore.open(path)).close();
+
+    const database = new Database(path, { strict: true });
+    expect(
+      database.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM schema_migrations WHERE version = 20").get(),
+    ).toEqual({ count: 1 });
+    const insertCommand = database.query(
+      `INSERT INTO slack_command_events (workspace_id, event_key, delivery_id, conversation_id, thread_ts, actor_user_id,
+         command_kind, task_id, outcome, reason, memory_id, received_at, updated_at)
+       VALUES ('T1', ?, 'd', 'C1', NULL, 'U1', ?, NULL, 'started', NULL, NULL, '2026-09-21T00:00:00.000Z', '2026-09-21T00:00:00.000Z')`,
+    );
+    // A later lane's command kind needs no table rebuild.
+    insertCommand.run("C1:1.1", "some-future-command");
+    expect(() => insertCommand.run("C1:1.1", "help")).toThrow();
+    expect(
+      database
+        .query<{ name: string }, []>("SELECT name FROM pragma_index_list('slack_command_events') ORDER BY name")
+        .all()
+        .map((row) => row.name),
+    ).toContain("slack_command_events_actor_idx");
+
+    const insertControl = database.query(
+      `INSERT INTO slack_thread_controls (workspace_id, conversation_id, thread_ts, muted_at, muted_by, mute_source, updated_at)
+       VALUES ('T1', 'C1', ?, ?, ?, ?, '2026-09-21T00:00:00.000Z')`,
+    );
+    insertControl.run("1.1", "2026-09-21T00:00:00.000Z", "U1", "command");
+    insertControl.run("1.2", null, null, null);
+    expect(() => insertControl.run("1.3", "2026-09-21T00:00:00.000Z", "U1", "other")).toThrow();
+    expect(() => insertControl.run("1.4", "2026-09-21T00:00:00.000Z", null, "command")).toThrow();
+    database.close();
+  } finally {
+    if (!directory.startsWith(`${tmpdir()}/agent-tag-migration-commands-`)) {
+      throw new Error(`refusing to remove unexpected migration fixture path ${directory}`);
+    }
+    await rm(directory, { recursive: true });
+  }
+});
