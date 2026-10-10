@@ -78,7 +78,8 @@ export type SlackIngressResult =
         | "dm-owner-denied"
         | "task-route-denied"
         | "edit-irrelevant"
-        | "thread-muted";
+        | "thread-muted"
+        | "command-handled";
     };
 type IgnoredReason = Extract<SlackIngressResult, { kind: "ignored" }>["reason"];
 
@@ -330,6 +331,8 @@ export class SlackEventRouter {
         },
       };
     }
+    // Already answered as a command (before a config change turned commands off): never a prompt too.
+    if (this.#store.isCommandEvent({ workspaceId, eventKey })) return ignored("command-handled");
     const binding = this.#findBinding(workspaceId, event.channel, threadTs);
     const explicitMention = this.#mentionsBot(event.text);
     let profileId: string;

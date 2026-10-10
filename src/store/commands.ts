@@ -75,6 +75,15 @@ export function beginCommand(database: Database, input: BeginCommandInput): "acc
   return begin.immediate();
 }
 
+/** Whether the event was claimed as a command, so a redelivery never also becomes a prompt. */
+export function isCommandEvent(database: Database, input: { readonly workspaceId: string; readonly eventKey: string }): boolean {
+  return (
+    database
+      .query("SELECT 1 FROM slack_command_events WHERE workspace_id = ? AND event_key = ?")
+      .get(requiredId(input.workspaceId, "workspaceId"), requiredId(input.eventKey, "eventKey")) !== null
+  );
+}
+
 export interface SettleCommandInput {
   readonly workspaceId: string;
   readonly eventKey: string;

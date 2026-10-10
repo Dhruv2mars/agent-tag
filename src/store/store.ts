@@ -452,6 +452,10 @@ export class AgentTagStore {
     commands.settleCommand(this.#database, input);
   }
 
+  isCommandEvent(input: { readonly workspaceId: string; readonly eventKey: string }): boolean {
+    return commands.isCommandEvent(this.#database, input);
+  }
+
   isThreadMuted(input: commands.ThreadKey): boolean {
     return commands.isThreadMuted(this.#database, input);
   }

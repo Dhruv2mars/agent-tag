@@ -199,6 +199,30 @@ describe("!commands", () => {
     });
   });
 
+  test("a command redelivered after commands are turned off does not become a request", async () => {
+    await withHarness(makeConfig(), async (harness) => {
+      const event = eventBody({ eventId: "Ev1", ts: "1000.000100", text: "<@U0BOT> !status" });
+      await harness.send(event);
+      const off = makeConfig({ commands: { enabled: false } });
+      expect(harness.route(event, off)).toEqual({ kind: "ignored", reason: "command-handled" });
+      expect(harness.route(eventBody({ eventId: "Ev2", type: "message", ts: "1000.000100", text: "<@U0BOT> !status" }), off))
+        .toEqual({ kind: "ignored", reason: "command-handled" });
+      expect(harness.store.diagnostics()).toMatchObject({ tasks: 0, operations: 0, events: 0 });
+      expect(harness.sender.sent).toHaveLength(1);
+    });
+  });
+
+  test("a request ingested while commands were off is not re-run as a command", async () => {
+    await withHarness(makeConfig(), async (harness) => {
+      const event = eventBody({ eventId: "Ev1", ts: "1000.000100", text: "<@U0BOT> !status" });
+      expect(harness.route(event, makeConfig({ commands: { enabled: false } })).kind).toBe("accepted");
+      await harness.send(event);
+      expect(harness.sender.sent).toHaveLength(0);
+      expect(harness.commandRows()).toHaveLength(0);
+      expect(harness.store.diagnostics()).toMatchObject({ operations: 1 });
+    });
+  });
+
   test("a user outside allowedUserIds and a DM non-owner are ignored silently", async () => {
     await withHarness(makeConfig(), async (harness) => {
       expect(harness.route(eventBody({ eventId: "Ev1", ts: "1000.000100", user: "U9", text: "<@U0BOT> !help" }))).toEqual({
