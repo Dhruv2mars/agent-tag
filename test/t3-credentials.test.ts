@@ -747,6 +747,24 @@ describe("credential state", () => {
     expect(await stat(`${world.stateFile}.lock`).catch(() => null)).toBeNull();
   });
 
+  test("a chain of dead reclaimer slots deeper than the limit cannot hold a waiter past abort", async () => {
+    const world = await setup();
+    await mkdir(join(world.dir, "runtime"), { recursive: true, mode: 0o700 });
+    let path = `${world.stateFile}.lock`;
+    let content = "999999999:dead";
+    for (let level = 0; level <= 5; level += 1) {
+      await writeFile(path, content);
+      path = `${path}.reclaim-${content.replace(/[^A-Za-z0-9]/g, "_")}`;
+      content = `99999999${level}:dead${level}`;
+    }
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(), 300);
+    const started = Date.now();
+    await expect(world.lifecycle().rotate("manual", controller.signal)).rejects.toThrow();
+    expect(Date.now() - started).toBeLessThan(2_000);
+    expect(world.t3.issued()).toBe(0);
+  });
+
   test("a corrupt state file is an actionable error", async () => {
     const world = await setup();
     await mkdir(join(world.dir, "runtime"), { recursive: true, mode: 0o700 });

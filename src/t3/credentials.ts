@@ -526,8 +526,7 @@ export class T3CredentialLifecycle {
         if (content === undefined) continue;
         signal?.throwIfAborted();
         if (Date.now() >= deadlineAt) throw new Error(`another Agent Tag process (pid ${content.split(":")[0]}) is rotating the T3 token`);
-        if (lockOwnerAlive(content)) await Bun.sleep(100);
-        else await reclaimStaleLock(lockPath, content, draft);
+        if (lockOwnerAlive(content) || !(await reclaimStaleLock(lockPath, content, draft))) await Bun.sleep(100);
       }
     } finally {
       await rm(draft, { force: true });
@@ -554,25 +553,26 @@ function lockOwnerAlive(content: string): boolean {
  * Removes `path` only while it still holds `content`, whose owner is dead. Removal is guarded by an
  * exclusive slot keyed on that content: owners are unique (`pid:nonce`), so of several waiters that
  * read the same stale lock exactly one may remove it, and a lock taken since is never touched. A slot
- * left by a reclaimer that died is reclaimed the same way. Exported for tests.
+ * left by a reclaimer that died is reclaimed the same way. Makes one attempt and never waits, so the
+ * caller's abort and deadline checks run between attempts; returns whether anything was removed.
+ * Exported for tests.
  */
-export async function reclaimStaleLock(path: string, content: string, draft: string, depth = 0): Promise<void> {
+export async function reclaimStaleLock(path: string, content: string, draft: string, depth = 0): Promise<boolean> {
   const slot = `${path}.reclaim-${content.replace(/[^A-Za-z0-9]/g, "_")}`;
-  while (true) {
-    try {
-      await link(draft, slot);
-      break;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-    }
+  try {
+    await link(draft, slot);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
     const holder = await readFile(slot, "utf8").catch(() => undefined);
-    if (holder === undefined) continue;
-    // A live waiter is reclaiming it already; the caller retries the lock.
-    if (lockOwnerAlive(holder) || depth >= 4) return;
-    await reclaimStaleLock(slot, holder, draft, depth + 1);
+    // Gone (retry now), held by a live waiter (it is reclaiming already), or too deep a chain of dead reclaimers.
+    if (holder === undefined) return true;
+    if (lockOwnerAlive(holder) || depth >= 4) return false;
+    return reclaimStaleLock(slot, holder, draft, depth + 1);
   }
   try {
-    if ((await readFile(path, "utf8").catch(() => undefined)) === content) await rm(path, { force: true });
+    if ((await readFile(path, "utf8").catch(() => undefined)) !== content) return true;
+    await rm(path, { force: true });
+    return true;
   } finally {
     await rm(slot, { force: true });
   }
