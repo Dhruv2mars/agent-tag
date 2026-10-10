@@ -9,6 +9,7 @@ import { requiredId, parseStoredJson } from "./context.ts";
 import { leaseExpiry, requireLeaseHeld } from "./lease.ts";
 import { enqueueInteractionCardRefresh } from "./interaction-cards.ts";
 import { insertOutboxMessage } from "./outbox.ts";
+import { markStatusStopping } from "./status.ts";
 import {
   interactionIdentitySchema,
   interactionRowSchema,
@@ -265,6 +266,11 @@ export interface RequestTaskCancellationInput {
   readonly threadTs: string;
   readonly actorUserId: string;
   readonly sourceActionId: string;
+  /**
+   * The operation a status message's Stop button belongs to. When set, the request is denied unless
+   * that operation is the one it would cancel, so a stale button never stops a later turn.
+   */
+  readonly operationId?: string | undefined;
   readonly now: string;
 }
 
@@ -410,6 +416,8 @@ export function requestTaskCancellation(
         )
         .get(taskId, ...endedCodes),
     );
+    const expected = input.operationId;
+    if (stranded !== null && expected !== undefined && stranded.operation_id !== expected) return { kind: "denied" };
     if (stranded !== null) {
       return requeueExhaustedCancellation(database, stranded, { actorUserId, sourceActionId, now });
     }
@@ -431,6 +439,7 @@ export function requestTaskCancellation(
         .get(taskId),
     );
     if (target === null) return { kind: "denied" };
+    if (expected !== undefined && target.operation_id !== expected) return { kind: "denied" };
     const requestId = `cancel:${target.operation_id}`;
     const prior = priorRowSchema.extend({
       state: nonEmpty,
@@ -527,7 +536,7 @@ export function requestTaskCancellation(
         conversationId: input.conversationId,
         threadTs: input.threadTs,
         clientMessageId,
-        payload: outboxPayloadSchema.parse({ text: "Cancelled." }),
+        payload: outboxPayloadSchema.parse({ text: `Stopped by <@${actorUserId}>.` }),
         createdAt: now,
       });
       writeAudit(database, {
@@ -555,6 +564,7 @@ export function requestTaskCancellation(
         createdAt: now,
       });
     }
+    if (!queued) markStatusStopping(database, { operationId: target.operation_id, actorUserId, now });
     return { kind: "accepted", interactionId, commandId, disposition };
   });
   return request.immediate();

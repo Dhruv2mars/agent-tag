@@ -36,9 +36,18 @@ const slackUiSchema = z
       .regex(/^[a-z0-9_+'-]{1,100}(::skin-tone-[2-6])?$/, "an emoji name without colons, e.g. eyes")
       .nullable()
       .default("eyes"),
+    /**
+     * The live status message shows the turn's plan, recent tool lines and tool count. Tool titles can
+     * include shell commands and paths; false keeps only the headline and the Stop button.
+     */
+    statusProgress: z.boolean().default(true),
+    /** Least time between two edits of one status message. */
+    statusUpdateIntervalMs: z.number().int().min(1_000).max(60_000).default(2_000),
+    /** Budget for progress edits across all status messages (chat.update is rate limited per workspace). */
+    statusUpdatesPerMinute: z.number().int().min(1).max(600).default(40),
   })
   .strict()
-  .default({ ackReaction: "eyes" });
+  .default({ ackReaction: "eyes", statusProgress: true, statusUpdateIntervalMs: 2_000, statusUpdatesPerMinute: 40 });
 
 const isolationSchema = z.discriminatedUnion("mode", [
   z.object({

@@ -9,6 +9,7 @@ import { type StoreContext, requiredId, parseStoredJson } from "./context.ts";
 import { OPERATION_SETTLED, closeOperationInteractions } from "./interactions.ts";
 import { leaseExpiry, requireLeaseHeld } from "./lease.ts";
 import { insertOutboxMessage } from "./outbox.ts";
+import { cancellingActor, liveStatusPost, settleStatusMessage } from "./status.ts";
 import { type PrSyncInput, recordPrSync } from "./pull-requests.ts";
 import { consumeThreadNotes } from "./thread-notes.ts";
 import {
@@ -427,6 +428,7 @@ export function completeOperation(database: Database, input: CompleteOperationIn
       keepAwaitingHuman: true,
       now,
     });
+    settleStatusMessage(database, { operationId: input.operationId, now });
     writeAudit(database, {
       actorType: "worker",
       actorId: input.workerId,
@@ -496,6 +498,7 @@ export function completeOperationWithOutbox(
       keepAwaitingHuman: true,
       now,
     });
+    settleStatusMessage(database, { operationId, now });
 
     // A single reply keeps the historical `:final` id; chunked replies get stable
     // `:final-1..n` ids. Chunks are spaced 1ms apart so the outbox claim order
@@ -747,6 +750,7 @@ export function failOperation(database: Database, input: FailOperationInput): vo
     if (!input.retryable) {
       // A terminally failed operation tracks no T3 turn, so none of its responses may reach T3.
       closeOperationInteractions(database, { operationId: input.operationId, errorCode: OPERATION_SETTLED, now });
+      settleStatusMessage(database, { operationId: input.operationId, now });
     }
     writeAudit(database, {
       actorType: "worker",
@@ -814,6 +818,7 @@ export function settleFailedOperation(
   // A failed operation tracks no T3 turn, so none of its responses may reach T3 (stall exhaustion,
   // expiry, abandonment, unrecoverable errors).
   closeOperationInteractions(database, { operationId, errorCode: OPERATION_SETTLED, now });
+  settleStatusMessage(database, { operationId, now });
 
   const clientMessageId = `${operationId}:failed`;
   const prior = outboxIdentitySchema.nullable().parse(
@@ -899,18 +904,25 @@ export function cancelOperationWithOutbox(database: Database, input: CancelOpera
       keepAwaitingHuman: true,
       now,
     });
-    const clientMessageId = `${operationId}:cancelled`;
-    const outboxId = crypto.randomUUID();
-    insertOutboxMessage(database, {
-      outboxId,
-      taskId,
-      correlationId: operationId,
-      conversationId: requiredId(input.conversationId, "conversationId"),
-      threadTs: requiredId(input.threadTs, "threadTs"),
-      clientMessageId,
-      payload: outboxPayloadSchema.parse({ text: "Cancelled." }),
-      createdAt: now,
-    });
+    // The status message turns into "Stopped by <@U>" and is the whole notice. Only when it cannot
+    // carry it (an operation from before status messages, or a post Slack refused) is a line posted.
+    const hasStatusPost = liveStatusPost(database, operationId) !== null;
+    const edited = settleStatusMessage(database, { operationId, now });
+    let outboxId = hasStatusPost ? edited : null;
+    if (outboxId === null) {
+      const actor = cancellingActor(database, operationId);
+      outboxId = crypto.randomUUID();
+      insertOutboxMessage(database, {
+        outboxId,
+        taskId,
+        correlationId: operationId,
+        conversationId: requiredId(input.conversationId, "conversationId"),
+        threadTs: requiredId(input.threadTs, "threadTs"),
+        clientMessageId: `${operationId}:cancelled`,
+        payload: outboxPayloadSchema.parse({ text: actor === null ? "Stopped." : `Stopped by <@${actor}>.` }),
+        createdAt: now,
+      });
+    }
     writeAudit(database, {
       actorType: "worker",
       actorId: input.workerId,

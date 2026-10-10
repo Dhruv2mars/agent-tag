@@ -9,7 +9,7 @@ import { z } from "zod";
 
 import { writeAudit } from "./audit.ts";
 import { parseStoredJson, requiredId } from "./context.ts";
-import { enqueueMessageRefresh } from "./message-edits.ts";
+import { type MessageEditResult, enqueueMessageRefresh } from "./message-edits.ts";
 import { insertOutboxMessage } from "./outbox.ts";
 import { isoDateTime, nonEmpty, outboxIdentitySchema, outboxPayloadSchema } from "./schema.ts";
 import type { SlackOutboxPayload } from "./types.ts";
@@ -92,16 +92,18 @@ export function getStatusMessageView(database: Database, operationId: string): S
   return row === null ? null : toView(row);
 }
 
-/** Queues an edit of the status post; null `notBefore` sends it as soon as the post is settled. */
-function refresh(database: Database, operationId: string, now: string, notBefore: string | null): boolean {
-  const result = enqueueMessageRefresh(database, {
+/**
+ * Queues an edit of the status post; null `notBefore` sends it as soon as the post is settled.
+ * Returns the edit row, or null when the post failed or was never queued.
+ */
+function refresh(database: Database, operationId: string, now: string, notBefore: string | null): MessageEditResult {
+  return enqueueMessageRefresh(database, {
     targetClientMessageId: statusPostId(operationId),
     refreshKind: "status-message",
     refreshKey: operationId,
     now,
     ...(notBefore === null ? {} : { notBefore }),
   });
-  return result !== null && !result.reused;
 }
 
 function audit(database: Database, operationId: string, action: "status.opened" | "status.terminal", result: string, now: string, actorId?: string): void {
@@ -243,7 +245,8 @@ export function updateStatusProgress(database: Database, input: UpdateStatusProg
     database
       .query("UPDATE status_messages SET view_json = ?, updated_at = ? WHERE operation_id = ?")
       .run(viewJson, now, operationId);
-    if (refresh(database, operationId, now, notBefore)) {
+    const edit = refresh(database, operationId, now, notBefore);
+    if (edit !== null && !edit.reused) {
       database
         .query("UPDATE status_messages SET next_refresh_at = ? WHERE operation_id = ?")
         .run(new Date(Date.parse(notBefore) + input.intervalMs).toISOString(), operationId);
@@ -312,10 +315,14 @@ export function cancellingActor(database: Database, operationId: string): string
 
 /**
  * Makes a live status message terminal to match its settled operation: done, stopped (by whom),
- * expired or failed. Call inside the transaction that settles the operation. No-op when there is
- * no status message, it is already terminal, or the operation has not settled.
+ * expired or failed. Call inside the transaction that settles the operation. No-op (null) when there
+ * is no status message, it is already terminal, or the operation has not settled; otherwise returns
+ * the queued edit's outbox id (null if the post itself failed).
  */
-export function settleStatusMessage(database: Database, input: { readonly operationId: string; readonly now: string }): void {
+export function settleStatusMessage(
+  database: Database,
+  input: { readonly operationId: string; readonly now: string },
+): string | null {
   const now = isoDateTime.parse(input.now);
   const operationId = requiredId(input.operationId, "operationId");
   const row = z
@@ -335,10 +342,10 @@ export function settleStatusMessage(database: Database, input: { readonly operat
         )
         .get(operationId),
     );
-  if (row === null || isTerminalStatus(row.state)) return;
+  if (row === null || isTerminalStatus(row.state)) return null;
   let state: StatusState;
   if (row.status === "succeeded") state = "done";
-  else if (row.status !== "failed") return;
+  else if (row.status !== "failed") return null;
   else if (row.last_error_code === USER_CANCELLED) state = "stopped";
   else if (row.last_error_code === EXPIRED_ERROR_CODE) state = "expired";
   else state = "failed";
@@ -349,12 +356,13 @@ export function settleStatusMessage(database: Database, input: { readonly operat
        WHERE operation_id = ? AND state IN ('running', 'waiting', 'stopping')`,
     )
     .run(state, actor, now, now, operationId);
-  refresh(database, operationId, now, null);
+  const edit = refresh(database, operationId, now, null);
   audit(database, operationId, "status.terminal", state, now);
+  return edit?.outboxId ?? null;
 }
 
-/** Whether the operation's status post can still be edited (queued, sending or sent). */
-export function hasLiveStatusPost(database: Database, operationId: string): string | null {
+/** The operation's status post while it can still be edited (queued, sending or sent). */
+export function liveStatusPost(database: Database, operationId: string): string | null {
   const row = z.object({ outbox_id: nonEmpty, status: nonEmpty }).nullable().parse(
     database
       .query("SELECT outbox_id, status FROM slack_outbox WHERE client_message_id = ?")

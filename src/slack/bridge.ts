@@ -11,6 +11,7 @@ import type { SlackContextSource } from "./context-source.ts";
 import { THREAD_CONTEXT_TIMEOUT_MS, type SlackRepliesPage } from "./context.ts";
 import { SlackEventRouter } from "./events.ts";
 import { deliverNextSlackOutbox, type RefreshRenderers, type SlackOutboxOutcome } from "./outbox.ts";
+import { renderStatusMessage } from "./status.ts";
 import { deliverNextSlackReaction, type SlackReactionOutcome } from "./reactions.ts";
 import { installUndiciWebSocketCompat } from "./undici-compat.ts";
 import { SlackUserDirectory, slackErrorCode } from "./users.ts";
@@ -122,12 +123,16 @@ export async function createSlackUserDirectory(input: {
   });
 }
 
-/** Delivery-time renderers for outbox refresh rows, by refresh kind. PR-F adds "status-message". */
+/** Delivery-time renderers for outbox refresh rows, by refresh kind. */
 export function refreshRenderers(store: AgentTagStore, config: AgentTagConfig): RefreshRenderers {
   return {
     "interaction-card": (interactionId) => {
       const view = store.getInteractionCardView(interactionId);
       return view === null ? null : renderInteractionCard(view, { expirySeconds: config.limits.interactionExpirySeconds });
+    },
+    "status-message": (operationId) => {
+      const view = store.getStatusMessageView(operationId);
+      return view === null ? null : renderStatusMessage(view, { showProgress: config.slack.ui.statusProgress });
     },
   };
 }

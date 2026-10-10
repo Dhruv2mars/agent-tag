@@ -100,8 +100,23 @@ describe("Agent Tag config", () => {
       .toBe(3_600);
   });
 
+  test("validates the status message keys", () => {
+    const withUi = (ui: unknown) =>
+      agentTagConfigSchema.safeParse({ ...baseConfig, slack: { ...baseConfig.slack, ui } });
+    expect(withUi({ statusProgress: false }).data?.slack.ui).toEqual({
+      ackReaction: "eyes",
+      statusProgress: false,
+      statusUpdateIntervalMs: 2_000,
+      statusUpdatesPerMinute: 40,
+    });
+    expect(withUi({ statusUpdateIntervalMs: 999 }).success).toBe(false);
+    expect(withUi({ statusUpdateIntervalMs: 5_000 }).data?.slack.ui.statusUpdateIntervalMs).toBe(5_000);
+    expect(withUi({ statusUpdatesPerMinute: 0 }).success).toBe(false);
+    expect(withUi({ statusMessage: true }).success).toBe(false);
+  });
+
   test("defaults and validates the ack reaction", () => {
-    expect(agentTagConfigSchema.parse(baseConfig).slack.ui).toEqual({ ackReaction: "eyes" });
+    expect(agentTagConfigSchema.parse(baseConfig).slack.ui).toEqual({ ackReaction: "eyes", statusProgress: true, statusUpdateIntervalMs: 2_000, statusUpdatesPerMinute: 40 });
     const withAck = (ackReaction: unknown) =>
       agentTagConfigSchema.safeParse({ ...baseConfig, slack: { ...baseConfig.slack, ui: { ackReaction } } });
     expect(withAck(null).data?.slack.ui.ackReaction).toBeNull();

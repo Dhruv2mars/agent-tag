@@ -12,6 +12,7 @@ import { closeOperationInteractions, queueTurnInterrupt } from "./interactions.t
 import { requireLeaseHeld } from "./lease.ts";
 import { requireTurnActiveMs, settleFailedOperation } from "./operations.ts";
 import { isoDateTime, nonEmpty } from "./schema.ts";
+import { markStatusWaiting } from "./status.ts";
 
 export interface PendingInteractionRequest {
   readonly requestId: string;
@@ -157,6 +158,7 @@ export function awaitOperationInteractions(
         metadata: { blockedUntil, unanswered: unanswered.length },
         createdAt: now,
       });
+      markStatusWaiting(database, { operationId, now });
       return { kind: "deferred", blockedUntil, unanswered: unanswered.length };
     }
 
