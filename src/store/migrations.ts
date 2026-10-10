@@ -427,4 +427,20 @@ export const STORE_MIGRATIONS: readonly StoreMigration[] = [
         ON thread_context_notes(task_id, consumed_by_operation_id, source_order_key);
     `,
   },
+  {
+    // Per-task model selection (PR-P2b). `model_selection_json` is the selection a user asked for
+    // (NULL = route or profile default); `t3_model_selection_json` is the last one T3 accepted for the
+    // task's thread; `t3_rejected_model_selection_json` is a switch T3 refused for it since then.
+    // `operations.turn_model_json` freezes the model a turn runs on, so a replay
+    // records what T3 actually ran. Columns only, so it applies in any order relative to other new versions.
+    version: 18,
+    sql: `
+      ALTER TABLE operations ADD COLUMN turn_model_json TEXT;
+      ALTER TABLE tasks ADD COLUMN model_selection_json TEXT;
+      ALTER TABLE tasks ADD COLUMN model_selected_by TEXT;
+      ALTER TABLE tasks ADD COLUMN model_selected_at TEXT;
+      ALTER TABLE tasks ADD COLUMN t3_model_selection_json TEXT;
+      ALTER TABLE tasks ADD COLUMN t3_rejected_model_selection_json TEXT;
+    `,
+  },
 ];

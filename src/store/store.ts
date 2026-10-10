@@ -17,6 +17,7 @@
 import type { Database } from "bun:sqlite";
 
 import type { StoreContext } from "./context.ts";
+import type { T3ModelSelection } from "../t3/gateway.ts";
 import type {
   ActiveTaskBinding,
   AmbientDecision,
@@ -232,6 +233,14 @@ export class AgentTagStore {
     return operations.peekResolvedTurnText(this.#database, input);
   }
 
+  peekOperationTurnModel(input: operations.PeekResolvedTurnTextInput): operations.OperationTurnModel | null {
+    return operations.peekOperationTurnModel(this.#database, input);
+  }
+
+  resolveOperationTurnModel(input: operations.ResolveOperationTurnModelInput): operations.OperationTurnModel {
+    return operations.resolveOperationTurnModel(this.#database, input);
+  }
+
   resolveOperationTurnText(input: operations.ResolveOperationTurnTextInput): string {
     return operations.resolveOperationTurnText(this.#database, input);
   }
@@ -402,6 +411,26 @@ export class AgentTagStore {
 
   markT3ThreadStarted(input: tasks.MarkT3ThreadStartedInput): void {
     tasks.markT3ThreadStarted(this.#database, input);
+  }
+
+  setTaskModelSelection(input: tasks.SetTaskModelSelectionInput): void {
+    tasks.setTaskModelSelection(this.#database, input);
+  }
+
+  recordAppliedModelSelection(input: tasks.RecordAppliedModelSelectionInput): boolean {
+    return tasks.recordAppliedModelSelection(this.#database, input);
+  }
+
+  revertDesiredModelSelection(input: tasks.RevertDesiredModelSelectionInput): tasks.ModelRevert | null {
+    return tasks.revertDesiredModelSelection(this.#database, input);
+  }
+
+  recordModelRejection(input: tasks.RecordModelRejectionInput): boolean {
+    return tasks.recordModelRejection(this.#database, input);
+  }
+
+  clearInvalidModelSelection(input: tasks.ClearInvalidModelSelectionInput): readonly tasks.TaskModelColumn[] {
+    return tasks.clearInvalidModelSelection(this.#database, input);
   }
 
   recordPendingInteraction(
