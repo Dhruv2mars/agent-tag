@@ -8,7 +8,8 @@ import { z } from "zod";
 
 import { agentTagConfigSchema } from "../src/config.ts";
 import { AgentTagService, type ServiceLogRecord } from "../src/service.ts";
-import { SLACK_CLIENT_OPTIONS } from "../src/slack/bridge.ts";
+import { refreshRenderers, SLACK_CLIENT_OPTIONS } from "../src/slack/bridge.ts";
+import { approvalMessage } from "../src/slack/cards.ts";
 import { deliverNextSlackOutbox, type RefreshRenderers, type SlackOutboxOutcome } from "../src/slack/outbox.ts";
 import { classifySlackDeliveryError, outboxRetryDelayMs, plainTextFallback } from "../src/slack/outbox-policy.ts";
 import { AgentTagStore, type SlackOutboxPayload } from "../src/store/store.ts";
@@ -543,6 +544,31 @@ describe("Slack message edits (chat.update)", () => {
       });
       const enqueued = store.listAuditRecords({ limit: 200 }).filter((row) => row.action === "slack.outbox.enqueued" && row.correlationId === "interaction-1");
       expect(enqueued.map((row) => row.result)).toEqual(["pending", "coalesced", "coalesced"]);
+    });
+  });
+
+  test("an interaction card refresh updates the card's own message from current state, without buttons", async () => {
+    await withStore(async (store, taskId, operationId) => {
+      const prompt = { requestId: "approval-1", requestKind: "command" as const, detail: "bun test", options: [] };
+      const { interactionId } = store.recordPendingInteraction({
+        taskId, operationId, threadId: store.getTaskExecution(taskId).threadId, requestId: "approval-1",
+        kind: "approval", prompt, conversationId: "C1", threadTs: "1000.000001",
+        message: (id) => approvalMessage(id, prompt), now: at(0),
+      });
+      await withFakeSlack([ok("1000.000060"), ok("1000.000060")], async ({ client, requests }) => {
+        expect((await deliver(store, client, at(10))).kind).toBe("delivered");
+        expect(JSON.parse(requests[0]?.blocks ?? "[]").some((block: { type: string }) => block.type === "actions")).toBe(true);
+        expect(store.submitInteractionResponse({
+          interactionId, workspaceId: "T1", conversationId: "C1", threadTs: "1000.000001", actorUserId: "U1",
+          sourceActionId: "click-1", response: { decision: "decline" }, expirySeconds: 86_400, now: at(20),
+        }).kind).toBe("accepted");
+        expect((await deliver(store, client, at(30), { refreshRenderers: refreshRenderers(store, config) })).kind).toBe("delivered");
+        expect(requests[1]).toMatchObject({ apiMethod: "chat.update", channel: "C1", ts: "1000.000060" });
+        expect(requests[1]?.text).toContain("Deny, chosen by <@U1>");
+        const blocks: Array<{ type: string }> = JSON.parse(requests[1]?.blocks ?? "[]");
+        expect(blocks.map((block) => block.type)).toEqual(["section", "context"]);
+        expect(requests).toHaveLength(2);
+      });
     });
   });
 

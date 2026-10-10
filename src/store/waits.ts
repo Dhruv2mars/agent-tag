@@ -7,6 +7,7 @@ import { z } from "zod";
 
 import { writeAudit } from "./audit.ts";
 import { requiredId } from "./context.ts";
+import { enqueueInteractionCardRefresh } from "./interaction-cards.ts";
 import { closeOperationInteractions, queueTurnInterrupt } from "./interactions.ts";
 import { requireLeaseHeld } from "./lease.ts";
 import { requireTurnActiveMs, settleFailedOperation } from "./operations.ts";
@@ -182,6 +183,7 @@ export function awaitOperationInteractions(
         metadata: { expirySeconds: input.expirySeconds },
         createdAt: now,
       });
+      enqueueInteractionCardRefresh(database, entry.interactionId, now);
     }
     queueTurnInterrupt(database, {
       taskId: input.taskId,
