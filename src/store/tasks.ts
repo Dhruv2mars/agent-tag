@@ -492,7 +492,8 @@ export interface RecordModelRejectionInput {
 
 /**
  * Records a switch T3 refused for the task's thread, audited once as `task.model.reverted`
- * (`t3-rejected`). The thread keeps its applied selection: a desired selection reverts to it, and a
+ * (`t3-rejected`). The thread keeps its applied selection: a desired selection equal to the rejected
+ * one reverts to it (a newer choice is kept), and a
  * route or profile default equal to the rejected one is not retried until the default or the applied
  * selection changes (the coordinator reads `rejectedModelSelection`). Returns whether it was written.
  */
@@ -502,7 +503,8 @@ export function recordModelRejection(database: Database, input: RecordModelRejec
   return database.transaction(() => {
     const current = taskModelRow(database, taskId);
     if (current.threadId !== requiredId(input.threadId, "threadId")) return false;
-    const desired = current.desired === null ? null : current.applied;
+    // Only the choice this rejection was for reverts; a newer one (made while it awaited replay) stays.
+    const desired = sameStoredSelection(current.desired, input.rejected) ? current.applied : current.desired;
     if (sameStoredSelection(current.rejected, input.rejected) && sameStoredSelection(desired, current.desired)) {
       return false;
     }

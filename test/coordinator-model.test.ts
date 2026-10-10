@@ -172,7 +172,11 @@ afterEach(async () => {
   for (const directory of directories.splice(0)) await rm(directory, { recursive: true, force: true });
 });
 
-async function harness(config: AgentTagConfig = baseConfig, catalog: T3ServerInfo | null = fixtureCatalog) {
+async function harness(
+  config: AgentTagConfig = baseConfig,
+  catalog: T3ServerInfo | null = fixtureCatalog,
+  catalogOptions: { readonly refresh?: () => Promise<boolean>; readonly budgetMs?: number } = {},
+) {
   const directory = await mkdtemp(join(tmpdir(), "agent-tag-coordinator-model-"));
   directories.push(directory);
   const store = await AgentTagStore.open(join(directory, "agent-tag.sqlite"));
@@ -185,7 +189,7 @@ async function harness(config: AgentTagConfig = baseConfig, catalog: T3ServerInf
     current: () => catalog,
     refresh: async () => {
       refreshes.push(clock);
-      return catalog !== null;
+      return catalogOptions.refresh?.() ?? catalog !== null;
     },
   };
   const coordinatorFor = (current: AgentTagConfig) =>
@@ -194,6 +198,7 @@ async function harness(config: AgentTagConfig = baseConfig, catalog: T3ServerInf
       store,
       t3: t3.gateway,
       catalog: providerCatalog,
+      ...(catalogOptions.budgetMs === undefined ? {} : { catalogRefreshBudgetMs: catalogOptions.budgetMs }),
       workerId: "worker-model",
       now: () => new Date(clock),
       sleep: async (milliseconds) => {
@@ -547,6 +552,46 @@ describe("per-task model selection (P2b)", () => {
     expect(h.store.getTaskExecution(first.taskId).invalidModelSelection).toBe(false);
     expect(h.audits("task.model.reverted")).toEqual([{ result: "invalid", metadata: { columns: "model_selection_json" } }]);
     expect(JSON.stringify(h.audits("task.model.reverted"))).not.toContain("secret");
+  });
+
+  test("a rejection replayed after the user chose again keeps the newer choice", async () => {
+    const h = await harness();
+    const first = h.send();
+    await h.process();
+    h.choose(first.taskId, MINI);
+    h.t3.rejectNextTurn =
+      "Thread 'thread-1' cannot switch from instance 'codex' to 'codex' because their provider resume state is incompatible.";
+    h.t3.failNextFetch = true;
+    h.send();
+    expect(await h.process()).toMatchObject({ kind: "retry-scheduled" });
+    h.choose(first.taskId, SONNET);
+    h.advance(60_000);
+    expect(await h.process()).toMatchObject({ kind: "failed", errorCode: "T3ModelSwitchRejected" });
+
+    const task = h.store.getTaskExecution(first.taskId);
+    expect(task.desiredModelSelection).toEqual(SONNET);
+    expect(task.appliedModelSelection).toEqual(SOL);
+    expect(task.rejectedModelSelection).toEqual(MINI);
+    expect(h.audits("task.model.reverted")).toMatchObject([{ result: "t3-rejected" }]);
+  });
+
+  test("a catalog refresh that outlasts the budget is not waited on; planning proceeds without it", async () => {
+    let release = () => {};
+    const pending = new Promise<boolean>((resolve) => {
+      release = () => resolve(true);
+    });
+    const h = await harness(baseConfig, null, { refresh: () => pending, budgetMs: 20 });
+    const first = h.send();
+    await h.process();
+    h.choose(first.taskId, MINI);
+    h.send();
+    const started = performance.now();
+    expect(await h.process()).toMatchObject({ kind: "completed" });
+    expect(performance.now() - started).toBeLessThan(2_000);
+    // Without a catalog only a same-instance change is allowed, which this is.
+    expect(h.t3.turnStarts().at(-1)!.modelSelection).toEqual(MINI);
+    expect(h.refreshes.length).toBe(1);
+    release();
   });
 
   test("an asynchronous turn-start failure for this message fails fast instead of stalling", async () => {

@@ -73,6 +73,8 @@ export interface CoordinatorOptions {
   readonly memory?: AgentTagMemory;
   /** Provider catalog for planning model switches on started threads. Absent means unknown (fail closed). */
   readonly catalog?: CoordinatorProviderCatalog;
+  /** Wall-clock budget for refreshing a stale catalog before planning a switch. Defaults to 3s. */
+  readonly catalogRefreshBudgetMs?: number;
   /** Slack reads for speaker labels. Absent (tests, legacy) means speakers render as raw IDs. */
   readonly slackContext?: SlackContextSource;
   /** Turn-wide wall-clock budget for speaker lookups. Defaults to min(5s, lease / 4). */
@@ -453,6 +455,7 @@ export class AgentTagCoordinator {
   readonly #t3: T3CoordinatorGateway;
   readonly #memory: AgentTagMemory;
   readonly #catalog: CoordinatorProviderCatalog | null;
+  readonly #catalogRefreshBudgetMs: number;
   readonly #slackContext: SlackContextSource | undefined;
   readonly #speakerLookupBudgetMs: number;
   readonly #threadContextBudgetMs: number;
@@ -472,6 +475,7 @@ export class AgentTagCoordinator {
     this.#t3 = options.t3 ?? defaultT3Gateway(options.config.t3);
     this.#memory = options.memory ?? new AgentTagMemory({ config: options.config, store: options.store });
     this.#catalog = options.catalog ?? null;
+    this.#catalogRefreshBudgetMs = options.catalogRefreshBudgetMs ?? CATALOG_REFRESH_BUDGET_MS;
     this.#slackContext = options.slackContext;
     this.#workerId = options.workerId ?? `t3-worker-${crypto.randomUUID()}`;
     this.#leaseMs = options.leaseMs ?? 30_000;
@@ -1167,8 +1171,16 @@ export class AgentTagCoordinator {
     if (this.#catalog === null) return null;
     const current = this.#catalog.current();
     if (current !== null) return current;
-    const budget = AbortSignal.timeout(CATALOG_REFRESH_BUDGET_MS);
-    await abortable(this.#catalog.refresh(signal === undefined ? budget : AbortSignal.any([signal, budget])), signal);
+    // The budget bounds this wait, not the refresh: a read shared with the maintenance worker ignores
+    // our signal, so past the budget the plan proceeds without a catalog and the read carries on.
+    const budget = AbortSignal.timeout(this.#catalogRefreshBudgetMs);
+    const deadline = signal === undefined ? budget : AbortSignal.any([signal, budget]);
+    try {
+      await abortable(this.#catalog.refresh(deadline), deadline);
+    } catch (error) {
+      if (signal?.aborted === true) throw new CoordinatorAborted();
+      if (!(error instanceof CoordinatorAborted)) throw error;
+    }
     return this.#catalog.current();
   }
 
