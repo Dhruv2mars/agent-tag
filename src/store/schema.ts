@@ -232,6 +232,8 @@ export const AUDIT_ACTIONS = [
   "schedule.denied",
   "schedule.run.outcome",
   "schedule.run.settled",
+  "slack.command.denied",
+  "slack.command.executed",
   "slack.delivery.duplicate",
   "slack.event.ingested",
   "slack.outbox.claimed",
@@ -251,6 +253,8 @@ export const AUDIT_ACTIONS = [
   "thread-context.unavailable",
   "thread-note.dropped",
   "thread-note.recorded",
+  "thread.muted",
+  "thread.unmuted",
 ] as const;
 export const auditActionSchema = z.enum(AUDIT_ACTIONS);
 export type AuditAction = z.infer<typeof auditActionSchema>;

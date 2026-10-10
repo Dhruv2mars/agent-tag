@@ -495,4 +495,44 @@ export const STORE_MIGRATIONS: readonly StoreMigration[] = [
       CREATE INDEX pr_sync_jobs_task_idx ON pr_sync_jobs(task_id, status, created_at);
     `,
   },
+  {
+    // `@bot !commands` (PR-H1): the command ledger and per-thread mute. Independent of earlier
+    // versions (new tables only). `slack_command_events` is shared with PR-K2's memory commands, so
+    // `command_kind` and `outcome` have no CHECK: their values are validated in zod (schema.ts) and
+    // later lanes add kinds without a table rebuild. The ledger never stores message text.
+    // Mute is keyed by Slack thread, not task, so it survives task close/reopen and restart.
+    version: 20,
+    sql: `
+      CREATE TABLE slack_command_events (
+        workspace_id TEXT NOT NULL,
+        event_key TEXT NOT NULL,
+        delivery_id TEXT NOT NULL,
+        conversation_id TEXT NOT NULL,
+        thread_ts TEXT,
+        actor_user_id TEXT NOT NULL,
+        command_kind TEXT NOT NULL,
+        task_id TEXT REFERENCES tasks(task_id),
+        outcome TEXT NOT NULL,
+        reason TEXT,
+        memory_id TEXT,
+        received_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (workspace_id, event_key)
+      );
+      CREATE INDEX slack_command_events_actor_idx
+        ON slack_command_events(workspace_id, actor_user_id, received_at);
+      CREATE TABLE slack_thread_controls (
+        workspace_id TEXT NOT NULL,
+        conversation_id TEXT NOT NULL,
+        thread_ts TEXT NOT NULL,
+        muted_at TEXT,
+        muted_by TEXT,
+        mute_source TEXT CHECK (mute_source IS NULL OR mute_source IN ('command', 'feedback')),
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (workspace_id, conversation_id, thread_ts),
+        CHECK ((muted_at IS NULL) = (muted_by IS NULL)),
+        CHECK ((muted_at IS NULL) = (mute_source IS NULL))
+      );
+    `,
+  },
 ];
