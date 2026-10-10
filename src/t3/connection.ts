@@ -152,6 +152,7 @@ export class T3Connection {
   readonly #logger: ServiceLogger | undefined;
   readonly #now: () => Date;
   readonly #sharedTimeoutMs: number;
+  readonly #onCredentialRejected: (() => void) | undefined;
   #session: LoadedSession | null = null;
   #sessionCheck: Promise<LoadedSession> | null = null;
   #tokenCheckedAt = 0;
@@ -168,7 +169,10 @@ export class T3Connection {
     readonly now?: () => Date;
     /** Test seam; defaults to 30 s. */
     readonly sharedTimeoutMs?: number;
+    /** Told when T3 rejects the token itself (revoked or expired), so credential rotation can act. */
+    readonly onCredentialRejected?: () => void;
   }) {
+    this.#onCredentialRejected = input.onCredentialRejected;
     this.#config = { baseUrl: input.config.baseUrl, tokenFile: input.config.tokenFile };
     this.#logger = input.logger;
     this.#now = input.now ?? (() => new Date());
@@ -231,7 +235,13 @@ export class T3Connection {
     const mtimeMs = await stat(this.#config.tokenFile).then((metadata) => metadata.mtimeMs, () => Number.NaN);
     const token = await readSecretFile(this.#config.tokenFile);
     this.stats.sessionInspects += 1;
-    const session = await inspectT3Session({ baseUrl: this.#config.baseUrl, token, ...signalOption(signal) });
+    let session: T3Session;
+    try {
+      session = await inspectT3Session({ baseUrl: this.#config.baseUrl, token, ...signalOption(signal) });
+    } catch (error) {
+      if (isT3CredentialRejection(error)) this.#onCredentialRejected?.();
+      throw error;
+    }
     // The security property is unchanged: every (re)inspection still requires the restricted token.
     assertRestrictedOrchestrationSession(session);
     const loaded = { token, session, mtimeMs };

@@ -44,6 +44,7 @@ async function managedConfig(root: string): Promise<ManagedT3Config> {
       homeDir,
       runtimeDir: join(root, "runtime"),
       autoInstall: true,
+      rotation: { rotateBeforeDays: 7, revokeGraceMinutes: 15 },
     },
   };
 }

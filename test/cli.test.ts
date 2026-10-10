@@ -1,8 +1,9 @@
-import { expect, test } from "bun:test";
+import { describe, expect, test } from "bun:test";
 import { mkdtemp, readdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
+import { externalT3AdminFlags } from "../src/cli-commands.ts";
 import { PINNED_T3, t3ArtifactFor } from "../src/t3/lock.ts";
 import { buildFakeT3Tarball, serveFakeT3Mirror } from "./fixtures/fake-t3-tarball.ts";
 
@@ -118,6 +119,8 @@ test("t3 status prints the install fields as JSON without installing anything", 
     filesVerified: false,
     installedAt: null,
     problem: t3ArtifactFor(PINNED_T3) === undefined ? `t3.lock.json pins no artifact for ${process.platform}-${process.arch}` : null,
+    // No T3 answers on the configured URL (and the token file does not exist), so only the problem is set.
+    token: { expiresAt: null, daysRemaining: null, problem: expect.any(String) },
   });
   expect(await readdir(dataDir).catch(() => [])).toEqual([]);
 });
@@ -216,4 +219,57 @@ test("t3 status rejects --allow-non-tty, which only applies to t3 pair", async (
   const result = await runCli(["t3", "status", "--allow-non-tty"]);
   expect(result.exitCode).toBe(1);
   expect(result.stderr).toContain("--allow-non-tty only applies to t3 pair");
+});
+
+describe("externalT3AdminFlags", () => {
+  test("--admin-token-file resolves to an absolute path", () => {
+    expect(externalT3AdminFlags(new Map([["admin-token-file", "secrets/t3-admin"]]))).toEqual({
+      adminTokenFile: join(process.cwd(), "secrets", "t3-admin"),
+    });
+  });
+
+  test("--t3-base-dir defaults the T3 binary to t3", () => {
+    expect(externalT3AdminFlags(new Map([["t3-base-dir", "/srv/t3-base"]]))).toEqual({
+      t3BaseDir: "/srv/t3-base",
+      t3Bin: "t3",
+    });
+  });
+
+  test("--t3-base-dir with --t3-bin uses the explicit binary", () => {
+    expect(
+      externalT3AdminFlags(new Map([
+        ["t3-base-dir", "/srv/t3-base"],
+        ["t3-bin", "/opt/t3/bin/t3"],
+      ])),
+    ).toEqual({ t3BaseDir: "/srv/t3-base", t3Bin: "/opt/t3/bin/t3" });
+  });
+
+  test("--t3-bin alone and admin-token-file combined with base-dir flags are rejected", () => {
+    expect(() => externalT3AdminFlags(new Map([["t3-bin", "t3"]]))).toThrow("--t3-bin needs --t3-base-dir");
+    expect(() =>
+      externalT3AdminFlags(new Map([
+        ["admin-token-file", "/srv/admin"],
+        ["t3-base-dir", "/srv/t3-base"],
+      ])),
+    ).toThrow("pass --admin-token-file or --t3-base-dir/--t3-bin, not both");
+    expect(() =>
+      externalT3AdminFlags(new Map([
+        ["admin-token-file", "/srv/admin"],
+        ["t3-bin", "t3"],
+      ])),
+    ).toThrow("pass --admin-token-file or --t3-base-dir/--t3-bin, not both");
+  });
+
+  test("returns undefined when no admin flags are given", () => {
+    expect(externalT3AdminFlags(new Map())).toBeUndefined();
+  });
+});
+
+test("t3 status rejects --admin-token-file, which only applies to t3 rotate", async () => {
+  const result = await runCli(["t3", "status", "--admin-token-file", "x"]);
+  expect(result.exitCode).toBe(1);
+  expect(result.stdout).toBe("");
+  expect(result.stderr).toContain(
+    "agent-tag t3: --admin-token-file, --t3-base-dir and --t3-bin only apply to t3 rotate",
+  );
 });

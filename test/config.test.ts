@@ -372,6 +372,7 @@ describe("t3 config", () => {
         homeDir: "/var/lib/agent-tag/t3/home",
         runtimeDir: "/var/lib/agent-tag/t3/runtime",
         autoInstall: true,
+        rotation: { rotateBeforeDays: 7, revokeGraceMinutes: 15 },
       },
     });
     expect(managedOf(t3)).not.toHaveProperty("downloadBaseUrl");
@@ -392,6 +393,7 @@ describe("t3 config", () => {
       homeDir: "/srv/t3/home",
       runtimeDir: "/srv/t3/runtime",
       autoInstall: true,
+      rotation: { rotateBeforeDays: 7, revokeGraceMinutes: 15 },
     });
   });
 
@@ -460,5 +462,43 @@ describe("t3 config", () => {
         withT3({ mode: "remote", baseUrl: "http://127.0.0.1:37841", tokenFile: "/secrets/t3" }),
       ).success,
     ).toBe(false);
+  });
+
+  describe("managed rotation", () => {
+    const withRotation = (rotation: Record<string, unknown>) => withT3({ ...managedBase, rotation });
+    const rotationAccepts = (rotation: Record<string, unknown>) =>
+      agentTagConfigSchema.safeParse(withRotation(rotation)).success;
+
+    test("defaults to rotating 7 days before expiry with a 15 minute revoke grace when omitted", () => {
+      expect(managedOf(agentTagConfigSchema.parse(withT3(managedBase)).t3).rotation).toEqual({
+        rotateBeforeDays: 7,
+        revokeGraceMinutes: 15,
+      });
+    });
+
+    test("resolves a custom rotation and fills the key that is left out", () => {
+      expect(managedOf(agentTagConfigSchema.parse(withRotation({ rotateBeforeDays: 3, revokeGraceMinutes: 60 })).t3).rotation)
+        .toEqual({ rotateBeforeDays: 3, revokeGraceMinutes: 60 });
+      expect(managedOf(agentTagConfigSchema.parse(withRotation({ rotateBeforeDays: 3 })).t3).rotation)
+        .toEqual({ rotateBeforeDays: 3, revokeGraceMinutes: 15 });
+    });
+
+    test("accepts the inclusive range bounds", () => {
+      expect(rotationAccepts({ rotateBeforeDays: 1, revokeGraceMinutes: 1 })).toBe(true);
+      expect(rotationAccepts({ rotateBeforeDays: 25, revokeGraceMinutes: 1_440 })).toBe(true);
+    });
+
+    test("rejects out-of-range values, non-integers, and unknown keys", () => {
+      for (const rotation of [
+        { rotateBeforeDays: 0 },
+        { rotateBeforeDays: 26 },
+        { rotateBeforeDays: 1.5 },
+        { revokeGraceMinutes: 0 },
+        { revokeGraceMinutes: 1_441 },
+        { rotateBeforeDays: 7, unknown: true },
+      ]) {
+        expect(rotationAccepts(rotation)).toBe(false);
+      }
+    });
   });
 });

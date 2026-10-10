@@ -17,6 +17,7 @@ const USAGE = [
   "       agent-tag service <install|upgrade|uninstall|status|restart|logs> [CONFIG] [--lines N] [--follow]",
   "       agent-tag t3 <install|status> [CONFIG] [--download-base-url URL]",
   "       agent-tag t3 <serve|pair> [CONFIG] [--allow-non-tty]",
+  "       agent-tag t3 rotate [CONFIG] [--admin-token-file F | --t3-base-dir D [--t3-bin B]]",
   "       agent-tag <run|status|audit|backup> CONFIG [ARG]",
   "       agent-tag restore BACKUP NEW_DATA_DIR",
   "       agent-tag schedule-<add|list|cancel> CONFIG TASK ACTOR PROFILE [SPEC_OR_ID]",

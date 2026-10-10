@@ -10,7 +10,9 @@ import { createScheduleWorkers } from "./scheduler.ts";
 import { SlackSocketBridge } from "./slack/bridge.ts";
 import { createRetentionWorker } from "./store/retention.ts";
 import { AgentTagStore } from "./store/store.ts";
+import { isT3CredentialRejection } from "./t3/auth.ts";
 import { T3Connection } from "./t3/connection.ts";
+import { createT3CredentialWorker, managedT3Credentials, T3CredentialLifecycle } from "./t3/credentials.ts";
 import { createT3GateWorker, T3RuntimeGate } from "./t3/gate.ts";
 import { inspectT3, type T3ServerInfo } from "./t3/gateway.ts";
 import { PINNED_T3 } from "./t3/lock.ts";
@@ -56,7 +58,7 @@ export interface ServiceSlackBridge {
 }
 
 export interface ServiceLogRecord {
-  readonly level: "info" | "warn";
+  readonly level: "info" | "warn" | "error";
   readonly event: string;
   readonly at: string;
   readonly worker?: string;
@@ -109,7 +111,7 @@ function waitUntilWorkOrStop(milliseconds: number, signal: AbortSignal): Promise
 }
 
 function defaultLogger(record: ServiceLogRecord): void {
-  const target = record.level === "warn" ? console.error : console.log;
+  const target = record.level === "info" ? console.log : console.error;
   target(JSON.stringify(record));
 }
 
@@ -282,6 +284,26 @@ export class AgentTagService {
 }
 
 /**
+ * Logs a failed catalog refresh. The catalog probes T3 outside `T3Connection`, so a rejected token is
+ * reported to the credential lifecycle here too; otherwise rotation could wait for the next 6 h check.
+ */
+export function catalogRefreshFailed(input: {
+  readonly logger: ServiceLogger;
+  readonly now: () => Date;
+  readonly onCredentialRejected: () => void;
+}): (error: unknown) => void {
+  return (error) => {
+    input.logger({
+      level: "warn",
+      event: "t3.catalog.refresh.failed",
+      errorCode: error instanceof Error && error.name ? error.name : "T3CatalogError",
+      at: input.now().toISOString(),
+    });
+    if (isT3CredentialRejection(error)) input.onCredentialRejected();
+  };
+}
+
+/**
  * One warning per allowed model T3 cannot run now. These never block startup: only profile and route
  * defaults are validated strictly.
  */
@@ -315,7 +337,13 @@ export async function createAgentTagService(input: {
   const quarantined = store.quarantineExpiredOutbox(now().toISOString());
   // One T3 session and WebSocket for the whole service, and one subscription per watched thread.
   // The connection is lazy, so building it before a managed runtime starts makes no request.
-  const t3 = new T3Connection({ config: input.config.t3, logger, now });
+  let credentials: T3CredentialLifecycle | undefined;
+  const t3 = new T3Connection({
+    config: input.config.t3,
+    logger,
+    now,
+    onCredentialRejected: () => credentials?.noteRejected(),
+  });
   const watch = input.config.t3.watch;
   const watcher = watch.enabled
     ? new ThreadWatcher({ source: protocolV1Source(t3), logger, now, lingerMs: watch.lingerMs })
@@ -331,6 +359,18 @@ export async function createAgentTagService(input: {
       const installed = await prepareManagedT3Binary({ settings: t3Config.managed, pin: PINNED_T3, logger, now });
       runtime = new T3ManagedRuntime({ settings: t3Config.managed, installed, logger, now });
       await runtime.start();
+      credentials = managedT3Credentials({ t3: t3Config, binary: installed.binary, logger, now });
+      // The runtime passed its version and protocol check, so the admin session goes to our own server.
+      await credentials.ensureToken();
+    } else {
+      credentials = new T3CredentialLifecycle({
+        mode: "external",
+        baseUrl: t3Config.baseUrl,
+        tokenFile: t3Config.tokenFile,
+        rotateCommand: "agent-tag t3 rotate CONFIG --admin-token-file FILE",
+        logger,
+        now,
+      });
     }
     const server = await inspectT3(t3Config);
     validateConfiguredProviders(input.config, server);
@@ -339,13 +379,7 @@ export async function createAgentTagService(input: {
     const catalog = new ProviderCatalog({
       inspect: (signal) => inspectT3(t3Config, signal),
       now,
-      onRefreshFailed: (error) =>
-        logger({
-          level: "warn",
-          event: "t3.catalog.refresh.failed",
-          errorCode: error instanceof Error && error.name ? error.name : "T3CatalogError",
-          at: now().toISOString(),
-        }),
+      onRefreshFailed: catalogRefreshFailed({ logger, now, onCredentialRejected: () => credentials?.noteRejected() }),
     });
     catalog.seed(server);
     const gate = new T3RuntimeGate({
@@ -409,6 +443,7 @@ export async function createAgentTagService(input: {
           },
         },
         createT3GateWorker({ gate, now }),
+        createT3CredentialWorker({ credentials }),
         createProviderCatalogWorker({ catalog, now }),
         ...(pullRequests === undefined
           ? []
