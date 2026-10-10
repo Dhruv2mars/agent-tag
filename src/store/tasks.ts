@@ -439,6 +439,8 @@ export interface RevertDesiredModelSelectionInput {
    * the thread keeps what it has. (A switch T3 itself rejected goes through `recordModelRejection`.)
    */
   readonly reason: ModelRevertReason;
+  /** The desired selection the caller planned with; a different (newer) choice is left alone. */
+  readonly expected: T3ModelSelection;
   /** A stable refusal code (`SwitchRefusalCode` or a failure code) for the audit row. */
   readonly code: string;
   readonly correlationId: string;
@@ -447,7 +449,8 @@ export interface RevertDesiredModelSelectionInput {
 
 /**
  * Drops a desired selection that cannot be honoured, audited as `task.model.reverted`. Returns the
- * change, or null when there was nothing to revert (already reverted, or no choice made).
+ * change, or null when there was nothing to revert (already reverted, no choice made, or the user
+ * chose again since `expected` was read).
  */
 export function revertDesiredModelSelection(
   database: Database,
@@ -457,7 +460,7 @@ export function revertDesiredModelSelection(
   const now = isoDateTime.parse(input.now);
   return database.transaction(() => {
     const current = taskModelRow(database, taskId);
-    if (current.desired === null) return null;
+    if (current.desired === null || !sameStoredSelection(current.desired, input.expected)) return null;
     const next = input.reason === "revoked" ? null : current.applied;
     if (sameStoredSelection(next, current.desired)) return null;
     database

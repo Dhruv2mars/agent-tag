@@ -594,6 +594,50 @@ describe("per-task model selection (P2b)", () => {
     release();
   });
 
+  test("a choice made while a refused plan awaited the catalog is kept for the next turn", async () => {
+    let onRefresh = () => {};
+    const h = await harness(baseConfig, null, {
+      refresh: async () => {
+        onRefresh();
+        return false;
+      },
+    });
+    const first = h.send();
+    await h.process();
+    h.choose(first.taskId, OPUS);
+    onRefresh = () => h.choose(first.taskId, MINI);
+    h.send();
+    expect(await h.process()).toMatchObject({ kind: "completed" });
+    expect(h.t3.turnStarts().at(-1)!.modelSelection).toEqual(SOL);
+    expect(h.store.getTaskExecution(first.taskId).desiredModelSelection).toEqual(MINI);
+    expect(h.audits("task.model.reverted")).toEqual([]);
+
+    onRefresh = () => {};
+    h.send();
+    expect(await h.process()).toMatchObject({ kind: "completed" });
+    expect(h.t3.turnStarts().at(-1)!.modelSelection).toEqual(MINI);
+  });
+
+  test("a choice made while the legacy backfill read T3 survives a revocation of the old one", async () => {
+    const h = await harness();
+    const first = h.send();
+    h.choose(first.taskId, MINI);
+    await h.process();
+    h.database.query("UPDATE tasks SET t3_model_selection_json = NULL").run();
+    h.reconfigure(configWith({ allowedModels: ALLOWED.filter((entry) => entry.model !== MINI.model) }));
+    const fetchThread = h.t3.gateway.fetchThread;
+    h.t3.gateway.fetchThread = async (threadId: string) => {
+      h.t3.gateway.fetchThread = fetchThread;
+      h.choose(first.taskId, SONNET);
+      return fetchThread(threadId);
+    };
+    h.send();
+    expect(await h.process()).toMatchObject({ kind: "completed" });
+    // The revoked MINI planned with is dropped in favour of the default; the newer SONNET stays.
+    expect(h.store.getTaskExecution(first.taskId).desiredModelSelection).toEqual(SONNET);
+    expect(h.audits("task.model.reverted")).toEqual([]);
+  });
+
   test("an asynchronous turn-start failure for this message fails fast instead of stalling", async () => {
     const h = await harness();
     h.t3.rejectNextTurn = "Requested provider instance 'codex' is not configured in this build.";

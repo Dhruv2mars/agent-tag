@@ -173,6 +173,7 @@ describe("per-task model selection store", () => {
       const dropped = store.revertDesiredModelSelection({
         taskId,
         reason: "revoked",
+        expected: selectionB,
         code: "model-not-allowed",
         correlationId: "corr-revoked",
         now: revertAt,
@@ -202,6 +203,7 @@ describe("per-task model selection store", () => {
       const dropped = store.revertDesiredModelSelection({
         taskId,
         reason: "refused",
+        expected: selectionB,
         code: "switch-refused",
         correlationId: "corr-refused",
         now: revertAt,
@@ -216,6 +218,7 @@ describe("per-task model selection store", () => {
       const repeat = store.revertDesiredModelSelection({
         taskId,
         reason: "refused",
+        expected: selectionB,
         code: "switch-refused",
         correlationId: "corr-refused-again",
         now: "2026-09-21T00:04:00.000Z",
@@ -227,11 +230,30 @@ describe("per-task model selection store", () => {
     });
   });
 
+  test("a revert planned against an older choice leaves a newer one alone", async () => {
+    await withTask(({ store, taskId, threadId }) => {
+      store.recordAppliedModelSelection({ taskId, threadId, selection: selectionA, now: setAt });
+      store.setTaskModelSelection({ taskId, selection: selectionB, selectedBy: "U1", now: secondSetAt });
+
+      expect(store.revertDesiredModelSelection({
+        taskId,
+        reason: "refused",
+        expected: selectionA,
+        code: "switch-refused",
+        correlationId: "corr-stale",
+        now: revertAt,
+      })).toBeNull();
+      expect(store.getTaskExecution(taskId).desiredModelSelection).toEqual(selectionB);
+      expect(modelAuditRows(store, "task.model.reverted", taskId)).toHaveLength(0);
+    });
+  });
+
   test("reverting a task with no desired selection returns null and writes no audit", async () => {
     await withTask(({ store, taskId }) => {
       const dropped = store.revertDesiredModelSelection({
         taskId,
         reason: "revoked",
+        expected: selectionB,
         code: "model-not-allowed",
         correlationId: "corr-none",
         now: revertAt,

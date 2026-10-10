@@ -1126,6 +1126,7 @@ export class AgentTagCoordinator {
       this.#store.revertDesiredModelSelection({
         taskId: task.taskId,
         reason: "revoked",
+        expected: dropped,
         code: "not-allowed",
         correlationId: operation.operationId,
         now: this.#now().toISOString(),
@@ -1155,14 +1156,16 @@ export class AgentTagCoordinator {
         operation,
         `This thread already started on *${appliedLabel}*; T3 can't move it to *${escapeSlackText(modelLabel(profile, route, target))}* (${plan.code}). It stays on *${appliedLabel}*; start a new thread to use another provider.`,
       );
+      // Guarded by the choice planned with: one made during the catalog refresh is kept for the next turn.
+      this.#store.revertDesiredModelSelection({
+        taskId: task.taskId,
+        reason: "refused",
+        expected: target,
+        code: plan.code,
+        correlationId: operation.operationId,
+        now: this.#now().toISOString(),
+      });
     }
-    this.#store.revertDesiredModelSelection({
-      taskId: task.taskId,
-      reason: "refused",
-      code: plan.code,
-      correlationId: operation.operationId,
-      now: this.#now().toISOString(),
-    });
     return { selection: applied, previous: applied, movedThread: false };
   }
 
