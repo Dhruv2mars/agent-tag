@@ -43,6 +43,8 @@ export type PrSyncInput =
       readonly aheadCount: number;
       readonly requestText: string;
       readonly summaryText: string;
+      /** The agent switched the worktree off the task branch; the snapshot has the task branch only. */
+      readonly headMoved?: boolean;
     }
   | {
       /** The diff tripped a guard: no push. The notice is queued with the reply and the job is terminal. */
@@ -76,6 +78,7 @@ export interface ClaimedPrSyncJob {
   readonly aheadCount: number;
   readonly requestText: string;
   readonly summaryText: string;
+  readonly headMoved: boolean;
   readonly attempts: number;
 }
 
@@ -116,6 +119,7 @@ const claimedJobRowSchema = z.object({
   ahead_count: z.number().int().nonnegative(),
   request_text: z.string().nullable(),
   summary_text: z.string().nullable(),
+  head_moved: z.union([z.literal(0), z.literal(1)]),
   attempts: z.number().int().nonnegative(),
 });
 
@@ -258,8 +262,9 @@ export function recordPrSync(
     .query(
       `INSERT INTO pr_sync_jobs (
         job_id, task_id, operation_id, conversation_id, thread_ts, actor_user_id, github_repo, base_branch,
-        branch, sha, mirror_ref, ahead_count, request_text, summary_text, status, result_code, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        branch, sha, mirror_ref, ahead_count, request_text, summary_text, head_moved, status, result_code,
+        created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(operation_id) DO NOTHING`,
     )
     .run(
@@ -277,6 +282,7 @@ export function recordPrSync(
       prSync.kind === "ready" ? prSync.aheadCount : null,
       prSync.kind === "ready" ? truncate(prSync.requestText, MAX_PR_REQUEST_CHARS) : null,
       prSync.kind === "ready" ? truncate(prSync.summaryText, MAX_PR_SUMMARY_CHARS) : null,
+      prSync.kind === "ready" && prSync.headMoved === true ? 1 : 0,
       prSync.kind === "ready" ? "pending" : "blocked",
       prSync.kind === "ready" ? null : `blocked.${prSync.reason}`,
       input.now,
@@ -329,7 +335,7 @@ export function claimNextPrSyncJob(
         .query(
           `SELECT j.job_id, j.task_id, j.operation_id, j.conversation_id, j.thread_ts, j.actor_user_id,
              j.github_repo, j.base_branch, j.branch, j.sha, j.mirror_ref, j.ahead_count, j.request_text,
-             j.summary_text, j.attempts
+             j.summary_text, j.head_moved, j.attempts
            FROM pr_sync_jobs j
            WHERE ((j.status = 'pending' AND (j.blocked_until IS NULL OR j.blocked_until <= ?))
               OR (j.status = 'inflight' AND j.lease_expires_at <= ?))
@@ -381,6 +387,7 @@ export function claimNextPrSyncJob(
       aheadCount: row.ahead_count,
       requestText: row.request_text ?? "",
       summaryText: row.summary_text ?? "",
+      headMoved: row.head_moved === 1,
       attempts: row.attempts + 1,
     };
   });

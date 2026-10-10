@@ -462,6 +462,7 @@ export const STORE_MIGRATIONS: readonly StoreMigration[] = [
         ahead_count INTEGER CHECK (ahead_count IS NULL OR ahead_count >= 0),
         request_text TEXT,
         summary_text TEXT,
+        head_moved INTEGER NOT NULL DEFAULT 0 CHECK (head_moved IN (0, 1)),
         status TEXT NOT NULL CHECK (status IN
           ('awaiting-approval', 'pending', 'inflight', 'succeeded', 'skipped', 'blocked', 'failed')),
         result_code TEXT,

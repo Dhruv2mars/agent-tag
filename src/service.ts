@@ -396,7 +396,15 @@ export async function createAgentTagService(input: {
         createT3GateWorker({ gate, now }),
         ...(pullRequests === undefined
           ? []
-          : [new PrWorker({ config: input.config, store, runner: pullRequests.runner, now })]),
+          : [
+              new PrWorker({
+                config: input.config,
+                store,
+                runner: pullRequests.runner,
+                threadLink: (conversationId, threadTs) => bridge.threadPermalink(conversationId, threadTs),
+                now,
+              }),
+            ]),
       ],
       resources: [{ close: closeT3 }],
       logger,

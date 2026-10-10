@@ -261,6 +261,12 @@ export class PrWorker {
       if (pull.merged || pull.state === "closed") return this.#closed(job, existing.headBranch, pull);
     }
     const headBranch = existing?.headBranch ?? job.branch;
+    // A recorded push without a PR number means an earlier attempt may have created the PR and lost the
+    // response. Look it up before pushing so a PR merged or closed since then is not re-pushed.
+    const replayed = existing !== null && existing.number === null
+      ? await github.findPullByHead(job.githubRepo, headBranch, signal)
+      : undefined;
+    if (replayed !== undefined && (replayed.merged || replayed.state === "closed")) return this.#closed(job, headBranch, replayed);
     const mirrorPath = mirrorPathFor(this.#gitRoot, job.githubRepo);
     const pushedCommits = await this.#countNewCommits(mirrorPath, existing?.lastPushedSha ?? null, job, signal);
 
@@ -319,6 +325,8 @@ export class PrWorker {
             number: pull.number,
             url: pull.htmlUrl,
             pushedCommits,
+            headBranch,
+            headMoved: job.headMoved,
             ...(pull.additions === undefined ? {} : { additions: pull.additions }),
             ...(pull.deletions === undefined ? {} : { deletions: pull.deletions }),
           }),
@@ -330,7 +338,7 @@ export class PrWorker {
     }
 
     // No PR recorded yet: a crash after the push (or after GitHub created the PR) replays into this lookup.
-    const found = await github.findPullByHead(job.githubRepo, headBranch, signal);
+    const found = replayed ?? await github.findPullByHead(job.githubRepo, headBranch, signal);
     if (found !== undefined && (found.merged || found.state === "closed")) return this.#closed(job, headBranch, found);
     let pull: GitHubPull;
     let created = false;
@@ -388,6 +396,7 @@ export class PrWorker {
           baseBranch: pull.baseRef,
           draft: pull.draft,
           draftUnavailable,
+          headMoved: job.headMoved,
           ...(pull.commits === undefined ? {} : { commits: pull.commits }),
           ...(pull.changedFiles === undefined ? {} : { changedFiles: pull.changedFiles }),
           ...(pull.additions === undefined ? {} : { additions: pull.additions }),

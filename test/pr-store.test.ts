@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { recordPrSync, type PrSyncInput } from "../src/store/pull-requests.ts";
+import { PRUNED_TEXT, pruneRetainedData } from "../src/store/retention.ts";
 import { AgentTagStore, type SlackEventInput } from "../src/store/store.ts";
 
 const T0 = "2026-09-21T00:00:00.000Z";
@@ -573,4 +574,34 @@ describe("claiming PR sync jobs", () => {
       expect(store.listPrSyncJobs(turn.taskId)[0]).toMatchObject({ status: "succeeded" });
     });
   });
+});
+
+describe("retention", () => {
+test("messageDays redacts request and summary text of settled PR jobs only", async () => {
+  await withStore(({ store, database }) => {
+    const settled = startTurn(store, 1, "1000.0001", at(1));
+    completeTurn(store, settled, readySync, at(2));
+    const pending = startTurn(store, 2, "2000.0001", at(3));
+    completeTurn(store, pending, readySync, at(4));
+    database.query("UPDATE pr_sync_jobs SET status = 'succeeded' WHERE operation_id = ?").run(settled.operationId);
+    const texts = () =>
+      database
+        .query("SELECT operation_id, request_text, summary_text FROM pr_sync_jobs ORDER BY created_at")
+        .all() as { operation_id: string; request_text: string | null; summary_text: string | null }[];
+    const before = texts();
+    const input = { policy: { messageDays: 1 }, now: "2026-10-01T00:00:00.000Z" };
+
+    const dryRun = pruneRetainedData(database, { ...input, dryRun: true });
+    expect(dryRun.prJobsRedacted).toBe(1);
+    expect(texts()).toEqual(before);
+
+    expect(pruneRetainedData(database, input).prJobsRedacted).toBe(1);
+    expect(texts()).toEqual([
+      { operation_id: settled.operationId, request_text: PRUNED_TEXT, summary_text: PRUNED_TEXT },
+      // A pending job still needs its text for the PR title and body.
+      { operation_id: pending.operationId, request_text: "Fix the flaky test", summary_text: "Fixed it." },
+    ]);
+    expect(pruneRetainedData(database, input).prJobsRedacted).toBe(0);
+  });
+});
 });

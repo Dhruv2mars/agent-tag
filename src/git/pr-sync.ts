@@ -62,6 +62,7 @@ export function prSyncFromSnapshot(
         aheadCount: result.aheadCount,
         requestText: input.requestText,
         summaryText: input.summaryText,
+        ...(result.warning === "head-moved" ? { headMoved: true } : {}),
       };
   }
 }

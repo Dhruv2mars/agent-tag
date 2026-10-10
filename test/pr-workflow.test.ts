@@ -239,7 +239,11 @@ interface Harness {
   advance(milliseconds: number): void;
   now(): Date;
   coordinator(options?: { readonly runner?: GitRunner; readonly config?: AgentTagConfig; readonly noPullRequests?: boolean }): AgentTagCoordinator;
-  worker(options?: { readonly config?: AgentTagConfig; readonly github?: GitHubClient }): PrWorker;
+  worker(options?: {
+    readonly config?: AgentTagConfig;
+    readonly github?: GitHubClient;
+    readonly threadLink?: (conversationId: string, threadTs: string) => Promise<string | undefined>;
+  }): PrWorker;
   /** Ingests one Slack mention in the shared thread and runs the coordinator to completion. */
   turn(text: string, coordinator?: AgentTagCoordinator): Promise<string>;
   /** Claims and delivers every queued Slack message, oldest first. */
@@ -368,6 +372,7 @@ async function withHarness(body: (harness: Harness) => Promise<void>): Promise<v
           gitRoot: repo.gitRoot,
           testRemoteUrlFor: (name) => githubRemoteUrl(`file://${remoteBase}`, name, { allowTestRemote: true }),
           workerId: "pr-a",
+          ...(options.threadLink === undefined ? {} : { threadLink: options.threadLink }),
           now,
         }),
       turn: async (text, runner = coordinator()) => {
@@ -542,6 +547,65 @@ describe("draft PR workflow", () => {
       expect(h.github.creates).toHaveLength(1);
       expect(h.drain().map((message) => message.clientMessageId)).toEqual([`${operationId}:pr`]);
     });
+  });
+
+  test("a lost create response, then a merge and branch delete: the replay does not push again", async () => {
+    await withHarness(async (h) => {
+      await Bun.write(join(h.repo.worktree, "feature.txt"), "feature\n");
+      const operationId = await h.turn("add a feature file");
+      h.drain();
+      h.github.failCreate = { error: new GitHubApiError({ kind: "transient", message: "socket hang up" }), afterCreate: true };
+      const worker = h.worker();
+      expect(await worker.processNext()).toMatchObject({ kind: "retry-scheduled" });
+      h.github.update(1, { state: "closed", merged: true });
+      git(h.remotePath, "update-ref", "-d", `refs/heads/${h.repo.branch}`);
+      h.advance(31_000);
+      expect(await worker.processNext()).toMatchObject({ kind: "skipped", code: "pr.merged" });
+      expect(h.remoteHead(h.repo.branch)).toBeUndefined();
+      expect(h.github.creates).toHaveLength(1);
+      expect(h.store.getTaskPullRequest(h.taskId())).toMatchObject({ number: 1, state: "merged" });
+      expect(h.drain().map((message) => message.clientMessageId)).toEqual([`${operationId}:pr-closed`]);
+    });
+  });
+
+  test("a branch switch in the worktree is called out on the card and on the follow-up line", async () => {
+    await withHarness(async (h) => {
+      await Bun.write(join(h.repo.worktree, "feature.txt"), "feature\n");
+      git(h.repo.worktree, "add", "feature.txt");
+      git(h.repo.worktree, "-c", "user.name=Agent", "-c", "user.email=agent@example.com", "commit", "--quiet", "-m", "add feature");
+      git(h.repo.worktree, "checkout", "--quiet", "-b", "agent-side");
+      await Bun.write(join(h.repo.worktree, "side.txt"), "side\n");
+      await h.turn("add a feature file");
+      h.drain();
+      const worker = h.worker();
+      expect(await worker.processNext()).toMatchObject({ kind: "created" });
+      const card = h.drain();
+      expect(JSON.stringify(card[0]?.payload)).toContain("switched branches in its worktree");
+      expect(git(h.remotePath, "ls-tree", "--name-only", `refs/heads/${h.repo.branch}`)).not.toContain("side.txt");
+
+      git(h.repo.worktree, "checkout", "--quiet", h.repo.branch);
+      git(h.repo.worktree, "add", "side.txt");
+      git(h.repo.worktree, "-c", "user.name=Agent", "-c", "user.email=agent@example.com", "commit", "--quiet", "-m", "add side");
+      git(h.repo.worktree, "checkout", "--quiet", "-b", "agent-side-2");
+      await h.turn("add side");
+      h.drain();
+      expect(await worker.processNext()).toMatchObject({ kind: "pushed" });
+      expect(texts(h.drain())[0]).toContain("switched branches in its worktree");
+    });
+  });
+
+  test("the PR body links the Slack thread permalink, falling back to channel/ts", async () => {
+    for (const [threadLink, expected] of [
+      [async () => "https://example.slack.com/archives/C1/p1000000001", "https://example.slack.com/archives/C1/p1000000001"],
+      [async () => { throw new Error("slack down"); }, "C1/1000.000001"],
+    ] as const) {
+      await withHarness(async (h) => {
+        await Bun.write(join(h.repo.worktree, "feature.txt"), "feature\n");
+        await h.turn("add a feature file");
+        expect(await h.worker({ threadLink }).processNext()).toMatchObject({ kind: "created" });
+        expect(h.github.creates[0]?.body).toContain(expected);
+      });
+    }
   });
 
   test("a merged PR stops pushing with one notice; later jobs end quietly", async () => {

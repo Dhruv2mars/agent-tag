@@ -113,9 +113,15 @@ export function pullRequestPushedLine(input: {
   readonly pushedCommits: number;
   readonly additions?: number;
   readonly deletions?: number;
+  readonly headBranch?: string;
+  readonly headMoved?: boolean;
 }): SlackOutboxPayload {
   const stats = churn(input.additions, input.deletions);
-  const text = `Pushed ${plural(input.pushedCommits, "commit")} to ${link(input.url, `${input.repo}#${input.number}`)}${stats === undefined ? "" : ` (${stats} total)`}`;
+  const moved =
+    input.headMoved === true && input.headBranch !== undefined
+      ? `. The agent switched branches in its worktree; only ${code(input.headBranch)} was pushed.`
+      : "";
+  const text = `Pushed ${plural(input.pushedCommits, "commit")} to ${link(input.url, `${input.repo}#${input.number}`)}${stats === undefined ? "" : ` (${stats} total)`}${moved}`;
   return { text, blocks: [{ type: "context", elements: [{ type: "mrkdwn", text }] }] };
 }
 
