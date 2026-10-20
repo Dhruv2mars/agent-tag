@@ -628,8 +628,6 @@ export const agentTagConfigSchema = z
 export type AgentTagConfig = z.infer<typeof agentTagConfigSchema>;
 export type AgentTagProfile = AgentTagConfig["profiles"][number];
 export type AgentTagRoute = AgentTagConfig["routes"][number];
-export type ThreadContextConfig = AgentTagConfig["profiles"][number]["threadContext"];
-export type ConfiguredModelRef = ModelRef;
 
 export interface ResolvedPullRequestRepository {
   readonly root: string;

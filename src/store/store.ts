@@ -20,7 +20,6 @@
 import type { Database } from "bun:sqlite";
 
 import type { StoreContext } from "./context.ts";
-import type { T3ModelSelection } from "../t3/gateway.ts";
 import type {
   ActiveTaskBinding,
   AmbientDecision,
@@ -61,7 +60,7 @@ import * as pullRequests from "./pull-requests.ts";
 import * as commands from "./commands.ts";
 import * as reactions from "./reactions.ts";
 
-export { AUDIT_ACTIONS, type AuditAction } from "./schema.ts";
+export type { AuditAction } from "./schema.ts";
 export type {
   ClaimedPrSyncJob,
   PrSyncInput,
@@ -164,7 +163,6 @@ export type {
   PendingInteractionRequest,
 } from "./waits.ts";
 export type { GetPendingUserInputQuestionInput, SubmitUserInputAnswerInput } from "./user-input.ts";
-export { RESOLVED_ELSEWHERE } from "./interaction-cards.ts";
 export type {
   InteractionCardState,
   InteractionCardView,
@@ -178,7 +176,6 @@ export type {
   RetryOutboxInput,
   ExhaustOutboxRetriesInput,
 } from "./outbox.ts";
-export { REFRESH_KINDS } from "./message-edits.ts";
 export type {
   ClaimedReaction,
   ClaimNextReactionInput,
