@@ -522,13 +522,6 @@ export async function checkT3Session(
   return { id, status: "pass", summary: `T3 token has exact orchestration scopes; expires ${session.expiresAt}` };
 }
 
-export async function checkT3Providers(
-  config: AgentTagConfig,
-  dependencies: Pick<DoctorDependencies, "inspectT3">,
-): Promise<DoctorCheck> {
-  return (await inspectT3Providers(config, dependencies)).check;
-}
-
 /** Validates profile and route defaults strictly, and returns the catalog for the allowed-model report. */
 async function inspectT3Providers(
   config: AgentTagConfig,

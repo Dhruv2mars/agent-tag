@@ -15,7 +15,7 @@ curl -fsSL https://raw.githubusercontent.com/Dhruv2mars/agent-tag/main/install.s
 agent-tag version
 ```
 
-Until GA every release is a prerelease, and the installer's default (`latest`) only finds stable releases, so pin one from [the releases page](https://github.com/Dhruv2mars/agent-tag/releases) with `AGENT_TAG_VERSION`. For the same reason, move between prereleases with `agent-tag update --version X` rather than a bare `agent-tag update`. After the first stable release, drop the pin and use `agent-tag update --check`.
+No release has been tagged yet, so this command fails until the first prerelease is published; until then, use a [source checkout](#development). Until GA every release is a prerelease, and the installer's default (`latest`) only finds stable releases, so pin one from [the releases page](https://github.com/Dhruv2mars/agent-tag/releases) with `AGENT_TAG_VERSION`. For the same reason, move between prereleases with `agent-tag update --version X` rather than a bare `agent-tag update`. After the first stable release, drop the pin and use `agent-tag update --check`.
 
 The installer verifies the release's `SHA256SUMS` and installs to `~/.local/bin`. Set `AGENT_TAG_INSTALL_DIR` to change the destination. Then run `agent-tag onboard` (see [Quickstart](#quickstart)): it walks through the [Slack app](docs/slack-setup.md), T3, and the config, and can install the background service, whose unit runs the installed binary directly. Check everything with `agent-tag doctor`. A Docker image is also available. See [install](docs/install.md) for both, plus self-update and how releases are cut.
 
@@ -30,7 +30,7 @@ Requirements:
 ```sh
 bun install
 bun run verify:t3-pin
-bun test
+bun run test      # bun test with a 20 s per-test budget for I/O-heavy fixtures
 bun run typecheck
 ```
 

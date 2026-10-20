@@ -2,7 +2,7 @@
 
 Agent Tag is an open-source, local-first Slack coworker built on T3 Code. It is intended to provide the team experience of Claude Tag while letting the operator choose the T3-supported agent, provider, and model. The current deployment target is one dedicated local machine.
 
-Agent Tag is not generally available yet. The source of truth is the [GA acceptance matrix](ga-acceptance.md); evidence must remain live, exact, and honest.
+Agent Tag is not generally available yet, and no release has been tagged. The source of truth is the [GA acceptance matrix](ga-acceptance.md); evidence must remain live, exact, and honest.
 
 ## Read first
 
@@ -12,27 +12,33 @@ Agent Tag is not generally available yet. The source of truth is the [GA accepta
 4. [Slack setup](slack-setup.md)
 5. [Provider access and licensing](provider-licensing.md)
 
-The active continuation branch is `feat/t3-slack-spike`, with [draft PR #1](https://github.com/Dhruv2mars/agent-tag/pull/1). Use Bun and pinned T3 Code `0.0.45` (orchestration protocol 1).
+Work lands on `main` through one squash-merged pull request per change. Use Bun `1.3.13` and pinned T3 Code `0.0.45` (orchestration protocol 1; `0.0.42`–`0.0.45` are accepted).
 
-## Working baseline
+## On `main`
 
-- Slack Socket Mode ingestion, authorization, durable deduplication, T3 dispatch, and Slack replies are implemented.
-- Queued turns, interaction responses, schedules, and Slack replies recheck current loaded task authority before dispatch. [Revocation evidence](evidence/2026-09-30-authority-revocation.md) covers restart fixtures, real Codex continuation, and real Slack delivery. OS isolation and tool-write enforcement remain unimplemented.
-- SQLite owns tasks, operations, leases, interactions, memory, schedules, ambient decisions, audit records, and the Slack outbox.
-- Live Codex runs have completed from Slack, preserved same-thread context, survived a controlled T3 restart, and completed in an owner-bound DM.
-- Approval, question, cancellation, memory, scheduling, ambient participation, backup/restore, status, audit verification, and secret scanning have executable coverage. One live approval remains intentionally unanswered and must remain a human decision.
-- A macOS per-user LaunchAgent completed install, upgrade, uninstall, and reinstall exercises. Clean GitHub-hosted macOS 15 and Ubuntu 24.04 gates pass.
-- `agent-tag onboard` (interactive or flag-driven), `agent-tag doctor [--fix]`, and a platform-neutral `agent-tag service` command (launchd on macOS, `systemd --user` on Linux) are implemented. The Linux unit is fixture-tested only and has not been exercised on a live host.
-- The pinned T3 adapter can upload, download, and delete pending image/file attachments with the existing restricted token. [Transport evidence](evidence/2026-09-30-t3-attachments.md) covers real byte round trips; Slack file ingestion and artifact return remain unimplemented.
-- Provider/model selection is explicit. Codex `gpt-5.6-sol` and Claude `claude-sonnet-4-6`/`claude-haiku-4-5` complete live through the adapter on T3 `0.0.45` ([evidence](evidence/2026-10-06-t3-0.0.45.md)). Earlier Claude failures came from an organization policy rejecting the Claude Code subscription login, not from T3; Agent Tag now reports that case as `T3ProviderAuthPolicy`.
+- Slack Socket Mode ingestion, authorization, durable deduplication, T3 dispatch, and Slack replies. Replies are rendered as safe, chunked mrkdwn, and the outbox classifies delivery errors and retries with backoff.
+- An instant :eyes: reaction on accepted mentions (`reactions:write`), and durable `chat.update` edits for messages Agent Tag already posted.
+- Speaker identity in every turn (`users:read`), a window of earlier thread messages on the first mention, and thread updates (other bots, non-allowed people, edits) carried into the next turn.
+- `!help`, `!status`, `!mute`, and `!unmute` commands. Approval and question cards reflect clicks, outcomes, and expiry.
+- One shared T3 connection with a thread watcher, a progress-based stall policy, approval expiry, and interaction retries with backoff.
+- Per-profile `allowedModels` and a per-task model that stays sticky across turns.
+- A draft pull request worker (`pullRequests.mode: "auto"`) with a Slack PR card. The live GitHub run is still owner-blocked (PR-01).
+- Routine parsing, run outcomes, and auto-disable after repeated failures. Creating, listing, and cancelling routines from Slack is not on `main` yet.
+- A pinned T3 runtime installer, a supervised managed `t3 serve` with a runtime protocol gate, and restricted-token rotation (`agent-tag t3 install|status|serve|pair|rotate`).
+- `agent-tag onboard`, `agent-tag doctor [--fix]`, and a platform-neutral `agent-tag service` (launchd on macOS, `systemd --user` on Linux). The Linux unit is fixture-tested only and has not run on a live host.
+- Credential redaction, retention pruning, `security audit`, and secret scanning.
+- `install.sh`, a tag-triggered release workflow, self-updating binaries, and a Docker image.
+- Queued turns, interaction responses, schedules, and Slack replies recheck current task authority before dispatch ([revocation evidence](evidence/2026-09-30-authority-revocation.md)). OS isolation and tool-write enforcement remain unimplemented.
+- The pinned T3 adapter can transfer image and file attachments ([transport evidence](evidence/2026-09-30-t3-attachments.md)). Slack file ingestion and artifact return remain unimplemented, so the manifest requests no file scopes.
+- Codex `gpt-5.6-sol` and Claude `claude-sonnet-4-6`/`claude-haiku-4-5` complete live through the adapter on T3 `0.0.45` ([evidence](evidence/2026-10-06-t3-0.0.45.md)).
 
 ## Required work
 
-Start by reviewing the repository and validating the current branch and CI. Then work down the acceptance matrix without weakening it.
+Work down the acceptance matrix without weakening it.
 
-1. Enforce isolation and external-write authority where tools execute. Separate worktrees alone do not isolate paths or credentials, and the current configuration fields are not proof of enforcement.
-2. Complete Slack files, images, returned artifacts, and usable PR-link workflows with least-privilege scopes.
-3. Run independent human acceptance for thread context, two-person steering, approvals, questions, cancellation, DMs, memory, schedules, and ambient behavior.
+1. Finish the Slack experience teams expect from Claude Tag: a live status message with Stop, `!stop`/`!restart`, routines from Slack, channel memory, task close/reopen, Slack files in and out, and plain-language model switching.
+2. Enforce isolation and external-write authority where tools execute. Separate worktrees alone do not isolate paths or credentials, and configuration fields are not proof of enforcement.
+3. Run independent human acceptance for thread context, two-person steering, approvals, questions, cancellation, DMs, memory, schedules, ambient behavior, and draft PRs.
 4. Close outage recovery, asset-path privacy, tool credential scoping, and full audit-transition coverage.
 5. Resolve or explicitly bound provider parity and deployment licensing.
 6. Publish a runnable release only after every required GA row passes.

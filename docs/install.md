@@ -1,6 +1,8 @@
 # Install
 
-Agent Tag ships three ways. Each one still needs a running T3 Code `0.0.42` server and the Slack app from [Slack setup](slack-setup.md).
+Agent Tag ships three ways. Each one still needs a running T3 Code `0.0.45` server (orchestration protocol 1; `0.0.42`–`0.0.45` are accepted) and the Slack app from [Slack setup](slack-setup.md).
+
+No release has been tagged yet, so the binary and Docker commands below fail until the first prerelease is published. Until then, use a [source checkout](#source-checkout).
 
 | Method | Platforms | Updates with |
 | --- | --- | --- |

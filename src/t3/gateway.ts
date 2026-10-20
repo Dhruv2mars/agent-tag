@@ -576,20 +576,6 @@ export function threadModelSelectionCommand(input: {
   });
 }
 
-export async function updateT3ThreadModelSelection(input: {
-  readonly config: T3ConnectionConfig;
-  readonly commandId: string;
-  readonly threadId: string;
-  readonly modelSelection: T3ModelSelection;
-  readonly signal?: AbortSignal;
-}): Promise<T3DispatchResult> {
-  return dispatchT3Command({
-    config: input.config,
-    command: threadModelSelectionCommand(input),
-    ...signalOption(input.signal),
-  });
-}
-
 /** T3 answered the snapshot request with HTTP 404: the thread does not exist. */
 export class T3ThreadNotFoundError extends Error {
   constructor(readonly threadId: string) {
