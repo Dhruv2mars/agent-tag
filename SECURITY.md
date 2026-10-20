@@ -56,6 +56,7 @@ Even in tier 2, the agent can still push to anything its own credentials reach, 
 ### What Agent Tag protects
 
 - **Who can start work.** Only users in `access.allowedUserIds`, in conversations listed in `access.allowedChannelIds` and bound by a route. DM routes are bound to a single owner. Authority is checked again before every queued turn, interaction response, schedule run, and Slack reply. Removing a user or route stops queued work after a restart.
+- **Who can run commands.** `!commands` use the same user, channel, route, and DM-owner checks as requests, then the task's execution authority in a bound thread. `commands.disabled` and `commands.adminOnly` narrow them further. Command replies other than mute notices are visible only to the sender, and commands never store or echo message text.
 - **Which repositories a task uses.** Each route is pinned to one root in its profile's `repositoryRoots`. This is a routing guarantee, not a filesystem sandbox.
 - **Secrets at rest from other local users.** Owner and mode checks cover the secret files, their parent directory, the data directory, and the database.
 - **Secrets in the audit trail.** Audit metadata passes through a redactor for known credential shapes (Slack, GitHub, AWS, Anthropic, OpenAI) before it is written. The audit log never stores Slack message bodies.
