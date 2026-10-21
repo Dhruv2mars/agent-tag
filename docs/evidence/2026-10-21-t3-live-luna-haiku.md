@@ -18,7 +18,7 @@ T3 0.0.45 builds its model list from a model manifest. At startup it fetches the
 - **Restart:** after one restart the catalog listed `claudeAgent` / `claude-haiku-5-5` (manifest adapter `claudeCode` `minVersion` `2.1.293`). It also listed `codex` / `gpt-6-luna`.
 - **No restart:** in a second fresh base directory, the cached manifest contained `claude-haiku-5-5` from boot onward. The catalog still lacked it at boot, 3 minutes and 12.5 minutes after boot.
 
-`agent-tag doctor` now points a `model-missing` result at this behavior and the restart remedy (`docs/operations.md`, "Models and providers").
+`agent-tag doctor` now points a `model-missing` result at this behavior and the restart remedy (`docs/t3-runtime.md`, "Models and providers"; `docs/operations.md` when this ran).
 
 The `codex` instance on this machine hit its usage limit. Luna ran on the machine's second Codex instance (`codex_0155bb4f-…`, a separate account) through `AGENT_TAG_LIVE_CODEX_INSTANCE`. Both instances use the `codex` driver, the same model, and the same T3 adapter.
 

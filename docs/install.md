@@ -26,7 +26,7 @@ The resulting config has a three-line `t3` block. Everything else has a default 
 "t3": { "mode": "managed", "port": 37841, "tokenFile": "/home/me/.agent-tag/secrets/t3-token" }
 ```
 
-Managed mode needs a pinned artifact for the host: macOS arm64, Linux x64 and Linux arm64. T3 `0.0.45` ships no Intel macOS build, so Intel Macs use external mode. The first start downloads about 70 MB from GitHub (`downloadBaseUrl` points at a mirror instead), and each installed version takes about 205 MB on disk. The coding agents themselves (Codex, Claude) run under your OS user and use the logins in your home directory, so sign in to them once as that user. See [operations](operations.md#managed-t3) for `agent-tag t3 status|pair|serve|install`.
+Managed mode needs a pinned artifact for the host: macOS arm64, Linux x64 and Linux arm64. T3 `0.0.45` ships no Intel macOS build, so Intel Macs use external mode. The first start downloads about 70 MB from GitHub (`downloadBaseUrl` points at a mirror instead), and each installed version takes about 205 MB on disk. The coding agents themselves (Codex, Claude) run under your OS user and use the logins in your home directory, so sign in to them once as that user. See [T3 runtime](t3-runtime.md#managed-t3) for `agent-tag t3 status|pair|serve|install`.
 
 **External.** Run T3 yourself and point Agent Tag at it with `"t3": { "baseUrl": "http://127.0.0.1:3773", "tokenFile": "..." }` (a config without `t3.mode` is external). Onboarding picks this when it finds a running T3 in `~/.t3` (or `$T3CODE_HOME`), or when you pass `--t3-url`. The Docker image always uses external mode, because the container does not run T3.
 
@@ -117,25 +117,3 @@ Inside the container, the config refers to container paths: `"dataDir": "/data"`
 ## Source checkout
 
 See the [README](../README.md#development). Follow [operations](operations.md#background-service) for the background service. `agent-tag service install` works from a checkout (the unit runs `bun run src/cli.ts`) or from a release binary (the unit runs the binary itself), on macOS (LaunchAgent) and Linux (`systemd --user`).
-
-## Cutting a release (maintainers)
-
-1. Make sure `bun run check` passes on `main`.
-2. Tag and push: `git tag v0.1.0-rc.1 && git push origin v0.1.0-rc.1`.
-3. `.github/workflows/release.yml` then runs these jobs:
-   - cross-compiles the four binaries with `scripts/build-release.ts`. The macOS binaries are built on macOS so they carry Bun's ad-hoc signature.
-   - runs a smoke test of each binary on a native runner (`macos-15`, `macos-15-intel`, `ubuntu-24.04`, `ubuntu-24.04-arm`). The test runs `--help`, `version --json`, and `install.sh` against a local `file://` mirror.
-   - builds the Docker image and checks it.
-   - writes `SHA256SUMS` and publishes the GitHub Release once the typecheck, tests, smoke tests, and image checks have passed. A hyphenated version is published as a prerelease.
-   - pushes the verified image to GHCR only after the GitHub Release exists, so a failed gate never moves `:<version>` or `:latest`.
-
-Only a pushed `v*` tag publishes. Pull requests that touch the build inputs and manual `workflow_dispatch` runs (including one started on a tag) run the same build, smoke, and Docker jobs as a dry run. They never create a release or push an image.
-
-To build locally:
-
-```sh
-bun run build:release                          # all four targets into dist/, plus dist/SHA256SUMS
-bun run build:release --target darwin-arm64 --version 0.1.0
-```
-
-Each binary runs `--help` and `version --json` as a smoke test when it matches the host.

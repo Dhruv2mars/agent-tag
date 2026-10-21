@@ -6,6 +6,8 @@ Commands that take `CONFIG` fall back to `$AGENT_TAG_CONFIG` and then to `~/.age
 
 Complete the [Slack setup](slack-setup.md) before running live checks.
 
+Every config key, with its type, limits and default, is in the generated [configuration reference](configuration.md).
+
 Before enabling a provider for other Slack users, complete the [provider access and licensing review](provider-licensing.md). T3 readiness proves connectivity only; it does not prove that a personal subscription or session may be shared.
 
 ## Clean-checkout verification
@@ -29,7 +31,7 @@ Hosts installed with `install.sh` run a standalone binary from `~/.local/bin/age
 1. Acknowledge that agents run as your OS user with access to the configured repositories, so only users you would trust with a shell should be allowed. Non-interactive runs require `--accept-risk`.
 2. Choose the Agent Tag home (`--dir`, default `$AGENT_TAG_HOME` or `~/.agent-tag`). It creates `data/` and `secrets/` at mode `0700`. An existing home directory is left as is, and an existing config is replaced only with `--force` or after an interactive confirmation.
 3. Create the Slack app. The wizard prints `config/slack-manifest.example.json` together with a `https://api.slack.com/apps?new_app=1&manifest_json=...` link that opens Slack's create-from-manifest flow. It then reads the app-level token (`xapp-`) and the bot token (`xoxb-`) from a hidden prompt, from `AGENT_TAG_SLACK_APP_TOKEN` / `AGENT_TAG_SLACK_BOT_TOKEN`, or from token files that already exist. It writes them to `secrets/` at mode `0600` and runs `auth.test` to learn the workspace ID (`--skip-slack-check` skips this check).
-4. Connect T3. With `--t3-managed`, or by default when no T3 server is running and no external T3 flag (`--t3-url`, `--t3-base-dir`, `--t3-bin`, `--t3-admin-token-file`, `--t3-issue-token`) is given, the wizard sets up [managed T3](#managed-t3): it writes `t3: {mode: "managed", port, tokenFile}` (`--t3-port`, default `37841`), downloads and verifies the pinned T3 into `<dataDir>/t3/runtime`, starts it, mints the restricted token, lists providers (waiting up to 30 s while a fresh T3 probes them), and stops it again; the service starts it from then on. Interactive runs ask before choosing managed mode. A failed start stops the run with `--t3-managed` and only warns otherwise. Onboarding refuses to start a second T3 while the service already runs one in that home; stop the service before onboarding again. On a platform without a pinned T3 build (Intel macOS) the wizard stays on external T3. Otherwise the wizard reads `<T3 base dir>/userdata/server-runtime.json` (`--t3-base-dir`, else `$T3CODE_HOME` or `~/.t3`, the same order T3 uses) to find the server URL (`--t3-url` overrides it) and probes it with the same environment check as `doctor`. When that check fails, because T3 is unreachable or does not speak orchestration protocol `1` (for example a nightly or `main` build), the wizard skips token minting and provider discovery and does not install the service. With `--t3-issue-token` or `--t3-admin-token-file` it stops with an error instead. Run the T3 version pinned in `t3.lock.json`. If no restricted token exists yet, it can run `t3 auth session issue --base-dir D --ttl 10m --label agent-tag-onboard --json` (`--t3-issue-token`, `--t3-bin`) or use `--t3-admin-token-file`. It issues a session only when the base dir's running server is the one at the T3 URL. If you pass `--t3-url` for an isolated instance, also pass that instance's `--t3-base-dir`; otherwise the session would come from another instance with different signing keys, so the wizard refuses (or stops, with `--t3-issue-token`). In both cases it mints a restricted token with the same checks as `bun run enroll:t3`. The administrative token is used once and never written. A session the wizard issued is revoked with `t3 auth session revoke` right after enrollment, whether enrollment succeeded or not. If revocation fails, the wizard prints the session ID and the revoke command; the session (administrative scopes, label `agent-tag-onboard`) expires on its own after 10 minutes. A token passed with `--t3-admin-token-file` belongs to you and is not revoked; issue it with a short `--ttl`.
+4. Connect T3. With `--t3-managed`, or by default when no T3 server is running and no external T3 flag (`--t3-url`, `--t3-base-dir`, `--t3-bin`, `--t3-admin-token-file`, `--t3-issue-token`) is given, the wizard sets up [managed T3](t3-runtime.md#managed-t3): it writes `t3: {mode: "managed", port, tokenFile}` (`--t3-port`, default `37841`), downloads and verifies the pinned T3 into `<dataDir>/t3/runtime`, starts it, mints the restricted token, lists providers (waiting up to 30 s while a fresh T3 probes them), and stops it again; the service starts it from then on. Interactive runs ask before choosing managed mode. A failed start stops the run with `--t3-managed` and only warns otherwise. Onboarding refuses to start a second T3 while the service already runs one in that home; stop the service before onboarding again. On a platform without a pinned T3 build (Intel macOS) the wizard stays on external T3. Otherwise the wizard reads `<T3 base dir>/userdata/server-runtime.json` (`--t3-base-dir`, else `$T3CODE_HOME` or `~/.t3`, the same order T3 uses) to find the server URL (`--t3-url` overrides it) and probes it with the same environment check as `doctor`. When that check fails, because T3 is unreachable or does not speak orchestration protocol `1` (for example a nightly or `main` build), the wizard skips token minting and provider discovery and does not install the service. With `--t3-issue-token` or `--t3-admin-token-file` it stops with an error instead. Run the T3 version pinned in `t3.lock.json`. If no restricted token exists yet, it can run `t3 auth session issue --base-dir D --ttl 10m --label agent-tag-onboard --json` (`--t3-issue-token`, `--t3-bin`) or use `--t3-admin-token-file`. It issues a session only when the base dir's running server is the one at the T3 URL. If you pass `--t3-url` for an isolated instance, also pass that instance's `--t3-base-dir`; otherwise the session would come from another instance with different signing keys, so the wizard refuses (or stops, with `--t3-issue-token`). In both cases it mints a restricted token with the same checks as `bun run enroll:t3`. The administrative token is used once and never written. A session the wizard issued is revoked with `t3 auth session revoke` right after enrollment, whether enrollment succeeded or not. If revocation fails, the wizard prints the session ID and the revoke command; the session (administrative scopes, label `agent-tag-onboard`) expires on its own after 10 minutes. A token passed with `--t3-admin-token-file` belongs to you and is not revoked; issue it with a short `--ttl`.
 5. Set the repositories (`--repo`, comma-separated absolute paths), `--base-branch`, `--provider` (by default the first ready T3 provider) and `--model` (by default T3's default model for the selected provider; required when T3 reports none), `--runtime-mode`, and `--profile`.
 6. Set the allowed users (`--users U…`) and channels (`--channels C…`), plus `--max-concurrent-tasks`. Each channel gets a route to the profile. DM routes stay manual; see [DM routes](#dm-routes).
 7. Validate the result with the config schema and write `agent-tag.json` atomically at mode `0600`. Then offer to install the service (`--install-service` / `--no-install-service`).
@@ -106,9 +108,7 @@ Doctor reports each check as `PASS`, `WARN`, `FAIL`, or `SKIP` and exits non-zer
 - `service-state`: what the running service recorded in `<dataDir>/service-state.json`. A live service still waiting for an unreachable T3 fails with the wait's start, attempts, and last error; a record left by a stopped process is skipped.
 - The background service is installed, runs this install (the same checkout and Bun, or the same release binary) with the same config, matches the current unit template, and is running. A missing or stopped service is a warning, so doctor still passes before the first install.
 
-`--fix` repairs only safe, local problems. It creates a missing data or secret directory, chmods permissive secret files and directories, regenerates a service unit whose template drifted, and restarts a stopped service. It regenerates a unit only when the installed unit already runs this install: this checkout with the same Bun, or this release binary, and the same config. A unit that runs another checkout (for example the live install, when doctor runs from a worktree or a temporary clone), another Bun, a release binary when doctor runs from a checkout (or the reverse), or another config gets a warning and is left alone. To move the service, run `agent-tag service upgrade CONFIG` from the checkout or binary it should run. A stopped service is restarted with `service restart`, which on macOS bootstraps an installed plist whose job is no longer loaded before starting it. It never writes tokens, changes the config, or touches T3 or Slack. Service repair runs only when no other check failed, because `service upgrade` reruns doctor. `--json` prints the structured report. Output never contains tokens or message text.
-
-This build speaks T3 orchestration protocol 1 (T3 `0.0.42`–`0.0.45`). A descriptor without `orchestrationProtocolVersion` is protocol 1. Any other version makes `doctor` and `start` fail closed with `T3 server speaks orchestration protocol N; this Agent Tag build supports protocol 1 (T3 0.0.42–0.0.45)` before the T3 token is presented. Upgrade Agent Tag before pointing it at a newer protocol.
+`--fix` repairs only safe, local problems. It creates a missing data or secret directory, chmods permissive secret files and directories, regenerates a service unit whose template drifted, and restarts a stopped service. It regenerates a unit only when the installed unit already runs this install: this checkout with the same Bun, or this release binary, and the same config. A unit that runs another checkout (for example the live install, when doctor runs from a worktree or a temporary clone), another Bun, a release binary when doctor runs from a checkout (or the reverse), or another config gets a warning and is left alone. To move the service, run `agent-tag service upgrade CONFIG` from the checkout or binary it should run. A stopped service is restarted with `service restart`, which on macOS bootstraps an installed plist whose job is no longer loaded before starting it. It never writes tokens or changes the config; like a plain doctor run, it still calls Slack and T3 to check them. Service repair runs only when no other check failed, because `service upgrade` reruns doctor. `--json` prints the structured report. Output never contains tokens or message text.
 
 A failed provider turn settles with one sanitized Slack notice and a stable code in audit and status output: `T3ProviderAuthPolicy` when the provider's organization rejects the login method (for Claude, HTTP 403 `oauth_not_allowed_for_organization` on a subscription login), `T3ProviderAuth` when the provider is signed out or its credential is invalid, `T3ProviderLimit` for usage limits, and `T3TurnError` otherwise. T3 sometimes reports only `Claude gave up after repeated API errors.`; that text does not carry the cause, so it stays `T3TurnError` and the operator must inspect the T3 server log.
 
@@ -137,85 +137,9 @@ A terminal stall says only that Agent Tag could not confirm completion; the oper
 
 `limits.interactionExpirySeconds` (default `86400`, 24 h; minimum `60`, maximum 30 days) bounds how long an approval or question waits for a human. While it waits, the operation is deferred until the earliest unanswered request expires, and a Slack response wakes it immediately. If every request T3 still shows as pending already has a response in Agent Tag (queued or delivered), the turn keeps polling instead of deferring, so a response that lands while T3 catches up is never lost. Each request stops accepting responses at its own deadline (posting time plus the expiry), even before the coordinator's next poll closes it, so a late click is never delivered to T3. When the wait expires, Agent Tag closes the requests (late button clicks are ignored), posts a notice, fails the operation with `InteractionExpired`, and queues a durable `thread.turn.interrupt`. The next queued message in the thread starts once that interrupt has been delivered to T3, or has failed terminally.
 
-`t3.watch` (optional; defaults shown in the table) controls how the service talks to T3 while turns run. The service keeps one shared T3 connection. The T3 session is inspected once and cached, and re-inspected before it expires, when the token file changes on disk (checked at most every 5 s), or after T3 answers 401 or 403. One long-lived WebSocket is shared by all workers, and a WebSocket ticket is minted only when that socket (re)opens.
+## T3
 
-With `t3.watch.enabled`, coordinators subscribe to each running T3 thread's event stream (`orchestration.subscribeThread`, one subscription per thread shared by all waiters) and re-read the thread snapshot when a settlement-relevant event arrives, instead of polling every 500 ms. Streamed text and tool-progress events do not trigger a re-read, but they still count as progress for the stalled-turn timer.
-
-| Key | Default | Meaning |
-|---|---|---|
-| `enabled` | `true` | When `false`, the service falls back to the 500 ms snapshot poll. |
-| `safetyPollMs` | `15000` (1000–60000) | Longest wait between snapshot reads while a turn runs, even if no event arrives. Also capped at half the lease and at the stall deadline. If the stream dies, turns still settle at this cadence. |
-| `lingerMs` | `30000` (0–600000) | How long a thread's subscription stays open after its turn ends, so a follow-up turn reuses it. |
-
-Every 60 s the service logs `t3.connection.stats` with the counters `sessionInspects`, `wsTickets`, `wsConnects`, `snapshotFetches`, `rpcCalls`, and `watchedThreads`. Other connection events are `t3.connection.opened`, `t3.connection.reconnect`, `t3.connection.lost`, `t3.connection.rotated` (the token file changed, so the socket is replaced after the new token passes inspection), and `t3.connection.closed`; watch events are `t3.watch.subscribed`, `t3.watch.ended`, `t3.watch.failed`, `t3.watch.resync`, and `t3.watch.released`. Logs never contain the token or the WebSocket ticket URL.
-
-## Managed T3
-
-With `t3.mode: "managed"`, Agent Tag owns its T3 server. Every key except `mode` and `tokenFile` is optional:
-
-| Key | Default | Meaning |
-|---|---|---|
-| `t3.port` | `37841` | Loopback port for `t3 serve`; `baseUrl` becomes `http://127.0.0.1:<port>`. |
-| `t3.homeDir` | `<dataDir>/t3/home` | T3's `--base-dir` (its SQLite, logs, environment id). Must not be the desktop T3's `~/.t3` or `$T3CODE_HOME`. |
-| `t3.runtimeDir` | `<dataDir>/t3/runtime` | Verified binaries, `state.json` (downgrade guard) and `credential-state.json`. |
-| `t3.autoInstall` | `true` | Download the pinned T3 at startup when it is missing or does not verify. |
-| `t3.downloadBaseUrl` | GitHub releases | https mirror laid out as `<base>/<tag>/<asset>`. |
-| `t3.rotation` | see [T3 token rotation](#t3-token-rotation) | Token rotation thresholds. |
-
-**Install.** The only trust root is the sha256 in `t3.lock.json`. The archive is streamed to a private staging directory (256 MiB cap) and hashed. Every tar entry must be a regular file or directory under the one expected top directory, which is checked before anything is extracted. `t3 --version` must print the pinned version. The tree is then renamed into `versions/<version>/` with a record of every file's hash. Each start re-hashes the install; a changed file logs `t3.install.tampered` and is reinstalled. The pinned version and the newest one other version are kept; older ones are pruned. Each version is about 205 MB.
-
-**Downgrade guard.** T3 migrates its database forward only. Once a version has started against `homeDir`, a build pinned to an older T3 refuses to start (`T3DowngradeError`) rather than open that database. Keep the newer Agent Tag, or point `homeDir` at a fresh directory.
-
-**Supervision.** The service starts `t3 serve --host 127.0.0.1 --port <port> --base-dir <homeDir>` before anything else. It waits up to 60 s for `/.well-known/t3/environment` to report the pinned version and protocol `1`, and for `server-runtime.json` to name the pid it spawned. T3 inherits your environment (`HOME`, `PATH`, provider logins) minus every `AGENT_TAG_*` and `T3CODE_*` variable. Its stdout, which carries a pairing credential, is discarded. Its stderr is redacted, rate-limited, and logged as `t3.runtime.stderr`. If something else already listens on the port, startup fails with `T3PortInUseError`; Agent Tag never sends a token to a server it did not start. When T3 exits unexpectedly it is restarted with backoff (1 s doubling to 60 s), logged as `t3.runtime.restarted`. Five restarts within 10 minutes log `t3.runtime.crashloop` and stop the service with exit code 75, so launchd or systemd restarts it. If Agent Tag itself is killed, the next start finds the orphaned `t3 serve` through `server-runtime.json` and `ps`, stops it (`t3.runtime.orphan_reaped`), and starts a fresh one. Stopping the service stops its workers first, then T3 (SIGTERM, SIGKILL after 15 s).
-
-**Gate.** Every 60 s (every 10 s while closed, and after each restart) the service re-reads the environment descriptor. Another protocol, another version, a changed environment id, or no answer closes the gate (`t3.gate.closed`). While it is closed, coordinators, interaction workers and schedules pause; Slack ingestion, the outbox and maintenance keep running, so mentions queue and drain once the gate reopens (`t3.gate.opened`).
-
-**Commands.**
-
-```sh
-agent-tag t3 install CONFIG   # download and verify only; prints {version, binary, sha256, downloaded}
-agent-tag t3 status CONFIG    # install, runtime and token as JSON; never starts T3 or prints a token
-agent-tag t3 serve CONFIG     # the managed T3 in the foreground without Slack, for debugging
-agent-tag t3 pair CONFIG      # a 5-minute link that pairs a browser with the managed T3's web UI
-```
-
-`t3 status` prints `mode`, `version`, `binarySha256Verified`, `filesVerified`, `pid`, `protocol`, `runtime` and `token.{expiresAt, daysRemaining, label, rotatedAt, pendingRevocations}`. Agent threads live in the managed T3, not your desktop T3. Open them with `t3 pair`, which prints the link only to a terminal (pass `--allow-non-tty` to override). Treat that link like a password until it expires.
-
-Configure providers once in the managed T3 (through `t3 pair`) if T3's defaults are not enough. Provider logins under `HOME` (`~/.codex`, Claude) are shared with your own use.
-
-Managed mode was verified live on macOS arm64 ([evidence](evidence/2026-10-21-t3-managed.md)). The Linux x64 and arm64 artifacts are pinned and their digests are checked by `bun run verify:t3-pin`, but they have not had a live run yet.
-
-## T3 token rotation
-
-The restricted T3 token (scopes `orchestration:read orchestration:operate`) lasts 30 days. Each token Agent Tag mints is labeled `agent-tag-orchestration-YYYYMMDDTHHMMSSZ-xxxxxx` (UTC time plus 6 random hex characters, so two rotations in the same second get distinct labels).
-
-With `t3.mode: "managed"` the service owns the token:
-
-- At startup, after the managed runtime is ready, it mints a token when the token file is missing or T3 rejects it.
-- Every 6 h it checks expiry and rotates when fewer than `t3.managed.rotation.rotateBeforeDays` days are left. When the T3 connection reports a 401/403 (or a revoked token), it checks at once and rotates, at most once per 5 minutes.
-- A rotation issues a 10-minute admin session with `t3 auth session issue`, mints the new token, verifies its scopes and that it cannot reach admin endpoints, writes it atomically over the token file (`0600`), and revokes the admin session in `finally`. Admin tokens are held in memory only.
-- The replaced token is recorded in `<runtimeDir>/credential-state.json` and revoked after `revokeGraceMinutes`, so turns already running keep working. Only that token is revoked, matched by its exact label; other clients, including other `agent-tag-orchestration-*` tokens and the current one, are never touched. A token without an Agent Tag label (for example one from `bun run enroll:t3`) is never revoked: the service logs `t3.token.revoke_skipped` and it expires on its own.
-- A revoke that T3 does not confirm is retried with backoff (1, 2, 4, 8, 16 minutes after each failed attempt, recorded as `nextAttemptAt`). After 6 attempts the service gives up, logs it, and leaves the token to expire.
-- Nothing is sent to a T3 that failed the version or protocol gate, and an unreachable T3 never causes a rotation.
-
-| Key | Default | Meaning |
-|---|---|---|
-| `t3.managed.rotation.rotateBeforeDays` | `7` (1–25) | Rotate when fewer than this many days are left. |
-| `t3.managed.rotation.revokeGraceMinutes` | `15` (1–1440) | How long a replaced token keeps working before it is revoked. |
-
-With `t3.mode: "external"` the service cannot mint tokens. It logs `t3.token.expiring` as a warning from 7 days before expiry, and as an error from 1 day before, when the token is missing, or when T3 rejects it. The log line includes the rotate command.
-
-Rotate by hand with:
-
-```sh
-agent-tag t3 rotate CONFIG                                   # managed: the runtime must be running
-agent-tag t3 rotate CONFIG --admin-token-file FILE           # external: an admin token for that T3
-agent-tag t3 rotate CONFIG --t3-base-dir DIR [--t3-bin BIN]  # external: issue an admin session from the T3 base dir
-```
-
-It prints `{mode, tokenFile, label, expiresAt, daysRemaining, previousToken}`. In managed mode the running service revokes the old token after the grace period. In external mode the old token is not revoked; it expires on its own. A running service picks up the new token file within 5 s. `agent-tag t3 status CONFIG` reports `token.expiresAt`, `token.daysRemaining`, `token.label`, `token.rotatedAt` and `token.pendingRevocations`.
-
-Log events: `t3.token.rotated`, `t3.token.rotate_failed`, `t3.token.expiring`, `t3.token.revoked`, `t3.token.revoke_skipped` (the token has no Agent Tag label, the client list was unreadable, T3 failed, or retries ran out; the token expires on its own), and `t3.token.admin_revoke_failed` (the admin session expires within 10 minutes). None contains a token.
+How Agent Tag runs and talks to T3 Code is in [T3 runtime](t3-runtime.md): the pinned version and protocol, managed T3 and its commands, token rotation, the `t3.watch` connection, and which providers and models a profile may use.
 
 ## Background service
 
@@ -303,9 +227,18 @@ bun run status -- /absolute/path/to/agent-tag.json
 
 This status covers only events already stored by Agent Tag. [Slack's Events API](https://docs.slack.dev/apis/events-api/) is best effort, and [Socket Mode requires an acknowledgement](https://docs.slack.dev/apis/events-api/using-socket-mode/). A sleeping or disconnected host may miss events that never enter the local store; `status` cannot detect those gaps. After an outage, compare the affected Slack threads with the Agent Tag audit log before claiming recovery.
 
+## Upgrading
+
+1. Back up the store (see [Audit and backup](#audit-and-backup)): `agent-tag backup CONFIG /private/backup/agent-tag-before-upgrade.sqlite`.
+2. Replace the code: `agent-tag update` for a binary install ([install](install.md#version-and-update)), or check out the new commit and run `bun install --frozen-lockfile` in a source checkout.
+3. Restart onto it: `agent-tag service upgrade CONFIG`. It reruns `doctor`, rewrites a stale unit and restarts the service. The new release applies its store migrations when it opens the database.
+4. Run `agent-tag doctor CONFIG` and `agent-tag status CONFIG`.
+
+An older release does not refuse a store that a newer one has migrated, and migrations are not reversible. To roll back, restore the step 1 backup into a new data directory, point the config at it and start the older release; work done after the upgrade is lost.
+
 ## Audit and backup
 
-Export the complete structured audit log as newline-delimited JSON:
+Export the complete structured audit log as newline-delimited JSON. [Audit actions](audit-actions.md) lists every action, when it is written, and its metadata keys.
 
 ```sh
 bun run audit -- /absolute/path/to/agent-tag.json > audit.ndjson
@@ -484,24 +417,9 @@ Profile `memory` settings, all optional except the first three:
 | `maxEntriesPerConversation` | `100` | Active notes per channel or DM |
 | `maxWorkspaceEntries` | `200` | Active workspace notes |
 
+People save, list, edit and forget notes from Slack with the phrases in [Using Agent Tag in Slack](slack-usage.md#managing-memory-from-slack); operators use the CLI below.
+
 Claude Tag keeps notes without expiry during its beta; set `retentionDays: 3650` for parity. Editing a note refreshes its retention. A note that looks like a credential is refused, duplicates return the existing note, and audit records hold note IDs and scopes but never note content. Note content is stored in plain text in `agent-tag.sqlite` and its backups.
-
-### Managing memory from Slack
-
-Mention the bot, write in your DM with it, or reply in a thread it is part of:
-
-| Say | What happens |
-|---|---|
-| `remember: …` or `remember for this channel: …` | Saves a channel note (a DM note in a DM) and replies with its 8-character ref |
-| `remember for the workspace: …` | Saves a workspace note; only from a public channel |
-| `what do you remember?` or `!memory` | Lists this conversation's notes, workspace notes and operator notes, with author and date |
-| `forget a1b2c3d4` | Forgets the note with that ref |
-| `forget: deploy` | Forgets the one note here whose text contains "deploy", or lists the candidates |
-| `update memory a1b2c3d4: …` | Replaces the note's text and bumps its version |
-
-A colon or a `!` is always required, so sentences like "remember that outage last week?" or "forget it" stay ordinary requests. Unmentioned top-level channel messages are never memory commands. `!remember …`, `!remember --workspace …`, `!forget <ref>` and `!memory edit <ref> …` work too.
-
-These phrases never start a T3 turn and reply in the thread. Each Slack message runs at most once: the note, its reply and its `slack_command_events` row (kinds `memory-remember|list|forget|edit`) commit together, so a redelivery or the duplicate `message` event for one mention is answered once. A ref for a note from another channel, or another person's DM, answers "I don't have a note … here". Workspace notes are read-only outside public channels, and operator notes are read-only from Slack. Set `memory.slackCommands: false` on a profile to send every phrase to the agent instead.
 
 ### Managing memory from the CLI
 
@@ -524,16 +442,7 @@ These commands audit `memory.created`, `memory.updated`, `memory.forgotten` and 
 
 ## Commands
 
-A message that starts with `@Agent Tag !<command>` runs a command instead of a request. In a DM route the owner can drop the mention and send `!status` directly. The command word must come right after the mention; `@Agent Tag please !help` is an ordinary request.
-
-| Command | Where | What it does |
-| --- | --- | --- |
-| `!help` | anywhere | Lists the commands enabled here. Only the sender sees it. |
-| `!status` | anywhere | In a thread: whether the agent is working, waiting on an approval or question, or has requests queued, plus the thread's model and mute state. At the top level: a count across the channel's threads. Only the sender sees it. |
-| `!mute` | a thread the agent is part of | Stops the agent answering unmentioned replies in that thread. Posts a public notice. |
-| `!unmute` | a thread the agent is part of | Reverses `!mute`. Any message that mentions the agent in a muted thread also unmutes it. |
-| `!stop` | a thread the agent is working in | Stops the running turn, the same way as the status message's Stop button: the status message turns into "Stopped by @you". Requests in that thread sent before `!stop` and not started yet are dropped, with one public note saying how many. Requests sent after it still run. |
-| `!restart` | a thread the agent is part of | Starts a fresh T3 session for the thread: a new T3 thread on a new worktree branch (`agent-tag/<task>-g2`, `-g3`, ...) from the profile's base branch. With nothing running it happens at once. Requests queued before `!restart` are dropped, and its notice says how many. Otherwise the running turn is stopped first, new messages wait, and the agent confirms in the thread once the fresh session is ready (after at most `commands.restartTimeoutSeconds`, default 120; past that the old turn may still post a late reply; if its worker restarts, the agent says it stopped that request instead of resuming it on the fresh session, and the old T3 thread's session is stopped once the turn ends). The first request on the fresh session rereads the earlier thread messages (without `!commands` and the agent's own replies) when `threadContext` is enabled. |
+People run `!help`, `!status`, `!stop`, `!restart`, `!mute` and `!unmute` in Slack; what each one does is in [Using Agent Tag in Slack](slack-usage.md#commands).
 
 Commands never create a T3 turn and never store the message text. Each run is recorded once per Slack message in `slack_command_events` and audited as `slack.command.executed` or `slack.command.denied`; mute changes are audited as `thread.muted` and `thread.unmuted`, `!stop` as `task.stop.requested`, and `!restart` as `task.restart.requested` and `task.session.rotated`. Other `!words` (for example `!model`) are still treated as ordinary requests until their commands ship.
 
@@ -554,61 +463,6 @@ Configure commands under `commands`:
 - `restartTimeoutSeconds` (10–3600, default 120) is how long a `!restart` waits for the stopped turn to end before it switches sessions anyway.
 
 Only-you replies use `chat.postEphemeral` (covered by the existing `chat:write` scope). They are sent at most once, with one retry after a rate limit.
-
-## Models and providers
-
-Each profile runs on `defaultProviderInstanceId` / `defaultModel` unless people pick something else. `allowedModels` lists what else a thread may use (up to 20 entries); with no entries, threads stay on the default:
-
-```json
-"allowedModels": [
-  { "instanceId": "codex", "model": "gpt-5.6-mini", "label": "GPT Mini", "aliases": ["mini"] },
-  { "instanceId": "claudeAgent", "model": "claude-opus-5-5", "label": "Opus 5.5", "aliases": ["opus"] }
-]
-```
-
-`instanceId` is the T3 provider instance (as `doctor` lists it), `label` is the name Slack replies use, and `aliases` are short lowercase names people can type. A route can set its own `defaultModel` (`{ "instanceId", "model" }`) for one channel; it must be the profile default or one of its `allowedModels`. `modelSwitch.enabled: false` on a profile turns switching off; `modelSwitch.crossProvider: "deny"` keeps every thread on its default's provider. `agent-tag doctor` reports each allowed entry as `available` or the reason T3 can't serve it, and never fails startup over one; the service logs a `provider.allowed-model` line for each unavailable entry.
-
-T3 0.0.45 takes its model list from a model manifest. It fetches the manifest from GitHub while running, but only applies it on its next start. A model released after T3 started, such as `claude-haiku-5-5` on 2026-10-21, shows as `model-missing` until T3 restarts. A missing profile or route default blocks startup, and Agent Tag keeps retrying. Restart T3 (managed: `agent-tag service restart`, which also restarts the managed T3), then rerun `agent-tag doctor`. Doctor's hint points there whenever it reports `model-missing`.
-
-### Switching models from Slack
-
-Mention the bot, write in your DM with it, or reply in a thread it is part of:
-
-| Say | What happens |
-|---|---|
-| `use opus` | Switches this thread to Opus and replies in the thread; no turn runs |
-| `use opus: fix the flaky test` | Switches, then runs the request on the new model |
-| `switch to gpt-5.6-mini`, `change the model to sonnet` | Same as `use …` |
-| `use Opus 5.5 for the rest of this thread` | Same; the tail is optional |
-| `model: sonnet` | Same |
-
-A model is named by its alias, label, slug, or `instance/model`. The directive ends at a `:`, `,`, `;`, `.`, `—` or a new line; anything after it is the request. A message only counts as a switch when the words right after the verb name a model, so "use the README to fix the install docs" or "switch to dark mode" stay ordinary requests. Unmentioned top-level channel messages, including ambient ones, are never parsed. `!commands` come first, then a switch, then memory phrases, then the request.
-
-The choice belongs to the thread and lasts for the rest of it, across closing, reopening and `!restart`. `!status` shows the model the next turn will use. Each Slack message switches at most once: the choice, its `task.model.selected` audit row, the reply, its `slack_command_events` row (kind `model-switch`) and any request after it commit together, so a redelivery or the duplicate `message` event for one mention is answered once.
-
-Refusals reply in the thread, say which model the thread stays on, and are audited as `task.model.denied` with a code. A request that came with a refused switch is not run:
-
-- a name outside the allowlist (`not-allowed`, the reply lists what is allowed) or one that matches several entries (`ambiguous`);
-- a provider T3 doesn't report as ready (`unavailable`);
-- switching turned off (`switch-disabled`) or `crossProvider: "deny"` (`cross-provider-denied`).
-
-A name that is neither an allowed model nor a model T3 reports (say `use sonnet` when no allowed entry is called that) is not a switch, so the whole message runs as a request on the thread's current model.
-
-### The cross-provider rule
-
-T3 0.0.45 keeps a started conversation on its provider's session, so Agent Tag only moves a started thread where T3 can follow it:
-
-- **Before the first turn** (a new thread, or a closed one whose next request starts a fresh session) any allowed model works, and the first turn starts on it.
-- **On a started thread** the switch must stay on the same driver and the same resume state (for example `codex` to `codex`, not `codex` to `codex-work` with another home). It is applied in place with `thread.meta.update` before the next turn.
-- **Anything else** is refused (`cross-provider-started`, or `requires-new-thread` for a driver that needs a new thread for any model change, or `incompatible-continuation`). The reply offers a new thread (`@Agent Tag use opus: <request>`) or, when `!restart` is enabled for the person, `!restart` in the thread followed by the switch. A fresh session does not remember the conversation.
-
-A turn already sent to T3 counts as started, even before its reply arrives. If T3 still rejects a switch at turn time, the thread keeps the model it had and says so (`task.model.reverted`). When a config change removes a thread's model from the allowlist, the next turn falls back to the default only when T3 can make that move, and otherwise stays on what the thread already runs; both are audited as `task.model.reverted`.
-
-Tested live on T3 0.0.45: the `codex` and `claudeAgent` drivers ([evidence](evidence/2026-10-21-model-switch.md)). Other drivers (for example `grok` or `opencode`) follow the capabilities T3 reports for them but have not been run live.
-
-### Licensing
-
-Every provider in `allowedModels` is used on behalf of everyone who can reach the bot. Only list providers the organisation has approved for that shared use; see [Provider access and licensing](provider-licensing.md).
 
 ## Access changes and live verification
 
@@ -666,17 +520,9 @@ After upgrading, every task idle for longer than `closeIdleAfterHours` becomes d
 
 `agent-tag doctor` reports a `lifecycle` check: active (and released) and closed tasks, retired threads pending cleanup, kept dirty worktrees with the earliest expiry, and cleanup failures. Failures make it a warning; the cause is in the `task.cleanup.failed` audit rows. `agent-tag status --json` carries the same counts under `lifecycle`.
 
-## Routines from Slack
+## Routines
 
-Mention the bot (or write in your DM with it) to manage routines in that conversation:
-
-- **Create:** `@Agent Tag every weekday at 9am summarize open PRs`, `@Agent Tag remind me tomorrow at 3pm to deploy`, `@Agent Tag schedule tomorrow at 3pm: run the release checklist`. A one-off agent run needs the `schedule` lead; a recurring lead (`every`, `daily`, `weekdays`, …) or `remind` is enough otherwise. The routine binds to the thread it was requested in, and its results post there.
-- **List:** `@Agent Tag list routines` shows the conversation's active routines (up to 20, each with a Cancel button) and any turned off for repeated failures in the last 7 days.
-- **Cancel:** `@Agent Tag cancel routine a1b2c3` (the ID from the confirmation or list), `cancel routine 2` (list number), `cancel this routine` (in the routine's thread), `cancel the reminder about deploys` (prompt text), or the Cancel button on any confirmation or list.
-
-Times use the requester's Slack profile time zone (`users.info` `tz`, needs `users:read`). Name a zone to override it (`… at 9am in Europe/London`, `9am PT`). Without `users:read`, or when the profile has no zone, `routines.defaultTimeZone` (default `UTC`) applies and the confirmation says so. Unmentioned channel messages and ambient triggers are never treated as routine requests. A free-text cancel that matches no routine ("remove the schedule field from the API") stays a normal prompt.
-
-Anyone allowed in a shared channel can list and cancel that channel's routines. DM routines belong to the DM owner. Every request is recorded in `slack_command_events` (kinds `routine-create|list|cancel`) with a `slack.command.executed` or `slack.command.denied` audit row, and a Socket Mode redelivery or the duplicate `message` event for one mention is answered once.
+People create, list and cancel routines from Slack with the phrases in [Using Agent Tag in Slack](slack-usage.md#routines-from-slack). Every request is recorded in `slack_command_events` (kinds `routine-create|list|cancel`) with a `slack.command.executed` or `slack.command.denied` audit row. The operator settings:
 
 ```jsonc
 "routines": {
@@ -718,6 +564,14 @@ Then use the task, actor, and profile IDs from the private audit export:
 bun run schedule:add -- CONFIG TASK_ID USER_ID PROFILE_ID SPEC.json
 bun run schedule:list -- CONFIG TASK_ID USER_ID PROFILE_ID
 bun run schedule:cancel -- CONFIG TASK_ID USER_ID PROFILE_ID SCHEDULE_ID
+```
+
+From the standalone binary the same commands are:
+
+```sh
+agent-tag schedule-add CONFIG TASK_ID USER_ID PROFILE_ID SPEC.json
+agent-tag schedule-list CONFIG TASK_ID USER_ID PROFILE_ID
+agent-tag schedule-cancel CONFIG TASK_ID USER_ID PROFILE_ID SCHEDULE_ID
 ```
 
 `kind: "agent"` adds a normal durable T3 operation when due. `kind: "reminder"` sends `Reminder: ...` through the durable Slack outbox without running a provider. Cadence is optional for a one-shot schedule and must be at least 60 seconds when present. Workspace active schedules are capped by `limits.maxActiveSchedules`.
