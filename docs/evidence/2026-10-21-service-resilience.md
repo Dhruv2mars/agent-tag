@@ -68,7 +68,7 @@ The log cap truncates in place, which is only safe if launchd's `StandardErrorPa
 
 - `test/service-resilience.test.ts`: backoff and cap, 5xx retry, no wait on a 404, real refused port + abort, state file lifecycle and stale pid, log cap with an `O_APPEND` writer, LaunchAgent-only log paths, and `createAgentTagService` waiting on a real dead port (fails on `main`: it throws `T3EnvironmentRequestError` instead).
 - `test/doctor.test.ts`: `service-state` fail/skip/pass, mode-aware hint, managed T3 down without a service is a warning.
-- `bun run check`: 1531 pass, 2 skip, 0 fail.
+- `bun run check`: 1550 pass, 2 skip, 1 fail. The failure is `test/cli.test.ts` "t3 status prints the install fields as JSON without installing anything", which fails the same way on origin/main (8adf797) on this host, because the local T3 install has extra fields (label, pendingRevocations, rotatedAt). Main CI passes it.
 
 ## Managed T3 under launchd: two more exit loops
 
