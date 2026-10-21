@@ -19,11 +19,14 @@ import {
 } from "./auth.ts";
 import {
   dispatchResultSchema,
+  parseT3ShellWorktrees,
   protocolLayer,
+  requestT3ShellWorktrees,
   requestT3ThreadSnapshot,
   rpcGroup,
   t3CommandSchema,
   t3ServerConfigSchema,
+  t3VcsStatusSchema,
   threadStreamItemSchema,
   type T3Command,
   type T3ConnectionConfig,
@@ -31,6 +34,8 @@ import {
   type T3ServerInfo,
   type T3ThreadSnapshot,
   type T3ThreadStreamItem,
+  type T3VcsStatus,
+  type T3WorktreeBinding,
 } from "./gateway.ts";
 
 type Client = RpcClient.FromGroup<typeof rpcGroup, RpcClientError>;
@@ -274,6 +279,25 @@ export class T3Connection {
     const parsed = t3CommandSchema.parse(command);
     const raw = await this.#rpc(signal, (client) => client["orchestration.dispatchCommand"](parsed));
     return dispatchResultSchema.parse(raw);
+  }
+
+  /** `vcs.refreshStatus` for a worktree: dirty tree, commits ahead of the default ref, change request. */
+  async vcsStatus(cwd: string, signal?: AbortSignal): Promise<T3VcsStatus> {
+    const raw = await this.#rpc(signal, (client) => client["vcs.refreshStatus"]({ cwd }));
+    return t3VcsStatusSchema.parse(raw);
+  }
+
+  /** `vcs.removeWorktree`: T3 runs `git worktree remove` (`--force` only when asked) in `cwd`'s repository. */
+  async removeWorktree(input: { readonly cwd: string; readonly path: string; readonly force: boolean }, signal?: AbortSignal): Promise<void> {
+    await this.#rpc(signal, (client) => client["vcs.removeWorktree"]({ cwd: input.cwd, path: input.path, force: input.force }));
+  }
+
+  /** Every T3 thread's worktree binding, live (shell snapshot) and archived. */
+  async worktreeBindings(signal?: AbortSignal): Promise<readonly T3WorktreeBinding[]> {
+    const live = await this.#withSession(signal, (token) =>
+      requestT3ShellWorktrees({ baseUrl: this.#config.baseUrl, token, ...signalOption(signal) }));
+    const archived = await this.#rpc(signal, (client) => client["orchestration.getArchivedShellSnapshot"]({}));
+    return [...live, ...parseT3ShellWorktrees(archived)];
   }
 
   async inspect(signal?: AbortSignal): Promise<T3ServerInfo> {
