@@ -175,7 +175,7 @@ export function listPrSyncJobs(database: Database, taskId: string): readonly PrS
 }
 
 /** Queues one Slack message keyed by `clientMessageId` unless it already exists. Call inside a transaction. */
-function enqueueOnce(
+export function enqueueOnce(
   database: Database,
   input: {
     readonly taskId: string;

@@ -80,6 +80,8 @@ function snapshot(input: {
           : []),
       ],
       activities: [],
+      // The turn's diff is already recorded, so completion does not wait for it (see reply-footer.test.ts).
+      checkpoints: completed ? [{ turnId: "turn-1", status: "ready", files: [] }] : [],
       session: {
         threadId: input.threadId,
         status: completed ? "ready" : "running",

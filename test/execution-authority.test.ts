@@ -220,6 +220,16 @@ test("channel-members: a due schedule without a membership snapshot is deferred,
     state = "member";
     clock += 2_000;
     expect((await worker.processNext()).kind).toBe("dispatched");
+    // Membership that never comes back (a missing scope) skips each run after its misfire grace: bounded
+    // re-claims, no revocation, and the next run is still scheduled.
+    state = "unknown";
+    clock = new Date(now).getTime() + 60_000;
+    expect((await worker.processNext()).kind).toBe("authority-deferred");
+    clock += 61_000;
+    expect((await worker.processNext()).kind).toBe("missed-skipped");
+    const [schedule] = store.listSchedules(receipt.taskId);
+    expect(schedule?.state).not.toBe("cancelled");
+    expect(store.listAuditRecords({ limit: 100 }).some((row) => row.action === "schedule.authority-revoked")).toBe(false);
   } finally {
     store.close();
     await rm(directory, { recursive: true });

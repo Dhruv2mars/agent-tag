@@ -38,6 +38,8 @@ const config = agentTagConfigSchema.parse({
   ],
   routes: [{ conversationId: "C1", profileId: "engineering" }],
   limits: { maxConcurrentTasks: 1 },
+  // Envelope text only; the outbound upload line has its own tests (slack-uploads.test.ts).
+  files: { outbound: { enabled: false } },
 });
 
 const PEOPLE: Record<string, string> = { U0A1: "Alice Chen", U0B2: "Bob Lee" };
@@ -596,7 +598,7 @@ describe("coordinator thread window", () => {
         commandKey: "C1:1000.000003",
         commandOrderKey: "1000.000003",
         profileId: "engineering",
-        replies: { ready: { text: "ready" }, restarting: { text: "restarting" } },
+        replies: { ready: () => ({ text: "ready" }), restarting: () => ({ text: "restarting" }) },
         now: start,
       })).toMatchObject({ kind: "rotated", generation: 2 });
       // A reply in a bound thread carries no ingest seed: the restart makes the coordinator read the thread.
