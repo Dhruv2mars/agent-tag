@@ -29,7 +29,7 @@ The pinned T3 0.0.45 lists `claude-haiku-5-5` only after its remote model manife
 | # | What | Status | Who |
 | --- | --- | --- | --- |
 | P1 | Slack app reinstalled with the 11-scope manifest (`config/slack-manifest.example.json`): `app_mentions:read`, `channels:history`, `channels:read`, `chat:write`, `files:read`, `files:write`, `groups:history`, `groups:read`, `im:history`, `reactions:write`, `users:read`. Afterwards `agent-tag doctor CONFIG` reports no missing scope. | Done (2026-10-21) | — |
-| P2 | GitHub sandbox repository plus a fine-grained personal access token limited to it (Contents: read/write, Pull requests: read/write, Metadata: read). The agent asks for the token with `request_secret` and writes it to a `0600` file. Needed for step 8. | **Open** | Creating the repository: agent (`gh repo create`). Creating the token: agent-CU in Helium with Dhruv confirming, or Dhruv. |
+| P2 | GitHub sandbox repository plus a fine-grained personal access token limited to it (Contents: read/write, Pull requests: read/write, Metadata: read). The agent asks for the token with `request_secret` and writes it to a `0600` file. Needed for step 8. | **Open** | Creating the repository: agent (`gh repo create`). Creating the token: agent-CU in Helium's default profile (GitHub, not Slack) with Dhruv confirming, or Dhruv. |
 | P3 | A second human Slack account in `T0BS9MA4BUP`: "Agent Tag Tester", `U0CBQ5BNKEU`, a member of `C0C2RHJ1BUP`. Needed for steps 3, 4, 10 and 11. | Done | — |
 | P4 | Optional: a clean Ubuntu 24.04 VM for the linux-x64 half of T3-05. Without it, `T3-05L` stays `UNCONFIRMED` (decision O-2). | Optional | Dhruv |
 
@@ -181,9 +181,9 @@ Run them in this order. Step 1 starts first because its routines need time to fi
 - **Matrix rows:** ACL-02, ACL-01
 - **Who:** agent (config), agent-CU: Helium (tester) for the mentions and the Allow click, app (Dhruv) for removing and re-inviting the tester
 - **Preconditions:** `access.mode: "channel-members"`, and the tester is **not** in `access.allowedUserIds`; restart.
-- **Send:** the four steps in `docs/evidence/2026-10-21-q1-access.md` §2: the tester mentions the bot; the tester presses Allow on an approval card; the owner removes the tester from the channel and waits `ttlSeconds` (300 s); the tester mentions again.
+- **Send:** the four steps in `docs/evidence/2026-10-21-q1-access.md` §2: the tester mentions the bot; the tester presses Allow on an approval card; the owner removes the tester from the channel and waits `ttlSeconds` (300 s); the tester mentions again. Afterwards the owner re-invites the tester.
 - **Expect:** a turn runs; the approval is honoured; after removal the mention is ignored and audit shows `access.denied` with `user-denied`.
-- **Agent captures:** fill in that file. Re-invite the tester afterwards.
+- **Agent captures:** fill in that file.
 - **Fallback:** `FAIL` ACL-02, continue.
 
 ### 11. Direct messages
