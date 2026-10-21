@@ -59,7 +59,8 @@ export class AgentTagSchedules {
     /** Slack request source. A repeated `eventKey` returns the schedule it already created. */
     readonly source?: ScheduleSourceInput;
   }): ScheduleMutationResult {
-    const denial = this.#denial(input.context);
+    // A new schedule needs an active task; a closed task's existing schedules stay listable and cancellable.
+    const denial = this.#denial(input.context, false);
     if (denial !== null) return this.#deny(input.context, input.context.taskId, denial, input.now);
     const parsed = scheduleSpecSchema.safeParse(input.spec);
     if (!parsed.success) {
@@ -131,7 +132,7 @@ export class AgentTagSchedules {
       : { kind: "denied" };
   }
 
-  #denial(context: ScheduleContext): string | null {
+  #denial(context: ScheduleContext, includeClosed = true): string | null {
     if (context.workspaceId !== this.#config.slack.workspaceId) return "workspace-denied";
     if (!this.#config.access.allowedUserIds.includes(context.actorUserId)) return "user-denied";
     if (!this.#config.profiles.some((profile) => profile.id === context.profileId)) return "profile-denied";
@@ -141,7 +142,7 @@ export class AgentTagSchedules {
         workspaceId: context.workspaceId,
         profileId: context.profileId,
         actorUserId: context.actorUserId,
-        includeClosed: true,
+        includeClosed,
       })
     ) {
       return "task-denied";
@@ -257,6 +258,9 @@ export class ScheduleWorker {
       });
     } else {
       const task = this.#store.getTaskExecution(schedule.taskId);
+      // This run reopens a closed task into a fresh T3 thread, so it rereads the Slack thread like a reply would.
+      const rereadThread = task.state === "closed" &&
+        this.#config.profiles.find((profile) => profile.id === schedule.profileId)?.threadContext.enabled === true;
       const receipt = this.#store.ingestSlackEvent({
         deliveryId: `schedule:${schedule.scheduleId}:${schedule.dueAt}`,
         eventKey: `schedule:${schedule.scheduleId}:${schedule.dueAt}`,
@@ -271,6 +275,7 @@ export class ScheduleWorker {
         receivedAt: current.toISOString(),
         sourceOrderKey: slackOrderKey(new Date(schedule.dueAt)),
         origin: "schedule",
+        ...(rereadThread ? { threadContext: { rootTs: schedule.threadTs, beforeTs: slackOrderKey(current) } } : {}),
       });
       operationId = receipt.operationId;
     }

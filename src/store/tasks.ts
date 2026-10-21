@@ -779,6 +779,8 @@ function reopenTask(database: Database, input: { readonly taskId: string; readon
     )
     .run(generation, threadId, input.now, input.now, input.taskId, input.generation);
   if (result.changes !== 1) throw new Error("closed task not found");
+  // The PR belonged to the retired branch (its url is on the retired row); the new branch gets its own.
+  database.query("DELETE FROM task_pull_requests WHERE task_id = ?").run(input.taskId);
   writeAudit(database, {
     actorType: "service",
     actorId: "agent-tag",

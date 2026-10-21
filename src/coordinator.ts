@@ -507,7 +507,7 @@ export class AgentTagCoordinator {
         },
       memory: memory.block,
     });
-    const prNote = this.#pullRequests === undefined ? null : pullRequestTurnNote(profile, task.repositoryRoot, operation.taskId);
+    const prNote = this.#pullRequests === undefined ? null : pullRequestTurnNote(profile, task.repositoryRoot, taskBranchName(task.taskId, task.sessionGeneration));
     const proposedText = prNote === null ? turnText : `${turnText}\n\n${prNote}`;
     return this.#store.resolveOperationTurnText({
       ...lease,

@@ -286,7 +286,13 @@ describe("task lifecycle: reopen", () => {
       const receipt = store.ingestSlackEvent(slackEvent());
       settleTurn(store, receipt, startedAt);
       const before = store.getTaskExecution(receipt.taskId);
+      // Generation 1's PR was merged; its url moves to the retired row and the binding is dropped on reopen.
+      database.query(
+        `INSERT INTO task_pull_requests (task_id, github_repo, head_branch, base_branch, pr_number, pr_url, state, created_at, updated_at)
+         VALUES (?, 'acme/example', ?, 'main', 7, 'https://github.com/acme/example/pull/7', 'merged', ?, ?)`,
+      ).run(receipt.taskId, taskBranchName(receipt.taskId, 1), startedAt, startedAt);
       store.closeTask({ taskId: receipt.taskId, reason: "idle", actorId: "w", now: weekLater });
+      expect(retiredRows(database, receipt.taskId)[0]?.pr_url).toBe("https://github.com/acme/example/pull/7");
       expect(store.findTaskForThread({ workspaceId: "T1", conversationId: "C1", threadTs: "1000.0001" })).toMatchObject({
         taskId: receipt.taskId,
         state: "closed",
@@ -310,6 +316,7 @@ describe("task lifecycle: reopen", () => {
       const after = store.getTaskExecution(receipt.taskId);
       expect(after).toMatchObject({ state: "active", sessionGeneration: 2, threadStarted: false, projectId: before.projectId });
       expect(after.threadId).not.toBe(before.threadId);
+      expect(store.getTaskPullRequest(receipt.taskId)).toBeNull();
       expect(taskRow(database, receipt.taskId)).toMatchObject({
         t3_thread_started_at: null,
         closed_at: null,
@@ -389,13 +396,23 @@ describe("task lifecycle: reopen", () => {
       if (created.kind !== "accepted") throw new Error(`schedule fixture denied: ${created.reason}`);
       store.closeTask({ taskId: receipt.taskId, reason: "idle", actorId: "w", now: weekLater });
       expect(store.listSchedules(receipt.taskId)).toHaveLength(1);
+      // Existing schedules survive the close, but a closed task takes no new ones.
+      expect(schedules.create({
+        context: { workspaceId: "T1", actorUserId: "U1", profileId: "engineering", taskId: receipt.taskId },
+        spec: { kind: "reminder", prompt: "later", runAt: "2026-10-10T00:00:00.000Z" },
+        now: weekLater,
+      })).toMatchObject({ kind: "denied", reason: "task-denied" });
 
       const due = "2026-10-09T00:00:00.000Z";
       const worker = new ScheduleWorker({ config, store, workerId: "schedule-a", now: () => new Date(due) });
       expect(await worker.processNext()).toMatchObject({ kind: "dispatched" });
       expect(store.getTaskExecution(receipt.taskId)).toMatchObject({ state: "active", sessionGeneration: 2 });
       const scheduled = store.claimNextOperation({ workerId: "w", now: due, leaseMs: 10_000, maxConcurrentTasks: 1 });
-      expect(scheduled).toMatchObject({ taskId: receipt.taskId, payload: { text: "run the weekly check" } });
+      // The fresh T3 thread rereads the Slack thread up to the run, as a reopening reply would.
+      expect(scheduled).toMatchObject({
+        taskId: receipt.taskId,
+        payload: { text: "run the weekly check", threadContext: { rootTs: "1000.0001", beforeTs: `${Date.parse(due) / 1_000}.000000` } },
+      });
     });
   });
 });

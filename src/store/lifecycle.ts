@@ -118,8 +118,9 @@ export function closeTask(database: Database, input: CloseTaskInput): CloseTaskR
         .query(
           `INSERT INTO task_retired_t3_threads (
             task_id, generation, t3_project_id, t3_thread_id, repository_root, branch, reason, retired_at,
-            thread_created, session_stop_command_id, delete_command_id, worktree_state, branch_state, completed_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            thread_created, session_stop_command_id, delete_command_id, worktree_state, branch_state, completed_at, pr_url
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+            (SELECT pr_url FROM task_pull_requests WHERE task_id = ?))`,
         )
         .run(
           taskId,
@@ -136,6 +137,7 @@ export function closeTask(database: Database, input: CloseTaskInput): CloseTaskR
           created ? "unknown" : "none",
           created ? "unknown" : "deleted",
           created ? null : now,
+          taskId,
         );
     }
     database
