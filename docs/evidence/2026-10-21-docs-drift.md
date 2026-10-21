@@ -11,8 +11,9 @@ Actor type: `automated-fixture`. The checks read the repository's own files and 
 | D2 | `docs/configuration.md` is byte-equal to `bun run docs:config --stdout`, generated from `agentTagConfigSchema`. Every leaf key appears exactly once as a table row, and there are at least 127 keys. | Deleting one row from `docs/configuration.md` failed both tests (checked by hand on this branch, then restored). |
 | D3 | Every command in `agent-tag help` (`HELP_TEXT`) is written as `` `agent-tag <word>` `` in a doc; every `agent-tag <word>` in a fenced block is a real command; every `bun run <name>` is a `package.json` script. | A stale and an undocumented command; an unknown script. |
 | D3 | Every implemented `!command` appears in `docs/slack-usage.md`. | An undocumented `!command`. |
+| AUD-01 docs | Every action in `AUDIT_ACTIONS` (`src/store/schema.ts`) has exactly one row in `docs/audit-actions.md`, and the page lists no other action. | A missing, a duplicated and an unknown action. |
 | D4 | The JSON block in `docs/slack-setup.md` deep-equals `config/slack-manifest.example.json`, and the "For the Slack admin" table lists exactly its 11 bot scopes. | A manifest mismatch; a scope missing from the table. |
-| D5 | Every relative link and `#anchor` resolves in `README.md`, `SECURITY.md` and every `.md` under `docs/` (47 files, evidence included). `CHANGELOG.md` is checked once it exists. | A broken link and a broken anchor; GitHub anchor slugs with punctuation and duplicates. |
+| D5 | Every relative link and `#anchor` resolves in `README.md`, `SECURITY.md` and every `.md` under `docs/` (51 files in all, evidence included). `CHANGELOG.md` is checked once it exists. | A broken link and a broken anchor; GitHub anchor slugs with punctuation and duplicates. |
 
 The onboard usage lines named in D3 are not checked yet: `agent-tag onboard` flags arrive with O4 (#41).
 
@@ -22,7 +23,7 @@ The onboard usage lines named in D3 are not checked yet: `agent-tag onboard` fla
 bun test test/docs-drift.test.ts
 ```
 
-On `feat/u1-docs-ga-matrix` with Bun `1.3.13` on macOS arm64: 14 pass, 0 fail, 147 assertions. The full `bun run check` on the same tree also ran these tests.
+On `feat/u1-docs-ga-matrix` with Bun `1.3.13` on macOS arm64: 16 pass, 0 fail, 149 assertions. The full `bun run check` on the same tree also ran these tests.
 
 ## What this does not prove
 

@@ -7,7 +7,7 @@ Agent Tag is a coworker in Slack that hands work to a coding agent (Codex or Cla
 - **Mention it** in a channel it was added to: `@Agent Tag fix the flaky test in src/store`. The mention starts a task, and the thread is that task.
 - **Reply in the thread** to steer the same task. Replies from allowed people need no mention; each one becomes the next turn, in order.
 - **DM it** in its Messages tab if the operator routed your DM. A DM needs no mention, and only you can use your DM.
-- Who may use it is set by the operator: listed people only (`allowlist`), or any member of the channel (`channel-members`). Guests and other bots can't start or approve work.
+- Who may use it is set by the operator: listed people only (`allowlist`), or any member of the channel (`channel-members`). Bots can't start or approve work. Guests can't either, unless the operator lets them steer (`access.membership.guests: "steer-only"`, which still never lets them approve) or lists them by user ID.
 
 ## What you see
 

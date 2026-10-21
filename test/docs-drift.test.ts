@@ -3,8 +3,10 @@ import { existsSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { IMPLEMENTED_COMMANDS } from "../src/commands/parse.ts";
 import { HELP_TEXT } from "../src/distribution.ts";
+import { AUDIT_ACTIONS } from "../src/store/schema.ts";
 import {
   checkAgentCommands,
+  checkAuditActions,
   checkBunScripts,
   checkCliCommands,
   checkLinks,
@@ -49,6 +51,10 @@ describe("docs drift", () => {
     expect(checkLinks(linked, REPOSITORY, readIfExists)).toEqual([]);
   });
 
+  test("every audit action has exactly one row in docs/audit-actions.md", () => {
+    expect(checkAuditActions(read("docs/audit-actions.md"), AUDIT_ACTIONS)).toEqual([]);
+  });
+
   test("docs/configuration.md is what `bun run docs:config` generates", () => {
     expect(read("docs/configuration.md")).toBe(generateConfigDocs(REPOSITORY));
   });
@@ -89,6 +95,15 @@ describe("docs drift checks catch broken docs", () => {
   test("an unknown bun script", () => {
     expect(checkBunScripts([{ path: "docs/x.md", text: "Run `bun run nope` first." }], { check: "x" })).toEqual([
       "docs/x.md: `bun run nope` is not a package.json script",
+    ]);
+  });
+
+  test("a missing, a duplicated and an unknown audit action", () => {
+    const reference = "| `access.denied` | x | — |\n| `access.denied` | y | — |\n| `made.up` | z | — |\n";
+    expect(checkAuditActions(reference, ["access.denied", "ambient.decided"])).toEqual([
+      "docs/audit-actions.md has 2 rows for `access.denied`, expected 1",
+      "docs/audit-actions.md has 0 rows for `ambient.decided`, expected 1",
+      "docs/audit-actions.md lists `made.up`, which is not an audit action",
     ]);
   });
 

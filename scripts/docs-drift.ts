@@ -82,6 +82,20 @@ export function checkAgentCommands(slackUsage: string, commands: readonly string
   return commands.filter((name) => !slackUsage.includes(`!${name}`)).map((name) => `docs/slack-usage.md does not mention \`!${name}\``);
 }
 
+/** `docs/audit-actions.md` has exactly one table row per audit action, and no row for an action that does not exist. */
+export function checkAuditActions(reference: string, actions: readonly string[]): string[] {
+  const rows = [...reference.matchAll(/^\| `([a-z0-9._-]+)` \|/gm)].map((match) => match[1]!);
+  const problems: string[] = [];
+  for (const action of actions) {
+    const count = rows.filter((row) => row === action).length;
+    if (count !== 1) problems.push(`docs/audit-actions.md has ${count} rows for \`${action}\`, expected 1`);
+  }
+  for (const row of new Set(rows)) {
+    if (!actions.includes(row)) problems.push(`docs/audit-actions.md lists \`${row}\`, which is not an audit action`);
+  }
+  return problems;
+}
+
 /** GitHub's heading anchor: lowercase, punctuation dropped, spaces to hyphens, duplicates numbered. */
 export function headingAnchors(markdown: string): Set<string> {
   const anchors = new Set<string>();

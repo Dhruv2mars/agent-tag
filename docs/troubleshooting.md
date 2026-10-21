@@ -11,7 +11,11 @@ agent-tag doctor CONFIG
 agent-tag doctor CONFIG --fix    # repairs file modes, missing directories, and a stale or stopped service
 ```
 
-`--fix` never writes tokens, edits the config, or touches T3 or Slack. Other places to look:
+`--fix` never writes tokens or edits the config. Like a plain doctor run it calls Slack and T3 to check them, and when every other check passes it may reinstall or restart the service.
+
+Unless an entry says otherwise, a change to the config or to a Slack token file takes effect only after a restart: `agent-tag service restart`, or stop and start `agent-tag run`. A rotated T3 token file is the exception; a running service picks it up on its own.
+
+Other places to look:
 
 ```sh
 agent-tag status CONFIG          # queued, failed and stalled work, outbox state, service state
@@ -51,7 +55,7 @@ agent-tag onboard
 bun upgrade
 ```
 
-A `WARN` saying `differs from the verified <version>` means the version works but is not the one tested. No action is needed.
+A `WARN` saying `differs from the verified <version>` means the version meets the minimum but is not the one tested; it does not prove that version works. Use the verified version if you see unexplained failures.
 
 **Check:** `bun-version`
 
@@ -77,7 +81,7 @@ If doctor says `is owned by uid <uid>, not the Agent Tag user` or `is not writab
 
 - Slack app token: create a Socket Mode app-level token with `connections:write` and rerun `agent-tag onboard`.
 - Slack bot token: install the Slack app and rerun `agent-tag onboard` with its `xoxb-` token.
-- T3 token, managed mode: start the service (it mints the token) or run `agent-tag t3 rotate CONFIG`.
+- T3 token, managed mode: an installed service mints it when it restarts (`agent-tag service restart`). Before the first `service install`, whose doctor run fails on the missing token, run `agent-tag run CONFIG` once, or run `agent-tag t3 serve CONFIG` and then `agent-tag t3 rotate CONFIG` in another terminal.
 - T3 token, external mode: `agent-tag t3 rotate CONFIG --admin-token-file FILE`, or `bun run enroll:t3`.
 - GitHub token: see the GitHub token entry under [Pull requests](#pull-requests).
 
@@ -205,7 +209,7 @@ A state of `too-large` means the channel has more than `access.membership.maxMem
 
 ### One person gets no reply while others do
 
-**Cause.** The access policy denied them. With `access.mode: "allowlist"`, only users in `access.allowedUserIds` can use the agent. With `channel-members`, a member's access may be unknown while the membership snapshot is stale. Agent Tag stays silent and writes an `access.denied` audit row with the reason (`user-denied`, `guest-denied`, `membership-unknown`, `dm-owner-denied`, `dm-disabled`, …).
+**Cause.** The access policy denied them. With `access.mode: "allowlist"`, only users in `access.allowedUserIds` can use the agent. With `channel-members`, a member's access may be unknown while the membership snapshot is stale. Agent Tag stays silent. For an explicit request (a mention, a DM or a button click) it writes an `access.denied` audit row with the reason (`user-denied`, `guest-denied`, `membership-unknown`, `dm-owner-denied`, `dm-disabled`, …).
 
 **Fix.** Find the reason:
 
@@ -233,9 +237,9 @@ Add the user to `access.allowedUserIds`, or switch to `access.mode: "channel-mem
 
 **Check:** `access` (a passing summary shows `DMs <mode>`)
 
-### Work is accepted but replies never appear, and the log shows `"event":"worker.outcome"` with `"outcome":"failed"`
+### Work is accepted but replies never appear, and the log shows `"event":"worker.outcome"` with `"worker":"outbox"` and `"outcome":"failed"`
 
-**Cause.** Slack rejected the reply. The `errorCode` field says why. `not_in_channel` means the bot was removed from the channel. `channel_not_found` or `is_archived` means the channel is gone or archived. `invalid_auth` or `token_revoked` means the bot token is no longer valid. These rejections are not retried.
+**Cause.** Slack rejected the reply. Only the `outbox` worker delivers to Slack; a failed outcome from another worker is not a delivery failure. The `errorCode` field says why. `not_in_channel` means the bot was removed from the channel. `channel_not_found` or `is_archived` means the channel is gone or archived. `invalid_auth` or `token_revoked` means the bot token is no longer valid. These rejections are not retried.
 
 **Fix.** Re-invite the bot, or replace the bot token and restart. `agent-tag status CONFIG` shows pending and failed outbox rows.
 
@@ -265,7 +269,7 @@ Add the user to `access.allowedUserIds`, or switch to `access.mode: "channel-mem
 
 **Fix.** External T3: start the pinned T3 server (see `t3.lock.json`) and check `t3.baseUrl`. Managed T3: check the service logs and `agent-tag t3 status CONFIG`.
 
-A `WARN` saying `managed T3 is not running at <url>; the Agent Tag service starts it` is expected before the service is installed. Start the service:
+A `WARN` saying `managed T3 is not running at <url>; the Agent Tag service starts it` is expected before the service is installed. Start the service (if `secret:t3-token` also fails, mint the token first, as in the `secret file <path> is missing` entry above):
 
 ```sh
 agent-tag service install CONFIG    # or: agent-tag service restart
@@ -302,7 +306,7 @@ agent-tag t3 rotate CONFIG                            # managed mode; the runtim
 agent-tag t3 rotate CONFIG --admin-token-file FILE    # external mode
 ```
 
-A running service picks up the new token file within 5 s. `T3 token expires in <n> days` is a warning with the same fix. Managed mode rotates on its own `t3.managed.rotation.rotateBeforeDays` days before expiry.
+A running service picks up the new token file on its next T3 call; it checks the file at most every 5 s. `T3 token expires in <n> days` is a warning with the same fix. Managed mode rotates on its own `t3.rotation.rotateBeforeDays` days before expiry (default 7).
 
 **Check:** `t3-session`
 
@@ -380,7 +384,7 @@ A running service picks up the new token file within 5 s. `T3 token expires in <
 
 ### Slack says "T3 refused to move this thread to the requested model; it stays on …"
 
-**Cause.** T3 0.0.45 cannot move a started conversation to that provider. Code: `T3ModelSwitchRejected`. The thread keeps its model.
+**Cause.** T3 0.0.45 cannot move a started conversation to that provider, or to a model whose resume state differs (for example another instance of the same driver with a different home). Code: `T3ModelSwitchRejected`. The thread keeps its model. See [the cross-provider rule](operations.md#the-cross-provider-rule).
 
 **Fix.** Start a new thread with the model you want: `@<bot name> use <model>: <request>`.
 
@@ -412,7 +416,7 @@ A running service picks up the new token file within 5 s. `T3 token expires in <
 
 ### Startup fails with `managed T3 did not become ready on <url> within <n>s`
 
-**Cause.** Managed mode only. The T3 child started but did not answer before the deadline. `managed T3 exited with <exit> before becoming ready` means it crashed while starting. The message ends with T3's last stderr lines.
+**Cause.** Managed mode only. The T3 child started but did not answer before the deadline. `managed T3 exited with <exit> before becoming ready` means it crashed while starting. The message ends with T3's last stderr lines: at most 10, each cut to 2 KiB, with secrets redacted.
 
 **Fix.** Read the stderr lines in the message. Run T3 alone to see the full output:
 
@@ -452,7 +456,7 @@ agent-tag t3 install CONFIG
 
 ## Files
 
-Skipped inbound files are listed in one thread notice, for example `I couldn't read 1 file you shared, so I'm working without it:`. Each line gives the file name and a reason. Outbound failures post `:warning: Couldn't share <file>: <reason>.`
+Skipped inbound files are listed in one thread notice, for example `I couldn't read 1 file you shared, so I'm working without it:`. Each line gives the file name and a reason; when the list does not fit, it ends with `…and <n> more`. Outbound failures post `:warning: Couldn't share <file>: <reason>.`
 
 ### "Agent Tag lacks the Slack permission to read files (the operator must reinstall the app)"
 
@@ -464,7 +468,7 @@ Skipped inbound files are listed in one thread notice, for example `I couldn't r
 
 ### "only the first <n> files of a message are read" or "larger than the <n> MB limit"
 
-**Cause.** The message hit `files.inbound.maxFilesPerMessage` (default 5, at most 8) or the size limits `files.inbound.maxFileBytes` (default 25 MiB) and `maxImageBytes` (10 MiB).
+**Cause.** The message hit `files.inbound.maxFilesPerMessage` (default 5, at most 8) or the size limit. An image up to `files.inbound.maxImageBytes` (10 MiB) is sent as an image; a larger image, or any other file, is sent as a file up to `files.inbound.maxFileBytes` (default 25 MiB). The limit in the message is the larger of the two.
 
 **Fix.** Share fewer or smaller files, or raise the limits within their allowed ranges. See [Slack files](operations.md#slack-files).
 
@@ -472,9 +476,9 @@ Skipped inbound files are listed in one thread notice, for example `I couldn't r
 
 ### "this file type is not accepted" or "its contents do not match its file type"
 
-**Cause.** The extension is in `files.inbound.deniedExtensions`, or the file's bytes do not match its claimed type.
+**Cause.** The extension is in `files.inbound.deniedExtensions`, or the file is a Slack canvas (canvases are always rejected), or a file Slack labels as an image whose bytes are not that image type.
 
-**Fix.** Remove the extension from `deniedExtensions`, or share the file with the right extension.
+**Fix.** Remove the extension from `deniedExtensions`, or share the file with the right type. Paste a canvas's text into the message instead.
 
 **Check:** none
 
@@ -747,7 +751,7 @@ agent-tag restore BACKUP NEW_DATA_DIR
 
 ### `<n> cleanup failure(s)` in the `lifecycle` line (WARN)
 
-**Cause.** Cleanup of a closed task's T3 thread, worktree or branch failed. Failed rows keep their worktree and branch.
+**Cause.** Cleanup of a closed task's T3 thread, worktree or branch failed. Cleanup stops at the failing step, so earlier steps may already have run (for example the T3 thread is deleted but the worktree is kept).
 
 **Fix.** Find the cause in the `task.cleanup.failed` audit rows:
 
