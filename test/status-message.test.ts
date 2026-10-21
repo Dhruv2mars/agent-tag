@@ -523,6 +523,57 @@ describe("live status message (F3)", () => {
     });
   });
 
+  test("a throttled retry of a status edit goes out at once when the turn ends", async () => {
+    const budget = { ...config, slack: { ...config.slack, ui: { ...config.slack.ui, statusUpdatesPerMinute: 1 } } };
+    await withHarness(async ({ store, calls, drain }) => {
+      const [first, second] = [1, 2].map((index) => {
+        const receipt = store.ingestSlackEvent({
+          deliveryId: `delivery-${index}`,
+          eventKey: `C1:3000.00000${index}`,
+          workspaceId: "T1",
+          conversationId: "C1",
+          threadTs: `3000.00000${index}`,
+          actorUserId: "U1",
+          conversationType: "channel",
+          profileId: "engineering",
+          repositoryRoot: "/srv/repos/example",
+          text: "request",
+          receivedAt: now,
+          sourceOrderKey: `3000.00000${index}`,
+        });
+        store.claimNextOperation({ workerId: "worker-a", now, leaseMs: 600_000, maxConcurrentTasks: 2 });
+        store.openStatusMessage({
+          operationId: receipt.operationId,
+          taskId: receipt.taskId,
+          conversationId: "C1",
+          threadTs: `3000.00000${index}`,
+          message: (view) => renderStatusMessage(view, { showProgress: true }),
+          now,
+        });
+        return receipt.operationId;
+      });
+      if (first === undefined || second === undefined) throw new Error("operations missing");
+      await drain(now);
+      const progress = { plan: [], recent: ["Ran tests"], toolCount: 1 };
+      const statusEdits = { intervalMs: budget.slack.ui.statusUpdateIntervalMs, perMinute: 1 };
+      // The first message's edit fails once and backs off until 75 s; the second's spends the budget.
+      store.updateStatusProgress({ operationId: first, progress, now: at(70_000) });
+      const failed = store.claimNextOutbox({ workerId: "slack-b", now: at(70_000), leaseMs: 30_000, statusEdits });
+      if (failed === null) throw new Error("first edit was not claimable");
+      store.retryOutbox({ outboxId: failed.outboxId, workerId: "slack-b", errorCode: "fixture", blockedUntil: at(75_000), now: at(70_000) });
+      store.updateStatusProgress({ operationId: second, progress, now: at(70_000) });
+      await drain(at(70_000));
+      await drain(at(80_000));
+      expect(calls.filter((call) => call.method === "update").map((call) => call.at)).toEqual([at(70_000)]);
+      // The turn ends while the retry waits on the budget: the final render is not held to it.
+      store.completeOperation({ operationId: first, workerId: "worker-a", resultSequence: 1, now: at(81_000) });
+      await drain(at(81_000));
+      const final = calls.filter((call) => call.method === "update").at(-1);
+      expect(final?.at).toBe(at(81_000));
+      expect(hasActions(final?.blocks ?? [])).toBe(false);
+    }, budget);
+  });
+
   test("terminal renders are sticky and progress after settling is ignored", async () => {
     await withHarness(async ({ store }) => {
       const receipt = ingest(store, 1);

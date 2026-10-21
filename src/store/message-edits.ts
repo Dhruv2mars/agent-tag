@@ -120,12 +120,9 @@ function enqueueEdit(database: Database, input: {
       .get(target.outbox_id),
   );
   if (pending !== null) {
-    // The coalesced edit is due again: the claim re-applies any throttle (see statusEditDeferral),
-    // so newer state, such as a terminal status, is never held back. A retry keeps its backoff.
     database
       .query(
-        `UPDATE slack_outbox SET payload_json = ?, refresh_kind = ?, correlation_id = ?, updated_at = ?,
-           blocked_until = CASE WHEN attempts = 0 THEN NULL ELSE blocked_until END
+        `UPDATE slack_outbox SET payload_json = ?, refresh_kind = ?, correlation_id = ?, updated_at = ?
          WHERE outbox_id = ? AND status = 'pending'`,
       )
       .run(JSON.stringify(input.payload), input.refreshKind, correlationId, now, pending.outbox_id);

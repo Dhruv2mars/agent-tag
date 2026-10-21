@@ -106,8 +106,9 @@ export interface ClaimNextOutboxInput {
   readonly now: string;
   readonly leaseMs: number;
   /**
-   * When a claimable refresh row may go out instead (a throttle), or null for now. A deferred row
-   * gets that `blocked_until` and the claim moves on to the next row.
+   * When a claimable refresh row may go out instead (a throttle), or null for now. The claim passes
+   * over a deferred row, without marking it, so a later claim asks again (and a retry backoff in
+   * `blocked_until` stays the row's own).
    */
   readonly deferRefresh?: (refresh: OutboxRefreshCandidate, now: string) => string | null;
 }
@@ -178,6 +179,7 @@ export function claimNextOutbox(
   const expiresAt = leaseExpiry(now, input.leaseMs);
   const claim = database.transaction((): ClaimedOutboxMessage | null => {
     if (activeOutboxRateLimit(database, now) !== null) return null;
+    const deferred: string[] = [];
     const next = () => claimCandidateSchema.nullable().parse(
       database
         .query(
@@ -185,6 +187,7 @@ export function claimNextOutbox(
            FROM slack_outbox AS candidate
            WHERE candidate.status = 'pending'
              AND (candidate.blocked_until IS NULL OR candidate.blocked_until <= ?)
+             AND candidate.outbox_id NOT IN (SELECT value FROM json_each(?))
              AND CASE candidate.method
                -- Invariant 1: a post waits only on earlier blocked posts of its thread.
                WHEN 'post' THEN NOT EXISTS (
@@ -215,7 +218,7 @@ export function claimNextOutbox(
            ORDER BY ${CLAIM_ORDER_COLUMNS("candidate")}
            LIMIT 1`,
         )
-        .get(now, now, now),
+        .get(now, JSON.stringify(deferred), now, now),
     );
     let candidate = next();
     while (candidate !== null && candidate.refresh_kind !== null && candidate.target_outbox_id !== null) {
@@ -224,7 +227,7 @@ export function claimNextOutbox(
         now,
       ) ?? null;
       if (deferredUntil === null) break;
-      database.query("UPDATE slack_outbox SET blocked_until = ? WHERE outbox_id = ?").run(deferredUntil, candidate.outbox_id);
+      deferred.push(candidate.outbox_id);
       candidate = next();
     }
     if (candidate === null) return null;
