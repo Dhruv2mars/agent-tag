@@ -82,9 +82,12 @@ const slackConnectionSchema = z.union([
 export const SLACK_BOT_SCOPES: readonly string[] = [
   "app_mentions:read",
   "channels:history",
+  "channels:read",
   "chat:write",
   "files:read",
+  "files:write",
   "groups:history",
+  "groups:read",
   "im:history",
   "reactions:write",
   "users:read",
