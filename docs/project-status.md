@@ -29,7 +29,7 @@ Work lands on `main` through one squash-merged pull request per change. Use Bun 
 - Credential redaction, retention pruning, `security audit`, and secret scanning.
 - `install.sh`, a tag-triggered release workflow, self-updating binaries, and a Docker image.
 - Queued turns, interaction responses, schedules, and Slack replies recheck current task authority before dispatch ([revocation evidence](evidence/2026-09-30-authority-revocation.md)). OS isolation and tool-write enforcement remain unimplemented.
-- The pinned T3 adapter can transfer image and file attachments ([transport evidence](evidence/2026-09-30-t3-attachments.md)). Files shared in Slack are attached to the turn (`files:read`; fixture tests only, live evidence pending). Artifact return remains unimplemented; the manifest requests `files:write` ahead of it.
+- The pinned T3 adapter can transfer image and file attachments ([transport evidence](evidence/2026-09-30-t3-attachments.md)). Files shared in Slack are attached to the turn (`files:read`; fixture tests only, live evidence pending). Files the agent writes can be shared back to the thread (`files:write`; a reply line names the file, the worktree copy is scanned for credentials, then uploaded; fixture and live T3 worktree tests, Slack live evidence pending).
 - Codex `gpt-5.6-sol` and Claude `claude-sonnet-4-6`/`claude-haiku-4-5` complete live through the adapter on T3 `0.0.45` ([evidence](evidence/2026-10-06-t3-0.0.45.md)).
 
 ## Required work

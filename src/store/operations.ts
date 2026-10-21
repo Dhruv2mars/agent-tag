@@ -5,6 +5,7 @@ import { z } from "zod";
 import { type T3ModelSelection, t3ModelSelectionSchema } from "../t3/gateway.ts";
 
 import { writeAudit } from "./audit.ts";
+import { type FileUploadsInput, recordFileUploads } from "./file-uploads.ts";
 import { type StoreContext, requiredId, parseStoredJson } from "./context.ts";
 import { OPERATION_SETTLED, closeOperationInteractions } from "./interactions.ts";
 import { leaseExpiry, requireLeaseHeld } from "./lease.ts";
@@ -474,6 +475,8 @@ export interface CompleteOperationWithOutboxInput {
   readonly prSync?: PrSyncInput;
   /** The requesting user, recorded on a PR job. Required with `prSync`. */
   readonly actorUserId?: string;
+  /** Files the reply shares (PR-L2), queued behind its last chunk (file-uploads.ts). */
+  readonly uploads?: FileUploadsInput;
   readonly now: string;
 }
 
@@ -558,6 +561,20 @@ export function completeOperationWithOutbox(
         prSync: input.prSync,
         now,
         noticeAt: new Date(new Date(now).getTime() + texts.length).toISOString(),
+      });
+    }
+    const last = outboxIds.at(-1);
+    if (input.uploads !== undefined && last !== undefined) {
+      recordFileUploads(database, {
+        operationId,
+        taskId,
+        workerId: input.workerId,
+        conversationId: input.conversationId,
+        threadTs: input.threadTs,
+        uploads: input.uploads,
+        afterOutboxId: last.outboxId,
+        now,
+        noticeAt: new Date(new Date(now).getTime() + texts.length + 1).toISOString(),
       });
     }
     writeAudit(database, {
