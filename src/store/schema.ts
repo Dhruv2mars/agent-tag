@@ -11,7 +11,8 @@ export const isoDateTime = z.iso.datetime();
  */
 export const inboundFileRefSchema = z.object({
   id: z.string().regex(/^F[A-Z0-9]+$/),
-  name: z.string().max(1_000).optional(),
+  // Slack sends `name: null` for some files; the id stands in for it.
+  name: z.string().max(1_000).nullish(),
   mimetype: z.string().max(200).optional(),
   filetype: z.string().max(100).optional(),
   size: z.number().int().nonnegative().optional(),

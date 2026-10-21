@@ -9,7 +9,7 @@ import type { InboundSkipReason, OperationAttachment } from "../store/attachment
 import type { InboundFileRef } from "../store/schema.ts";
 import { type T3Attachment, type T3ConnectionConfig, uploadT3Attachment } from "../t3/gateway.ts";
 import type { TurnFile } from "../turn-text.ts";
-import { escapeSlackText } from "./render.ts";
+import { escapeSlackText, SLACK_SECTION_TEXT_LIMIT } from "./render.ts";
 import { sniffImageMime } from "./sniff.ts";
 
 export type InboundFileLimits = AgentTagConfig["files"]["inbound"];
@@ -35,8 +35,11 @@ export interface SlackDownload {
 export interface SlackFileClient {
   /** Rejects with a SlackFileError (or a Web API error carrying `data.error`). */
   info(fileId: string, signal?: AbortSignal): Promise<SlackFileInfo>;
-  /** Rejects with a SlackFileError when the body would exceed `maxBytes` or the download fails. */
-  download(url: string, maxBytes: number, signal?: AbortSignal): Promise<SlackDownload>;
+  /**
+   * Rejects with a SlackFileError when the body would exceed `maxBytes` or the download fails. An HTML
+   * body counts as Slack's sign-in page unless the file itself is declared `text/html`.
+   */
+  download(url: string, maxBytes: number, declaredMimeType: string | undefined, signal?: AbortSignal): Promise<SlackDownload>;
 }
 
 export type T3AttachmentUploader = (input: {
@@ -73,7 +76,8 @@ const fileInfoSchema = z.object({
   file: z
     .object({
       id: z.string().min(1),
-      name: z.string().optional(),
+      // Slack sends `name: null` for some files; the id stands in for it.
+      name: z.string().nullish(),
       mimetype: z.string().optional(),
       filetype: z.string().optional(),
       size: z.number().int().nonnegative().optional(),
@@ -90,7 +94,7 @@ export function parseSlackFileInfo(raw: unknown): SlackFileInfo {
   return {
     id: file.id,
     isExternal: file.is_external === true,
-    ...(file.name === undefined ? {} : { name: file.name }),
+    ...(file.name == null ? {} : { name: file.name }),
     ...(file.mimetype === undefined ? {} : { mimetype: file.mimetype }),
     ...(file.filetype === undefined ? {} : { filetype: file.filetype }),
     ...(file.size === undefined ? {} : { size: file.size }),
@@ -350,6 +354,7 @@ export async function materializeInboundFiles(input: MaterializeInboundFilesInpu
       download = await input.slack.download(
         info.urlPrivateDownload ?? "",
         Math.max(input.limits.maxImageBytes, input.limits.maxFileBytes),
+        normalizedMime(info.mimetype ?? ref.mimetype) ?? undefined,
         input.signal,
       );
     } catch (error) {
@@ -419,9 +424,19 @@ export function skippedFilesNotice(
     return row.state === "skipped" && ref !== undefined ? [{ name: inboundFileName(ref), reason: row.reason }] : [];
   });
   if (skipped.length === 0) return null;
-  const lines = skipped.map((file) => `• ${escapeSlackText(file.name)}: ${describeSkipReason(file.reason, limits)}`);
   const count = skipped.length === 1 ? "1 file" : `${skipped.length} files`;
-  return [`I couldn't read ${count} you shared, so I'm working without ${skipped.length === 1 ? "it" : "them"}:`, ...lines].join("\n");
+  const header = `I couldn't read ${count} you shared, so I'm working without ${skipped.length === 1 ? "it" : "them"}:`;
+  const lines = [header];
+  // The notice is one section block: list files while they fit, keeping room for the "more" line.
+  let length = header.length + 40;
+  for (const file of skipped) {
+    const line = `• ${escapeSlackText(file.name)}: ${describeSkipReason(file.reason, limits)}`;
+    if (length + 1 + line.length > SLACK_SECTION_TEXT_LIMIT) break;
+    lines.push(line);
+    length += 1 + line.length;
+  }
+  const hidden = skipped.length + 1 - lines.length;
+  return [...lines, ...(hidden > 0 ? [`• …and ${hidden} more`] : [])].join("\n");
 }
 
 /** The turn text's view of every shared file, in payload order. */

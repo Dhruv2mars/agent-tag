@@ -148,11 +148,12 @@ export async function createSlackFileClient(input: {
   return {
     // The Web API client has no per-call abort; the materializer checks the signal between files.
     info: async (fileId) => parseSlackFileInfo(await client.files.info({ file: fileId })),
-    download: (url, maxBytes, signal) =>
+    download: (url, maxBytes, declaredMimeType, signal) =>
       downloadSlackFile({
         url,
         token: input.botToken,
         maxBytes,
+        ...(declaredMimeType === undefined ? {} : { declaredMimeType }),
         ...(signal === undefined ? {} : { signal }),
         ...(input.fetch === undefined ? {} : { fetch: input.fetch }),
       }),

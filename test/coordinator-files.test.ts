@@ -69,21 +69,23 @@ function fakeFile(id: string, name: string, mimetype: string, bytes: Uint8Array<
 
 function fakeSlackFiles(files: readonly FakeFile[]) {
   const downloads: string[] = [];
+  const declared: (string | undefined)[] = [];
   const client: SlackFileClient = {
     info: async (fileId) => {
       const file = files.find((candidate) => candidate.info.id === fileId);
       if (file === undefined) throw Object.assign(new Error("file_not_found"), { data: { ok: false, error: "file_not_found" } });
       return file.info;
     },
-    download: async (url, maxBytes) => {
+    download: async (url, maxBytes, declaredMimeType) => {
       const file = files.find((candidate) => candidate.info.urlPrivateDownload === url);
       if (file?.bytes === undefined) throw new Error("unexpected download");
       downloads.push(file.info.id);
+      declared.push(declaredMimeType);
       expect(file.bytes.byteLength).toBeLessThanOrEqual(maxBytes);
       return { bytes: file.bytes, contentType: file.info.mimetype ?? null };
     },
   };
-  return { client, downloads };
+  return { client, downloads, declared };
 }
 
 function fakeUploader() {
@@ -318,6 +320,7 @@ describe("inbound Slack files (PR-L1)", () => {
       expect((await coordinatorFor(harness, t3, slack.client, uploader.upload).processNext()).kind).toBe("completed");
       expect(uploader.uploads.map((upload) => upload.name)).toEqual(["chart.png", "data.csv"]);
       expect(slack.downloads).toEqual(["F0PNG", "F0CSV"]);
+      expect(slack.declared).toEqual(["image/png", "text/csv"]);
       expect(turnStarts).toHaveLength(1);
       expect(turnStarts[0]?.message.attachments).toEqual([
         { type: "image", id: "t3-attachment-1", name: "chart.png", mimeType: "image/png", sizeBytes: PNG.byteLength },

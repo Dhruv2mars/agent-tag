@@ -6,9 +6,13 @@ import {
   downloadSlackFile,
   parseSlackFileInfo,
   precheckInboundFile,
+  skippedFilesNotice,
   SlackFileError,
   type SlackFileInfo,
 } from "../src/slack/files.ts";
+import { createSlackFileClient } from "../src/slack/bridge.ts";
+import { SLACK_SECTION_TEXT_LIMIT } from "../src/slack/render.ts";
+import { inboundFileRefs } from "../src/store/schema.ts";
 import { sniffImageMime } from "../src/slack/sniff.ts";
 
 const baseConfig = {
@@ -129,6 +133,12 @@ describe("downloadSlackFile", () => {
       fetch: loopback,
     });
     expect(new TextDecoder().decode(page.bytes)).toBe("<html>sign in</html>");
+    // The production client passes the declared type through.
+    const client = await createSlackFileClient({ botToken: token, fetch: loopback });
+    expect(new TextDecoder().decode((await client.download("https://files.slack.com/login", 100, "text/html")).bytes)).toBe(
+      "<html>sign in</html>",
+    );
+    await expect(client.download("https://files.slack.com/login", 100, undefined)).rejects.toEqual(new SlackFileError("missing-scope"));
   });
 
   test("caps the streamed body, maps HTTP errors and times out", async () => {
@@ -275,6 +285,20 @@ describe("classification", () => {
       urlPrivateDownload: "https://files.slack.com/x",
     });
     expect(parseSlackFileInfo({ ok: true, file: { id: "F2", is_external: true } })).toEqual({ id: "F2", isExternal: true });
+    // Slack sends a null name for some files: the file is kept and its id names it.
+    expect(parseSlackFileInfo({ ok: true, file: { id: "F3", name: null } })).toEqual({ id: "F3", isExternal: false });
+    expect(inboundFileRefs([{ id: "F3", name: null }]).map((ref) => ref.id)).toEqual(["F3"]);
+  });
+
+  test("the skipped-files notice fits one section block and counts what it leaves out", () => {
+    const refs = inboundFileRefs(Array.from({ length: 20 }, (_, index) => ({ id: `F${index}`, name: `${"&".repeat(250)}${index}` })));
+    const outcomes = refs.map((ref, ordinal) => ({ ordinal, slackFileId: ref.id, state: "skipped" as const, reason: "too-large" as const }));
+    const notice = skippedFilesNotice(refs, outcomes, limits) ?? "";
+    expect(notice.length).toBeLessThanOrEqual(SLACK_SECTION_TEXT_LIMIT);
+    expect(notice.startsWith("I couldn't read 20 files")).toBe(true);
+    const listed = notice.split("\n").filter((line) => line.includes("&amp;")).length;
+    expect(listed).toBeGreaterThan(0);
+    expect(notice.endsWith(`• …and ${20 - listed} more`)).toBe(true);
   });
 });
 
