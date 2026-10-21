@@ -165,7 +165,7 @@ function retiredTask(
   const { threadId } = fixture.store.getTaskExecution(taskId);
   const claimed = fixture.store.claimNextOperation({ workerId: "w", now: startedAt, leaseMs: 10_000, maxConcurrentTasks: 10 });
   if (claimed?.taskId !== taskId) throw new Error("operation was not claimable");
-  fixture.store.markOperationTurnDispatched({ operationId: claimed.operationId, workerId: "w", now: startedAt });
+  fixture.store.markOperationTurnDispatched({ operationId: claimed.operationId, workerId: "w", threadId, now: startedAt });
   fixture.store.markOperationTurnStarted({ operationId: claimed.operationId, workerId: "w", turnId: null, now: startedAt });
   fixture.store.markT3ThreadStarted({ taskId, threadId, now: startedAt });
   fixture.store.completeOperationWithOutbox({

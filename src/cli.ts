@@ -6,6 +6,7 @@ import { loadConfig } from "./config.ts";
 import { isDistributionCommand, processDistributionContext, runDistributionCommand } from "./distribution.ts";
 import { runSecurityCli, SECURITY_CLI_USAGE } from "./security/cli.ts";
 import { launchAgentLogPathsForProcess } from "./launchd.ts";
+import { MEMORY_COMMANDS, MEMORY_USAGE, runMemoryCommand } from "./memory-cli.ts";
 import { createAgentTagService } from "./service.ts";
 import { readServiceState, ServiceStateRecorder } from "./service-state.ts";
 import { AgentTagSchedules } from "./scheduler.ts";
@@ -25,6 +26,7 @@ const USAGE = [
   "       agent-tag restore BACKUP NEW_DATA_DIR",
   "       agent-tag schedule-<add|list|cancel> CONFIG TASK ACTOR PROFILE [SPEC_OR_ID]",
   ...TASKS_USAGE.replace("usage: ", "").split(" | ").map((line) => `       ${line}`),
+  ...MEMORY_USAGE.replace("usage: ", "").split(" | ").map((line) => `       ${line}`),
   "       agent-tag <version|update|help>",
   ...SECURITY_CLI_USAGE.split(" | ").map((line) => `       ${line}`),
 ].join("\n");
@@ -43,6 +45,7 @@ const KNOWN_COMMANDS = new Set([
   "schedule-add",
   "schedule-list",
   "schedule-cancel",
+  ...MEMORY_COMMANDS,
 ]);
 
 /** Prints a usage error without a stack trace and exits, like runDistributionCommand. */
@@ -75,6 +78,7 @@ const operatorCommands = new Map<string, (argv: readonly string[]) => Promise<nu
   ["service", runServiceCommand],
   ["t3", runT3Command],
   ["tasks", runTasksCommand],
+  ...MEMORY_COMMANDS.map((name) => [name, (argv: readonly string[]) => runMemoryCommand(name, argv)] as const),
 ]);
 const operatorCommand = operatorCommands.get(command);
 

@@ -125,7 +125,7 @@ export function claimNextOperation(
       database
         .query(
           `SELECT operation_id, task_id, command_id, message_id, payload_json, source_event_key,
-                  attempts, lease_expires_at, turn_active_ms
+                  attempts, lease_expires_at, turn_active_ms, t3_thread_id
            FROM operations WHERE operation_id = ?`,
         )
         .get(identity.operation_id),
@@ -154,6 +154,7 @@ export function claimNextOperation(
       attempt: row.attempts,
       leaseExpiresAt: row.lease_expires_at,
       turnActiveMs: row.turn_active_ms,
+      threadId: row.t3_thread_id,
     };
   });
   return claim.immediate();
@@ -650,6 +651,8 @@ export function markOperationTurnStarted(database: Database, input: MarkOperatio
 export interface MarkOperationTurnDispatchedInput {
   readonly operationId: string;
   readonly workerId: string;
+  /** The thread the turn is about to be sent to. */
+  readonly threadId: string;
   readonly now: string;
 }
 
@@ -657,17 +660,31 @@ export interface MarkOperationTurnDispatchedInput {
  * Records, before each `thread.turn.start` is sent, that T3 may receive this operation's turn. A lost
  * receipt leaves the turn's state unknown, so cancellation must not treat the operation as queued.
  * The latest attempt's time is kept: a replay may be the first send T3 receives, and cancellation
- * measures its bootstrap window from it.
+ * measures its bootstrap window from it. The first send pins the turn to its thread (PR-H2). `false`,
+ * with nothing recorded: the thread is not the task's current one or the turn was pinned to another,
+ * because `!restart` retired it, so the turn must not go out.
  */
-export function markOperationTurnDispatched(database: Database, input: MarkOperationTurnDispatchedInput): void {
+export function markOperationTurnDispatched(database: Database, input: MarkOperationTurnDispatchedInput): boolean {
   const now = isoDateTime.parse(input.now);
-  const result = database
-    .query(
-      `UPDATE operations SET t3_turn_dispatched_at = ?, updated_at = ?
-       WHERE operation_id = ? AND status = 'inflight' AND lease_owner = ? AND lease_expires_at > ?`,
-    )
-    .run(now, now, requiredId(input.operationId, "operationId"), requiredId(input.workerId, "workerId"), now);
-  requireLeaseHeld(result, "operation");
+  const operationId = requiredId(input.operationId, "operationId");
+  const workerId = requiredId(input.workerId, "workerId");
+  const threadId = requiredId(input.threadId, "threadId");
+  return database.transaction((): boolean => {
+    const result = database
+      .query(
+        `UPDATE operations SET t3_turn_dispatched_at = ?, t3_thread_id = ?, updated_at = ?
+         WHERE operation_id = ? AND status = 'inflight' AND lease_owner = ? AND lease_expires_at > ?
+           AND (t3_thread_id IS NULL OR t3_thread_id = ?)
+           AND EXISTS (SELECT 1 FROM tasks t WHERE t.task_id = operations.task_id AND t.t3_thread_id = ?)`,
+      )
+      .run(now, threadId, now, operationId, workerId, now, threadId, threadId);
+    if (result.changes === 1) return true;
+    const held = database
+      .query("SELECT 1 FROM operations WHERE operation_id = ? AND status = 'inflight' AND lease_owner = ? AND lease_expires_at > ?")
+      .get(operationId, workerId, now);
+    requireLeaseHeld({ changes: held === null ? 0 : 1 }, "operation");
+    return false;
+  }).immediate();
 }
 
 export interface DeferOperationInput {

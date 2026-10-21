@@ -391,7 +391,12 @@ describe("live status message (F3)", () => {
       const first = ingest(store, 1);
       const claimed = store.claimNextOperation({ workerId: "worker-a", now, leaseMs: 60_000, maxConcurrentTasks: 2 });
       expect(claimed?.operationId).toBe(first.operationId);
-      store.markOperationTurnDispatched({ operationId: first.operationId, workerId: "worker-a", now });
+      store.markOperationTurnDispatched({
+        operationId: first.operationId,
+        workerId: "worker-a",
+        threadId: store.getTaskExecution(first.taskId).threadId,
+        now,
+      });
       store.markOperationTurnStarted({ operationId: first.operationId, workerId: "worker-a", turnId: "turn-1", now });
       const router = new SlackActionRouter({ config, store, now: () => now });
       const stale = JSON.stringify({ taskId: first.taskId, operationId: "an-earlier-operation" });

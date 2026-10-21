@@ -68,7 +68,7 @@ export const retirableTaskSchema = z.object({
 /**
  * Records the task's current T3 thread in task_retired_t3_threads (generation, branch and stable
  * command ids for the session stop and PR-N2's cleanup), inside the caller's transaction. A thread
- * that never started has nothing in T3 or git, so its row is already complete.
+ * no turn was ever sent to has nothing in T3 or git, so its row is already complete.
  */
 export function retireCurrentThread(
   database: Database,
@@ -82,7 +82,10 @@ export function retireCurrentThread(
   const { taskId, task, now } = input;
   if (task.t3_project_id === null || task.t3_thread_id === null) return;
   const generation = task.session_generation;
-  const created = task.t3_thread_started_at !== null;
+  // A turn sent to the thread may have created it even with no receipt (or one a forced `!restart`
+  // outran). Every sent turn is pinned to its thread (migration 28 backfilled earlier ones).
+  const created = task.t3_thread_started_at !== null ||
+    database.query("SELECT 1 FROM operations WHERE task_id = ? AND t3_thread_id = ? LIMIT 1").get(taskId, task.t3_thread_id) !== null;
   // A session that adopted the previous generation's worktree ran on that generation's branch.
   const adopted = z.object({ branch: nonEmpty }).nullable().parse(
     database

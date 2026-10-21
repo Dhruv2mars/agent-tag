@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 import { externalT3AdminFlags } from "../src/cli-commands.ts";
+import { type MemoryCommand, runMemoryCommand } from "../src/memory-cli.ts";
 import { AgentTagStore } from "../src/store/store.ts";
 import { runTasksCommand } from "../src/tasks-cli.ts";
 import { PINNED_T3, t3ArtifactFor } from "../src/t3/lock.ts";
@@ -360,4 +361,166 @@ test("tasks list and tasks close work against the store without the service", as
     if (!home.startsWith(`${tmpdir()}/agent-tag-cli-tasks-`)) throw new Error(`refusing to remove unexpected fixture path ${home}`);
     await rm(home, { recursive: true });
   }
+});
+
+describe("memory-* operator commands", () => {
+  const OPERATOR = "ops-fixture";
+  const NOW = new Date("2026-10-21T10:00:00.000Z");
+
+  async function withFixture(run: (input: { configPath: string; dataDir: string }) => Promise<void>): Promise<void> {
+    const home = await mkdtemp(join(tmpdir(), "agent-tag-cli-memory-"));
+    try {
+      const dataDir = await mkdtemp(join(home, "data-"));
+      const configPath = join(home, "agent-tag.json");
+      const profile = (id: string) => ({
+        id,
+        repositoryRoots: ["/repos/example"],
+        defaultProviderInstanceId: "codex",
+        defaultModel: "gpt-5.6-sol",
+        runtimeMode: "approval-required",
+        isolation: { mode: "trusted-same-user", acknowledgedSharedMachineAccess: true },
+        externalWrites: { mode: "deny" },
+        memory: { shared: true, privateDm: true, retentionDays: 30, maxEntryChars: 80 },
+      });
+      await writeFile(configPath, JSON.stringify({
+        version: 1,
+        dataDir,
+        t3: { baseUrl: "http://127.0.0.1:37841", tokenFile: join(home, "t3-token") },
+        slack: { workspaceId: "T1", appTokenFile: join(home, "app"), botTokenFile: join(home, "bot") },
+        access: { allowedUserIds: ["U1"], allowedChannelIds: ["C1", "C2", "D1"] },
+        profiles: [profile("engineering"), profile("design")],
+        routes: [
+          { conversationId: "C1", profileId: "engineering" },
+          { conversationId: "C2", profileId: "design" },
+          { conversationId: "D1", profileId: "engineering", conversationType: "dm", ownerUserId: "U1" },
+        ],
+        limits: { maxConcurrentTasks: 2 },
+      }));
+      await run({ configPath, dataDir });
+    } finally {
+      if (!home.startsWith(`${tmpdir()}/agent-tag-cli-memory-`)) throw new Error(`refusing to remove unexpected fixture path ${home}`);
+      await rm(home, { recursive: true });
+    }
+  }
+
+  // Each command runs one second after the last, so "newest first" has no ties.
+  let tick = 0;
+  const memory = async (command: MemoryCommand, argv: readonly string[]) => {
+    const lines: string[] = [];
+    const now = () => new Date(NOW.getTime() + 1_000 * tick++);
+    const exitCode = await runMemoryCommand(command, argv, { now, operatorId: OPERATOR, write: (line) => lines.push(line) });
+    return { exitCode, stdout: lines.join("\n") };
+  };
+  const refOf = (stdout: string) => /^(?:saved|already saved as) ([0-9a-f]{8})/.exec(stdout)?.[1] ?? "";
+
+  test("add, list, edit and forget notes in every store, audited as the operator without content", async () => {
+    await withFixture(async ({ configPath, dataDir }) => {
+      // A Slack user's channel and DM notes already exist.
+      const seeded = await AgentTagStore.open(join(dataDir, "agent-tag.sqlite"));
+      const slackNote = seeded.createMemory({
+        workspaceId: "T1", scope: "channel", conversationId: "C1", content: "reports go out as tables",
+        sourceType: "slack-command", sourceId: "C1:1.1", actorUserId: "U1",
+        expiresAt: "2026-11-20T10:00:00.000Z", now: "2026-10-20T10:00:00.000Z",
+      });
+      seeded.createMemory({
+        workspaceId: "T1", scope: "private", profileId: "engineering", ownerUserId: "U1", content: "I prefer terse replies",
+        sourceType: "slack-command", sourceId: "D1:1.1", actorUserId: "U1",
+        expiresAt: "2026-11-20T10:00:00.000Z", now: "2026-10-20T10:00:01.000Z",
+      });
+      seeded.close();
+
+      const channel = await memory("memory-add", [configPath, "--scope", "channel", "--conversation", "C1", "--content", "  deploys need a ticket  "]);
+      expect(channel).toEqual({ exitCode: 0, stdout: expect.stringMatching(/^saved [0-9a-f]{8} \(channel C1, expires 2026-11-20\)$/) });
+      // The route's profile decides limits and retention for a channel note, so no --profile is needed.
+      const workspace = await memory("memory-add", [configPath, "--scope", "workspace", "--profile", "engineering", "--content", "our default branch is main"]);
+      expect(workspace.stdout).toMatch(/^saved [0-9a-f]{8} \(workspace, expires 2026-11-20\)$/);
+      const operator = await memory("memory-add", [configPath, "--scope", "operator", "--profile", "design", "--content", "Figma is the source of truth"]);
+      expect(operator.stdout).toMatch(/^saved [0-9a-f]{8} \(operator design,/);
+      expect(await memory("memory-add", [configPath, "--scope", "channel", "--conversation", "C1", "--content", "Deploys need a ticket"]))
+        .toEqual({ exitCode: 0, stdout: `already saved as ${refOf(channel.stdout)} (channel C1)` });
+
+      // Refusals: no profile to take limits from, too long, a credential, a DM ID as a channel.
+      expect(await memory("memory-add", [configPath, "--scope", "workspace", "--content", "x"])).toEqual({ exitCode: 1, stdout: "refused: profile-required" });
+      expect(await memory("memory-add", [configPath, "--scope", "operator", "--profile", "design", "--content", "y".repeat(81)])).toEqual({ exitCode: 1, stdout: "refused: entry-too-long" });
+      expect(await memory("memory-add", [configPath, "--scope", "channel", "--conversation", "C1", "--content", `token xoxb-${"1".repeat(12)}-${"2".repeat(12)}-${"a".repeat(24)}`]))
+        .toEqual({ exitCode: 1, stdout: "refused: secret-detected" });
+      expect(await memory("memory-add", [configPath, "--scope", "channel", "--conversation", "D1", "--content", "x"])).toEqual({ exitCode: 1, stdout: "refused: channel-conversation-required" });
+      await expect(memory("memory-add", [configPath, "--scope", "dm", "--content", "x"])).rejects.toThrow("--scope must be channel, workspace or operator");
+
+      // The operator sees every store, newest first, with no visibility filter.
+      const listed = JSON.parse((await memory("memory-list", [configPath, "--json"])).stdout) as { ref: string; store: string; content: string }[];
+      expect(listed.map((note) => [note.store, note.content])).toEqual([
+        ["operator", "Figma is the source of truth"],
+        ["workspace", "our default branch is main"],
+        ["channel", "deploys need a ticket"],
+        ["dm", "I prefer terse replies"],
+        ["channel", "reports go out as tables"],
+      ]);
+      expect(listed[2]).toMatchObject({ ref: refOf(channel.stdout), createdBy: OPERATOR, conversationId: "C1" });
+      // --conversation is the notes stored for that conversation: a channel's, or a DM route owner's.
+      const inC1 = JSON.parse((await memory("memory-list", [configPath, "--conversation", "C1", "--json"])).stdout) as { content: string }[];
+      expect(inC1.map((note) => note.content)).toEqual(["deploys need a ticket", "reports go out as tables"]);
+      const inD1 = JSON.parse((await memory("memory-list", [configPath, "--conversation", "D1", "--json"])).stdout) as { content: string }[];
+      expect(inD1.map((note) => note.content)).toEqual(["I prefer terse replies"]);
+      expect((await memory("memory-list", [configPath, "--conversation", "D1", "--scope", "channel"])).stdout).toBe("no notes");
+      const table = (await memory("memory-list", [configPath, "--scope", "workspace"])).stdout.split("\n");
+      expect(table).toHaveLength(2);
+      expect(table[0]).toStartWith("REF      STORE");
+      expect(table[1]).toStartWith(`${refOf(workspace.stdout)} workspace  -`);
+      expect(table[1]).toContain(`${OPERATOR} `);
+      expect(table[1]).toEndWith("our default branch is main");
+
+      // Edit and forget take a full ID or any unique prefix, including a Slack user's note.
+      expect(await memory("memory-edit", [configPath, slackNote.memoryId, "--content", "reports go out as markdown tables"]))
+        .toEqual({ exitCode: 0, stdout: `updated ${slackNote.memoryId.slice(0, 8)} (version 2)` });
+      expect(await memory("memory-forget", [configPath, refOf(workspace.stdout)])).toEqual({ exitCode: 0, stdout: `forgot ${refOf(workspace.stdout)}` });
+      expect(await memory("memory-forget", [configPath, refOf(workspace.stdout)])).toEqual({ exitCode: 1, stdout: "no active note with that ID" });
+      expect(await memory("memory-edit", [configPath, "not-a-ref", "--content", "x"])).toEqual({ exitCode: 1, stdout: "no active note with that ID" });
+
+      // Forgetting a whole conversation needs --yes and is all or nothing.
+      expect(await memory("memory-forget", [configPath, "--conversation", "C1", "--all"]))
+        .toEqual({ exitCode: 1, stdout: "would forget 2 notes stored for C1; rerun with --yes" });
+      expect(await memory("memory-forget", [configPath, "--conversation", "C1", "--all", "--yes"]))
+        .toEqual({ exitCode: 0, stdout: "forgot 2 notes stored for C1" });
+      expect((await memory("memory-list", [configPath, "--conversation", "C1"])).stdout).toBe("no notes");
+      expect(await memory("memory-forget", [configPath, "--conversation", "C1", "--all"]))
+        .toEqual({ exitCode: 0, stdout: "would forget 0 notes stored for C1; rerun with --yes" });
+
+      const store = await AgentTagStore.open(join(dataDir, "agent-tag.sqlite"));
+      try {
+        const audit = store.listAuditRecords().filter((record) => record.action.startsWith("memory.") && record.actorType === "operator");
+        expect(audit.every((record) => record.actorId === OPERATOR && record.authority === "operator-cli")).toBe(true);
+        const count = (action: string) => audit.filter((record) => record.action === action).length;
+        expect([count("memory.created"), count("memory.updated"), count("memory.forgotten"), count("memory.denied")]).toEqual([3, 1, 3, 4]);
+        // The Slack user's own rows keep their actor.
+        expect(store.listAuditRecords().filter((record) => record.action === "memory.created" && record.actorType === "slack-user")).toHaveLength(2);
+        const serialized = JSON.stringify(store.listAuditRecords());
+        for (const content of ["deploys need a ticket", "our default branch is main", "Figma is the source of truth", "markdown tables", "xoxb-"]) {
+          expect(serialized).not.toContain(content);
+        }
+      } finally {
+        store.close();
+      }
+    });
+  });
+
+  test("argument mistakes print a clean usage error through the binary", async () => {
+    await withFixture(async ({ configPath }) => {
+      await expect(memory("memory-list", [configPath, "--scope", "everything"])).rejects.toThrow("--scope must be channel, workspace, dm, operator or task");
+      await expect(memory("memory-edit", [configPath, "abcd1234"])).rejects.toThrow("memory-edit requires --content");
+      await expect(memory("memory-forget", [configPath, "--all"])).rejects.toThrow("--all requires --conversation");
+      await expect(memory("memory-forget", [configPath, "abcd1234", "--yes"])).rejects.toThrow("--yes does not apply to memory-forget");
+      await expect(memory("memory-list", [])).rejects.toThrow("memory-list requires CONFIG");
+
+      const misuse = await runCli(["memory-add", configPath, "--scope", "channel"]);
+      expect(misuse.exitCode).toBe(1);
+      expect(misuse.stderr).toContain("agent-tag memory-add: memory-add requires --content");
+      expect(misuse.stderr).toContain("usage: agent-tag memory-list CONFIG");
+      expect(misuse.stderr).not.toContain("cli.ts:");
+      const listed = await runCli(["memory-list", configPath]);
+      expect(listed).toEqual({ exitCode: 0, stdout: "no notes\n", stderr: "" });
+      const help = await runCli(["help"]);
+      expect(help.stdout + help.stderr).toContain("agent-tag memory-forget CONFIG --conversation ID --all [--yes]");
+    });
+  });
 });

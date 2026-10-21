@@ -90,15 +90,16 @@ function seedVersionOne(database: Database): void {
 
 test("upgrades every historical SQLite schema while preserving existing work", async () => {
   const versions = STORE_MIGRATIONS.map((migration) => migration.version);
-  expect(versions).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]);
+  expect(versions).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28]);
   // Each historical prefix, plus a store that applied 14 (from main) before 13 existed: applied
-  // versions are tracked as a set, so 13 must still apply on top of it.
+  // versions are tracked as a set, so 13 must still apply on top of it (before any later version,
+  // which that store only gets from a build that already has 13).
   const startingSets: ReadonlyArray<{ readonly label: string; readonly applied: ReadonlyArray<number> }> = [
     ...versions.map((startingVersion) => ({
       label: `v${startingVersion}`,
       applied: versions.filter((version) => version <= startingVersion),
     })),
-    { label: "v14-without-13", applied: versions.filter((version) => version !== 13) },
+    { label: "v14-without-13", applied: versions.filter((version) => version !== 13 && version <= 14) },
   ];
 
   for (const { label, applied } of startingSets) {
@@ -856,6 +857,69 @@ test("H2: migration 26 adds the restart request columns to a database holding ta
     database.close();
   } finally {
     if (!directory.startsWith(`${tmpdir()}/agent-tag-migration-restart-`)) {
+      throw new Error(`refusing to remove unexpected migration fixture path ${directory}`);
+    }
+    await rm(directory, { recursive: true });
+  }
+});
+
+test("H2: migration 28 pins every sent turn to its thread and reopens a retired thread one was sent to", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-tag-migration-pin-"));
+  const path = join(directory, "agent-tag.sqlite");
+  const before = "2026-09-21T00:01:00.000Z";
+  const retiredAt = "2026-09-21T00:02:00.000Z";
+  const after = "2026-09-21T00:03:00.000Z";
+  try {
+    const historical = new Database(path, { create: true, strict: true });
+    historical.exec("PRAGMA foreign_keys = ON");
+    historical.exec("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)");
+    applyMigration(historical, 1);
+    seedVersionOne(historical);
+    for (const migration of STORE_MIGRATIONS) {
+      if (migration.version > 1 && migration.version < 28) applyMigration(historical, migration.version);
+    }
+    // Generation 1 was retired by a `!restart` as never created, though its turn had been sent
+    // (no receipt, retries exhausted); generation 2 has one sent turn and one not sent yet.
+    historical
+      .query("UPDATE tasks SET t3_project_id = 'p', t3_thread_id = 'thread-g2', session_generation = 2 WHERE task_id = 'task-1'")
+      .run();
+    historical
+      .query("UPDATE operations SET status = 'failed', t3_turn_dispatched_at = ? WHERE operation_id = 'operation-1'")
+      .run(before);
+    const copy = historical.query(
+      `INSERT INTO operations (operation_id, task_id, source_delivery_id, source_event_key, kind, command_id, message_id,
+         payload_json, status, created_at, updated_at, t3_turn_dispatched_at)
+       SELECT ?, task_id, source_delivery_id, ?, kind, ?, ?, payload_json, 'pending', created_at, updated_at, ?
+       FROM operations WHERE operation_id = 'operation-1'`,
+    );
+    copy.run("operation-2", "C1:1000.000002", "command-2", "message-2", after);
+    copy.run("operation-3", "C1:1000.000003", "command-3", "message-3", null);
+    historical
+      .query(
+        `INSERT INTO task_retired_t3_threads (task_id, generation, t3_project_id, t3_thread_id, repository_root, branch,
+           reason, retired_at, thread_created, session_stop_command_id, delete_command_id, worktree_state, branch_state,
+           completed_at)
+         VALUES ('task-1', 1, 'p', 'thread-g1', '/srv/repos/example', 'agent-tag/task-1', 'restart', ?, 0,
+           'task-1:g1:session.stop', 'task-1:g1:thread.delete', 'none', 'deleted', ?)`,
+      )
+      .run(retiredAt, retiredAt);
+    historical.close();
+    (await AgentTagStore.open(path)).close();
+
+    const database = new Database(path, { strict: true });
+    expect(database.query("SELECT operation_id, t3_thread_id FROM operations ORDER BY operation_id").all()).toEqual([
+      { operation_id: "operation-1", t3_thread_id: "thread-g1" },
+      { operation_id: "operation-2", t3_thread_id: "thread-g2" },
+      { operation_id: "operation-3", t3_thread_id: null },
+    ]);
+    expect(
+      database
+        .query("SELECT thread_created, worktree_state, branch_state, completed_at, session_stopped_at FROM task_retired_t3_threads")
+        .get(),
+    ).toEqual({ thread_created: 1, worktree_state: "unknown", branch_state: "unknown", completed_at: null, session_stopped_at: null });
+    database.close();
+  } finally {
+    if (!directory.startsWith(`${tmpdir()}/agent-tag-migration-pin-`)) {
       throw new Error(`refusing to remove unexpected migration fixture path ${directory}`);
     }
     await rm(directory, { recursive: true });
