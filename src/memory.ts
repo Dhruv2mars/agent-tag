@@ -531,7 +531,7 @@ export class AgentTagMemory {
   /** A denial reason for note content, or null when it may be stored. */
   #checkContent(profile: Profile | null, content: string): string | null {
     if (content === "") return "entry-empty";
-    // Without a profile (an operator edit of a workspace note), the store's own limit applies.
+    // Without a profile (an operator edit of a workspace note), the highest `maxEntryChars` config allows.
     if (content.length > (profile?.memory.maxEntryChars ?? 2_000)) return "entry-too-long";
     if (containsKnownSecret(content)) return "secret-detected";
     return null;
