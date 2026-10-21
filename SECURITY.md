@@ -30,7 +30,7 @@ This is the only deployment Agent Tag supports and tests today. The config must 
 Assumptions:
 
 - Agent Tag, T3 Code, and every agent process run as **the same OS user** on one host.
-- Every user in `access.allowedUserIds` is trusted with shell access to that account. With `access.mode: "channel-members"`, so is every non-guest member of every channel in `access.allowedChannelIds`: anyone who can join such a channel can run code as the host user. This covers everything the account can read or write: other repositories, `~/.ssh`, cloud credentials, browser profiles, and Agent Tag's own secret files and database.
+- Every user in `access.allowedUserIds` is trusted with shell access to that account. With `access.mode: "channel-members"`, so is every non-guest member of every channel in `access.allowedChannelIds`: anyone who can join such a channel can run code as the host user. Guests are recognized only when Agent Tag can read the account kind (`users:read`); if that lookup fails or is disabled, a guest member may still start turns, though never approve. This covers everything the account can read or write: other repositories, `~/.ssh`, cloud credentials, browser profiles, and Agent Tag's own secret files and database.
 - Repository content and Slack thread text are untrusted input to the model. Prompt injection from a file, issue, or message can steer the agent within the authority above.
 - The host, the OS account, and the T3 server are trusted and patched.
 

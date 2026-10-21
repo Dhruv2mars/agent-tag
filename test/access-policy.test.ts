@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
 import { agentTagConfigSchema, type AgentTagConfig } from "../src/config.ts";
+import { actionPurpose } from "../src/slack/actions.ts";
 import {
   bindMembership,
   isSteeringAllowed,
@@ -211,5 +212,17 @@ describe("resolveRoute", () => {
     expect(resolveRoute(auto, "C5", "UA")).toBeUndefined();
     expect(resolveRoute(buildConfig(AL), "D5", "UA")).toBeUndefined();
     expect(resolveRoute(buildConfig(AL, { directMessages: { mode: "off" } }), "D5", "UA")).toBeUndefined();
+  });
+});
+
+describe("actionPurpose", () => {
+  test.each([
+    ["agent-tag.turn.stop", "cancel"],
+    ["agent-tag.turn.cancel", "cancel"],
+    ["agent-tag.approval.accept", "approve"],
+    ["agent-tag.approval.decline", "approve"],
+    ["agent-tag.input.submit", "answer"],
+  ] as const)("%s is a %s click", (actionId, purpose) => {
+    expect(actionPurpose(actionId)).toBe(purpose);
   });
 });

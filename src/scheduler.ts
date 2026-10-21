@@ -241,9 +241,14 @@ export class ScheduleWorker {
       });
     } catch (error) {
       if (!(error instanceof ExecutionAuthorityDenied)) throw error;
-      // No fresh membership snapshot yet (startup, Slack outage): leave the claim to lapse and retry.
+      // No fresh membership snapshot yet (startup, Slack outage): leave the claim to lapse and retry within
+      // the misfire grace. Past it (a missing scope never yields a snapshot) skip this run, never revoke.
       if (error.reason === "membership-unknown") {
-        return { kind: "authority-deferred", scheduleId: schedule.scheduleId, dueAt: schedule.dueAt };
+        if (current.getTime() <= new Date(schedule.dueAt).getTime() + schedule.misfireGraceSeconds * 1_000) {
+          return { kind: "authority-deferred", scheduleId: schedule.scheduleId, dueAt: schedule.dueAt };
+        }
+        this.#settle(schedule, "missed-skipped", current, nextRunAt(schedule, current));
+        return { kind: "missed-skipped", scheduleId: schedule.scheduleId, dueAt: schedule.dueAt };
       }
       this.#store.revokeClaimedSchedule({ scheduleId: schedule.scheduleId, workerId: this.#workerId, now: current.toISOString() });
       return { kind: "authority-revoked", scheduleId: schedule.scheduleId, dueAt: schedule.dueAt };
