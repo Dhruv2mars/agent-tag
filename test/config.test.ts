@@ -76,12 +76,14 @@ describe("Agent Tag config", () => {
   });
 
   test("defaults and validates the routine auto-disable policy", () => {
+    const slackDefaults = { enabled: true, defaultTimeZone: "UTC", maxActivePerConversation: 25 };
     expect(agentTagConfigSchema.parse(baseConfig).routines).toEqual({
+      ...slackDefaults,
       autoDisable: { consecutiveFailures: 3, minFailureSpanSeconds: 3_600 },
     });
     expect(
       agentTagConfigSchema.parse({ ...baseConfig, routines: { autoDisable: { consecutiveFailures: 5 } } }).routines,
-    ).toEqual({ autoDisable: { consecutiveFailures: 5, minFailureSpanSeconds: 3_600 } });
+    ).toEqual({ ...slackDefaults, autoDisable: { consecutiveFailures: 5, minFailureSpanSeconds: 3_600 } });
     for (const autoDisable of [
       { consecutiveFailures: 0 },
       { consecutiveFailures: 51 },
@@ -90,6 +92,23 @@ describe("Agent Tag config", () => {
       { unknown: true },
     ]) {
       expect(() => agentTagConfigSchema.parse({ ...baseConfig, routines: { autoDisable } })).toThrow();
+    }
+  });
+
+  test("validates the Slack routine settings", () => {
+    const routines = agentTagConfigSchema.parse({
+      ...baseConfig,
+      routines: { enabled: false, defaultTimeZone: "Asia/Kolkata", maxActivePerConversation: 5 },
+    }).routines;
+    expect(routines).toMatchObject({ enabled: false, defaultTimeZone: "Asia/Kolkata", maxActivePerConversation: 5 });
+    for (const bad of [
+      { defaultTimeZone: "Mars/Olympus" },
+      { defaultTimeZone: "" },
+      { maxActivePerConversation: 0 },
+      { maxActivePerConversation: 1_001 },
+      { userTimeZoneCacheSeconds: 60 },
+    ]) {
+      expect(() => agentTagConfigSchema.parse({ ...baseConfig, routines: bad })).toThrow();
     }
   });
 

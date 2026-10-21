@@ -59,6 +59,39 @@ describe("SlackUserDirectory", () => {
     expect(labels.get("U1")).toEqual({ userId: "U1", label: "Alice Chen", resolved: true });
   });
 
+  test("returns the profile time zone from the same cached lookup (J3)", async () => {
+    let calls = 0;
+    const users: Record<string, Record<string, unknown>> = {
+      U1: { name: "alice", tz: "America/New_York" },
+      U2: { name: "bob", tz: "  " },
+      U3: { name: "carol" },
+      U4: { name: "dave", tz: "x".repeat(65) },
+    };
+    const { directory } = fixture({
+      lookup: async (id) => {
+        calls += 1;
+        return userResponse(id, users[id] ?? {});
+      },
+    });
+    expect(await directory.label("U1")).toEqual({ userId: "U1", label: "alice", resolved: true });
+    expect(await directory.timeZone("U1")).toBe("America/New_York");
+    expect(calls).toBe(1);
+    expect(await directory.timeZone("U2")).toBeNull();
+    expect(await directory.timeZone("U3")).toBeNull();
+    expect(await directory.timeZone("U4")).toBeNull();
+  });
+
+  test("a disabled directory has no time zones", async () => {
+    const { directory } = fixture({
+      lookup: async () => {
+        throw platformError("missing_scope");
+      },
+    });
+    expect(await directory.timeZone("U1")).toBeNull();
+    expect(await directory.timeZone("U2")).toBeNull();
+    expect(directory.disabledCode).toBe("missing_scope");
+  });
+
   test("labels deactivated users and bot users", async () => {
     const { directory } = fixture({
       lookup: async (id) =>

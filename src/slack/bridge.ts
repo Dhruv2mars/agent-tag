@@ -14,6 +14,8 @@ import { SlackEventRouter } from "./events.ts";
 import { deliverNextSlackOutbox, type RefreshRenderers, type SlackOutboxOutcome } from "./outbox.ts";
 import { renderStatusMessage } from "./status.ts";
 import { classifySlackDeliveryError } from "./outbox-policy.ts";
+import { ROUTINE_CANCEL_ACTION_ID } from "./routine-replies.ts";
+import { SlackRoutines } from "./routines.ts";
 import { deliverNextSlackReaction, type SlackReactionOutcome } from "./reactions.ts";
 import { installUndiciWebSocketCompat } from "./undici-compat.ts";
 import { SlackUserDirectory, slackErrorCode } from "./users.ts";
@@ -178,13 +180,21 @@ export function createCommandReplySender(
   };
 }
 
-/** Routes one Slack event; a `!command` is executed after the router returns (never inside ingest). */
+/**
+ * Routes one Slack event; a `!command` or routine request is executed after the router returns
+ * (never inside ingest).
+ */
 export async function handleSlackEvent(
-  input: { readonly router: Pick<SlackEventRouter, "ingest">; readonly commands: Pick<AgentTagCommands, "execute"> },
+  input: {
+    readonly router: Pick<SlackEventRouter, "ingest">;
+    readonly commands: Pick<AgentTagCommands, "execute">;
+    readonly routines?: Pick<SlackRoutines, "handle">;
+  },
   body: unknown,
 ): Promise<void> {
   const result = input.router.ingest(body);
   if (result.kind === "command") await input.commands.execute(result);
+  if (result.kind === "routine") await input.routines?.handle(result);
 }
 
 /** Delivery-time renderers for outbox refresh rows, by refresh kind. PR-F adds "status-message". */
@@ -301,19 +311,37 @@ export class SlackSocketBridge {
       botUserId: auth.user_id,
       ...(selfBotId === undefined ? {} : { selfBotId }),
     });
+    const commandReplies = createCommandReplySender(app.client as unknown as CommandReplyClient);
     const commands = new AgentTagCommands({
       config: () => input.config,
       store: input.store,
-      replies: createCommandReplySender(app.client as unknown as CommandReplyClient),
+      replies: commandReplies,
+      ...(auth.user === undefined ? {} : { botName: auth.user }),
+      ...(input.logger === undefined ? {} : { logger: input.logger }),
+    });
+    // users:read: speaker labels for thread context, and the requester's zone for routines.
+    const users = await createSlackUserDirectory({
+      botToken: botToken.exposeToBoundary(),
+      ...(input.logger === undefined ? {} : { logger: input.logger }),
+    });
+    const routines = new SlackRoutines({
+      config: () => input.config,
+      store: input.store,
+      users,
+      replies: commandReplies,
       ...(auth.user === undefined ? {} : { botName: auth.user }),
       ...(input.logger === undefined ? {} : { logger: input.logger }),
     });
     const actions = new SlackActionRouter({ config: input.config, store: input.store });
     app.event("app_mention", async ({ body }) => {
-      await handleSlackEvent({ router, commands }, body);
+      await handleSlackEvent({ router, commands, routines }, body);
     });
     app.event("message", async ({ body }) => {
-      await handleSlackEvent({ router, commands }, body);
+      await handleSlackEvent({ router, commands, routines }, body);
+    });
+    app.action(ROUTINE_CANCEL_ACTION_ID, async ({ ack, body, respond }) => {
+      await ack();
+      await routines.cancelFromAction(body, (text) => respond({ response_type: "ephemeral", replace_original: false, text }));
     });
     for (const actionId of SLACK_ACTION_IDS) {
       app.action(actionId, async ({ ack, body, client, respond }) => {
@@ -333,10 +361,6 @@ export class SlackSocketBridge {
       } else {
         await ack();
       }
-    });
-    const users = await createSlackUserDirectory({
-      botToken: botToken.exposeToBoundary(),
-      ...(input.logger === undefined ? {} : { logger: input.logger }),
     });
     const replies = await createSlackRepliesReader({ botToken: botToken.exposeToBoundary() });
     const contextSource: SlackContextSource = {
