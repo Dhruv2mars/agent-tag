@@ -491,6 +491,57 @@ Configure commands under `commands`:
 
 Only-you replies use `chat.postEphemeral` (covered by the existing `chat:write` scope). They are sent at most once, with one retry after a rate limit.
 
+## Models and providers
+
+Each profile runs on `defaultProviderInstanceId` / `defaultModel` unless people pick something else. `allowedModels` lists what else a thread may use (up to 20 entries); with no entries, threads stay on the default:
+
+```json
+"allowedModels": [
+  { "instanceId": "codex", "model": "gpt-5.6-mini", "label": "GPT Mini", "aliases": ["mini"] },
+  { "instanceId": "claudeAgent", "model": "claude-opus-5-5", "label": "Opus 5.5", "aliases": ["opus"] }
+]
+```
+
+`instanceId` is the T3 provider instance (as `doctor` lists it), `label` is the name Slack replies use, and `aliases` are short lowercase names people can type. A route can set its own `defaultModel` (`{ "instanceId", "model" }`) for one channel; it must be the profile default or one of its `allowedModels`. `modelSwitch.enabled: false` on a profile turns switching off; `modelSwitch.crossProvider: "deny"` keeps every thread on its default's provider. `agent-tag doctor` reports each allowed entry as `available` or the reason T3 can't serve it, and never fails startup over one; the service logs a `provider.allowed-model` line for each unavailable entry.
+
+### Switching models from Slack
+
+Mention the bot, write in your DM with it, or reply in a thread it is part of:
+
+| Say | What happens |
+|---|---|
+| `use opus` | Switches this thread to Opus and replies in the thread; no turn runs |
+| `use opus: fix the flaky test` | Switches, then runs the request on the new model |
+| `switch to gpt-5.6-mini`, `change the model to sonnet` | Same as `use …` |
+| `use Opus 5.5 for the rest of this thread` | Same; the tail is optional |
+| `model: sonnet` | Same |
+
+A model is named by its alias, label, slug, or `instance/model`. The directive ends at a `:`, `,`, `;`, `.`, `—` or a new line; anything after it is the request. A message only counts as a switch when the words right after the verb name a model, so "use the README to fix the install docs" or "switch to dark mode" stay ordinary requests. Unmentioned top-level channel messages, including ambient ones, are never parsed. `!commands` come first, then a switch, then memory phrases, then the request.
+
+The choice belongs to the thread and lasts for the rest of it, across closing, reopening and `!restart`. `!status` shows the model the next turn will use. Each Slack message switches at most once: the choice, its `task.model.selected` audit row, the reply, its `slack_command_events` row (kind `model-switch`) and any request after it commit together, so a redelivery or the duplicate `message` event for one mention is answered once.
+
+Refusals reply in the thread, say which model the thread stays on, and are audited as `task.model.denied` with a code. A request that came with a refused switch is not run, so it never runs on a model nobody asked for:
+
+- a name outside the allowlist (`not-allowed`, the reply lists what is allowed) or one that matches several entries (`ambiguous`);
+- a provider T3 doesn't report as ready (`unavailable`);
+- switching turned off (`switch-disabled`) or `crossProvider: "deny"` (`cross-provider-denied`).
+
+### The cross-provider rule
+
+T3 0.0.45 keeps a started conversation on its provider's session, so Agent Tag only moves a started thread where T3 can follow it:
+
+- **Before the first turn** (a new thread, or a closed one whose next request starts a fresh session) any allowed model works, and the first turn starts on it.
+- **On a started thread** the switch must stay on the same driver and the same resume state (for example `codex` to `codex`, not `codex` to `codex-work` with another home). It is applied in place with `thread.meta.update` before the next turn.
+- **Anything else** is refused (`cross-provider-started`, or `requires-new-thread` for a driver that needs a new thread for any model change, or `incompatible-continuation`). The reply offers a new thread (`@Agent Tag use opus: <request>`) or, when `!restart` is enabled for the person, `!restart` in the thread followed by the switch. A fresh session does not remember the conversation.
+
+A turn already sent to T3 counts as started, even before its reply arrives. If T3 still rejects a switch at turn time, the thread keeps the model it had and says so (`task.model.reverted`). When a config change removes a thread's model from the allowlist, the next turn falls back to the default only when T3 can make that move, and otherwise stays on what the thread already runs; both are audited as `task.model.reverted`.
+
+Tested live on T3 0.0.45: the `codex` and `claudeAgent` drivers ([evidence](evidence/2026-10-21-model-switch.md)). Other drivers (for example `grok` or `opencode`) follow the capabilities T3 reports for them but have not been run live.
+
+### Licensing
+
+Every provider in `allowedModels` is used on behalf of everyone who can reach the bot. Only list providers the organisation has approved for that shared use; see [Provider access and licensing](provider-licensing.md).
+
 ## Access changes and live verification
 
 Restart or upgrade the service after changing access configuration. Before each queued T3 turn, interaction response, or schedule, Agent Tag rechecks the stored task against the loaded workspace, user, channel, route, profile, repository, and DM-owner policy. Denied turns and interaction responses fail durably; revoked recurring schedules stop with an audit record. Queued Slack replies also recheck the task route and DM owner before sending. A sanitized failure notice may still reach an authorized shared channel after its requesting user is removed.

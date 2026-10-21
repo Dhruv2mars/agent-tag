@@ -776,14 +776,14 @@ describe("plain-language model switch from Slack (P2c)", () => {
     expect(h.audits("task.model.selected")).toHaveLength(1);
   });
 
-  test("4b + 4e: a plain bound reply 'switch to mini' runs no turn; the next turn moves T3 in place", async () => {
+  test("4b + 4e: '@bot switch to gpt-5.6-mini' on a started thread runs no turn; the next turn moves T3 in place", async () => {
     const h = await harness();
     const root = slackEvent({ text: "do a" });
     await h.slack(root.body);
     await h.process();
     const turns = h.t3.turnStarts().length;
 
-    await h.slack(slackEvent({ text: "switch to mini", threadTs: root.ts, mention: false }).body);
+    await h.slack(slackEvent({ text: "switch to gpt-5.6-mini", threadTs: root.ts }).body);
     expect(h.count("operations")).toBe(1);
     expect(h.t3.turnStarts()).toHaveLength(turns);
     expect(h.outboxTexts().filter((text) => text.startsWith("Switched"))).toEqual([
@@ -871,7 +871,8 @@ describe("plain-language model switch from Slack (P2c)", () => {
     const h = await harness();
     const root = slackEvent({ text: "do a" });
     await h.slack(root.body);
-    await h.slack(slackEvent({ text: "use opus", threadTs: root.ts }).body);
+    // A plain reply in the bound thread is addressed too.
+    await h.slack(slackEvent({ text: "use opus", threadTs: root.ts, mention: false }).body);
     expect(h.outboxTexts().at(-1)).toContain("The first turn will use it.");
 
     // The first turn has gone to T3 but the task has not recorded the thread as started.
@@ -897,6 +898,46 @@ describe("plain-language model switch from Slack (P2c)", () => {
       "Switched this thread to *Opus 5.5* (`claudeAgent/claude-opus-5-5`), requested by <@U0EXAMPLE>. The first turn will use it.",
     );
     await h.slack(slackEvent({ text: "carry on", threadTs: root.ts }).body);
+    expect(await h.process()).toMatchObject({ kind: "completed" });
+    expect(h.t3.turnStarts().at(-1)!.bootstrap?.createThread?.modelSelection).toEqual(OPUS);
+  });
+
+  test("after !restart the fresh session can move to another provider, as the refusal suggests", async () => {
+    const h = await harness();
+    const root = slackEvent({ text: "do a" });
+    await h.slack(root.body);
+    await h.process();
+    const taskId = h.store.findTaskForThread({ workspaceId: "T0EXAMPLE", conversationId: "C0EXAMPLE", threadTs: root.ts })!.taskId;
+    await h.slack(slackEvent({ text: "use opus", threadTs: root.ts }).body);
+    expect(h.outboxTexts().at(-1)).toContain("`@agent !restart`");
+
+    const commandKey = "C0EXAMPLE:2999.000001";
+    expect(h.store.beginCommand({
+      workspaceId: "T0EXAMPLE",
+      eventKey: commandKey,
+      deliveryId: "Ev-restart",
+      conversationId: "C0EXAMPLE",
+      threadTs: root.ts,
+      actorUserId: "U0EXAMPLE",
+      commandKind: "restart",
+      taskId,
+      now: NOW,
+    })).toBe("accepted");
+    expect(h.store.restartTaskCommand({
+      taskId,
+      workspaceId: "T0EXAMPLE",
+      conversationId: "C0EXAMPLE",
+      threadTs: root.ts,
+      actorUserId: "U0EXAMPLE",
+      commandKey,
+      commandOrderKey: "2999.000001",
+      profileId: "engineering",
+      replies: { ready: () => ({ text: "ready" }), restarting: () => ({ text: "restarting" }) },
+      now: NOW,
+    })).toMatchObject({ kind: "rotated" });
+
+    await h.slack(slackEvent({ text: "use opus: carry on", threadTs: root.ts }).body);
+    expect(h.outboxTexts().at(-1)).toContain("The first turn will use it.");
     expect(await h.process()).toMatchObject({ kind: "completed" });
     expect(h.t3.turnStarts().at(-1)!.bootstrap?.createThread?.modelSelection).toEqual(OPUS);
   });
