@@ -221,7 +221,7 @@ describe("final reply footer (F4)", () => {
         text: "Fixed the *bug*.",
         blocks: [
           { type: "section", text: { type: "mrkdwn", text: "Fixed the *bug*." } },
-          { type: "context", elements: [{ type: "plain_text", text: "claude-opus-5-5 · claudeAgent · 3m 12s" }] },
+          { type: "context", elements: [{ type: "plain_text", text: "claude-opus-5-5 · claudeAgent · 3m 12s", emoji: false }] },
         ],
       },
     ]);
@@ -239,7 +239,7 @@ describe("final reply footer (F4)", () => {
     const section = last?.blocks[0];
     expect(section?.type === "section" ? section.text.text : null).toBe(last?.text ?? "");
     expect((last?.text.length ?? 0) <= SLACK_SECTION_TEXT_LIMIT).toBe(true);
-    expect(last?.blocks[1]).toEqual({ type: "context", elements: [{ type: "plain_text", text: "claude-opus-5-5 · claudeAgent · 3m 12s" }] });
+    expect(last?.blocks[1]).toEqual({ type: "context", elements: [{ type: "plain_text", text: "claude-opus-5-5 · claudeAgent · 3m 12s", emoji: false }] });
     for (let index = 0; index < 40; index += 1) {
       expect(posts.some((post) => post.text.includes(`Paragraph ${index}:`))).toBe(true);
     }
@@ -333,13 +333,21 @@ describe("footer helpers", () => {
     expect(turnFilesChanged(withCheckpoints([{ turnId: "turn-2", status: "missing", files: [] }]))).toEqual({});
   });
 
-  test("a checkpoint shape the schema does not know drops the count, not the snapshot", () => {
+  test("a checkpoint shape the schema does not know is skipped, not the snapshot or the other checkpoints", () => {
     const parsed = threadSnapshotSchema.parse({
       ...completed,
-      thread: { ...completed.thread, checkpoints: [{ turnId: "turn-2", status: "archived", files: [{}] }] },
+      thread: {
+        ...completed.thread,
+        checkpoints: [
+          { turnId: "turn-1", status: "archived", files: [{}] },
+          { turnId: "turn-2", status: "ready", files: files(2) },
+        ],
+      },
     });
-    expect(parsed.thread.checkpoints).toBeUndefined();
-    expect(parsed.thread.latestTurn?.state).toBe("completed");
+    expect(parsed.thread.checkpoints).toEqual([{ turnId: "turn-2", status: "ready", files: files(2) }]);
+    expect(turnFilesChanged(parsed)).toEqual({ filesChanged: 2 });
+    expect(threadSnapshotSchema.parse({ ...completed, thread: { ...completed.thread, checkpoints: "nope" } }).thread.checkpoints)
+      .toBeUndefined();
   });
 
   test("chunks without a footer match splitForSlack; with one, every block passes the outbox schema", () => {

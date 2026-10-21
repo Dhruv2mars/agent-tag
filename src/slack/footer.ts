@@ -57,7 +57,7 @@ export function finalReplyChunks(mrkdwn: string, footer: ReplyFooter | null): Ar
     text: last,
     blocks: [
       { type: "section", text: { type: "mrkdwn", text: last } },
-      { type: "context", elements: [{ type: "plain_text", text: footerText(footer) }] },
+      { type: "context", elements: [{ type: "plain_text", text: footerText(footer), emoji: false }] },
     ],
   };
   return chunks;

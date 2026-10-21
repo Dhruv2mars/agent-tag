@@ -267,9 +267,14 @@ export const threadSnapshotSchema = z.object({
     messages: z.array(messageSchema),
     activities: z.array(activitySchema),
     /** Absent from test fixtures and older servers; T3 0.0.45 always sends it. */
-    // Only feeds the "N files changed" count, so a checkpoint shape this schema does not know drops
-    // the count instead of failing the snapshot (and the turn).
-    checkpoints: z.array(checkpointSchema).optional().catch(undefined),
+    // Only feeds the "N files changed" count, so a checkpoint shape this schema does not know is
+    // skipped instead of failing the snapshot (and the turn).
+    checkpoints: z
+      .array(checkpointSchema.nullable().catch(null))
+      .optional()
+      .catch(undefined)
+      .transform((list) => list?.filter((checkpoint) => checkpoint !== null))
+      .optional(),
     session: sessionSchema,
   }),
 });
