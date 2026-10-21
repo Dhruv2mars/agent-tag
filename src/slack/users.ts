@@ -29,10 +29,12 @@ export interface SlackUserDirectoryOptions {
 
 /**
  * The fields read from `users.info`. Extend this schema and `identityFromUser` to surface more
- * profile data (for example `tz`); the cache stores whatever identity those produce.
+ * profile data; the cache stores whatever identity those produce.
  */
 const slackUserSchema = z.object({
   id: z.string().optional(),
+  /** IANA time zone from the user's Slack profile ("America/New_York"); used for routines. */
+  tz: z.string().optional(),
   name: z.string().optional(),
   real_name: z.string().optional(),
   deleted: z.boolean().optional(),
@@ -99,9 +101,24 @@ export function slackErrorCode(error: unknown): string {
   return error instanceof Error && error.name ? error.name : "unknown_error";
 }
 
-interface CacheEntry {
+/** What one lookup yields: the speaker label and the profile time zone (null when unknown). */
+interface ResolvedUser {
   readonly identity: SpeakerIdentity;
+  readonly timeZone: string | null;
+}
+
+interface CacheEntry extends ResolvedUser {
   readonly expiresAt: number;
+}
+
+function unresolvedUser(userId: string): ResolvedUser {
+  return { identity: unresolvedSpeaker(userId), timeZone: null };
+}
+
+/** Slack's `tz`, kept only when it is a non-empty, plausibly IANA value; callers validate it. */
+function profileTimeZone(user: SlackUser): string | null {
+  const tz = user.tz?.trim();
+  return tz === undefined || tz === "" || tz.length > 64 ? null : tz;
 }
 
 function abortError(signal: AbortSignal): unknown {
@@ -146,7 +163,7 @@ export class SlackUserDirectory {
   readonly #now: () => number;
   readonly #logger: ServiceLogger;
   readonly #cache = new Map<string, CacheEntry>();
-  readonly #inflight = new Map<string, Promise<SpeakerIdentity>>();
+  readonly #inflight = new Map<string, Promise<ResolvedUser>>();
   #disabledCode: string | null = null;
 
   constructor(options: SlackUserDirectoryOptions) {
@@ -166,20 +183,33 @@ export class SlackUserDirectory {
   }
 
   label(userId: string, signal?: AbortSignal): Promise<SpeakerIdentity> {
+    return this.#resolve(userId, signal).then((user) => user.identity);
+  }
+
+  /**
+   * The user's Slack profile time zone (`users.info` `tz`), or null when it is unavailable: lookups
+   * disabled (for example `missing_scope`), a failed or slow lookup, or no zone on the profile.
+   * Shares the label cache, so a recent speaker costs no extra call.
+   */
+  timeZone(userId: string, signal?: AbortSignal): Promise<string | null> {
+    return this.#resolve(userId, signal).then((user) => user.timeZone);
+  }
+
+  #resolve(userId: string, signal?: AbortSignal): Promise<ResolvedUser> {
     if (signal?.aborted) return Promise.reject(abortError(signal));
-    if (this.#disabledCode !== null) return Promise.resolve(unresolvedSpeaker(userId));
+    if (this.#disabledCode !== null) return Promise.resolve(unresolvedUser(userId));
     const cached = this.#cache.get(userId);
     if (cached !== undefined) {
       if (cached.expiresAt > this.#now()) {
         this.#cache.delete(userId);
         this.#cache.set(userId, cached);
-        return Promise.resolve(cached.identity);
+        return Promise.resolve(cached);
       }
       this.#cache.delete(userId);
     }
     let pending = this.#inflight.get(userId);
     if (pending === undefined) {
-      if (this.#outstanding >= this.#maxOutstanding) return Promise.resolve(unresolvedSpeaker(userId));
+      if (this.#outstanding >= this.#maxOutstanding) return Promise.resolve(unresolvedUser(userId));
       pending = this.#fetch(userId).finally(() => this.#inflight.delete(userId));
       this.#inflight.set(userId, pending);
     }
@@ -235,25 +265,25 @@ export class SlackUserDirectory {
     return request;
   }
 
-  async #fetch(userId: string): Promise<SpeakerIdentity> {
+  async #fetch(userId: string): Promise<ResolvedUser> {
     try {
       const response = await this.#withTimeout(this.#startLookup(userId));
       const failure = usersInfoErrorSchema.safeParse(response);
       if (failure.success) throw new SlackUserLookupError(failure.data.error);
       const parsed = usersInfoResponseSchema.safeParse(response);
       if (!parsed.success) throw new SlackUserLookupError("invalid_response");
-      const identity = identityFromUser(userId, parsed.data.user);
-      this.#remember(userId, identity, this.#ttlMs);
-      return identity;
+      const user = { identity: identityFromUser(userId, parsed.data.user), timeZone: profileTimeZone(parsed.data.user) };
+      this.#remember(userId, user, this.#ttlMs);
+      return user;
     } catch (error) {
       const code = slackErrorCode(error);
       if (DISABLING_ERRORS.has(code)) {
         this.#disable(code);
       } else {
         // Includes `ratelimited`: no retry; the ID stands in until the negative entry expires.
-        this.#remember(userId, unresolvedSpeaker(userId), this.#negativeTtlMs);
+        this.#remember(userId, unresolvedUser(userId), this.#negativeTtlMs);
       }
-      return unresolvedSpeaker(userId);
+      return unresolvedUser(userId);
     }
   }
 
@@ -266,9 +296,9 @@ export class SlackUserDirectory {
     return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
   }
 
-  #remember(userId: string, identity: SpeakerIdentity, ttlMs: number): void {
+  #remember(userId: string, user: ResolvedUser, ttlMs: number): void {
     this.#cache.delete(userId);
-    this.#cache.set(userId, { identity, expiresAt: this.#now() + ttlMs });
+    this.#cache.set(userId, { ...user, expiresAt: this.#now() + ttlMs });
     while (this.#cache.size > this.#maxEntries) {
       const oldest = this.#cache.keys().next().value;
       if (oldest === undefined) break;

@@ -93,6 +93,9 @@
     "auditDays": 365
   },
   "routines": {
+    "enabled": true,
+    "defaultTimeZone": "UTC",
+    "maxActivePerConversation": 25,
     "autoDisable": {
       "consecutiveFailures": 3,
       "minFailureSpanSeconds": 3600
