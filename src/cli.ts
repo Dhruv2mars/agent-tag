@@ -8,6 +8,7 @@ import { runSecurityCli, SECURITY_CLI_USAGE } from "./security/cli.ts";
 import { createAgentTagService } from "./service.ts";
 import { AgentTagSchedules } from "./scheduler.ts";
 import { AgentTagStore } from "./store/store.ts";
+import { runTasksCommand, TASKS_USAGE } from "./tasks-cli.ts";
 import { T3_FATAL_EXIT_CODE, waitForShutdownOrFatal } from "./t3/operator.ts";
 
 // One leading "usage: agent-tag" line, continuation lines aligned under it.
@@ -21,6 +22,7 @@ const USAGE = [
   "       agent-tag <run|status|audit|backup> CONFIG [ARG]",
   "       agent-tag restore BACKUP NEW_DATA_DIR",
   "       agent-tag schedule-<add|list|cancel> CONFIG TASK ACTOR PROFILE [SPEC_OR_ID]",
+  ...TASKS_USAGE.replace("usage: ", "").split(" | ").map((line) => `       ${line}`),
   "       agent-tag <version|update|help>",
   ...SECURITY_CLI_USAGE.split(" | ").map((line) => `       ${line}`),
 ].join("\n");
@@ -30,6 +32,7 @@ const KNOWN_COMMANDS = new Set([
   "doctor",
   "service",
   "t3",
+  "tasks",
   "run",
   "status",
   "audit",
@@ -69,6 +72,7 @@ const operatorCommands = new Map<string, (argv: readonly string[]) => Promise<nu
   ["doctor", runDoctorCommand],
   ["service", runServiceCommand],
   ["t3", runT3Command],
+  ["tasks", runTasksCommand],
 ]);
 const operatorCommand = operatorCommands.get(command);
 

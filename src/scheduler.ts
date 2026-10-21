@@ -141,6 +141,7 @@ export class AgentTagSchedules {
         workspaceId: context.workspaceId,
         profileId: context.profileId,
         actorUserId: context.actorUserId,
+        includeClosed: true,
       })
     ) {
       return "task-denied";

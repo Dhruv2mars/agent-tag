@@ -563,4 +563,54 @@ export const STORE_MIGRATIONS: readonly StoreMigration[] = [
       );
     `,
   },
+  {
+    // Task lifecycle (PR-N1): idle close and reopen as a new session generation on the same task row.
+    // `task_retired_t3_threads` is the canonical retired-thread table shared with PR-H2 (`!restart`)
+    // and the PR-N2 cleanup worker, so it is created once with every reason and cleanup column: a
+    // widened CHECK would need a table rebuild. Backfill: an existing task's last activity is its
+    // `updated_at`. New tables and columns only, so it applies in any order relative to other versions.
+    version: 22,
+    sql: `
+      ALTER TABLE tasks ADD COLUMN session_generation INTEGER NOT NULL DEFAULT 1 CHECK (session_generation >= 1);
+      ALTER TABLE tasks ADD COLUMN last_activity_at TEXT;
+      ALTER TABLE tasks ADD COLUMN session_released_at TEXT;
+      ALTER TABLE tasks ADD COLUMN close_requested_at TEXT;
+      ALTER TABLE tasks ADD COLUMN close_reason TEXT
+        CHECK (close_reason IS NULL OR close_reason IN ('idle', 'command', 'root-deleted', 'admin'));
+      ALTER TABLE tasks ADD COLUMN closed_at TEXT;
+      UPDATE tasks SET last_activity_at = updated_at WHERE last_activity_at IS NULL;
+      CREATE INDEX tasks_lifecycle_idx ON tasks(state, last_activity_at);
+      CREATE TABLE task_retired_t3_threads (
+        task_id TEXT NOT NULL REFERENCES tasks(task_id),
+        generation INTEGER NOT NULL CHECK (generation >= 1),
+        t3_project_id TEXT NOT NULL,
+        t3_thread_id TEXT NOT NULL,
+        repository_root TEXT NOT NULL,
+        branch TEXT NOT NULL,
+        reason TEXT NOT NULL CHECK (reason IN ('restart', 'model-switch', 'idle', 'command', 'root-deleted', 'admin')),
+        retired_at TEXT NOT NULL,
+        thread_created INTEGER NOT NULL CHECK (thread_created IN (0, 1)),
+        session_stop_command_id TEXT NOT NULL UNIQUE,
+        session_stopped_at TEXT,
+        delete_command_id TEXT NOT NULL UNIQUE,
+        thread_deleted_at TEXT,
+        worktree_path TEXT,
+        worktree_state TEXT NOT NULL DEFAULT 'unknown'
+          CHECK (worktree_state IN ('unknown', 'none', 'removed', 'retained-dirty', 'adopted', 'failed')),
+        retain_until TEXT,
+        branch_state TEXT NOT NULL DEFAULT 'unknown'
+          CHECK (branch_state IN ('unknown', 'deleted', 'kept-commits', 'kept-pr', 'adopted', 'failed')),
+        head_commit_count INTEGER,
+        pr_url TEXT,
+        cleanup_attempts INTEGER NOT NULL DEFAULT 0 CHECK (cleanup_attempts >= 0),
+        next_attempt_at TEXT,
+        last_error_code TEXT,
+        lease_owner TEXT,
+        lease_expires_at TEXT,
+        completed_at TEXT,
+        PRIMARY KEY (task_id, generation)
+      );
+      CREATE INDEX task_retired_cleanup_idx ON task_retired_t3_threads(completed_at, next_attempt_at);
+    `,
+  },
 ];
