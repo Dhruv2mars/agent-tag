@@ -7,6 +7,8 @@ import { z } from "zod";
 import { agentTagConfigSchema, type AgentTagConfig } from "../src/config.ts";
 import { AgentTagCoordinator } from "../src/coordinator.ts";
 import { InteractionWorker } from "../src/interaction-worker.ts";
+import { bindMembership } from "../src/policy/access.ts";
+import { requireExecutionAuthority } from "../src/policy/execution.ts";
 import { AgentTagSchedules, ScheduleWorker } from "../src/scheduler.ts";
 import { deliverNextSlackOutbox } from "../src/slack/outbox.ts";
 import { AgentTagStore } from "../src/store/store.ts";
@@ -118,3 +120,72 @@ for (const revocation of revocations) {
     }
   });
 }
+
+test("channel-members: queued work by a member who left the channel is revoked like an allowlist removal", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-tag-authority-"));
+  const store = await AgentTagStore.open(join(directory, "agent-tag.sqlite"));
+  try {
+    const membersConfig = agentTagConfigSchema.parse({ ...config, access: { ...config.access, mode: "channel-members" } });
+    // U5 is not allowlisted: only channel membership lets them act. A refreshed snapshot flips them out.
+    let u5: "member" | "not-member" = "member";
+    bindMembership(membersConfig, {
+      lookup: (conversationId, userId) => (conversationId === "C1" && userId === "U5" ? u5 : "not-member"),
+      userKind: () => "member",
+    });
+    const receipt = store.ingestSlackEvent({
+      deliveryId: "delivery-1", eventKey: "C1:1000.000001", workspaceId: "T1",
+      conversationId: "C1", threadTs: "1000.000001", actorUserId: "U5",
+      conversationType: "channel", profileId: "engineering", repositoryRoot: root,
+      text: "member request canary", receivedAt: now,
+    });
+    const task = store.getTaskExecution(receipt.taskId);
+    const interaction = store.recordPendingInteraction({
+      ...receipt, threadId: task.threadId, requestId: "approval-1", kind: "approval",
+      prompt: { requestKind: "command" }, conversationId: "C1", threadTs: "1000.000001",
+      message: () => ({ text: "Approval requested" }), now,
+    });
+    expect(store.submitInteractionResponse({
+      interactionId: interaction.interactionId, workspaceId: "T1", conversationId: "C1",
+      threadTs: "1000.000001", actorUserId: "U5", sourceActionId: "action-1",
+      response: { decision: "accept" }, expirySeconds: 86_400, now,
+    }).kind).toBe("accepted");
+    const schedules = new AgentTagSchedules({ config: membersConfig, store });
+    for (const kind of ["reminder", "agent"] as const) {
+      expect(schedules.create({
+        context: { workspaceId: "T1", actorUserId: "U5", profileId: profile.id, taskId: receipt.taskId },
+        spec: { kind, prompt: "member schedule canary", runAt: now, cadenceSeconds: 60,
+          missedRunPolicy: "run-once", misfireGraceSeconds: 60, overlapPolicy: "skip" },
+        now,
+      }).kind).toBe("accepted");
+    }
+    expect(() => requireExecutionAuthority({ config: membersConfig, task, actorUserId: "U5" })).not.toThrow();
+
+    u5 = "not-member";
+    expect(() => requireExecutionAuthority({ config: membersConfig, task, actorUserId: "U5" })).toThrow(
+      expect.objectContaining({ name: "ExecutionAuthorityDenied", reason: "user-denied" }),
+    );
+    let calls = 0;
+    const dispatch = async () => { calls++; throw new Error("unauthorized dispatch"); };
+    const worker = new InteractionWorker({ config: membersConfig, store, t3: { dispatch, fetchThread: dispatch }, now: () => new Date(now) });
+    expect(await worker.processNext()).toMatchObject({ kind: "failed", errorCode: "ExecutionAuthorityDenied" });
+    const coordinator = new AgentTagCoordinator({
+      config: membersConfig, store, t3: { dispatch, fetchThread: dispatch }, now: () => new Date(now),
+    });
+    expect(await coordinator.processNext()).toMatchObject({ kind: "failed", errorCode: "ExecutionAuthorityDenied" });
+    expect(await coordinator.processNext()).toEqual({ kind: "idle" });
+    expect(calls).toBe(0);
+    const scheduleWorker = new ScheduleWorker({ config: membersConfig, store, now: () => new Date(now) });
+    expect((await scheduleWorker.processNext()).kind).toBe("authority-revoked");
+    expect((await scheduleWorker.processNext()).kind).toBe("authority-revoked");
+    expect((await scheduleWorker.processNext()).kind).toBe("idle");
+    expect(store.diagnostics().scheduleRuns).toBe(0);
+    expect(store.listSchedules(receipt.taskId).every((schedule) => schedule.state === "cancelled")).toBe(true);
+    const audit = store.listAuditRecords({ limit: 100 });
+    expect(audit.filter((row) => row.action === "operation.failed" && JSON.stringify(row.metadata).includes("ExecutionAuthorityDenied"))).toHaveLength(1);
+    expect(audit.filter((row) => row.action === "schedule.authority-revoked")).toHaveLength(2);
+    expect(JSON.stringify(audit)).not.toContain("member request canary");
+  } finally {
+    store.close();
+    await rm(directory, { recursive: true });
+  }
+});
