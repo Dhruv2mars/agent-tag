@@ -6,6 +6,7 @@ import { join } from "node:path";
 
 import { type AgentTagConfig, agentTagConfigSchema } from "../src/config.ts";
 import { resolveSelfBotId } from "../src/slack/bridge.ts";
+import { bindMembership } from "../src/policy/access.ts";
 import { SlackEventRouter } from "../src/slack/events.ts";
 import { AgentTagStore } from "../src/store/store.ts";
 
@@ -373,6 +374,47 @@ describe("Slack event ingress", () => {
       ).toEqual({ kind: "ignored", reason: "ambient-disabled" });
       expect(store.diagnostics()).toMatchObject({ events: 0, deliveries: 0, tasks: 0, operations: 0 });
     });
+  });
+});
+
+describe("channel-members access mode", () => {
+  test("a channel member's mention is accepted; a non-member, guest, or unknown snapshot is ignored", async () => {
+    const membersConfig = agentTagConfigSchema.parse({ ...config, access: { ...config.access, mode: "channel-members" } });
+    const snapshot: Record<string, "member" | "not-member" | "unknown"> = { U5: "member", U6: "not-member", U7: "member" };
+    bindMembership(membersConfig, {
+      lookup: (conversationId, userId) => (conversationId === "C1" ? (snapshot[userId] ?? "unknown") : "unknown"),
+      userKind: (userId) => (userId === "U7" ? "guest" : "member"),
+    });
+    const directory = await mkdtemp(join(tmpdir(), "agent-tag-slack-events-"));
+    const store = await AgentTagStore.open(join(directory, "agent-tag.sqlite"));
+    try {
+      const router = new SlackEventRouter({ config: membersConfig, store, botUserId: "U0BOT", now: () => receivedAt });
+      expect(router.ingest(eventBody({ eventId: "EvM1", type: "app_mention", user: "U5", ts: "1000.000101" }))).toMatchObject({
+        kind: "accepted",
+      });
+      expect(router.ingest(eventBody({ eventId: "EvM2", type: "app_mention", user: "U6", ts: "1000.000102" }))).toEqual({
+        kind: "ignored",
+        reason: "user-denied",
+      });
+      expect(router.ingest(eventBody({ eventId: "EvM3", type: "app_mention", user: "U7", ts: "1000.000103" }))).toEqual({
+        kind: "ignored",
+        reason: "user-denied",
+      });
+      expect(router.ingest(eventBody({ eventId: "EvM4", type: "app_mention", user: "U8", ts: "1000.000104" }))).toEqual({
+        kind: "ignored",
+        reason: "user-denied",
+      });
+      // The same config in allowlist mode keeps refusing the member.
+      const allowlistRouter = new SlackEventRouter({ config, store, botUserId: "U0BOT", now: () => receivedAt });
+      expect(allowlistRouter.ingest(eventBody({ eventId: "EvM5", type: "app_mention", user: "U5", ts: "1000.000105" }))).toEqual({
+        kind: "ignored",
+        reason: "user-denied",
+      });
+      expect(store.diagnostics()).toMatchObject({ tasks: 1, operations: 1 });
+    } finally {
+      store.close();
+      await rm(directory, { recursive: true });
+    }
   });
 });
 
