@@ -513,6 +513,34 @@ describe("thread context seed", () => {
       expect(claimOne(store)?.payload).not.toHaveProperty("threadContext");
     });
   });
+
+  test("a plain reply in a closed thread reopens its task and rereads the thread", async () => {
+    await withRouter(({ store, router }) => {
+      const accepted = router.ingest(eventBody({ eventId: "Ev1", type: "app_mention" }));
+      if (accepted.kind !== "accepted") throw new Error("initial mention was not accepted");
+      const first = claimOne(store);
+      if (first === null) throw new Error("initial mention was not claimable");
+      store.completeOperation({ operationId: first.operationId, workerId: "worker-a", resultSequence: 1, now: receivedAt });
+      for (let reaction = store.claimNextReaction({ workerId: "r", now: receivedAt, leaseMs: 10_000 }); reaction !== null;
+        reaction = store.claimNextReaction({ workerId: "r", now: receivedAt, leaseMs: 10_000 })) {
+        store.markReactionDelivered({ reactionKey: reaction.reactionKey, workerId: "r", now: receivedAt });
+      }
+      expect(store.closeTask({ taskId: first.taskId, reason: "idle", actorId: "test", now: receivedAt })).toMatchObject({
+        kind: "closed",
+      });
+
+      expect(
+        router.ingest(
+          eventBody({ eventId: "Ev2", type: "message", ts: "1000.000007", threadTs: "1000.000001", text: "pick this back up" }),
+        ),
+      ).toMatchObject({ kind: "accepted", receipt: { taskId: first.taskId } });
+      expect(store.getTaskExecution(first.taskId)).toMatchObject({ state: "active", sessionGeneration: 2, threadStarted: false });
+      expect(claimOne(store)?.payload).toMatchObject({
+        text: "pick this back up",
+        threadContext: { rootTs: "1000.000001", beforeTs: "1000.000007" },
+      });
+    });
+  });
 });
 
 const selfBotId = "B0SELF";

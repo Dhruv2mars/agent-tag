@@ -153,7 +153,7 @@ export class SlackRoutines {
       threadTs: req.threadTs,
       actorUserId: req.actorUserId,
       commandKind: `routine-${intent.kind}`,
-      taskId: this.#store.findActiveTask({ workspaceId: req.workspaceId, conversationId: req.conversationId, threadTs: req.threadTs })?.taskId ?? null,
+      taskId: this.#store.findTaskForThread({ workspaceId: req.workspaceId, conversationId: req.conversationId, threadTs: req.threadTs })?.taskId ?? null,
       now: req.receivedAt,
     });
     if (claim === "duplicate") return { kind: "duplicate" };
@@ -408,7 +408,7 @@ export class SlackRoutines {
     const clicked =
       clickedThread === undefined
         ? null
-        : this.#store.findActiveTask({ workspaceId: teamId, conversationId: channelId, threadTs: clickedThread });
+        : this.#store.findTaskForThread({ workspaceId: teamId, conversationId: channelId, threadTs: clickedThread });
     const target =
       clicked !== null && clickedThread !== undefined
         ? { taskId: clicked.taskId, threadTs: clickedThread }

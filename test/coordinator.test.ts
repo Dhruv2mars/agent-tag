@@ -1305,3 +1305,94 @@ describe("memory injection", () => {
     }
   });
 });
+
+describe("task lifecycle reopen", () => {
+  test("the first turn after a reopen bootstraps a new T3 thread on a generation branch", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "agent-tag-coordinator-reopen-"));
+    const store = await AgentTagStore.open(join(directory, "agent-tag.sqlite"));
+    const commands: T3Command[] = [];
+    let messageId: string | undefined;
+    const t3: T3CoordinatorGateway = {
+      dispatch: async (command) => {
+        commands.push(command);
+        if (command.type === "thread.turn.start") messageId = command.message.messageId;
+        return { sequence: commands.length };
+      },
+      fetchThread: async (threadId) => completedSnapshot(threadId, "done", messageId),
+    };
+    const coordinator = new AgentTagCoordinator({
+      config,
+      store,
+      t3,
+      workerId: "worker-a",
+      now: () => new Date(now),
+      sleep: async () => {},
+    });
+    const event = (n: number) => ({
+      deliveryId: `delivery-${n}`,
+      eventKey: `C1:1000.00000${n}`,
+      workspaceId: "T1",
+      conversationId: "C1",
+      threadTs: "1000.000001",
+      actorUserId: "U1",
+      conversationType: "channel" as const,
+      profileId: "engineering",
+      repositoryRoot: "/srv/repos/example",
+      text: `request ${n}`,
+      receivedAt: now,
+      sourceOrderKey: `1000.00000${n}`,
+    });
+    const drainOutbox = () => {
+      for (let row = store.claimNextOutbox({ workerId: "slack", now, leaseMs: 10_000 }); row !== null;
+        row = store.claimNextOutbox({ workerId: "slack", now, leaseMs: 10_000 })) {
+        store.markOutboxDelivered({ outboxId: row.outboxId, workerId: "slack", slackMessageTs: "1000.999999", now });
+      }
+    };
+    try {
+      const receipt = store.ingestSlackEvent(event(1));
+      const memory = new AgentTagMemory({ config, store });
+      expect(memory.create({
+        context: { workspaceId: "T1", actorUserId: "U1", profileId: "engineering", taskId: receipt.taskId, conversationType: "channel" },
+        scope: "task",
+        content: "remember the durable boundary",
+        sourceType: "slack-message",
+        sourceId: "C1:999.000001",
+        now,
+      }).kind).toBe("accepted");
+      expect((await coordinator.processNext()).kind).toBe("completed");
+      drainOutbox();
+      const first = commands.find((command) => command.type === "thread.turn.start");
+      if (first?.type !== "thread.turn.start") throw new Error("first turn was not dispatched");
+      expect(first.bootstrap?.prepareWorktree).toMatchObject({ branch: `agent-tag/${receipt.taskId}` });
+
+      expect(store.closeTask({ taskId: receipt.taskId, reason: "admin", actorId: "test", now })).toMatchObject({ kind: "closed" });
+      expect(store.ingestSlackEvent(event(2)).taskId).toBe(receipt.taskId);
+      // A turn on the closed generation's thread stays started; the new one has not.
+      expect(store.getTaskExecution(receipt.taskId)).toMatchObject({ sessionGeneration: 2, threadStarted: false });
+      expect((await coordinator.processNext()).kind).toBe("completed");
+
+      const turns = commands.filter((command) => command.type === "thread.turn.start");
+      expect(turns).toHaveLength(2);
+      const second = turns[1];
+      if (second?.type !== "thread.turn.start") throw new Error("reopened turn was not dispatched");
+      expect(second.threadId).not.toBe(first.threadId);
+      // The new T3 thread has seen none of the task's memory, so it is injected again.
+      expect(first.message.text).toContain("remember the durable boundary");
+      expect(second.message.text).toContain("remember the durable boundary");
+      expect(second.bootstrap).toMatchObject({
+        createThread: { projectId: first.bootstrap?.createThread?.projectId },
+        prepareWorktree: { projectCwd: "/srv/repos/example", baseBranch: "main", branch: `agent-tag/${receipt.taskId}-g2` },
+      });
+      // The T3 project is shared per repository: a reopen replays the same deduplicated create.
+      expect(new Set(commands.filter((command) => command.type === "project.create").map((command) => command.commandId)).size)
+        .toBe(1);
+      expect(store.getTaskExecution(receipt.taskId)).toMatchObject({ state: "active", threadStarted: true });
+    } finally {
+      store.close();
+      if (!directory.startsWith(`${tmpdir()}/agent-tag-coordinator-reopen-`)) {
+        throw new Error(`refusing to remove unexpected fixture path ${directory}`);
+      }
+      await rm(directory, { recursive: true });
+    }
+  });
+});

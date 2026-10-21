@@ -16,6 +16,7 @@
  *   commands.ts     `!command` ledger, thread mute, `!status` summaries
  *   reactions.ts    Slack reaction queue (instant ack)
  *   status.ts       live status message per turn (state, progress, throttled edits)
+ *   lifecycle.ts    task idle/operator close, retired T3 threads, task listing
  *   schema.ts       zod schemas                            types.ts        public types (re-exported)
  */
 import type { Database } from "bun:sqlite";
@@ -62,6 +63,7 @@ import * as commands from "./commands.ts";
 import * as reactions from "./reactions.ts";
 import * as attachments from "./attachments.ts";
 import * as status from "./status.ts";
+import * as lifecycle from "./lifecycle.ts";
 
 export type { AuditAction } from "./schema.ts";
 export type {
@@ -132,9 +134,18 @@ export type {
   TaskBelongsToContextInput,
   EnsureTaskForThreadInput,
   BindT3TaskInput,
-  FindActiveTaskInput,
+  FindTaskForThreadInput,
   MarkT3ThreadStartedInput,
 } from "./tasks.ts";
+export type {
+  CloseTaskInput,
+  CloseTaskResult,
+  ListTasksInput,
+  RequestTaskCloseInput,
+  RequestTaskCloseResult,
+  TaskCloseReason,
+  TaskSummary,
+} from "./lifecycle.ts";
 export type {
   ClaimNextOperationInput,
   RenewOperationLeaseInput,
@@ -524,8 +535,24 @@ export class AgentTagStore {
     return commands.getConversationStatus(this.#database, input);
   }
 
-  findActiveTask(input: tasks.FindActiveTaskInput): ActiveTaskBinding | null {
-    return tasks.findActiveTask(this.#database, input);
+  findTaskForThread(input: tasks.FindTaskForThreadInput): ActiveTaskBinding | null {
+    return tasks.findTaskForThread(this.#database, input);
+  }
+
+  listCloseCandidates(input: lifecycle.ListCloseCandidatesInput): readonly string[] {
+    return lifecycle.listCloseCandidates(this.#database, input);
+  }
+
+  closeTask(input: lifecycle.CloseTaskInput): lifecycle.CloseTaskResult {
+    return lifecycle.closeTask(this.#database, input);
+  }
+
+  requestTaskClose(input: lifecycle.RequestTaskCloseInput): lifecycle.RequestTaskCloseResult {
+    return lifecycle.requestTaskClose(this.#database, input);
+  }
+
+  listTasks(input: lifecycle.ListTasksInput): readonly lifecycle.TaskSummary[] {
+    return lifecycle.listTasks(this.#database, input);
   }
 
   getTaskExecution(taskIdInput: string): TaskExecutionBinding {

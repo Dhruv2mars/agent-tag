@@ -186,7 +186,7 @@ export class SlackEventRouter {
   }
 
   #findBinding(workspaceId: string, conversationId: string, threadTs: string): ActiveTaskBinding | null {
-    return this.#store.findActiveTask({ workspaceId, conversationId, threadTs });
+    return this.#store.findTaskForThread({ workspaceId, conversationId, threadTs });
   }
 
   /**
@@ -397,7 +397,9 @@ export class SlackEventRouter {
 
     // First mention partway into an existing thread: the coordinator reads the earlier messages.
     // Only an explicit mention gets here for an unbound reply (plain replies stop at unbound-thread).
-    const firstMentionInThread = binding === null && event.thread_ts !== undefined && event.thread_ts !== event.ts;
+    // A reply that reopens a closed task starts a fresh T3 thread, so it rereads the thread too.
+    const firstMentionInThread = (binding === null || binding.state === "closed") &&
+      event.thread_ts !== undefined && event.thread_ts !== event.ts;
     const threadContext = firstMentionInThread && profile.threadContext.enabled
       ? { rootTs: threadTs, beforeTs: event.ts }
       : undefined;
