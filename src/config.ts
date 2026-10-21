@@ -479,6 +479,19 @@ const commandsSchema = z
   .strict()
   .prefault({});
 
+/**
+ * Task lifecycle (PR-N). A task idle this long closes; the next reply in its thread reopens it as a
+ * new T3 session. Every key defaults, so existing configs stay valid.
+ */
+const lifecycleSchema = z
+  .object({
+    closeIdleAfterHours: z.number().int().min(1).max(24 * 90).default(168),
+    sweepIntervalSeconds: z.number().int().min(10).max(3_600).default(60),
+    maxClosesPerSweep: z.number().int().min(1).max(500).default(20),
+  })
+  .strict()
+  .prefault({});
+
 export const agentTagConfigSchema = z
   .object({
     version: z.literal(1),
@@ -507,6 +520,7 @@ export const agentTagConfigSchema = z
     }),
     retention: retentionSchema,
     routines: routinesSchema,
+    lifecycle: lifecycleSchema,
     github: githubSchema.optional(),
   })
   .superRefine((config, context) => {

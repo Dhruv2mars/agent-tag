@@ -13,6 +13,7 @@ import { renderStatusMessage } from "./slack/status.ts";
 import { EMPTY_PROGRESS, progressActivity, TurnProgress } from "./progress.ts";
 import { slackErrorCode, unresolvedSpeaker } from "./slack/users.ts";
 import type { AgentTagStore, ClaimedOperation, PrSyncInput, TaskExecutionBinding } from "./store/store.ts";
+import { taskBranchName } from "./store/tasks.ts";
 import { composeTurnText, type TurnWindow } from "./turn-text.ts";
 import {
   awaitingT3AnswerContinuation,
@@ -508,7 +509,7 @@ export class AgentTagCoordinator {
         },
       memory: memory.block,
     });
-    const prNote = this.#pullRequests === undefined ? null : pullRequestTurnNote(profile, task.repositoryRoot, operation.taskId);
+    const prNote = this.#pullRequests === undefined ? null : pullRequestTurnNote(profile, task.repositoryRoot, taskBranchName(task.taskId, task.sessionGeneration));
     const proposedText = prNote === null ? turnText : `${turnText}\n\n${prNote}`;
     return this.#store.resolveOperationTurnText({
       ...lease,
@@ -613,6 +614,38 @@ export class AgentTagCoordinator {
     return window;
   }
 
+  // --- Task lifecycle (PR-N): the T3 thread bootstrap for a task's session generation. ---
+  /**
+   * Creates the generation's T3 thread with a fresh worktree from the profile base branch, on
+   * `taskBranchName(id, generation)`: a reopened task never reuses the retired thread's branch.
+   */
+  #threadBootstrap(
+    task: TaskExecutionBinding,
+    operation: ClaimedOperation,
+    profile: AgentTagProfile,
+    modelSelection: T3ModelSelection,
+  ): NonNullable<Extract<T3Command, { readonly type: "thread.turn.start" }>["bootstrap"]> {
+    return {
+      createThread: {
+        projectId: task.projectId,
+        title: `Slack ${operation.payload.conversationId}/${operation.payload.threadTs}`,
+        modelSelection,
+        runtimeMode: profile.runtimeMode,
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+        createdAt: task.createdAt,
+      },
+      prepareWorktree: {
+        projectCwd: task.repositoryRoot,
+        baseBranch: profile.baseBranch,
+        branch: taskBranchName(task.taskId, task.sessionGeneration),
+      },
+      runSetupScript: false,
+    };
+  }
+  // --- End task lifecycle. ---
+
   async #run(
     operation: ClaimedOperation,
     signal: AbortSignal | undefined,
@@ -664,28 +697,7 @@ export class AgentTagCoordinator {
       titleSeed: `Slack ${operation.payload.conversationId}/${operation.payload.threadTs}`,
       runtimeMode: profile.runtimeMode,
       interactionMode: "default",
-      ...(task.threadStarted
-        ? {}
-        : {
-            bootstrap: {
-              createThread: {
-                projectId: task.projectId,
-                title: `Slack ${operation.payload.conversationId}/${operation.payload.threadTs}`,
-                modelSelection,
-                runtimeMode: profile.runtimeMode,
-                interactionMode: "default",
-                branch: null,
-                worktreePath: null,
-                createdAt: task.createdAt,
-              },
-              prepareWorktree: {
-                projectCwd: task.repositoryRoot,
-                baseBranch: profile.baseBranch,
-                branch: `agent-tag/${task.taskId}`,
-              },
-              runSetupScript: false,
-            },
-          }),
+      ...(task.threadStarted ? {} : { bootstrap: this.#threadBootstrap(task, operation, profile, modelSelection) }),
       createdAt: this.#now().toISOString(),
     }, signal), signal);
     this.#store.markT3ThreadStarted({ taskId: task.taskId, now: this.#now().toISOString() });

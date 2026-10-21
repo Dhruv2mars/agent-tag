@@ -289,6 +289,23 @@ describe("Slack routines: create", () => {
     });
   });
 
+  test("a routine asked for in a closed thread binds to that task without reopening it", async () => {
+    await withHarness({}, async ({ send, active, store }) => {
+      const ts = "2100.000009";
+      await send(mention({ text: "every weekday at 9am summarize open PRs", ts }));
+      const [first] = active() as [ScheduleSummary];
+      const delivery = store.claimNextOutbox({ workerId: "o", now: new Date(start + 10_000).toISOString(), leaseMs: 10_000 });
+      if (delivery === null) throw new Error("confirmation was not queued");
+      store.markOutboxDelivered({ outboxId: delivery.outboxId, workerId: "o", slackMessageTs: "2100.000010", now: new Date(start + 10_000).toISOString() });
+      expect(store.closeTask({ taskId: first.taskId, reason: "admin", actorId: "t", now: new Date(start + 20_000).toISOString() }))
+        .toMatchObject({ kind: "closed" });
+
+      await send(mention({ text: "remind me tomorrow at 3pm to deploy", threadTs: ts }));
+      expect(active().map((schedule) => schedule.taskId)).toEqual([first.taskId, first.taskId]);
+      expect(store.getTaskExecution(first.taskId)).toMatchObject({ state: "closed", sessionGeneration: 1 });
+    });
+  });
+
   test("falls back to the default zone when the profile has none, and says so", async () => {
     await withHarness({ zones: { U1: null, U2: new Error("boom") } }, async ({ send, active, outbox }) => {
       await send(mention({ text: "every day at 9am post standup notes" }));

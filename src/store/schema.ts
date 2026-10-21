@@ -112,6 +112,9 @@ export const taskLookupSchema = z.object({
   t3_thread_id: nonEmpty.nullable(),
   conversation_type: z.enum(["channel", "dm"]),
   owner_user_id: nonEmpty.nullable(),
+  state: z.enum(["active", "closed"]),
+  session_generation: z.number().int().positive(),
+  last_activity_at: isoDateTime.nullable(),
 });
 export const outboxIdentitySchema = z.object({ outbox_id: nonEmpty });
 export const taskExecutionSchema = z.object({
@@ -129,6 +132,8 @@ export const taskExecutionSchema = z.object({
   model_selection_json: z.string().nullable(),
   t3_model_selection_json: z.string().nullable(),
   t3_rejected_model_selection_json: z.string().nullable(),
+  state: z.enum(["active", "closed"]),
+  session_generation: z.number().int().positive(),
 });
 export const interactionIdentitySchema = z.object({ interaction_id: nonEmpty });
 export const interactionRowSchema = z.object({
@@ -252,6 +257,9 @@ export const AUDIT_ACTIONS = [
   "status.opened",
   "status.terminal",
   "task.cancellation.requested",
+  "task.close.requested",
+  "task.closed",
+  "task.reopened",
   "task.model.denied",
   "task.model.reverted",
   "task.model.selected",
