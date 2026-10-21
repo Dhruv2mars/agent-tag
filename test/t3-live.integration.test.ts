@@ -778,11 +778,11 @@ if (!enabled) {
             slackMessageTs: "1000.000002",
             now: new Date().toISOString(),
           });
-          const outbox = store.claimNextOutbox({
-            workerId: "slack-live-fixture",
-            now: new Date().toISOString(),
-            leaseMs: 10_000,
-          });
+          // Status-message refreshes (PR-F) queue beside the reply; the reply is the first new post.
+          let outbox = store.claimNextOutbox({ workerId: "slack-live-fixture", now: new Date().toISOString(), leaseMs: 10_000 });
+          while (outbox !== null && outbox.refreshKind !== null) {
+            outbox = store.claimNextOutbox({ workerId: "slack-live-fixture", now: new Date().toISOString(), leaseMs: 10_000 });
+          }
           expect(outbox?.payload.text.trim()).toBe("durable-fixture-ok");
           expect(outbox?.correlationId).toBe(receipt.operationId);
 
