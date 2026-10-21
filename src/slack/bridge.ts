@@ -19,6 +19,7 @@ import { ROUTINE_CANCEL_ACTION_ID } from "./routine-replies.ts";
 import { SlackRoutines } from "./routines.ts";
 import { deliverNextSlackReaction, type SlackReactionOutcome } from "./reactions.ts";
 import { installUndiciWebSocketCompat } from "./undici-compat.ts";
+import { slackUploadClient, type SlackUploadClient } from "./uploads.ts";
 import { SlackUserDirectory, slackErrorCode } from "./users.ts";
 
 const authTestSchema = z.object({
@@ -302,6 +303,12 @@ export class SlackSocketBridge {
   readonly contextSource: SlackContextSource;
   /** Shared-file reads for the coordinator (PR-L1). */
   readonly files: SlackFileClient;
+  /**
+   * Agent file shares (PR-L2) over the outbox's client: no SDK retries, so the upload worker owns
+   * every retry and a completed share is never repeated. Needs `files:write` (and `files:read` for
+   * the crash-recovery share check).
+   */
+  readonly uploads: SlackUploadClient;
 
   private constructor(
     app: SlackApp,
@@ -316,6 +323,7 @@ export class SlackSocketBridge {
     this.#refreshRenderers = refreshRenderers(store, config);
     this.contextSource = contextSource;
     this.files = files;
+    this.uploads = slackUploadClient(app.client);
   }
 
   static async create(input: {

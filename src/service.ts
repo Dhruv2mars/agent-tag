@@ -11,6 +11,7 @@ import { createScheduleWorkers } from "./scheduler.ts";
 import { createServiceLogWorker } from "./service-logs.ts";
 import type { ServiceStateRecorder } from "./service-state.ts";
 import { SlackSocketBridge } from "./slack/bridge.ts";
+import { FileUploadWorker } from "./slack/uploads.ts";
 import { createRetentionWorker } from "./store/retention.ts";
 import { AgentTagStore } from "./store/store.ts";
 import { isT3CredentialRejection } from "./t3/auth.ts";
@@ -481,6 +482,8 @@ export async function createAgentTagService(input: {
         },
         createRetentionWorker({ databasePath, policy: input.config.retention, now }),
         new LifecycleWorker({ store, policy: input.config.lifecycle, now }),
+        // Agent file shares (PR-L2); rows exist only while files.outbound is enabled.
+        new FileUploadWorker({ config: input.config, store, slack: bridge.uploads, now }),
         {
           processNext: async () => {
             const current = now();

@@ -39,6 +39,7 @@ import {
   t3AttachmentUploader,
   turnFiles,
 } from "./slack/files.ts";
+import { parseUploadDirectives, rejectedUploadsNotice, uploadInstruction } from "./slack/uploads.ts";
 
 export interface T3CoordinatorGateway {
   /** Implementations should stop the RPC (closing its socket) when `signal` aborts. */
@@ -523,6 +524,7 @@ export class AgentTagCoordinator {
           limits: { maxChars: profile.threadContext.maxChars, maxMessageChars: profile.threadContext.maxMessageChars },
         },
       memory: memory.block,
+      ...(this.#config.files.outbound.enabled ? { uploadInstruction: uploadInstruction(this.#config.files.outbound) } : {}),
     });
     const prNote = this.#pullRequests === undefined ? null : pullRequestTurnNote(profile, task.repositoryRoot, taskBranchName(task.taskId, task.sessionGeneration));
     const proposedText = prNote === null ? turnText : `${turnText}\n\n${prNote}`;
@@ -1024,7 +1026,19 @@ export class AgentTagCoordinator {
             !message.streaming,
         );
         if (assistant === undefined) throw new Error("completed T3 turn has no final assistant message");
-        const prSync = await this.#preparePullRequest(operation, task, profile, snapshot, assistant.text, turnActiveMs, signal);
+        // Agent file shares (PR-L2): directive lines leave the reply and become upload rows.
+        const outbound = this.#config.files.outbound;
+        const shares = outbound.enabled ? parseUploadDirectives(assistant.text, outbound.maxFilesPerTurn) : null;
+        const replyText = shares?.text ?? assistant.text;
+        const uploads = shares === null || shares.requests.length + shares.rejected.length === 0
+          ? undefined
+          : {
+            t3ThreadId: snapshot.thread.id,
+            workspaceRoot: snapshot.thread.worktreePath ?? task.repositoryRoot,
+            requests: shares.requests,
+            rejectedNotice: rejectedUploadsNotice(shares.rejected, outbound),
+          };
+        const prSync = await this.#preparePullRequest(operation, task, profile, snapshot, replyText, turnActiveMs, signal);
         const outboxId = this.#store.completeOperationWithOutbox({
           operationId: operation.operationId,
           taskId: operation.taskId,
@@ -1032,8 +1046,9 @@ export class AgentTagCoordinator {
           resultSequence: Math.max(turn.sequence, snapshot.snapshotSequence),
           conversationId: operation.payload.conversationId,
           threadTs: operation.payload.threadTs,
-          text: splitForSlack(markdownToMrkdwn(assistant.text)),
+          text: splitForSlack(markdownToMrkdwn(replyText)),
           ...(prSync === undefined ? {} : { prSync, actorUserId: operation.payload.actorUserId }),
+          ...(uploads === undefined ? {} : { uploads }),
           now: this.#now().toISOString(),
         });
         return { kind: "completed", operationId: operation.operationId, outboxId };

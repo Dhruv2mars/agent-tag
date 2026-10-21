@@ -37,6 +37,8 @@ const config = agentTagConfigSchema.parse({
   ],
   routes: [{ conversationId: "C1", profileId: "engineering" }],
   limits: { maxConcurrentTasks: 1 },
+  // Envelope text only; the outbound upload line has its own tests (coordinator-uploads.test.ts).
+  files: { outbound: { enabled: false } },
 });
 
 const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13, 0x49, 0x48, 0x44, 0x52, 1, 2, 3]);
@@ -462,7 +464,7 @@ describe("inbound Slack files (PR-L1)", () => {
 
   test("turned off: every file is skipped as disabled without a Slack call", async () => {
     await withHarness(async (harness) => {
-      const disabled = agentTagConfigSchema.parse({ ...config, files: { inbound: { enabled: false } } });
+      const disabled = agentTagConfigSchema.parse({ ...config, files: { ...config.files, inbound: { ...config.files.inbound, enabled: false } } });
       const slack = fakeSlackFiles([csv()]);
       const uploader = fakeUploader();
       const { t3, turnStarts } = recordingT3(harness.clock);

@@ -501,6 +501,19 @@ const filesSchema = z
       })
       .strict()
       .prefault({}),
+    /**
+     * Files the agent shares back (PR-L2): a reply line `[[agent-tag:upload <path>]]` uploads that
+     * workspace file to the thread. Every file is scanned for known credential shapes unless disabled.
+     */
+    outbound: z
+      .object({
+        enabled: z.boolean().default(true),
+        maxFilesPerTurn: z.number().int().min(1).max(10).default(5),
+        maxFileBytes: z.number().int().min(1).max(T3_MAX_FILE_BYTES).default(25 * 1024 * 1024),
+        scanForSecrets: z.boolean().default(true),
+      })
+      .strict()
+      .prefault({}),
   })
   .strict()
   .prefault({});
