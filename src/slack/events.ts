@@ -9,7 +9,8 @@ import { matchCancelTargets, type RoutineIngress } from "./routines.ts";
 
 const slackId = z.string().regex(/^[A-Z][A-Z0-9]+$/);
 const slackTimestamp = z.string().regex(/^\d{1,20}\.\d{1,9}$/);
-const slackFile = z.object({ name: z.string().optional(), title: z.string().optional() }).passthrough();
+// Slack sends `name: null` (and `title: null`) for some files; the file is still carried.
+const slackFile = z.object({ name: z.string().nullish(), title: z.string().nullish() }).passthrough();
 const messageFields = {
   channel: slackId,
   ts: slackTimestamp,

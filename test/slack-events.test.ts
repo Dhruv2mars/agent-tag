@@ -1003,11 +1003,16 @@ describe("bot, self and edit routing", () => {
     await withRouter(({ store, router }) => {
       expect(
         router.ingest(
-          eventBody({ eventId: "EvMention", type: "app_mention", files: [{ id: "F0LOG", name: "build.log", size: 9 }] }),
+          eventBody({
+            eventId: "EvMention",
+            type: "app_mention",
+            // Slack sends a null name and title for some files.
+            files: [{ id: "F0LOG", name: "build.log", size: 9 }, { id: "F0NULL", name: null, title: null }],
+          }),
         ),
       ).toMatchObject({ kind: "accepted" });
       const claimed = store.claimNextOperation({ workerId: "w", now: receivedAt, leaseMs: 10_000, maxConcurrentTasks: 1 });
-      expect(claimed?.payload.files).toEqual([{ id: "F0LOG", name: "build.log", size: 9 }]);
+      expect(claimed?.payload.files).toEqual([{ id: "F0LOG", name: "build.log", size: 9 }, { id: "F0NULL", name: null }]);
     });
   });
 });
