@@ -40,7 +40,7 @@ Its bot events are exactly `app_mention`, `message.channels`, `message.groups`, 
 
 Install the app to the target workspace. Under **Basic Information > App-Level Tokens**, create one token with only `connections:write`. This is the app token and begins with `xapp-`. Under **OAuth & Permissions**, copy the bot token created by the workspace install. It begins with `xoxb-`.
 
-Invite Agent Tag to each configured public or private channel. No channel-list scope is requested, so the operator supplies exact IDs in the config.
+Invite Agent Tag to each configured public or private channel. Agent Tag does not look channels up yet, so the operator supplies exact IDs in the config.
 
 ## 2. Store tokens
 
