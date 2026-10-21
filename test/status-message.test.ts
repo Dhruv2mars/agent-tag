@@ -189,7 +189,7 @@ function snapshot(input: {
 }
 
 function activity(id: string, kind: string, summary: string, turnId: string, payload: unknown = {}) {
-  return { id, tone: kind === "tool.failed" ? "error" : "tool", kind, summary, payload, turnId, createdAt: now };
+  return { id, tone: "tool" as const, kind, summary, payload, turnId, createdAt: now };
 }
 
 function hasActions(blocks: ReadonlyArray<Block>): boolean {
