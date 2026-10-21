@@ -650,13 +650,17 @@ describe("Agent Tag coordinator", () => {
         receivedAt: now,
         sourceOrderKey: "1000.000001",
       });
-      expect(await coordinator.processNext()).toMatchObject({
+      const waiting = await coordinator.processNext();
+      expect(waiting).toMatchObject({
         kind: "waiting-interaction",
         approvalCount: 1,
         questionCount: 1,
       });
+      if (waiting.kind !== "waiting-interaction") throw new Error("turn did not wait");
       expect(await coordinator.processNext()).toEqual({ kind: "idle" });
       expect(store.diagnostics().outbox).toBe(4);
+      // The cards carry the buttons while the turn waits; the status message drops its Stop.
+      expect(store.getStatusMessageView(waiting.operationId)?.state).toBe("waiting");
     } finally {
       store.close();
       if (!directory.startsWith(`${tmpdir()}/agent-tag-coordinator-waiting-`)) {
