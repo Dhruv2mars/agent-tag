@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -12,6 +12,7 @@ import {
   requireManagedT3,
   runManagedT3Pair,
   runManagedT3Serve,
+  startTransientManagedT3,
   T3_FATAL_EXIT_CODE,
 } from "../src/t3/operator.ts";
 import type { EnvironmentFetch } from "../src/t3/protocol.ts";
@@ -269,5 +270,25 @@ describe("runManagedT3Pair with the fake T3 CLI", () => {
     } finally {
       await runtime.stop();
     }
+  });
+});
+
+describe("startTransientManagedT3 with the fake T3 CLI", () => {
+  test("stops the runtime it started when the token cannot be minted", async () => {
+    const config = await liveManagedConfig();
+    const logs: string[] = [];
+    await expect(
+      startTransientManagedT3({
+        t3: { ...config, tokenFile: join(config.managed.homeDir, "missing-token") },
+        pin: PINNED_T3,
+        logger: (record) => logs.push(JSON.stringify(record)),
+        installed: { binary: FAKE_T3_BINARY, version: PINNED_T3.version },
+        runtimeOptions: { timing: FAST },
+      }),
+    ).rejects.toThrow();
+    const { pid } = JSON.parse(await readFile(join(config.managed.homeDir, "userdata", "server-runtime.json"), "utf8"));
+    expect(alive(pid)).toBe(false);
+    expect(logs.join("\n")).toContain("t3.runtime.stopped");
+    expect(logs.join("\n")).not.toContain(FAKE_PAIRING_TOKEN);
   });
 });

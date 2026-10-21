@@ -370,6 +370,16 @@ function resolveT3Config(t3: z.infer<typeof t3Schema>, dataDir: string): Resolve
   return { mode: "managed", baseUrl: `http://127.0.0.1:${managed.port}`, tokenFile: t3.tokenFile, watch: t3.watch, managed };
 }
 
+/**
+ * Parses a managed `t3` block and resolves it against `dataDir` exactly as `agentTagConfigSchema`
+ * does, for callers that need the runtime settings before a whole config exists (onboarding).
+ */
+export function resolveManagedT3Config(input: unknown, dataDir: string): Extract<ResolvedT3Config, { readonly mode: "managed" }> {
+  const resolved = resolveT3Config(managedT3Schema.parse(input), dataDir);
+  if (resolved.mode !== "managed") throw new Error("expected a managed t3 block");
+  return resolved;
+}
+
 type ParsedProfile = z.infer<typeof profileSchema>;
 type ModelRef = z.infer<typeof modelRefSchema>;
 

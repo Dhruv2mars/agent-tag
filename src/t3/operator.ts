@@ -87,6 +87,50 @@ export async function runManagedT3Serve(input: {
   }
 }
 
+export interface TransientManagedT3 {
+  readonly version: string | undefined;
+  /** "enrolled" when the restricted token was missing or rejected and a new one was minted. */
+  readonly token: "kept" | "enrolled";
+  readonly stop: () => Promise<void>;
+}
+
+/**
+ * Onboarding's managed T3: installs the pinned release, starts it, and makes sure the restricted token
+ * exists, the same steps as service startup. The caller lists providers, then calls `stop`.
+ */
+export async function startTransientManagedT3(input: {
+  readonly t3: ManagedT3Config;
+  readonly pin: T3Pin;
+  readonly logger: ServiceLogger;
+  /** Tests: skip install with an already verified binary, and tune the runtime (env, timing). */
+  readonly installed?: ManagedT3Binary;
+  readonly runtimeOptions?: Partial<Omit<T3ManagedRuntimeOptions, "settings" | "installed" | "logger">>;
+  readonly run?: CommandRunner;
+}): Promise<TransientManagedT3> {
+  const installed = input.installed
+    ?? (await prepareManagedT3Binary({ settings: input.t3.managed, pin: input.pin, logger: input.logger }));
+  const runtime = new T3ManagedRuntime({
+    ...input.runtimeOptions,
+    settings: input.t3.managed,
+    installed,
+    logger: input.logger,
+  });
+  const descriptor = await runtime.start();
+  try {
+    const credentials = managedT3Credentials({
+      t3: input.t3,
+      binary: installed.binary,
+      logger: input.logger,
+      ...(input.run === undefined ? {} : { run: input.run }),
+    });
+    const token = await credentials.ensureToken();
+    return { version: descriptor.serverVersion, token, stop: () => runtime.stop() };
+  } catch (error) {
+    await runtime.stop();
+    throw error;
+  }
+}
+
 const serverRuntimeSchema = z.object({ pid: z.number().int().positive() });
 
 function processAlive(pid: number): boolean {

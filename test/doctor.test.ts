@@ -6,6 +6,7 @@ import { join } from "node:path";
 import {
   checkBunVersion,
   checkServiceState,
+  checkT3Runtime,
   compareVersions,
   type DoctorCheck,
   type DoctorDependencies,
@@ -13,7 +14,9 @@ import {
   formatDoctorReport,
   runDoctor,
   SLACK_BOT_SCOPES,
+  type T3RuntimeProbe,
 } from "../src/doctor.ts";
+import type { ManagedT3Config } from "../src/t3/operator.ts";
 import type { CommandResult } from "../src/command.ts";
 import { AGENT_TAG_LAUNCHD_LABEL } from "../src/launchd.ts";
 import type { ServiceStateReport } from "../src/service-state.ts";
@@ -149,6 +152,19 @@ function json(value: unknown, status = 200): Response {
   return new Response(JSON.stringify(value), { status, headers: { "content-type": "application/json" } });
 }
 
+/** A verified install with T3 pid 5151 (child of service pid 4242) serving the pin; override parts per case. */
+function runtimeProbe(overrides: {
+  readonly install?: Partial<T3RuntimeProbe["install"]>;
+  readonly runtime?: Partial<T3RuntimeProbe["runtime"]>;
+  readonly parentPid?: number | null;
+} = {}): T3RuntimeProbe {
+  return {
+    install: { supported: true, installed: true, filesVerified: true, version: "0.0.45", runtimeDir: "/data/t3/runtime", problem: null, ...overrides.install },
+    runtime: { running: true, pid: 5151, protocol: 1, serverVersion: "0.0.45", problem: null, ...overrides.runtime },
+    parentPid: overrides.parentPid === undefined ? 4242 : overrides.parentPid,
+  };
+}
+
 function dependencies(world: FakeWorld, service: ServiceManager | undefined): DoctorDependencies {
   return {
     fetch: async (input, init) => {
@@ -171,6 +187,13 @@ function dependencies(world: FakeWorld, service: ServiceManager | undefined): Do
     uid: process.getuid?.(),
     now: () => NOW,
     pin,
+    // Never probe this host's real managed T3 (a live one may listen on the default port).
+    t3Runtime: async (t3) =>
+      runtimeProbe({
+        install: { runtimeDir: t3.managed.runtimeDir, installed: false, filesVerified: false, version: null },
+        runtime: { running: false, pid: null, protocol: null, serverVersion: null, problem: "not reachable" },
+        parentPid: null,
+      }),
     bunRequirement: { minimum: "1.2.0", pinned: "1.3.13" },
     inspectSession: async ({ token }) => {
       world.t3TokenRequests.push("session");
@@ -245,6 +268,7 @@ describe("agent-tag doctor", () => {
       ["t3-session", "pass"],
       ["t3-providers", "pass"],
       ["t3-models", "pass"],
+      ["t3-runtime", "skip"],
       ["t3-token-rotation", "skip"],
       ["slack-bot-auth", "pass"],
       ["slack-app-auth", "pass"],
@@ -254,7 +278,7 @@ describe("agent-tag doctor", () => {
     expect(world.seenAuthorization).toEqual([`Bearer ${BOT_TOKEN}`, `Bearer ${APP_TOKEN}`]);
     const output = `${formatDoctorReport(report)}\n${JSON.stringify(report)}`;
     for (const secret of [APP_TOKEN, BOT_TOKEN, T3_TOKEN]) expect(output).not.toContain(secret);
-    expect(formatDoctorReport(report)).toContain("15 passed, 0 warning(s), 0 failed, 2 skipped");
+    expect(formatDoctorReport(report)).toContain("15 passed, 0 warning(s), 0 failed, 3 skipped");
   });
 
   test("reports every allowed model, and warns without failing when one is unavailable", async () => {
@@ -352,10 +376,10 @@ describe("agent-tag doctor", () => {
   function expectCompleteReport(report: DoctorReport): void {
     expect(report.checks.map((item) => item.id)).toEqual([
       "bun-version", "config", "data-dir", "secret:slack-app-token", "secret:slack-bot-token", "secret:t3-token",
-      "store", "t3-environment", "t3-version", "t3-session", "t3-providers", "t3-models", "t3-token-rotation", "slack-bot-auth",
+      "store", "t3-environment", "t3-version", "t3-session", "t3-providers", "t3-models", "t3-runtime", "t3-token-rotation", "slack-bot-auth",
       "slack-app-auth", "service-state", "service",
     ]);
-    expect(JSON.parse(JSON.stringify(report)).checks).toHaveLength(17);
+    expect(JSON.parse(JSON.stringify(report)).checks).toHaveLength(18);
   }
 
   test.skipIf(process.getuid?.() === 0)("reports a data dir without owner search permission as a failed check instead of aborting", async () => {
@@ -720,5 +744,75 @@ describe("version checks", () => {
     expect(checkBunVersion({ bunVersion: "1.1.9", bunRequirement: requirement }).status).toBe("fail");
     expect(checkBunVersion({ bunVersion: "1.4.0", bunRequirement: requirement }).status).toBe("warn");
     expect(checkBunVersion({ bunVersion: "1.3.13", bunRequirement: requirement }).status).toBe("pass");
+  });
+});
+
+describe("t3-runtime", () => {
+  const t3: ManagedT3Config = {
+    mode: "managed",
+    baseUrl: "http://127.0.0.1:37841",
+    tokenFile: "/secrets/t3-token",
+    watch: { enabled: true, safetyPollMs: 15_000, lingerMs: 30_000 },
+    managed: {
+      port: 37841,
+      homeDir: "/data/t3/home",
+      runtimeDir: "/data/t3/runtime",
+      autoInstall: true,
+      rotation: { rotateBeforeDays: 7, revokeGraceMinutes: 15 },
+    },
+  };
+  const service = (alive: boolean): ServiceStateReport => ({
+    state: "running",
+    pid: 4242,
+    since: "2026-10-21T09:00:00.000Z",
+    updatedAt: "2026-10-21T09:00:00.000Z",
+    alive,
+  });
+
+  test("passes when the verified pinned T3 is the service's own child", () => {
+    expect(checkT3Runtime(t3, service(true), runtimeProbe())).toEqual({
+      id: "t3-runtime",
+      status: "pass",
+      summary: "T3 0.0.45 installed and verified; pid 5151 serves protocol 1 on http://127.0.0.1:37841, supervised by service pid 4242",
+    });
+  });
+
+  test("passes when installed and the service is down, warns when the service is up without T3", () => {
+    const stopped = runtimeProbe({ runtime: { running: false, pid: null, protocol: null, serverVersion: null, problem: "not reachable" }, parentPid: null });
+    expect(checkT3Runtime(t3, undefined, stopped)).toMatchObject({ status: "pass", summary: expect.stringContaining("not running (the Agent Tag service starts it)") });
+    expect(checkT3Runtime(t3, service(true), stopped)).toMatchObject({ status: "warn", summary: expect.stringContaining("while service pid 4242 is up") });
+  });
+
+  test("warns about a T3 that runs without the service or under another parent", () => {
+    expect(checkT3Runtime(t3, service(false), runtimeProbe())).toMatchObject({ status: "warn", summary: expect.stringContaining("without the Agent Tag service") });
+    expect(checkT3Runtime(t3, service(true), runtimeProbe({ parentPid: 1 }))).toMatchObject({
+      status: "warn",
+      summary: expect.stringContaining("its parent is pid 1, not service pid 4242"),
+    });
+  });
+
+  test("fails on a foreign server on the port, a wrong version, or an unsupported platform", () => {
+    expect(checkT3Runtime(t3, service(true), runtimeProbe({ runtime: { running: false, pid: null }, parentPid: null }))).toMatchObject({
+      status: "fail",
+      summary: "a server answers on http://127.0.0.1:37841, but /data/t3/home records no live managed T3",
+    });
+    expect(checkT3Runtime(t3, service(true), runtimeProbe({ runtime: { problem: "managed T3 reports version 0.0.44" } }))).toMatchObject({
+      status: "fail",
+      summary: "managed T3 pid 5151: managed T3 reports version 0.0.44",
+    });
+    expect(checkT3Runtime(t3, undefined, runtimeProbe({ install: { supported: false, installed: false, filesVerified: false, problem: "t3.lock.json pins no artifact for darwin-x64" } })))
+      .toMatchObject({ status: "fail", summary: "t3.lock.json pins no artifact for darwin-x64" });
+  });
+
+  test("a missing or tampered install warns while the service can repair it and fails otherwise", () => {
+    const down = { running: false, pid: null, protocol: null, serverVersion: null, problem: "not reachable" } as const;
+    const missing = runtimeProbe({ install: { installed: false, filesVerified: false, version: null }, runtime: down, parentPid: null });
+    expect(checkT3Runtime(t3, undefined, missing)).toMatchObject({ status: "warn", summary: "managed T3 is not installed in /data/t3/runtime yet" });
+    expect(checkT3Runtime({ ...t3, managed: { ...t3.managed, autoInstall: false } }, undefined, missing)).toMatchObject({ status: "fail" });
+    const tampered = runtimeProbe({ install: { filesVerified: false, problem: "binary sha256 mismatch; run agent-tag t3 install to replace it" } });
+    expect(checkT3Runtime(t3, service(true), tampered)).toMatchObject({
+      status: "fail",
+      summary: "managed T3 in /data/t3/runtime does not verify: binary sha256 mismatch; run agent-tag t3 install to replace it",
+    });
   });
 });
