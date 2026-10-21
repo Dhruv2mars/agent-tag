@@ -660,6 +660,29 @@ Use a fine-grained personal access token limited to the repositories you configu
 
 In `trusted-same-user` isolation the agent runs as the same OS user and could read `tokenFile` directly. These measures make sure the token is never handed to the agent; they do not make the file unreadable to it. Use `os-account` or `container` isolation for that.
 
+## Slack files
+
+Files people share with a request become T3 attachments for that turn, and files the agent names with `[[agent-tag:upload <path>]]` are posted back to the thread. Both need the `files:read` and `files:write` scopes ([reinstall to add them](slack-setup.md#1-create-the-app)). Both paths are on by default; set `files.inbound.enabled` or `files.outbound.enabled` to `false` to turn one off. Turning outbound off also fails files already queued, each with a notice.
+
+There is no spool directory. File bytes never touch disk or SQLite on the Agent Tag side:
+
+- Inbound bytes go from Slack into memory and straight to T3 (`attachments.createUploadUrl`). T3 stores the attachment. The `operation_attachments` table records only each file's Slack ID, outcome and T3 attachment metadata (ID, type, name, mime type, size), so a replayed turn sends the same attachments without downloading again.
+- Outbound bytes are read from the task's T3 worktree when the upload runs, held in memory for that one upload, and read again on a retry. The `slack_file_uploads` table records the relative path, title, state and Slack file ID.
+
+| Limit | Config key | Default | Allowed |
+| --- | --- | --- | --- |
+| Files per message (extras are skipped) | `files.inbound.maxFilesPerMessage` | 5 | 1–8 (T3's per-turn cap) |
+| Image size (a larger image is sent as a file) | `files.inbound.maxImageBytes` | 10 MiB | up to 10 MiB |
+| File size | `files.inbound.maxFileBytes` | 25 MiB | up to 50 MiB |
+| Refused extensions | `files.inbound.deniedExtensions` | none | up to 100, lowercase, no dot |
+| Files per reply (extras are noticed) | `files.outbound.maxFilesPerTurn` | 5 | 1–10 |
+| File size | `files.outbound.maxFileBytes` | 25 MiB | up to 50 MiB |
+| Credential scan on every outbound file | `files.outbound.scanForSecrets` | `true` | |
+
+Each inbound download has a 30 s timeout; each outbound byte upload 60 s. An upload is claimed with a 2-minute lease, so one left `inflight` by a crash is picked up again after that. Retryable Slack and network failures back off exponentially (about 5 s at first, at most 10 minutes, longer if Slack sends `Retry-After`), and a file fails with a thread notice after 10 attempts. A retry first asks Slack (`files.info`) whether the file already reached the thread, so a share is never posted twice. Audit rows (`slack.file.attached`, `slack.file.skipped`, `slack.file.upload-*`) record the file's extension, size or error code, never its name, path or content.
+
+Cleanup: nothing on the Agent Tag side holds file bytes, so there is nothing to sweep. `prune` does not touch `operation_attachments` or `slack_file_uploads`, and `messageDays` rewrites only the message text, so file names in `operations.payload_json`, the attachment rows and agent-chosen upload paths are kept until retention covers them (PR-T). T3's copies of inbound attachments follow T3's own lifecycle.
+
 ## Host constraints
 
 The verified runtime is macOS arm64 with Bun `1.3.13` and T3 Code `0.0.45` ([live adapter evidence](evidence/2026-10-06-t3-0.0.45.md)). The per-user LaunchAgent install, loaded-service upgrade, uninstall, and reinstall were exercised on macOS against T3 `0.0.42`. A logged-in user and awake host are still required for local T3 and Socket Mode availability. The Linux `systemd --user` manager is implemented and covered by unit tests against a scripted `systemctl`, but it has not been run on a live Linux host, so it remains outside the passing claim.
