@@ -475,6 +475,11 @@ const commandsSchema = z
     disabled: z.array(z.enum(AGENT_COMMANDS).exclude(["help"])).default([]),
     /** Commands only `access.adminUserIds` may run. `!help` and `!status` are read-only and stay open. */
     adminOnly: z.array(z.enum(AGENT_COMMANDS).exclude(["help", "status"])).default([]),
+    /**
+     * How long a busy `!restart` waits for the stopped turn to end before it rotates anyway (the old
+     * turn may then still post a late reply).
+     */
+    restartTimeoutSeconds: z.number().int().min(10).max(3_600).default(120),
   })
   .strict()
   .prefault({});

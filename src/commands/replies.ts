@@ -14,6 +14,8 @@ function payload(text: string): SlackOutboxPayload {
 const HELP_LINES: Readonly<Record<ImplementedCommandName, string>> = {
   help: "`!help` — list the commands you can use here (only you see it)",
   status: "`!status` — what I'm doing in this thread (only you see it)",
+  stop: "`!stop` — stop what I'm doing in this thread and drop its queued requests",
+  restart: "`!restart` — start a fresh session for this thread",
   mute: "`!mute` — stop answering messages in this thread unless they mention me",
   unmute: "`!unmute` — answer every message in this thread again",
 };
@@ -56,6 +58,8 @@ export interface ThreadStatusView {
   readonly workingForMs: number | null;
   readonly waitingForMs: number | null;
   readonly queued: number;
+  /** A `!restart` is waiting for the running turn to stop. */
+  readonly restarting?: boolean;
   readonly model: { readonly instanceId: string; readonly model: string; readonly override: boolean } | null;
 }
 
@@ -66,7 +70,9 @@ export function threadStatusReply(view: ThreadStatusView): SlackOutboxPayload {
   if (!view.bound) {
     activity.push("I'm not part of this thread yet.");
   } else {
-    if (view.waitingForMs !== null) {
+    if (view.restarting === true) {
+      activity.push("I'm restarting this thread's session.");
+    } else if (view.waitingForMs !== null) {
       activity.push(`I'm waiting for an answer to an approval or question here (since ${formatDuration(view.waitingForMs)} ago).`);
     } else if (view.workingForMs !== null) {
       activity.push(`I'm working in this thread (started ${formatDuration(view.workingForMs)} ago).`);
@@ -142,5 +148,46 @@ export function deniedReply(input: {
       return payload(`I can't run ${command} in this thread with the current configuration.`);
   }
 }
+
+export const STOP_NOTHING = payload("Nothing is running in this thread.");
+export const STOP_TOP_LEVEL = payload("`!stop` works inside a thread I'm working in.");
+
+function requests(count: number): string {
+  return plural(count, "queued request", "queued requests");
+}
+
+/**
+ * The public `!stop` line when queued requests were dropped. A stopped turn needs none: its status
+ * message already reads "Stopped by <@U>." (the Stop button's text).
+ */
+export function stopDroppedReply(input: { readonly actorUserId: string; readonly dropped: number; readonly interrupting: boolean }): SlackOutboxPayload {
+  return payload(
+    input.interrupting
+      ? `Also dropped ${requests(input.dropped)} (stopped by <@${input.actorUserId}>).`
+      : `:octagonal_sign: Stopped by <@${input.actorUserId}>. Dropped ${requests(input.dropped)}.`,
+  );
+}
+
+export function restartReadyReply(input: { readonly actorUserId: string; readonly rereads: boolean; readonly forced: boolean }): SlackOutboxPayload {
+  const parts = [
+    `:arrows_counterclockwise: Started a fresh session for this thread (requested by <@${input.actorUserId}>).`,
+    input.rereads ? "It will reread this thread on the next request." : "It starts without the earlier conversation.",
+  ];
+  if (input.forced) parts.push("The previous run didn't stop cleanly and may still post a late reply.");
+  return payload(parts.join(" "));
+}
+
+export function restartingReply(actorUserId: string): SlackOutboxPayload {
+  return payload(
+    `:arrows_counterclockwise: Restarting this thread's session (requested by <@${actorUserId}>). I'll confirm here when it's ready.`,
+  );
+}
+
+export const RESTART_PENDING = payload("A restart is already in progress here.");
+export const RESTART_TOP_LEVEL = payload(
+  "There's no session to restart here. Each @-mention at the top level already starts a fresh session.",
+);
+export const RESTART_UNBOUND = payload("I'm not part of this thread, so there's nothing to restart.");
+export const RESTART_CLOSED = payload("This thread's session already ended; the next request here starts a fresh one.");
 
 export const COMMAND_FAILED = payload("Something went wrong running that command. Please try again.");

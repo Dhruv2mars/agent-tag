@@ -465,7 +465,7 @@ export class AgentTagCoordinator {
     const frozen = this.#store.peekResolvedTurnText({ ...lease, now: this.#now().toISOString() });
     if (frozen !== null) return frozen;
     const { actorUserId, text, origin } = operation.payload;
-    const window = await this.#readThreadWindow(operation, profile, signal);
+    const window = await this.#readThreadWindow(operation, this.#windowSeed(operation, task, profile), profile, signal);
     // Updates since the last turn are context for the next human turn; schedule runs leave them pending.
     const notes = origin === "slack" ? this.#store.listPendingThreadNotes(operation.taskId) : [];
     const memory = this.#memoryForTurn(task, profile, operation.taskId, actorUserId);
@@ -557,15 +557,32 @@ export class AgentTagCoordinator {
   }
 
   /**
+   * The thread window to read: the ingest seed (a first mention partway into a thread, or a reopen),
+   * or, for the first turn of a session a `!restart` started, the thread before this message, so the
+   * fresh session rereads it (PR-H2). Requests queued during the restart were ingested unseeded.
+   */
+  #windowSeed(
+    operation: ClaimedOperation,
+    task: TaskExecutionBinding,
+    profile: AgentTagProfile,
+  ): ClaimedOperation["payload"]["threadContext"] {
+    const { threadContext, messageTs, threadTs, origin } = operation.payload;
+    if (threadContext !== undefined) return threadContext;
+    if (task.threadStarted || task.sessionGeneration === 1 || !profile.threadContext.enabled) return undefined;
+    if (origin !== "slack" || messageTs === undefined || messageTs === threadTs) return undefined;
+    return { rootTs: threadTs, beforeTs: messageTs };
+  }
+
+  /**
    * Reads the earlier thread messages for a first mention in an existing thread. Fails open: any
    * Slack error or timeout becomes an "unavailable" window (and an audit row); only shutdown aborts.
    */
   async #readThreadWindow(
     operation: ClaimedOperation,
+    seed: ClaimedOperation["payload"]["threadContext"],
     profile: AgentTagProfile,
     signal: AbortSignal | undefined,
   ): Promise<TurnWindow | null> {
-    const seed = operation.payload.threadContext;
     if (seed === undefined || this.#slackContext === undefined) return null;
     const source = this.#slackContext;
     let window: TurnWindow;
