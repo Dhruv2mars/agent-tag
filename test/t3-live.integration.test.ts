@@ -31,6 +31,14 @@ import {
 } from "../src/t3/gateway.ts";
 
 const enabled = Bun.env.RUN_T3_INTEGRATION === "1";
+/**
+ * Cases that wait on a real provider's first item. Codex has taken over 90 s to its first item
+ * (docs/evidence/2026-10-21-t3-live-main.md), so a 60 s window failed healthy turns; production's
+ * stall window defaults to 300 s. Each case's timeout covers its provider waits in sequence.
+ */
+const PROVIDER_WAIT_MS = 180_000;
+const RESTART_CASE_TIMEOUT_MS = 420_000;
+const CONTROL_CASE_TIMEOUT_MS = 660_000;
 
 /**
  * Removes a fixture directory after the caller's prefix guard. After `project.delete`, T3 0.0.45
@@ -753,7 +761,7 @@ if (!enabled) {
             },
             workerId: `live-before-restart-${crypto.randomUUID()}`,
             pollMs: 250,
-            stallMs: 60_000,
+            stallMs: PROVIDER_WAIT_MS,
           });
           expect(await firstCoordinator.processNext()).toMatchObject({
             kind: "retry-scheduled",
@@ -768,26 +776,26 @@ if (!enabled) {
             workerId: `live-after-restart-${crypto.randomUUID()}`,
             now: () => new Date(Date.now() + 2_000),
             pollMs: 250,
-            stallMs: 60_000,
+            stallMs: PROVIDER_WAIT_MS,
           });
           const outcome = await restartedCoordinator.processNext();
           expect(outcome).toMatchObject({ kind: "completed", operationId: receipt.operationId });
-          const progress = store.claimNextOutbox({
-            workerId: "slack-live-fixture",
-            now: new Date().toISOString(),
-            leaseMs: 10_000,
-          });
-          if (progress === null) throw new Error("durable progress message was not queued");
-          store.markOutboxDelivered({
-            outboxId: progress.outboxId,
-            workerId: "slack-live-fixture",
-            slackMessageTs: "1000.000002",
-            now: new Date().toISOString(),
-          });
-          // Status-message refreshes (PR-F) queue beside the reply; the reply is the first new post.
-          let outbox = store.claimNextOutbox({ workerId: "slack-live-fixture", now: new Date().toISOString(), leaseMs: 10_000 });
-          while (outbox !== null && outbox.refreshKind !== null) {
-            outbox = store.claimNextOutbox({ workerId: "slack-live-fixture", now: new Date().toISOString(), leaseMs: 10_000 });
+          if (outcome.kind !== "completed") throw new Error(`restarted operation did not complete: ${outcome.kind}`);
+          // Deliver rows in claim order until the completed outcome's reply. Since F3 (#31) the status
+          // message and its edits (some with an empty placeholder) may be claimed before it in any order.
+          let outbox: ReturnType<AgentTagStore["claimNextOutbox"]> = null;
+          for (let claimed = 0; claimed < 20; claimed += 1) {
+            const row = store.claimNextOutbox({ workerId: "slack-live-fixture", now: new Date().toISOString(), leaseMs: 10_000 });
+            if (row === null || row.outboxId === outcome.outboxId) {
+              outbox = row;
+              break;
+            }
+            store.markOutboxDelivered({
+              outboxId: row.outboxId,
+              workerId: "slack-live-fixture",
+              slackMessageTs: `1000.${String(2 + claimed).padStart(6, "0")}`,
+              now: new Date().toISOString(),
+            });
           }
           expect(outbox?.payload.text.trim()).toBe("durable-fixture-ok");
           expect(outbox?.correlationId).toBe(receipt.operationId);
@@ -852,7 +860,7 @@ if (!enabled) {
           }
         }
       },
-      150_000,
+      RESTART_CASE_TIMEOUT_MS,
     );
 
     test(
@@ -922,9 +930,10 @@ if (!enabled) {
           let rejectedSnapshot = await waitForSnapshot(
             rejectedThreadId,
             (snapshot) => pendingT3Approvals(snapshot).length > 0,
+            PROVIDER_WAIT_MS,
           );
           const declined = new Set<string>();
-          const rejectionDeadline = Date.now() + 60_000;
+          const rejectionDeadline = Date.now() + PROVIDER_WAIT_MS;
           while (
             rejectedSnapshot.thread.latestTurn?.state !== "completed" &&
             Date.now() < rejectionDeadline
@@ -956,6 +965,7 @@ if (!enabled) {
           const waiting = await waitForSnapshot(
             interruptedThreadId,
             (snapshot) => pendingT3Approvals(snapshot).length > 0,
+            PROVIDER_WAIT_MS,
           );
           await dispatchT3Command({
             config,
@@ -992,7 +1002,7 @@ if (!enabled) {
           await removeFixtureDirectory(workspaceRoot);
         }
       },
-      120_000,
+      CONTROL_CASE_TIMEOUT_MS,
     );
 
     test(
