@@ -10,7 +10,12 @@
     "workspaceId": "T0EXAMPLE",
     "appTokenFile": "/var/lib/agent-tag/secrets/slack-app-token",
     "botTokenFile": "/var/lib/agent-tag/secrets/slack-bot-token",
-    "ui": { "ackReaction": "eyes" }
+    "ui": {
+      "ackReaction": "eyes",
+      "statusProgress": true,
+      "statusUpdateIntervalMs": 2000,
+      "statusUpdatesPerMinute": 40
+    }
   },
   "access": {
     "allowedUserIds": ["U0EXAMPLE"],

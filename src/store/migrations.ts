@@ -613,12 +613,35 @@ export const STORE_MIGRATIONS: readonly StoreMigration[] = [
     `,
   },
   {
+    // Live status message (PR-F3): one Slack message per turn, posted as `${operationId}:status` and
+    // edited in place through outbox refresh rows (refresh_kind 'status-message', see message-edits.ts).
+    // view_json holds the progress view only (plan steps, recent tool titles), never tool payloads.
+    // Terminal states are sticky. The partial index serves the global edit budget. Independent table,
+    // so it applies in any order.
+    version: 23,
+    sql: `
+      CREATE TABLE status_messages (
+        operation_id TEXT PRIMARY KEY REFERENCES operations(operation_id),
+        task_id TEXT NOT NULL REFERENCES tasks(task_id),
+        state TEXT NOT NULL CHECK (state IN ('running', 'waiting', 'stopping', 'done', 'stopped', 'failed', 'expired')),
+        view_json TEXT NOT NULL,
+        actor_user_id TEXT,
+        started_at TEXT NOT NULL,
+        settled_at TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX status_messages_task_idx ON status_messages(task_id, state);
+      CREATE INDEX slack_outbox_status_refresh_idx ON slack_outbox(updated_at) WHERE refresh_kind = 'status-message';
+    `,
+  },
+  {
     // Task lifecycle (PR-N1): idle close and reopen as a new session generation on the same task row.
     // `task_retired_t3_threads` is the canonical retired-thread table shared with PR-H2 (`!restart`)
     // and the PR-N2 cleanup worker, so it is created once with every reason and cleanup column: a
     // widened CHECK would need a table rebuild. Backfill: an existing task's last activity is its
     // `updated_at`. New tables and columns only, so it applies in any order relative to other versions.
-    version: 23,
+    version: 24,
     sql: `
       ALTER TABLE tasks ADD COLUMN session_generation INTEGER NOT NULL DEFAULT 1 CHECK (session_generation >= 1);
       ALTER TABLE tasks ADD COLUMN last_activity_at TEXT;
