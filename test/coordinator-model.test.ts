@@ -6,6 +6,10 @@ import { join } from "node:path";
 
 import { type AgentTagConfig, agentTagConfigSchema } from "../src/config.ts";
 import { AgentTagCoordinator, classifyT3TurnFailure, type CoordinatorProviderCatalog } from "../src/coordinator.ts";
+import { handleSlackEvent } from "../src/slack/bridge.ts";
+import { SlackEventRouter } from "../src/slack/events.ts";
+import { refusedReply, type RefusalCopy } from "../src/slack/model-replies.ts";
+import { SlackModelSwitch } from "../src/slack/model-switch.ts";
 import { AgentTagStore } from "../src/store/store.ts";
 import {
   type T3Command,
@@ -239,12 +243,37 @@ async function harness(
       )
       .all(action)
       .map((row) => ({ result: row.result, metadata: JSON.parse(row.metadata_json) as Record<string, unknown> }));
+  // Slack ingress for the plain-language switch (P2c): router + switch handler on the same store.
+  const ephemerals: string[] = [];
+  const slackCatalog = { current: () => catalog };
+  const router = new SlackEventRouter({ config, store, botUserId: "U0BOT", catalog: slackCatalog, now: () => new Date(clock).toISOString() });
+  const models = new SlackModelSwitch({
+    config: () => config,
+    store,
+    replies: {
+      ephemeral: async ({ payload }) => {
+        ephemerals.push(payload.text);
+      },
+    },
+    catalog: slackCatalog,
+    botName: "agent",
+    now: () => new Date(clock),
+  });
+  const slack = async (body: unknown) => {
+    clock += 1_000;
+    await handleSlackEvent({ router, commands: { execute: async () => { throw new Error("no ! commands in these tests"); } }, models }, body);
+  };
+  const count = (table: string) => (database.query(`SELECT COUNT(*) AS n FROM ${table}`).get() as { n: number }).n;
   return {
     store,
     database,
     t3,
     refreshes,
     send,
+    slack,
+    route: (body: unknown) => router.ingest(body),
+    ephemerals,
+    count,
     outboxTexts,
     audits,
     process: () => coordinator.processNext(),
@@ -693,5 +722,238 @@ describe("classifyT3TurnFailure model-switch rejections", () => {
         "T3 refused to move this thread to the requested model; it stays on *Sol*. Start a new thread to use a different provider.",
     });
     expect(classifyT3TurnFailure(detail).userMessage).toContain("stays on its current model");
+  });
+});
+
+let slackSequence = 0;
+/** A Slack event in the example route's channel, from its allowed user; a mention unless `mention: false`. */
+function slackEvent(input: {
+  readonly text: string;
+  readonly ts?: string;
+  readonly threadTs?: string;
+  readonly type?: "app_mention" | "message";
+  readonly mention?: boolean;
+  readonly channel?: string;
+  readonly channelType?: "channel" | "im";
+}): { readonly body: unknown; readonly ts: string } {
+  slackSequence += 1;
+  const ts = input.ts ?? `2000.${String(slackSequence).padStart(6, "0")}`;
+  const type = input.type ?? (input.mention === false ? "message" : "app_mention");
+  return {
+    ts,
+    body: {
+      type: "event_callback",
+      event_id: `Ev${ts.replace(".", "")}${type}`,
+      team_id: "T0EXAMPLE",
+      event: {
+        type,
+        user: "U0EXAMPLE",
+        channel: input.channel ?? "C0EXAMPLE",
+        ...(input.channelType === undefined ? {} : { channel_type: input.channelType }),
+        ts,
+        text: input.mention === false ? input.text : `<@U0BOT> ${input.text}`,
+        ...(input.threadTs === undefined ? {} : { thread_ts: input.threadTs }),
+      },
+    },
+  };
+}
+
+describe("plain-language model switch from Slack (P2c)", () => {
+  test("4a: '@bot use sonnet: fix X' at top level switches before the first turn, which bootstraps with it", async () => {
+    const h = await harness();
+    const root = slackEvent({ text: "use sonnet: fix X" });
+    await h.slack(root.body);
+
+    expect(h.count("operations")).toBe(1);
+    expect(h.outboxTexts()).toEqual([
+      "Switched this thread to *Sonnet* (`claudeAgent/claude-sonnet-5`), requested by <@U0EXAMPLE>. The first turn will use it.",
+    ]);
+    expect(await h.process()).toMatchObject({ kind: "completed" });
+    const [turn] = h.t3.turnStarts();
+    expect(turn?.message.text).toContain("fix X");
+    expect(turn?.message.text).not.toContain("use sonnet");
+    expect(turn?.bootstrap?.createThread?.modelSelection).toEqual(SONNET);
+    expect(h.audits("task.model.selected")).toHaveLength(1);
+  });
+
+  test("4b + 4e: a plain bound reply 'switch to mini' runs no turn; the next turn moves T3 in place", async () => {
+    const h = await harness();
+    const root = slackEvent({ text: "do a" });
+    await h.slack(root.body);
+    await h.process();
+    const turns = h.t3.turnStarts().length;
+
+    await h.slack(slackEvent({ text: "switch to mini", threadTs: root.ts, mention: false }).body);
+    expect(h.count("operations")).toBe(1);
+    expect(h.t3.turnStarts()).toHaveLength(turns);
+    expect(h.outboxTexts().filter((text) => text.startsWith("Switched"))).toEqual([
+      "Switched this thread to *GPT Mini* (`codex/gpt-5.6-mini`), requested by <@U0EXAMPLE>.",
+    ]);
+
+    await h.slack(slackEvent({ text: "now do b", threadTs: root.ts, mention: false }).body);
+    expect(await h.process()).toMatchObject({ kind: "completed" });
+    expect(h.t3.metaUpdates().map((command) => command.modelSelection)).toEqual([MINI]);
+    expect(h.t3.turnStarts().at(-1)!.modelSelection).toEqual(MINI);
+    expect(h.t3.threadModel).toEqual(MINI);
+  });
+
+  test("4c: 'use opus: do y' on a started codex thread is refused and the request is not queued", async () => {
+    const h = await harness();
+    const root = slackEvent({ text: "do a" });
+    await h.slack(root.body);
+    await h.process();
+    const taskId = h.store.findTaskForThread({ workspaceId: "T0EXAMPLE", conversationId: "C0EXAMPLE", threadTs: root.ts })!.taskId;
+
+    await h.slack(slackEvent({ text: "use opus: do y", threadTs: root.ts }).body);
+    expect(h.count("operations")).toBe(1);
+    const reply = h.outboxTexts().at(-1)!;
+    expect(reply).toBe(
+      "This thread already started on *Sol* (codex); T3 can't move a running conversation to *Opus 5.5*. " +
+        "Start a new thread with `@agent use opus: <request>` or say `@agent !restart` here for a fresh session " +
+        "(it won't remember this conversation), then switch. Your request was not started.",
+    );
+    expect(h.audits("task.model.denied")).toEqual([{
+      result: "refused",
+      metadata: expect.objectContaining({ ...OPUS, code: "cross-provider-started" }),
+    }]);
+    expect(h.store.getTaskExecution(taskId).desiredModelSelection).toBeNull();
+  });
+
+  test("4d: 'use grok-5' is refused with the allowed list and runs nothing", async () => {
+    const h = await harness();
+    await h.slack(slackEvent({ text: "use grok-5" }).body);
+    expect(h.count("operations")).toBe(0);
+    expect(h.outboxTexts()).toEqual([
+      "*grok-5* isn't allowed here. Allowed: *Sol* (`codex/gpt-5.6-sol`), *GPT Mini* (`codex/gpt-5.6-mini`), " +
+        "*Opus 5.5* (`claudeAgent/claude-opus-5-5`), *Sonnet* (`claudeAgent/claude-sonnet-5`). This thread stays on *Sol*.",
+    ]);
+    expect(h.audits("task.model.denied")).toMatchObject([{ metadata: { code: "not-allowed", instanceId: "grok", model: "grok-5" } }]);
+  });
+
+  test("ambient chatter is never parsed as a switch, and an unbound reply is ignored", async () => {
+    const config = configWith({ allowedModels: ALLOWED, ambient: { enabled: true, keywords: ["opus"], cooldownSeconds: 60, maxTurnsPerHour: 10 } });
+    const h = await harness(config);
+    expect(h.route(slackEvent({ text: "use opus", mention: false }).body)).toMatchObject({ kind: "accepted" });
+    expect(h.route(slackEvent({ text: "use opus", threadTs: "1999.000001", mention: false }).body)).toEqual({
+      kind: "ignored",
+      reason: "unbound-thread",
+    });
+    expect(h.audits("task.model.selected")).toEqual([]);
+  });
+
+  test("a DM is addressed without a mention", async () => {
+    const input = structuredClone(example) as Record<string, any>;
+    Object.assign(input.profiles[0], { defaultProviderInstanceId: "codex", defaultModel: "gpt-5.6-sol", allowedModels: ALLOWED });
+    input.profiles[0].memory.privateDm = true;
+    input.access.allowedChannelIds.push("D0EXAMPLE");
+    input.routes.push({ conversationId: "D0EXAMPLE", conversationType: "dm", ownerUserId: "U0EXAMPLE", profileId: "engineering" });
+    const h = await harness(agentTagConfigSchema.parse(input));
+    expect(h.route(slackEvent({ text: "use opus", mention: false, channel: "D0EXAMPLE", channelType: "im" }).body)).toMatchObject({
+      kind: "model",
+      directive: { kind: "match", choice: OPUS },
+      prompt: null,
+    });
+  });
+
+  test("the app_mention + message pair and a redelivery switch once, reply once and queue one request", async () => {
+    const h = await harness();
+    const ts = "2100.000001";
+    await h.slack(slackEvent({ text: "use mini: do z", ts }).body);
+    await h.slack(slackEvent({ text: "use mini: do z", ts, type: "message" }).body);
+    await h.slack(slackEvent({ text: "use mini: do z", ts }).body);
+    expect(h.count("operations")).toBe(1);
+    expect(h.outboxTexts()).toHaveLength(1);
+    expect(h.audits("task.model.selected")).toHaveLength(1);
+    expect(h.count("slack_command_events")).toBe(1);
+  });
+
+  test("a queued first turn not yet sent to T3 still allows a cross-driver switch; a dispatched one does not", async () => {
+    const h = await harness();
+    const root = slackEvent({ text: "do a" });
+    await h.slack(root.body);
+    await h.slack(slackEvent({ text: "use opus", threadTs: root.ts }).body);
+    expect(h.outboxTexts().at(-1)).toContain("The first turn will use it.");
+
+    // The first turn has gone to T3 but the task has not recorded the thread as started.
+    h.database.run("UPDATE operations SET t3_turn_dispatched_at = ?", [NOW]);
+    await h.slack(slackEvent({ text: "use sol", threadTs: root.ts }).body);
+    expect(h.outboxTexts().at(-1)).toStartWith("This thread already started on *Opus 5.5*");
+    expect(h.audits("task.model.denied")).toMatchObject([{ metadata: { code: "cross-provider-started" } }]);
+  });
+
+  test("a switch on a closed thread applies before its reopening turn, which bootstraps with it", async () => {
+    const h = await harness();
+    const root = slackEvent({ text: "do a" });
+    await h.slack(root.body);
+    await h.process();
+    const taskId = h.store.findTaskForThread({ workspaceId: "T0EXAMPLE", conversationId: "C0EXAMPLE", threadTs: root.ts })!.taskId;
+    // Slack has the replies and reactions, so the thread is idle.
+    h.database.run("UPDATE slack_outbox SET status = 'delivered'");
+    h.database.run("UPDATE slack_reactions SET status = 'delivered'");
+    expect(h.store.closeTask({ taskId, reason: "admin", actorId: "test", now: NOW })).toMatchObject({ kind: "closed" });
+
+    await h.slack(slackEvent({ text: "use opus", threadTs: root.ts }).body);
+    expect(h.outboxTexts().at(-1)).toBe(
+      "Switched this thread to *Opus 5.5* (`claudeAgent/claude-opus-5-5`), requested by <@U0EXAMPLE>. The first turn will use it.",
+    );
+    await h.slack(slackEvent({ text: "carry on", threadTs: root.ts }).body);
+    expect(await h.process()).toMatchObject({ kind: "completed" });
+    expect(h.t3.turnStarts().at(-1)!.bootstrap?.createThread?.modelSelection).toEqual(OPUS);
+  });
+
+  test("asking for the current model answers briefly; with a request it just queues it", async () => {
+    const h = await harness();
+    const bare = slackEvent({ text: "use sol" });
+    await h.slack(bare.body);
+    expect(h.outboxTexts()).toEqual(["This thread is already on *Sol* (`codex/gpt-5.6-sol`)."]);
+    expect(h.count("operations")).toBe(0);
+
+    await h.slack(slackEvent({ text: "use sol: do it" }).body);
+    expect(h.count("operations")).toBe(1);
+    expect(h.outboxTexts()).toHaveLength(1);
+    expect(h.audits("task.model.selected")).toEqual([]);
+  });
+
+  test("with model switching off the switch is refused and its request is not run", async () => {
+    const h = await harness(configWith({ allowedModels: ALLOWED, modelSwitch: { enabled: false } }));
+    await h.slack(slackEvent({ text: "use opus: do y" }).body);
+    expect(h.count("operations")).toBe(0);
+    expect(h.outboxTexts()).toEqual(["Model switching is turned off for this channel. Your request was not started."]);
+  });
+});
+
+describe("refusedReply: a running conversation T3 cannot move", () => {
+  const sol = { selection: SOL, label: "Sol" };
+  const grok = { selection: { instanceId: "grok", model: "grok-5-fast" }, label: "Grok Fast" };
+  const base: RefusalCopy = {
+    code: "requires-new-thread",
+    query: "grok fast",
+    target: grok,
+    current: { selection: { instanceId: "grok", model: "grok-5" }, label: "Grok" },
+    currentDriver: "grok",
+    targetDriver: "grok",
+    allowed: [],
+    candidates: [],
+    detail: null,
+    hadRequest: false,
+    botName: "Agent Tag",
+    restartAvailable: true,
+    targetHandle: "grok-fast",
+  };
+
+  test("requires-new-thread names both ways out when !restart is open to the user", () => {
+    expect(refusedReply(base).text).toBe(
+      "This thread already started on *Grok* (grok); T3 can't move a running conversation to *Grok Fast*. " +
+        "Start a new thread with `@Agent Tag use grok-fast: <request>` or say `@Agent Tag !restart` here for a fresh session " +
+        "(it won't remember this conversation), then switch.",
+    );
+  });
+
+  test("incompatible-continuation without !restart offers only a new thread, and says the request did not start", () => {
+    expect(refusedReply({ ...base, code: "incompatible-continuation", current: sol, currentDriver: "codex", restartAvailable: false, hadRequest: true }).text)
+      .toBe(
+        "This thread already started on *Sol* (codex); T3 can't move a running conversation to *Grok Fast*. " +
+          "Start a new thread with `@Agent Tag use grok-fast: <request>`. Your request was not started.",
+      );
   });
 });
