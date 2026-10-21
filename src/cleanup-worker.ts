@@ -53,6 +53,8 @@ export interface CleanupPassResult {
   readonly completed: number;
   /** Rows waiting: a retained dirty worktree, or a backoff after a transient error. */
   readonly deferred: number;
+  /** Each claimed row as this pass left it. */
+  readonly rows: readonly RetiredThread[];
 }
 
 const LEASE_MS = 60_000;
@@ -73,7 +75,7 @@ class CleanupRefusal extends Error {
   }
 }
 
-type RowOutcome = "completed" | "deferred" | "lease-lost";
+type RowOutcome = { readonly kind: "completed" | "deferred" | "lease-lost"; readonly row: RetiredThread };
 
 export class CleanupWorker {
   readonly requiresT3 = true;
@@ -117,6 +119,7 @@ export class CleanupWorker {
   /** One pass over the due rows; `limit: null` takes every due row (`tasks cleanup --once`). */
   async runPass(input: { readonly limit: number | null; readonly signal?: AbortSignal }): Promise<CleanupPassResult> {
     const seen: string[] = [];
+    const rows: RetiredThread[] = [];
     let completed = 0;
     let deferred = 0;
     while (input.limit === null || seen.length < input.limit) {
@@ -130,14 +133,16 @@ export class CleanupWorker {
       if (row === null) break;
       seen.push(`${row.taskId}:${row.generation}`);
       const outcome = await this.#clean(row, input.signal);
-      if (outcome === "completed") completed += 1;
-      else if (outcome === "deferred") deferred += 1;
+      rows.push(outcome.row);
+      if (outcome.kind === "completed") completed += 1;
+      else if (outcome.kind === "deferred") deferred += 1;
     }
-    return { claimed: seen.length, completed, deferred };
+    return { claimed: seen.length, completed, deferred, rows };
   }
 
   async #clean(claimed: RetiredThread, signal: AbortSignal | undefined): Promise<RowOutcome> {
     let row = claimed;
+    const outcome = (kind: RowOutcome["kind"]): RowOutcome => ({ kind, row });
     const step = (
       patch: RetiredThreadPatch,
       audit?: { readonly action: AuditAction; readonly result: string; readonly metadata?: Readonly<Record<string, string | number | boolean | null>> },
@@ -173,7 +178,7 @@ export class CleanupWorker {
       let prState: string | null | undefined;
       if (row.worktreePath !== null && (row.worktreeState === "unknown" || row.worktreeState === "retained-dirty")) {
         const result = await this.#worktree(row, step, signal);
-        if (result.kind !== "removed") return result.kind;
+        if (result.kind !== "removed") return outcome(result.kind);
         prState = result.prState;
       } else if (row.worktreeState === "unknown") {
         step({ worktreeState: "none" });
@@ -187,13 +192,13 @@ export class CleanupWorker {
         { completed: true, lastErrorCode: null, nextAttemptAt: null },
         { action: "task.cleanup.completed", result: "completed", metadata: { worktreeState: row.worktreeState, branchState: row.branchState } },
       );
-      return "completed";
+      return outcome("completed");
     } catch (error) {
-      if (error instanceof RetiredLeaseLostError) return "lease-lost";
+      if (error instanceof RetiredLeaseLostError) return outcome("lease-lost");
       try {
-        return this.#fail(row, error, step);
+        return outcome(this.#fail(row, error, step));
       } catch (inner) {
-        if (inner instanceof RetiredLeaseLostError) return "lease-lost";
+        if (inner instanceof RetiredLeaseLostError) return outcome("lease-lost");
         throw inner;
       }
     }
@@ -329,7 +334,7 @@ export class CleanupWorker {
     return null;
   }
 
-  #fail(row: RetiredThread, error: unknown, step: StepFn): RowOutcome {
+  #fail(row: RetiredThread, error: unknown, step: StepFn): "completed" | "deferred" {
     const refusal = error instanceof CleanupRefusal;
     const code = refusal ? error.code : errorCode(error);
     const attempts = row.attempts + 1;

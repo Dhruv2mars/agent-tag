@@ -16,7 +16,7 @@ import { type AccessReport, checkAccess } from "./doctor-access.ts";
 import type { ServiceManager } from "./service-manager.ts";
 import { readServiceState, type ServiceStateReport } from "./service-state.ts";
 import { describeInstalledProgram } from "./service-unit.ts";
-import { AgentTagStore } from "./store/store.ts";
+import { AgentTagStore, type LifecycleCounts } from "./store/store.ts";
 import { readT3CredentialState, T3_CREDENTIAL_STATE_FILE, type T3CredentialState } from "./t3/credentials.ts";
 import { assertRestrictedOrchestrationSession, inspectT3Session, type T3Session } from "./t3/auth.ts";
 import { inspectT3, type T3ServerInfo } from "./t3/gateway.ts";
@@ -62,7 +62,11 @@ export interface DoctorDependencies {
   readonly bunRequirement: { readonly minimum: string; readonly pinned: string | undefined };
   readonly inspectSession: (input: { readonly baseUrl: string; readonly token: SecretString }) => Promise<T3Session>;
   readonly inspectT3: (config: AgentTagConfig["t3"]) => Promise<T3ServerInfo>;
-  readonly storeDiagnostics: (config: AgentTagConfig) => Promise<{ readonly tasks?: number; readonly operations?: number }>;
+  readonly storeDiagnostics: (config: AgentTagConfig) => Promise<{
+    readonly tasks?: number;
+    readonly operations?: number;
+    readonly lifecycle?: LifecycleCounts;
+  }>;
   readonly service: ServiceManager | undefined;
   /** `git --version` output, or undefined when git cannot run. Defaults to spawning git. */
   readonly gitVersion?: () => Promise<string | undefined>;
@@ -636,16 +640,37 @@ export async function checkSlackApp(token: SecretString, dependencies: DoctorDep
   }
 }
 
+/** The store check, then the task lifecycle block (PR-N2) read from the same store. */
 export async function checkStore(
   config: AgentTagConfig,
   dependencies: Pick<DoctorDependencies, "storeDiagnostics">,
-): Promise<DoctorCheck> {
+): Promise<readonly DoctorCheck[]> {
   try {
     const counts = await dependencies.storeDiagnostics(config);
-    return { id: "store", status: "pass", summary: `SQLite store migrated (${counts.tasks ?? 0} task(s), ${counts.operations ?? 0} operation(s))` };
+    const store: DoctorCheck = {
+      id: "store",
+      status: "pass",
+      summary: `SQLite store migrated (${counts.tasks ?? 0} task(s), ${counts.operations ?? 0} operation(s))`,
+    };
+    return counts.lifecycle === undefined ? [store] : [store, checkLifecycle(counts.lifecycle)];
   } catch (error) {
-    return { id: "store", status: "fail", summary: `SQLite store failed to open: ${errorMessage(error)}` };
+    return [{ id: "store", status: "fail", summary: `SQLite store failed to open: ${errorMessage(error)}` }];
   }
+}
+
+export function checkLifecycle(counts: LifecycleCounts): DoctorCheck {
+  const dirty = counts.retainedDirty === 0
+    ? "no dirty worktrees kept"
+    : `${counts.retainedDirty} dirty worktree(s) kept${counts.oldestRetainUntil === null ? "" : `, oldest until ${counts.oldestRetainUntil}`}`;
+  const summary = `tasks: ${counts.activeTasks} active (${counts.releasedTasks} released), ${counts.closedTasks} closed; ` +
+    `retired threads: ${counts.pendingCleanup} pending cleanup, ${dirty}, ${counts.cleanupFailures} cleanup failure(s)`;
+  if (counts.cleanupFailures === 0) return { id: "lifecycle", status: "pass", summary };
+  return {
+    id: "lifecycle",
+    status: "warn",
+    summary,
+    hint: "failed rows keep their worktree and branch; find the cause in the `task.cleanup.failed` audit rows (`agent-tag audit`)",
+  };
 }
 
 export async function checkService(
@@ -783,9 +808,9 @@ export async function runDoctor(input: {
   }
 
   checks.push(
-    dataDirectory.status === "pass"
+    ...(dataDirectory.status === "pass"
       ? await checkStore(config, dependencies)
-      : skipped("store", "data directory is not usable"),
+      : [skipped("store", "data directory is not usable")]),
   );
 
   const serviceState = await (dependencies.serviceState ?? readServiceState)(config.dataDir);
