@@ -128,8 +128,6 @@ export interface OpenStatusMessageInput {
   readonly threadTs: string;
   /** Renders the first post from the new row. */
   readonly message: (view: StatusMessageView) => SlackOutboxPayload;
-  /** The first progress edit is not sent sooner than this after the post. */
-  readonly intervalMs: number;
   readonly now: string;
 }
 
@@ -170,18 +168,10 @@ export function openStatusMessage(database: Database, input: OpenStatusMessageIn
     database
       .query(
         `INSERT INTO status_messages (
-          operation_id, task_id, state, view_json, started_at, next_refresh_at, created_at, updated_at
-        ) VALUES (?, ?, 'running', ?, ?, ?, ?, ?)`,
+          operation_id, task_id, state, view_json, started_at, created_at, updated_at
+        ) VALUES (?, ?, 'running', ?, ?, ?, ?)`,
       )
-      .run(
-        operationId,
-        taskId,
-        JSON.stringify({ plan: [], recent: [], toolCount: 0 }),
-        now,
-        new Date(Date.parse(now) + input.intervalMs).toISOString(),
-        now,
-        now,
-      );
+      .run(operationId, taskId, JSON.stringify({ plan: [], recent: [], toolCount: 0 }), now, now, now);
     const view = getStatusMessageView(database, operationId);
     if (view === null) throw new Error("status message was not stored");
     const clientMessageId = statusPostId(operationId);
@@ -227,53 +217,69 @@ export function updateStatusProgress(database: Database, input: UpdateStatusProg
   const viewJson = JSON.stringify(progressSchema.parse(input.progress));
   const update = database.transaction((): boolean => {
     const row = z
-      .object({ state: z.enum(STATUS_STATES), view_json: nonEmpty, next_refresh_at: isoDateTime.nullable() })
+      .object({ state: z.enum(STATUS_STATES), view_json: nonEmpty })
       .nullable()
-      .parse(
-        database
-          .query("SELECT state, view_json, next_refresh_at FROM status_messages WHERE operation_id = ?")
-          .get(operationId),
-      );
+      .parse(database.query("SELECT state, view_json FROM status_messages WHERE operation_id = ?").get(operationId));
     if (row === null || isTerminalStatus(row.state) || row.view_json === viewJson) return false;
-    const notBefore = new Date(
-      Math.max(
-        Date.parse(now),
-        row.next_refresh_at === null ? 0 : Date.parse(row.next_refresh_at),
-        budgetSlot(database, now, input.perMinute),
-      ),
-    ).toISOString();
+    const nowMs = Date.parse(now);
+    const notBefore = budgetSlot(database, nowMs, messageSlot(database, operationId, nowMs, input.intervalMs), input.perMinute);
     database
       .query("UPDATE status_messages SET view_json = ?, updated_at = ? WHERE operation_id = ?")
       .run(viewJson, now, operationId);
-    const edit = refresh(database, operationId, now, notBefore);
-    if (edit !== null && !edit.reused) {
-      database
-        .query("UPDATE status_messages SET next_refresh_at = ? WHERE operation_id = ?")
-        .run(new Date(Date.parse(notBefore) + input.intervalMs).toISOString(), operationId);
-    }
+    refresh(database, operationId, now, new Date(notBefore).toISOString());
     return true;
   });
   return update.immediate();
 }
 
+const slotRowsSchema = z.array(z.object({ status: nonEmpty, blocked_until: isoDateTime.nullable(), updated_at: isoDateTime }));
+
 /**
- * Earliest send time the global edit budget allows: status edits queued or sent in the last minute
- * beyond `perMinute` push new ones back, spread evenly. Terminal edits are counted but not delayed:
- * there is at most one per turn, and Slack's Retry-After still pauses every row.
+ * When outbox rows reached Slack or will: claimed and settled rows at their last update (delivery),
+ * pending ones when they become claimable, never earlier than now.
  */
-function budgetSlot(database: Database, now: string, perMinute: number): number {
-  const nowMs = Date.parse(now);
-  const since = new Date(nowMs - BUCKET_WINDOW_MS).toISOString();
-  const row = z.object({ count: z.number().int() }).parse(
-    database
-      .query(
-        `SELECT COUNT(*) AS count FROM slack_outbox
-         WHERE refresh_kind = 'status-message' AND updated_at > ?`,
-      )
-      .get(since),
-  );
-  if (row.count < perMinute) return nowMs;
-  return nowMs + Math.ceil(((row.count - perMinute + 1) * BUCKET_WINDOW_MS) / perMinute);
+function slotTimes(rows: unknown, nowMs: number): number[] {
+  return slotRowsSchema
+    .parse(rows)
+    .map((row) =>
+      row.status === "pending"
+        ? Math.max(nowMs, row.blocked_until === null ? 0 : Date.parse(row.blocked_until))
+        : Date.parse(row.updated_at),
+    );
+}
+
+/** Earliest send time of the message's next edit: an interval after its post and every edit went out or is due. */
+function messageSlot(database: Database, operationId: string, nowMs: number, intervalMs: number): number {
+  const rows = database
+    .query(
+      `SELECT status, blocked_until, updated_at FROM slack_outbox WHERE client_message_id = ?1
+       UNION ALL
+       SELECT edit.status, edit.blocked_until, edit.updated_at
+       FROM slack_outbox post JOIN slack_outbox edit ON edit.target_outbox_id = post.outbox_id AND edit.method = 'update'
+       WHERE post.client_message_id = ?1`,
+    )
+    .all(statusPostId(operationId));
+  return Math.max(nowMs, ...slotTimes(rows, nowMs).map((slot) => slot + intervalMs));
+}
+
+/**
+ * Earliest send time at or after `earliest` that keeps every minute at `perMinute` status edits
+ * across all messages: after the perMinute-th latest edit sent or due, plus a minute. Terminal edits
+ * are counted but not delayed: there is at most one per turn, and Slack's Retry-After still pauses
+ * every row.
+ */
+function budgetSlot(database: Database, nowMs: number, earliest: number, perMinute: number): number {
+  const rows = database
+    .query(
+      `SELECT status, blocked_until, updated_at FROM slack_outbox
+       WHERE refresh_kind = 'status-message' AND status = 'pending'
+       UNION ALL
+       SELECT status, blocked_until, updated_at FROM slack_outbox
+       WHERE refresh_kind = 'status-message' AND status <> 'pending' AND updated_at > ?`,
+    )
+    .all(new Date(nowMs - BUCKET_WINDOW_MS).toISOString());
+  const nth = slotTimes(rows, nowMs).sort((a, b) => b - a)[perMinute - 1];
+  return nth === undefined ? earliest : Math.max(earliest, nth + BUCKET_WINDOW_MS);
 }
 
 /** Running → waiting while the turn waits for an approval or answer (the card has the buttons). */
@@ -359,14 +365,4 @@ export function settleStatusMessage(
   const edit = refresh(database, operationId, now, null);
   audit(database, operationId, "status.terminal", state, now);
   return edit?.outboxId ?? null;
-}
-
-/** The operation's status post while it can still be edited (queued, sending or sent). */
-export function liveStatusPost(database: Database, operationId: string): string | null {
-  const row = z.object({ outbox_id: nonEmpty, status: nonEmpty }).nullable().parse(
-    database
-      .query("SELECT outbox_id, status FROM slack_outbox WHERE client_message_id = ?")
-      .get(statusPostId(operationId)),
-  );
-  return row === null || row.status === "failed" ? null : row.outbox_id;
 }

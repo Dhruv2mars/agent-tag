@@ -21,7 +21,7 @@ export const RECENT_LINES = 5;
 /** Longest rendered progress line; provider tool titles can embed whole shell commands. */
 export const PROGRESS_LINE_CHARS = 120;
 const MAX_PLAN_STEPS = 12;
-/** Activities remembered per turn; older ones only drop out of the recent lines. */
+/** Activities remembered per turn; older ones drop out of the recent lines but keep counting. */
 const MAX_ACTIVITIES = 400;
 
 const planSchema = z.object({
@@ -73,6 +73,10 @@ export const EMPTY_PROGRESS: StatusProgress = { plan: [], recent: [], toolCount:
 export class TurnProgress {
   #turnId: string | null = null;
   readonly #activities = new Map<string, ProgressActivity>();
+  // What the turn's evicted activities still add to the view; their ids are ignored if re-emitted.
+  readonly #evictedIds = new Set<string>();
+  #evictedPlan: ReadonlyArray<StatusPlanStep> | undefined;
+  #evictedTools = 0;
 
   get turnId(): string | null {
     return this.#turnId;
@@ -81,6 +85,9 @@ export class TurnProgress {
   setTurn(turnId: string): void {
     if (this.#turnId === turnId) return;
     this.#turnId = turnId;
+    this.#evictedIds.clear();
+    this.#evictedPlan = undefined;
+    this.#evictedTools = 0;
     for (const [id, activity] of this.#activities) {
       if (activity.turnId !== turnId) this.#activities.delete(id);
     }
@@ -89,19 +96,24 @@ export class TurnProgress {
   add(activity: ProgressActivity): void {
     if (activity.turnId === null) return;
     if (this.#turnId !== null && activity.turnId !== this.#turnId) return;
+    if (this.#evictedIds.has(activity.id)) return;
     this.#activities.set(activity.id, activity);
-    if (this.#activities.size > MAX_ACTIVITIES) {
-      const oldest = this.#activities.keys().next();
-      if (oldest.done !== true) this.#activities.delete(oldest.value);
-    }
+    if (this.#activities.size <= MAX_ACTIVITIES) return;
+    const oldest = this.#activities.values().next();
+    if (oldest.done === true) return;
+    this.#activities.delete(oldest.value.id);
+    if (oldest.value.turnId !== this.#turnId) return;
+    this.#evictedIds.add(oldest.value.id);
+    if (oldest.value.plan !== undefined) this.#evictedPlan = oldest.value.plan;
+    if (oldest.value.kind === "tool.completed") this.#evictedTools += 1;
   }
 
   /** The view for the current turn; empty until the turn is known. */
   view(): StatusProgress {
     if (this.#turnId === null) return EMPTY_PROGRESS;
-    let plan: ReadonlyArray<StatusPlanStep> = [];
+    let plan: ReadonlyArray<StatusPlanStep> = this.#evictedPlan ?? [];
     const recent: string[] = [];
-    let toolCount = 0;
+    let toolCount = this.#evictedTools;
     for (const activity of this.#activities.values()) {
       if (activity.turnId !== this.#turnId) continue;
       if (activity.plan !== undefined) plan = activity.plan;

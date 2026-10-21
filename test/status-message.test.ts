@@ -413,7 +413,6 @@ describe("live status message (F3)", () => {
         conversationId: "C1",
         threadTs: "1000.000001",
         message: (view) => renderStatusMessage(view, { showProgress: true }),
-        intervalMs: interval,
         now,
       });
       await drain(now);
@@ -471,7 +470,6 @@ describe("live status message (F3)", () => {
           conversationId: "C1",
           threadTs: `3000.00000${index}`,
           message: (view) => renderStatusMessage(view, { showProgress: true }),
-          intervalMs: 1_000,
           now,
         });
         return receipt.operationId;
@@ -493,8 +491,48 @@ describe("live status message (F3)", () => {
             "SELECT blocked_until FROM slack_outbox WHERE refresh_kind = 'status-message' ORDER BY blocked_until",
           )
           .all();
-        // Budget 2/min: the first two go after the per-message interval, the third waits a slot.
-        expect(rows.map((row) => row.blocked_until)).toEqual([at(5_000), at(5_000), at(5_000 + 30_000)]);
+        // Budget 2/min: the first two go after the per-message interval, the third a minute after them.
+        expect(rows.map((row) => row.blocked_until)).toEqual([at(5_000), at(5_000), at(5_000 + 60_000)]);
+      } finally {
+        database.close();
+      }
+    });
+  });
+
+  test("an edit delivered late pushes the next one an interval past its delivery", async () => {
+    await withHarness(async ({ store, path, calls, drain }) => {
+      const receipt = ingest(store, 1);
+      store.claimNextOperation({ workerId: "worker-a", now, leaseMs: 600_000, maxConcurrentTasks: 2 });
+      store.openStatusMessage({
+        operationId: receipt.operationId,
+        taskId: receipt.taskId,
+        conversationId: "C1",
+        threadTs: "1000.000001",
+        message: (view) => renderStatusMessage(view, { showProgress: true }),
+        now,
+      });
+      await drain(now);
+      const update = (recent: string, clock: string) =>
+        store.updateStatusProgress({
+          operationId: receipt.operationId,
+          progress: { plan: [], recent: [recent], toolCount: 1 },
+          intervalMs: 2_000,
+          perMinute: 40,
+          now: clock,
+        });
+      update("first", at(1_000));
+      // The outbox was busy: the edit due at 2 s goes out at 90 s.
+      await drain(at(90_000));
+      expect(calls.filter((call) => call.method === "update").map((call) => call.at)).toEqual([at(90_000)]);
+      update("second", at(90_100));
+      const database = new Database(path, { readonly: true, strict: true });
+      try {
+        const pending = database
+          .query<{ blocked_until: string }, []>(
+            "SELECT blocked_until FROM slack_outbox WHERE refresh_kind = 'status-message' AND status = 'pending'",
+          )
+          .all();
+        expect(pending.map((row) => row.blocked_until)).toEqual([at(92_000)]);
       } finally {
         database.close();
       }
@@ -511,7 +549,6 @@ describe("live status message (F3)", () => {
         conversationId: "C1",
         threadTs: "1000.000001",
         message: (view) => renderStatusMessage(view, { showProgress: true }),
-        intervalMs: 2_000,
         now,
       });
       store.completeOperation({ operationId: receipt.operationId, workerId: "worker-a", resultSequence: 1, now: at(3_000) });
@@ -532,7 +569,6 @@ describe("live status message (F3)", () => {
           conversationId: "C1",
           threadTs: "1000.000001",
           message: (view) => renderStatusMessage(view, { showProgress: true }),
-          intervalMs: 2_000,
           now: at(5_000),
         }),
       ).toEqual({ kind: "reattached" });
@@ -563,7 +599,6 @@ describe("live status message (F3)", () => {
           conversationId: "C1",
           threadTs: `4000.00000${index}`,
           message: (view) => renderStatusMessage(view, { showProgress: true }),
-          intervalMs: 1_000,
           now,
         });
         store.updateStatusProgress({
@@ -681,6 +716,28 @@ describe("turn progress", () => {
     expect(view.recent.slice(0, 2)).toEqual(["Ran ls", "Problem: Edit failed"]);
     expect(view.recent.at(-1)?.length).toBe(PROGRESS_LINE_CHARS);
     expect(view.toolCount).toBe(2);
+  });
+
+  test("a long turn keeps its plan and counts every tool once, however many activities it has", () => {
+    const progress = new TurnProgress();
+    progress.setTurn("turn-1");
+    progress.add({
+      id: "plan",
+      tone: "info",
+      kind: "turn.plan.updated",
+      summary: "Plan updated",
+      turnId: "turn-1",
+      plan: [{ step: "Fix", status: "inProgress" }],
+    });
+    const tool = (index: number) =>
+      ({ id: `t${index}`, tone: "tool", kind: "tool.completed", summary: `Ran step ${index}`, turnId: "turn-1" }) as const;
+    for (let index = 0; index < 405; index += 1) progress.add(tool(index));
+    // A snapshot replays early activities that were already evicted.
+    for (let index = 0; index < 10; index += 1) progress.add(tool(index));
+    const view = progress.view();
+    expect(view.plan).toEqual([{ step: "Fix", status: "inProgress" }]);
+    expect(view.toolCount).toBe(405);
+    expect(view.recent.at(-1)).toBe("Ran step 404");
   });
 
   test("the v1 stream adapter carries a plan update's steps but never other payloads", () => {

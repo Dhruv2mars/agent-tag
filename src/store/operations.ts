@@ -9,7 +9,7 @@ import { type StoreContext, requiredId, parseStoredJson } from "./context.ts";
 import { OPERATION_SETTLED, closeOperationInteractions } from "./interactions.ts";
 import { leaseExpiry, requireLeaseHeld } from "./lease.ts";
 import { insertOutboxMessage } from "./outbox.ts";
-import { cancellingActor, liveStatusPost, settleStatusMessage } from "./status.ts";
+import { cancellingActor, settleStatusMessage } from "./status.ts";
 import { type PrSyncInput, recordPrSync } from "./pull-requests.ts";
 import { consumeThreadNotes } from "./thread-notes.ts";
 import {
@@ -906,9 +906,7 @@ export function cancelOperationWithOutbox(database: Database, input: CancelOpera
     });
     // The status message turns into "Stopped by <@U>" and is the whole notice. Only when it cannot
     // carry it (an operation from before status messages, or a post Slack refused) is a line posted.
-    const hasStatusPost = liveStatusPost(database, operationId) !== null;
-    const edited = settleStatusMessage(database, { operationId, now });
-    let outboxId = hasStatusPost ? edited : null;
+    let outboxId = settleStatusMessage(database, { operationId, now });
     if (outboxId === null) {
       const actor = cancellingActor(database, operationId);
       outboxId = crypto.randomUUID();

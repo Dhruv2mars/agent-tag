@@ -567,8 +567,8 @@ export const STORE_MIGRATIONS: readonly StoreMigration[] = [
     // Live status message (PR-F3): one Slack message per turn, posted as `${operationId}:status` and
     // edited in place through outbox refresh rows (refresh_kind 'status-message', see message-edits.ts).
     // view_json holds the progress view only (plan steps, recent tool titles), never tool payloads.
-    // Terminal states are sticky. next_refresh_at throttles non-terminal edits per message; the
-    // partial index serves the global edit budget. Independent table, so it applies in any order.
+    // Terminal states are sticky. The partial index serves the global edit budget. Independent table,
+    // so it applies in any order.
     version: 22,
     sql: `
       CREATE TABLE status_messages (
@@ -579,7 +579,6 @@ export const STORE_MIGRATIONS: readonly StoreMigration[] = [
         actor_user_id TEXT,
         started_at TEXT NOT NULL,
         settled_at TEXT,
-        next_refresh_at TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );

@@ -681,7 +681,6 @@ export class AgentTagCoordinator {
       conversationId: operation.payload.conversationId,
       threadTs: operation.payload.threadTs,
       message: (view) => renderStatusMessage(view, { showProgress }),
-      intervalMs: this.#config.slack.ui.statusUpdateIntervalMs,
       now: this.#now().toISOString(),
     });
     const progress = new TurnProgress();
