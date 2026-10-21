@@ -522,18 +522,39 @@ describe("Slack routines: cancel by text", () => {
     });
   });
 
-  test("several matches list just those; no match says so", async () => {
+  test("several matches list just those under their list numbers; no match says so", async () => {
     await withHarness({}, async ({ send, active, outbox, ledger }) => {
-      await send(mention({ text: "every weekday at 9am summarize open PRs" }));
+      await send(mention({ text: "every weekday at 9am check CI" }));
       await send(mention({ text: "every day at 5pm post the build report" }));
-      await send(mention({ text: "cancel this routine" }));
+      await send(mention({ text: "every day at 6pm post the build summary" }));
+      await send(mention({ text: "cancel the routine about build" }));
       const ambiguous = outbox().at(-1)!;
       expect(ambiguous.payload.text).toBe("2 routines match. Which one should I cancel?");
       expect(buttons(ambiguous.payload)).toHaveLength(2);
+      const rows = JSON.stringify(ambiguous.payload.blocks);
+      expect(rows).toContain("2. :repeat:");
+      expect(rows).toContain("3. :repeat:");
+      expect(rows).not.toContain("1. :repeat:");
       await send(mention({ text: "cancel routine 9" }));
       expect(outbox().at(-1)!.payload.text).toBe("No active routine matches `#9`. Say `list routines` to see them.");
-      expect(active()).toHaveLength(2);
+      expect(active()).toHaveLength(3);
       expect(ledger().slice(-2).map((row) => row.reason)).toEqual(["ambiguous", "no-match"]);
+      await send(mention({ text: "cancel routine 2" }));
+      expect(active().map((schedule) => schedule.prompt)).toEqual(["check CI", "post the build summary"]);
+    });
+  });
+
+  test("'cancel this routine' never reaches routines of other threads", async () => {
+    await withHarness({}, async ({ send, active, outbox, ledger }) => {
+      const first = nextTs();
+      await send(mention({ text: "every weekday at 9am summarize open PRs", ts: first }));
+      await send(mention({ text: "every day at 5pm post the build report" }));
+      await send(mention({ text: "cancel this routine", threadTs: first }));
+      await send(mention({ text: "cancel this routine", threadTs: first }));
+      await send(mention({ text: "cancel this routine" }));
+      expect(active().map((schedule) => schedule.prompt)).toEqual(["post the build report"]);
+      expect(outbox().at(-1)!.payload.text).toBe("There's no active routine here to cancel. Say `list routines` to see them.");
+      expect(ledger().slice(-2).map((row) => row.reason)).toEqual(["no-match", "no-match"]);
     });
   });
 
@@ -682,7 +703,7 @@ describe("matchCancelTargets", () => {
 
   test("resolves each reference kind", () => {
     expect(matchCancelTargets(active, { kind: "only" }, "2.2")).toEqual([active[1]!]);
-    expect(matchCancelTargets(active, { kind: "only" }, "9.9")).toEqual(active);
+    expect(matchCancelTargets(active, { kind: "only" }, "9.9")).toEqual([]);
     expect(matchCancelTargets(active, { kind: "index", index: 1 }, "9.9")).toEqual([active[0]!]);
     expect(matchCancelTargets(active, { kind: "index", index: 3 }, "9.9")).toEqual([]);
     expect(matchCancelTargets(active, { kind: "id", prefix: "a1b2" }, "9.9")).toEqual(active);

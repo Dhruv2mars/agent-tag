@@ -52,11 +52,9 @@ export function matchCancelTargets(
 ): ReadonlyArray<ScheduleSummary> {
   const live = active.filter((schedule) => schedule.state === "active");
   switch (ref.kind) {
-    case "only": {
-      // "cancel this routine": the thread's routines, else the conversation's.
-      const here = live.filter((schedule) => schedule.threadTs === threadTs);
-      return here.length > 0 ? here : live;
-    }
+    case "only":
+      // "cancel this routine": only the routines of the thread it was said in.
+      return live.filter((schedule) => schedule.threadTs === threadTs);
     case "index": {
       const schedule = live[ref.index - 1];
       return schedule === undefined ? [] : [schedule];
@@ -317,7 +315,13 @@ export class SlackRoutines {
     if (targets.length === 0) return this.#reject(reply, settle, "no-match", copy.noMatchReply(refLabel(ref)));
     if (targets.length > 1) {
       const labels = await this.#labels(targets.map((schedule) => schedule.actorUserId));
-      const rows = targets.map((schedule) => ({ schedule, creatorLabel: labels.get(schedule.actorUserId) ?? schedule.actorUserId }));
+      // Keep the conversation-wide list numbers, so "cancel routine <n>" after this reply hits the row shown.
+      const live = active.filter((schedule) => schedule.state === "active");
+      const rows = targets.map((schedule) => ({
+        number: live.indexOf(schedule) + 1,
+        schedule,
+        creatorLabel: labels.get(schedule.actorUserId) ?? schedule.actorUserId,
+      }));
       return this.#reject(reply, settle, "ambiguous", copy.ambiguousCancelReply(rows));
     }
     const [schedule] = targets as [ScheduleSummary];

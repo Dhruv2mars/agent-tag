@@ -151,12 +151,15 @@ export function listReply(input: {
   return { text: lines.join("\n"), blocks };
 }
 
-/** Several routines match a cancel request: list just those, each with its own button. */
-export function ambiguousCancelReply(rows: ReadonlyArray<RoutineListRow>): SlackOutboxPayload {
+/**
+ * Several routines match a cancel request: list just those, each with its own button. `number` is the
+ * row's position in the full list, which is what "cancel routine <n>" resolves against.
+ */
+export function ambiguousCancelReply(rows: ReadonlyArray<RoutineListRow & { readonly number: number }>): SlackOutboxPayload {
   const header = `${rows.length} routines match. Which one should I cancel?`;
   const blocks: Block[] = [section(header)];
-  for (const [index, row] of rows.slice(0, ROUTINE_LIST_LIMIT).entries()) {
-    blocks.push(section(activeRowText(index + 1, row)), cancelButtonBlock(row.schedule));
+  for (const row of rows.slice(0, ROUTINE_LIST_LIMIT)) {
+    blocks.push(section(activeRowText(row.number, row)), cancelButtonBlock(row.schedule));
   }
   return { text: header, blocks };
 }
