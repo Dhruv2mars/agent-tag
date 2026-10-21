@@ -62,7 +62,13 @@ interface DeliverInput {
  */
 export async function deliverNextSlackOutbox(input: DeliverInput): Promise<SlackOutboxOutcome> {
   const now = input.now ?? (() => new Date().toISOString());
-  const claimed = input.store.claimNextOutbox({ workerId: input.workerId, now: now(), leaseMs: OUTBOX_LEASE_MS });
+  const { statusUpdateIntervalMs, statusUpdatesPerMinute } = input.config.slack.ui;
+  const claimed = input.store.claimNextOutbox({
+    workerId: input.workerId,
+    now: now(),
+    leaseMs: OUTBOX_LEASE_MS,
+    statusEdits: { intervalMs: statusUpdateIntervalMs, perMinute: statusUpdatesPerMinute },
+  });
   if (claimed === null) return { kind: "idle" };
   const settle = { outboxId: claimed.outboxId, workerId: input.workerId };
   try {

@@ -15,8 +15,8 @@ export interface RetentionPolicy {
   readonly outboxDays?: number | undefined;
   /**
    * Replace stored Slack message text, settled operation text, ended schedule prompts and consumed
-   * thread note text and settled PR job request/summary text older than this many days; delete
-   * unconsumed thread notes that old.
+   * thread note text, settled PR job request/summary text and settled status messages' progress
+   * (tool titles, plan steps) older than this many days; delete unconsumed thread notes that old.
    */
   readonly messageDays?: number | undefined;
 }
@@ -42,6 +42,8 @@ export interface PruneResult {
   readonly notesDeleted: number;
   /** Request and summary text of settled draft PR jobs. */
   readonly prJobsRedacted: number;
+  /** Progress (plan steps, tool titles) of settled live status messages. */
+  readonly statusRedacted: number;
 }
 
 export function retentionEnabled(policy: RetentionPolicy): boolean {
@@ -90,6 +92,8 @@ const PR_JOB_WHERE = `status IN ('succeeded', 'skipped', 'blocked', 'failed')
   AND julianday(updated_at) < julianday(?)
   AND (request_text IS NOT NULL AND request_text <> '${PRUNED_TEXT}'
     OR summary_text IS NOT NULL AND summary_text <> '${PRUNED_TEXT}')`;
+// Only settled status messages: a live one still renders its progress on the next edit.
+const STATUS_WHERE = `settled_at IS NOT NULL AND julianday(settled_at) < julianday(?) AND view_json <> '{}'`;
 const PENDING_NOTE_WHERE = "consumed_by_operation_id IS NULL AND julianday(created_at) < julianday(?)";
 
 function count(database: Database, table: string, where: string, cutoff: string): number {
@@ -121,6 +125,7 @@ export function pruneRetainedData(
     let notesRedacted = 0;
     let notesDeleted = 0;
     let prJobsRedacted = 0;
+    let statusRedacted = 0;
     if (cutoffs.audit !== null) {
       auditDeleted = dryRun
         ? count(database, "audit_log", AUDIT_WHERE, cutoffs.audit)
@@ -176,6 +181,9 @@ export function pruneRetainedData(
                WHERE ${PR_JOB_WHERE}`,
             )
             .run(PRUNED_TEXT, PRUNED_TEXT, cutoffs.message).changes;
+      statusRedacted = dryRun
+        ? count(database, "status_messages", STATUS_WHERE, cutoffs.message)
+        : database.query(`UPDATE status_messages SET view_json = '{}' WHERE ${STATUS_WHERE}`).run(cutoffs.message).changes;
     }
     return {
       dryRun,
@@ -188,6 +196,7 @@ export function pruneRetainedData(
       notesRedacted,
       notesDeleted,
       prJobsRedacted,
+      statusRedacted,
     };
   });
   // A dry run only reads, so it takes no write lock and works on a read-only connection.
@@ -203,7 +212,8 @@ export function prunedRowCount(result: PruneResult): number {
     result.schedulesRedacted +
     result.notesRedacted +
     result.notesDeleted +
-    result.prJobsRedacted
+    result.prJobsRedacted +
+    result.statusRedacted
   );
 }
 

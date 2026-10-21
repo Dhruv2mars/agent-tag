@@ -15,6 +15,7 @@
  *   pull-requests.ts  task pull requests and draft PR jobs
  *   commands.ts     `!command` ledger, thread mute, `!status` summaries
  *   reactions.ts    Slack reaction queue (instant ack)
+ *   status.ts       live status message per turn (state, progress, throttled edits)
  *   schema.ts       zod schemas                            types.ts        public types (re-exported)
  */
 import type { Database } from "bun:sqlite";
@@ -59,6 +60,7 @@ import * as threadNotes from "./thread-notes.ts";
 import * as pullRequests from "./pull-requests.ts";
 import * as commands from "./commands.ts";
 import * as reactions from "./reactions.ts";
+import * as status from "./status.ts";
 
 export type { AuditAction } from "./schema.ts";
 export type {
@@ -179,6 +181,16 @@ export type {
   RetryOutboxInput,
   ExhaustOutboxRetriesInput,
 } from "./outbox.ts";
+export { isTerminalStatus, STATUS_STATES, statusPostId } from "./status.ts";
+export type {
+  OpenStatusMessageInput,
+  OpenStatusMessageResult,
+  StatusMessageView,
+  StatusPlanStep,
+  StatusProgress,
+  StatusState,
+  UpdateStatusProgressInput,
+} from "./status.ts";
 export type {
   ClaimedReaction,
   ClaimNextReactionInput,
@@ -620,13 +632,38 @@ export class AgentTagStore {
     return this.#database.transaction(() => messageEdits.enqueueMessageRefresh(this.#database, input)).immediate();
   }
 
+  /** Posts the operation's live status message once; a resumed claim re-attaches (see status.ts). */
+  openStatusMessage(input: status.OpenStatusMessageInput): status.OpenStatusMessageResult {
+    return status.openStatusMessage(this.#database, input);
+  }
+
+  /** Stores the turn's progress and queues one throttled, coalesced status edit. */
+  updateStatusProgress(input: status.UpdateStatusProgressInput): boolean {
+    return status.updateStatusProgress(this.#database, input);
+  }
+
+  getStatusMessageView(operationId: string): status.StatusMessageView | null {
+    return status.getStatusMessageView(this.#database, operationId);
+  }
+
   /** Ensures the posted message is edited to `payload`; coalesces with a pending edit of it. */
   enqueueMessageEdit(input: messageEdits.EnqueueMessageEditInput): messageEdits.MessageEditResult {
     return this.#database.transaction(() => messageEdits.enqueueMessageEdit(this.#database, input)).immediate();
   }
 
-  claimNextOutbox(input: outbox.ClaimNextOutboxInput): ClaimedOutboxMessage | null {
-    return outbox.claimNextOutbox(this.#context, input);
+  /** `statusEdits` throttles status progress edits by what actually reached Slack (see store/status.ts). */
+  claimNextOutbox(
+    input: Omit<outbox.ClaimNextOutboxInput, "deferRefresh"> & { readonly statusEdits?: status.StatusEditThrottle },
+  ): ClaimedOutboxMessage | null {
+    const { statusEdits, ...claim } = input;
+    if (statusEdits === undefined) return outbox.claimNextOutbox(this.#context, claim);
+    return outbox.claimNextOutbox(this.#context, {
+      ...claim,
+      deferRefresh: (refresh, now) =>
+        refresh.refreshKind === "status-message"
+          ? status.statusEditDeferral(this.#database, { operationId: refresh.refreshKey, targetOutboxId: refresh.targetOutboxId }, now, statusEdits)
+          : null,
+    });
   }
 
   claimNextReaction(input: reactions.ClaimNextReactionInput): reactions.ClaimedReaction | null {

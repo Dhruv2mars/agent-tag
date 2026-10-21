@@ -543,7 +543,8 @@ describe("coordinator final replies", () => {
       for (;;) {
         const next = store.claimNextOutbox({ workerId: "slack-a", now, leaseMs: 10_000 });
         if (next === null) break;
-        claimed.push(next);
+        // The status message's Done edit is an edit of the first post, not a thread message.
+        if (next.refreshKind === null) claimed.push(next);
         store.markOutboxDelivered({
           outboxId: next.outboxId,
           workerId: "slack-a",
@@ -551,7 +552,7 @@ describe("coordinator final replies", () => {
           now,
         });
       }
-      expect(claimed[0]?.clientMessageId.endsWith(":started")).toBe(true);
+      expect(claimed[0]?.clientMessageId.endsWith(":status")).toBe(true);
       const finals = claimed.slice(1);
       expect(finals.length).toBeGreaterThan(1);
       finals.forEach((message, index) => {
