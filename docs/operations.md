@@ -55,7 +55,7 @@ In `channel-members` mode Agent Tag reads each routed channel's members with `co
 | Key | Default | Meaning |
 |---|---|---|
 | `access.membership.ttlSeconds` | 300 | A snapshot older than this is refreshed in the background and before a non-allowlisted user's event. |
-| `access.membership.maxStaleSeconds` | 3600 | Past this age (for example while Slack rate-limits the refresh) the snapshot answers "unknown": non-allowlisted users are denied with `membership-unknown`, and their due routines wait instead of being cancelled. |
+| `access.membership.maxStaleSeconds` | 3600 | Past this age (for example while Slack rate-limits the refresh) the snapshot answers "unknown": non-allowlisted users are denied with `membership-unknown`, and their due routines wait (up to the routine's misfire grace, then that run is skipped) instead of being cancelled. |
 | `access.membership.maxMembers` | 5000 | A larger channel is not snapshotted; only the allowlist works there. |
 | `access.membership.guests` | `deny` | Guests (restricted accounts) never approve, answer or cancel. `steer-only` lets them start and steer turns. |
 
