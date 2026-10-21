@@ -44,7 +44,10 @@
       "memory": {
         "shared": true,
         "privateDm": false,
-        "retentionDays": 180
+        "retentionDays": 180,
+        "dmReadsWorkspace": false,
+        "injection": "first-turn-and-changes",
+        "maxInjectedChars": 6000
       },
       "ambient": {
         "enabled": false,

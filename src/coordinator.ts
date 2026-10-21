@@ -3,6 +3,7 @@ import { preparePullRequestSync, pullRequestTurnNote, type PullRequestSyncOption
 import { ExecutionAuthorityDenied, requireExecutionAuthority } from "./policy/execution.ts";
 import { allowedChoices, effectiveSelection, planSwitch, type ModelChoice } from "./policy/models.ts";
 import { AgentTagMemory } from "./memory.ts";
+import { MEMORY_CLEARED_BLOCK, renderMemoryBlock } from "./memory-prompt.ts";
 import type { SlackContextSource } from "./slack/context-source.ts";
 import { fetchThreadWindow, SlackContextUnavailable, THREAD_CONTEXT_TIMEOUT_MS } from "./slack/context.ts";
 import { approvalMessage, describeDuration, questionMessage } from "./slack/cards.ts";
@@ -466,16 +467,7 @@ export class AgentTagCoordinator {
     const window = await this.#readThreadWindow(operation, profile, signal);
     // Updates since the last turn are context for the next human turn; schedule runs leave them pending.
     const notes = origin === "slack" ? this.#store.listPendingThreadNotes(operation.taskId) : [];
-    const memories = this.#memory.list({
-      context: {
-        workspaceId: this.#config.slack.workspaceId,
-        actorUserId,
-        profileId: task.profileId,
-        taskId: operation.taskId,
-        conversationType: task.conversationType,
-      },
-      now: this.#now().toISOString(),
-    });
+    const memory = this.#memoryForTurn(task, profile, operation.taskId, actorUserId);
     // Schedule prompts are plain text, so only Slack-origin text is scanned for mentions.
     const mentioned = origin === "slack" ? collectMentionedUserIds(text) : [];
     const windowIds = window === null || "unavailable" in window
@@ -514,7 +506,7 @@ export class AgentTagCoordinator {
           items: notes,
           limits: { maxChars: profile.threadContext.maxChars, maxMessageChars: profile.threadContext.maxMessageChars },
         },
-      memories,
+      memory: memory.block,
     });
     const prNote = this.#pullRequests === undefined ? null : pullRequestTurnNote(profile, task.repositoryRoot, operation.taskId);
     const proposedText = prNote === null ? turnText : `${turnText}\n\n${prNote}`;
@@ -522,8 +514,45 @@ export class AgentTagCoordinator {
       ...lease,
       proposedText,
       consumeNoteIds: notes.map((note) => note.noteId),
+      memoryDigest: memory.digest,
       now: this.#now().toISOString(),
     });
+  }
+
+  /**
+   * The memory block for a turn: on the thread's first turn, whenever the visible note set differs
+   * from what the task's last frozen turn showed, or every turn when the profile asks. The digest is
+   * recorded only when the turn text freezes, so a replay never advances it.
+   */
+  #memoryForTurn(
+    task: TaskExecutionBinding,
+    profile: AgentTagProfile,
+    taskId: string,
+    actorUserId: string,
+  ): { readonly block: string | null; readonly digest: string | null } {
+    const groups = this.#memory.listForConversation({
+      context: {
+        workspaceId: this.#config.slack.workspaceId,
+        actorUserId,
+        profileId: task.profileId,
+        conversationId: task.conversationId,
+        taskId,
+        conversationType: task.conversationType,
+      },
+      now: this.#now().toISOString(),
+    });
+    const digest = AgentTagMemory.digest([
+      ...groups.channel, ...groups.dm, ...groups.operator, ...groups.task, ...groups.workspace,
+    ]);
+    const previous = this.#store.getTaskMemoryDigest(task.taskId);
+    const changed = digest !== previous;
+    if (profile.memory.injection !== "every-turn" && task.threadStarted && !changed) return { block: null, digest };
+    const block = renderMemoryBlock({
+      groups,
+      maxChars: profile.memory.maxInjectedChars,
+      updated: task.threadStarted && changed,
+    });
+    return { block: block ?? (task.threadStarted && previous !== null ? MEMORY_CLEARED_BLOCK : null), digest };
   }
 
   /**

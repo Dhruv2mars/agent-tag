@@ -202,6 +202,11 @@ export interface ResolveOperationTurnTextInput {
   readonly proposedText: string;
   /** Pending thread notes shown in `proposedText`; consumed only when this call freezes the text. */
   readonly consumeNoteIds?: readonly string[];
+  /**
+   * The memory set `proposedText` reflects (`AgentTagMemory.digest`), recorded on the task only when
+   * this call freezes the text; undefined leaves the task's digest alone.
+   */
+  readonly memoryDigest?: string | null;
   readonly now: string;
 }
 
@@ -374,6 +379,12 @@ export function resolveOperationTurnText(database: Database, input: ResolveOpera
         noteIds,
         now,
       });
+    // Like notes, the digest advances only with the freeze: a replay must not move it.
+    if (input.memoryDigest !== undefined) {
+      database
+        .query("UPDATE tasks SET memory_digest = ? WHERE task_id = (SELECT task_id FROM operations WHERE operation_id = ?)")
+        .run(input.memoryDigest, operationId);
+    }
     writeAudit(database, {
       actorType: "worker",
       actorId: input.workerId,

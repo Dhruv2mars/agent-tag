@@ -180,6 +180,11 @@ const routeBaseSchema = z.object({
   repositoryRoot: absolutePath.optional(),
   /** Channel default model; must be the profile default or one of its `allowedModels`. */
   defaultModel: modelRefSchema.optional(),
+  /**
+   * Operator-declared channel visibility, overriding what Slack reports; workspace notes are written
+   * only from public channels. Channel routes only.
+   */
+  visibility: z.enum(["public", "private"]).optional(),
 });
 const routeSchema = z.union([
   routeBaseSchema.extend({ conversationType: z.literal("channel").default("channel") }),
@@ -205,6 +210,16 @@ const profileSchema = z.object({
     shared: z.boolean(),
     privateDm: z.boolean(),
     retentionDays: z.number().int().positive().max(3650),
+    /** Slack `remember…` / `forget…` phrases are handled without a T3 turn (PR-K2). */
+    slackCommands: z.boolean().default(true),
+    /** Whether 1:1 DMs read workspace notes; Claude Tag does not say, so off. */
+    dmReadsWorkspace: z.boolean().default(false),
+    /** When the memory block goes into a turn: the thread's first turn and whenever the visible set changes, or every turn. */
+    injection: z.enum(["first-turn-and-changes", "every-turn"]).default("first-turn-and-changes"),
+    maxInjectedChars: z.number().int().min(500).max(32_000).default(6_000),
+    maxEntryChars: z.number().int().min(50).max(2_000).default(1_000),
+    maxEntriesPerConversation: z.number().int().positive().max(1_000).default(100),
+    maxWorkspaceEntries: z.number().int().positive().max(5_000).default(200),
   }),
   ambient: z
     .object({
@@ -549,6 +564,13 @@ export const agentTagConfigSchema = z
         });
       }
       if (route.conversationType === "dm") {
+        if (route.visibility !== undefined) {
+          context.addIssue({
+            code: "custom",
+            path: ["routes", index, "visibility"],
+            message: "DM routes cannot set visibility",
+          });
+        }
         if (!route.conversationId.startsWith("D")) {
           context.addIssue({
             code: "custom",
