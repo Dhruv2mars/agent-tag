@@ -20,7 +20,7 @@ In Slack's app dashboard, create an app from [`config/slack-manifest.example.jso
 - `reactions:write`
 - `users:read`
 
-`channels:read`, `groups:read` and `files:write` are requested ahead of the GA channel and returned-file work, so an installed app does not need another reinstall when that work lands. No current code path uses them yet: Agent Tag does not read channel lists or return Slack files. `agent-tag doctor` warns until an app installed from an older manifest is reinstalled.
+`channels:read` and `groups:read` let Agent Tag check whether a routed channel is public (`conversations.info`) before it saves a workspace note; without them, workspace notes are refused outside channels whose route sets `visibility`. `files:write` is requested ahead of the returned-file work, so an installed app does not need another reinstall when that work lands; Agent Tag does not return Slack files yet. `agent-tag doctor` warns until an app installed from an older manifest is reinstalled.
 
 `reactions:write` lets Agent Tag react with :eyes: to a mention as soon as it is accepted, before any work starts, even when all coordinators are busy. Set `slack.ui.ackReaction` to another emoji name, or to `null` to turn the reaction off. An app installed before this scope existed must be reinstalled from the updated manifest. Until then Agent Tag logs one `slack.reaction.failed` warning with `errorCode: "missing_scope"` per process and otherwise keeps working. `agent-tag doctor` warns about the missing scope in the same way.
 
