@@ -707,6 +707,12 @@ if (!enabled) {
             limits: { maxConcurrentTasks: 1 },
           });
           const receivedAt = new Date().toISOString();
+          // PR-K: a channel note reaches the thread's first turn, and only that turn.
+          store.createMemory({
+            workspaceId: "T1", scope: "channel", conversationId: "C1", content: "reports go out as tables",
+            sourceType: "slack-command", sourceId: "C1:999.000001", actorUserId: "U1",
+            expiresAt: new Date(Date.now() + 86_400_000).toISOString(), now: receivedAt,
+          });
           const receipt = store.ingestSlackEvent({
             deliveryId: crypto.randomUUID(),
             eventKey: `C1:${Date.now()}.000001`,
@@ -780,13 +786,33 @@ if (!enabled) {
           expect(outbox?.payload.text.trim()).toBe("durable-fixture-ok");
           expect(outbox?.correlationId).toBe(receipt.operationId);
 
-          const beforeRevocation = await fetchT3ThreadSnapshot({ config, threadId: binding.threadId });
-          const followup = store.ingestSlackEvent({
+          const userTexts = (snapshot: T3ThreadSnapshot) =>
+            snapshot.thread.messages.filter((message) => message.role === "user").map((message) => message.text);
+          const firstTurn = userTexts(await fetchT3ThreadSnapshot({ config, threadId: binding.threadId }));
+          expect(firstTurn).toHaveLength(1);
+          expect(firstTurn[0]).toStartWith('<agent-tag-memory updated="false">\n');
+          expect(firstTurn[0]).toContain("reports go out as tables");
+          const second = store.ingestSlackEvent({
             deliveryId: crypto.randomUUID(), eventKey: `C1:${Date.now()}.000002`,
             workspaceId: "T1", conversationId: "C1", threadTs: "1000.000001",
             actorUserId: "U1", conversationType: "channel", profileId: "engineering",
-            repositoryRoot: workspaceRoot, text: "Revoked follow-up must never reach T3.",
+            repositoryRoot: workspaceRoot,
+            text: "Reply with exactly second-turn-ok. Do not call tools, change files, or use the network.",
             receivedAt: new Date().toISOString(), sourceOrderKey: "1000.000002",
+          });
+          expect(await restartedCoordinator.processNext()).toMatchObject({ kind: "completed", operationId: second.operationId });
+          const secondTurn = userTexts(await fetchT3ThreadSnapshot({ config, threadId: binding.threadId }));
+          expect(secondTurn).toHaveLength(2);
+          expect(secondTurn[1]).not.toContain("agent-tag-memory");
+          expect(secondTurn[1]).toContain("second-turn-ok");
+
+          const beforeRevocation = await fetchT3ThreadSnapshot({ config, threadId: binding.threadId });
+          const followup = store.ingestSlackEvent({
+            deliveryId: crypto.randomUUID(), eventKey: `C1:${Date.now()}.000003`,
+            workspaceId: "T1", conversationId: "C1", threadTs: "1000.000001",
+            actorUserId: "U1", conversationType: "channel", profileId: "engineering",
+            repositoryRoot: workspaceRoot, text: "Revoked follow-up must never reach T3.",
+            receivedAt: new Date().toISOString(), sourceOrderKey: "1000.000003",
           });
           store.close();
           store = await AgentTagStore.open(storePath);

@@ -458,6 +458,25 @@ A colon or a `!` is always required, so sentences like "remember that outage las
 
 These phrases never start a T3 turn and reply in the thread. Each Slack message runs at most once: the note, its reply and its `slack_command_events` row (kinds `memory-remember|list|forget|edit`) commit together, so a redelivery or the duplicate `message` event for one mention is answered once. A ref for a note from another channel, or another person's DM, answers "I don't have a note … here". Workspace notes are read-only outside public channels, and operator notes are read-only from Slack. Set `memory.slackCommands: false` on a profile to send every phrase to the agent instead.
 
+### Managing memory from the CLI
+
+The operator manages every note from the host. Like `schedule-*`, these commands open the store directly and are safe to run beside the service:
+
+```sh
+agent-tag memory-list CONFIG [--conversation ID] [--scope channel|workspace|dm|operator|task] [--json]
+agent-tag memory-add CONFIG --scope channel|workspace|operator --content TEXT [--conversation ID] [--profile ID]
+agent-tag memory-edit CONFIG MEMORY_ID --content TEXT
+agent-tag memory-forget CONFIG MEMORY_ID
+agent-tag memory-forget CONFIG --conversation ID --all [--yes]
+```
+
+- `memory-list` shows every active note in the workspace, newest first, with no Slack visibility filter: ref, store, where it is stored, author, last update, expiry and the start of its text. `--conversation C…` narrows to that channel's notes; for a DM route it shows the route owner's DM notes on that profile. `--json` prints the full records with `ref` and `store` added.
+- `memory-add` saves a channel note (`--conversation` is the channel ID), a workspace note or an operator note (a profile's `profile` store, read in every conversation routed to it). Length and retention come from `--profile`, else the channel's route; a workspace note needs `--profile` when several profiles exist. The Slack caps on notes per conversation do not apply, but the length, credential and duplicate checks do.
+- `memory-edit` and `memory-forget` take a full memory ID or any unique prefix, such as the 8-character ref Slack shows. They work on any note, including a workspace note saved from a channel that later became private, and DM notes. An edit keeps the note's expiry.
+- `memory-forget --conversation ID --all` prints how many notes it would forget and exits 1; rerun with `--yes` to forget them all in one transaction.
+
+These commands audit `memory.created`, `memory.updated`, `memory.forgotten` and `memory.denied` with `actorType: "operator"`, the local account name as `actorId`, and `authority: "operator-cli"`; like Slack's rows they hold IDs and scopes, never note content. In Slack lists, a note the operator wrote shows the local account name as its author.
+
 ## Commands
 
 A message that starts with `@Agent Tag !<command>` runs a command instead of a request. In a DM route the owner can drop the mention and send `!status` directly. The command word must come right after the mention; `@Agent Tag please !help` is an ordinary request.
