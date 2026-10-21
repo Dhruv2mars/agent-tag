@@ -421,21 +421,26 @@ A message that starts with `@Agent Tag !<command>` runs a command instead of a r
 | `!status` | anywhere | In a thread: whether the agent is working, waiting on an approval or question, or has requests queued, plus the thread's model and mute state. At the top level: a count across the channel's threads. Only the sender sees it. |
 | `!mute` | a thread the agent is part of | Stops the agent answering unmentioned replies in that thread. Posts a public notice. |
 | `!unmute` | a thread the agent is part of | Reverses `!mute`. Any message that mentions the agent in a muted thread also unmutes it. |
+| `!stop` | a thread the agent is working in | Stops the running turn, the same way as the status message's Stop button: the status message turns into "Stopped by @you". Requests in that thread sent before `!stop` and not started yet are dropped, with one public note saying how many. Requests sent after it still run. |
+| `!restart` | a thread the agent is part of | Starts a fresh T3 session for the thread: a new T3 thread on a new worktree branch (`agent-tag/<task>-g2`, `-g3`, ...) from the profile's base branch. With nothing running it happens at once. Otherwise the running turn is stopped first, new messages wait, and the agent confirms in the thread once the fresh session is ready (after at most `commands.restartTimeoutSeconds`, default 120; past that the old turn may still post a late reply). The first request on the fresh session rereads the earlier thread messages (without `!commands` and the agent's own replies) when `threadContext` is enabled. |
 
-Commands never create a T3 turn and never store the message text. Each run is recorded once per Slack message in `slack_command_events` and audited as `slack.command.executed` or `slack.command.denied`; mute changes are audited as `thread.muted` and `thread.unmuted`. Other `!words` (for example `!model`) are still treated as ordinary requests until their commands ship.
+Commands never create a T3 turn and never store the message text. Each run is recorded once per Slack message in `slack_command_events` and audited as `slack.command.executed` or `slack.command.denied`; mute changes are audited as `thread.muted` and `thread.unmuted`, `!stop` as `task.stop.requested`, and `!restart` as `task.restart.requested` and `task.session.rotated`. Other `!words` (for example `!model`) are still treated as ordinary requests until their commands ship.
+
+The retired T3 thread of a restart (or of an idle-closed task) is kept, with its worktree, for later cleanup; the service stops its provider session with `thread.session.stop` and audits `task.session.stopped`. Uncommitted work in it stays in the retired worktree.
 
 Configure commands under `commands`:
 
 ```json
 {
   "access": { "allowedUserIds": ["U0EXAMPLE"], "allowedChannelIds": ["C0EXAMPLE"], "adminUserIds": ["U0EXAMPLE"] },
-  "commands": { "enabled": true, "disabled": [], "adminOnly": ["mute", "unmute"] }
+  "commands": { "enabled": true, "disabled": [], "adminOnly": ["mute", "unmute", "restart"], "restartTimeoutSeconds": 120 }
 }
 ```
 
 - `enabled: false` turns every `!word` back into an ordinary request.
 - `disabled` answers with an only-you "not enabled" note. `!help` cannot be disabled.
 - `adminOnly` limits a command to `access.adminUserIds`, which must also be in `access.allowedUserIds`. `!help` and `!status` cannot be admin-only.
+- `restartTimeoutSeconds` (10–3600, default 120) is how long a `!restart` waits for the stopped turn to end before it switches sessions anyway.
 
 Only-you replies use `chat.postEphemeral` (covered by the existing `chat:write` scope). They are sent at most once, with one retry after a rate limit.
 
