@@ -18,7 +18,8 @@ export type StoreFaultPoint =
   | "operation-claim.after-update"
   | "outbox-enqueue.after-insert"
   | "outbox-claim.after-update"
-  | "schedule-outcome.after-record";
+  | "schedule-outcome.after-record"
+  | "command.after-execute";
 
 export interface StoreOpenOptions {
   readonly faultInjector?: (point: StoreFaultPoint) => void;
