@@ -7,15 +7,26 @@ import { z } from "zod";
 import { AGENT_COMMANDS } from "../commands/parse.ts";
 import { writeAudit } from "./audit.ts";
 import { requiredId } from "./context.ts";
-import { insertOutboxMessage } from "./outbox.ts";
+import type { StoreContext } from "./context.ts";
+import { enqueueOutbox, insertOutboxMessage } from "./outbox.ts";
 import { isoDateTime, nonEmpty, outboxPayloadSchema } from "./schema.ts";
+import { ensureTaskForThread, type EnsureTaskForThreadInput } from "./tasks.ts";
 import type { SlackOutboxPayload } from "./types.ts";
 
 /**
  * Ledger kinds. The column has no CHECK (the table is shared with PR-K2's memory commands), so this
  * list is the validation: later lanes append their kinds here.
  */
-export const SLACK_COMMAND_KINDS = [...AGENT_COMMANDS, "routine-create", "routine-list", "routine-cancel"] as const;
+export const SLACK_COMMAND_KINDS = [
+  ...AGENT_COMMANDS,
+  "routine-create",
+  "routine-list",
+  "routine-cancel",
+  "memory-remember",
+  "memory-list",
+  "memory-forget",
+  "memory-edit",
+] as const;
 export const slackCommandKindSchema = z.enum(SLACK_COMMAND_KINDS);
 export type SlackCommandKind = z.infer<typeof slackCommandKindSchema>;
 export const COMMAND_OUTCOMES = ["started", "succeeded", "denied", "rejected", "failed"] as const;
@@ -132,6 +143,67 @@ export function settleCommandRow(database: Database, input: SettleCommandInput):
 
 export function settleCommand(database: Database, input: SettleCommandInput): void {
   database.transaction(() => settleCommandRow(database, input)).immediate();
+}
+
+/** What a thread command did; `replies` go to the thread through the outbox, in order. */
+export interface ThreadCommandResult {
+  readonly outcome: Exclude<CommandOutcome, "started">;
+  readonly reason: string | null;
+  /** The note a memory command created or changed, recorded on the ledger row. */
+  readonly memoryId?: string;
+  readonly replies: ReadonlyArray<SlackOutboxPayload>;
+}
+
+export type ThreadCommandReceipt<T extends ThreadCommandResult> =
+  | { readonly kind: "duplicate" }
+  | { readonly kind: "executed"; readonly taskId: string; readonly result: T };
+
+/**
+ * A command answered in its thread (memory phrases, PR-K2), in one IMMEDIATE transaction: ledger
+ * claim, the thread's task, `execute`, the outbox replies and the settled ledger row. A crash or a
+ * throw anywhere rolls all of it back, so a redelivery runs the command exactly once.
+ */
+export function runThreadCommand<T extends ThreadCommandResult>(
+  context: StoreContext,
+  input: Omit<BeginCommandInput, "taskId" | "threadTs"> &
+    Omit<EnsureTaskForThreadInput, "now"> & { readonly threadTs: string; readonly profileId: string },
+  execute: (taskId: string) => T,
+): ThreadCommandReceipt<T> {
+  const { database, faultInjector } = context;
+  const now = isoDateTime.parse(input.now);
+  const run = database.transaction((): ThreadCommandReceipt<T> => {
+    const taskId = ensureTaskForThread(database, { ...input, now });
+    if (beginCommand(database, { ...input, taskId, now }) === "duplicate") return { kind: "duplicate" };
+    const result = execute(taskId);
+    faultInjector("command.after-execute");
+    result.replies.forEach((payload, index) => {
+      enqueueOutbox(context, {
+        taskId,
+        correlationId: input.eventKey,
+        conversationId: input.conversationId,
+        threadTs: input.threadTs,
+        clientMessageId: `${input.commandKind}:${input.eventKey}:${index}`,
+        payload,
+        // One millisecond apart: the outbox claims by created_at, so the replies keep their order.
+        createdAt: new Date(Date.parse(now) + index).toISOString(),
+      });
+    });
+    if (result.memoryId !== undefined) {
+      database
+        .query("UPDATE slack_command_events SET memory_id = ? WHERE workspace_id = ? AND event_key = ?")
+        .run(requiredId(result.memoryId, "memoryId"), input.workspaceId, input.eventKey);
+    }
+    settleCommandRow(database, {
+      workspaceId: input.workspaceId,
+      eventKey: input.eventKey,
+      outcome: result.outcome,
+      reason: result.reason,
+      profileId: input.profileId,
+      now,
+    });
+    return { kind: "executed", taskId, result };
+  });
+  return run.immediate();
 }
 
 export interface ThreadKey {

@@ -516,6 +516,13 @@ export class AgentTagStore {
     commands.settleCommand(this.#database, input);
   }
 
+  runThreadCommand<T extends commands.ThreadCommandResult>(
+    input: Parameters<typeof commands.runThreadCommand>[1],
+    execute: (taskId: string) => T,
+  ): commands.ThreadCommandReceipt<T> {
+    return commands.runThreadCommand(this.#context, input, execute);
+  }
+
   isCommandEvent(input: { readonly workspaceId: string; readonly eventKey: string }): boolean {
     return commands.isCommandEvent(this.#database, input);
   }
