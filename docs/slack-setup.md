@@ -1,6 +1,6 @@
 # Slack setup
 
-This is the shortest supported path to a live Agent Tag mention. File transfer is not implemented yet, so the manifest does not request Slack file scopes.
+This is the shortest supported path to a live Agent Tag mention.
 
 `bun run onboard` automates steps 1–3. It prints a create-from-manifest link, stores both tokens at mode `0600` under `~/.agent-tag/secrets/`, checks `auth.test`, and writes a config with one route per channel. See [Onboarding](operations.md#onboarding). For unattended runs, pass the tokens through `AGENT_TAG_SLACK_APP_TOKEN` and `AGENT_TAG_SLACK_BOT_TOKEN` in a process environment that is not logged, and never as command-line arguments. The manual steps below remain the reference.
 
@@ -10,11 +10,17 @@ In Slack's app dashboard, create an app from [`config/slack-manifest.example.jso
 
 - `app_mentions:read`
 - `channels:history`
+- `channels:read`
 - `chat:write`
+- `files:read`
+- `files:write`
 - `groups:history`
+- `groups:read`
 - `im:history`
 - `reactions:write`
 - `users:read`
+
+`channels:read`, `groups:read`, `files:read` and `files:write` are requested ahead of the GA channel and file work, so an installed app does not need another reinstall when that work lands. No current code path uses them yet: Agent Tag does not read channel lists and does not accept or return Slack files. `agent-tag doctor` warns until an app installed from an older manifest is reinstalled.
 
 `reactions:write` lets Agent Tag react with :eyes: to a mention as soon as it is accepted, before any work starts, even when all coordinators are busy. Set `slack.ui.ackReaction` to another emoji name, or to `null` to turn the reaction off. An app installed before this scope existed must be reinstalled from the updated manifest. Until then Agent Tag logs one `slack.reaction.failed` warning with `errorCode: "missing_scope"` per process and otherwise keeps working. `agent-tag doctor` warns about the missing scope in the same way.
 
@@ -36,7 +42,7 @@ Its bot events are exactly `app_mention`, `message.channels`, `message.groups`, 
 
 Install the app to the target workspace. Under **Basic Information > App-Level Tokens**, create one token with only `connections:write`. This is the app token and begins with `xapp-`. Under **OAuth & Permissions**, copy the bot token created by the workspace install. It begins with `xoxb-`.
 
-Invite Agent Tag to each configured public or private channel. No channel-list scope is requested, so the operator supplies exact IDs in the config.
+Invite Agent Tag to each configured public or private channel. Agent Tag does not look channels up yet, so the operator supplies exact IDs in the config.
 
 ## 2. Store tokens
 
@@ -85,5 +91,5 @@ Mention the app in an allowed channel. Agent Tag should acknowledge work in the 
 
 - A Codex-backed mention and a same-thread follow-up completed with final Slack replies. Independent human acceptance remains open; see [live Slack evidence](evidence/2026-09-28-slack-live.md).
 - The App Home Messages tab was made writable, and one owner-bound Codex DM completed with a final reply. Independent human and cross-identity privacy exercises, plus Assistant Threads, remain open; see [DM evidence](evidence/2026-09-29-dm-live.md).
-- Slack files are not accepted or returned. `files:read` and `files:write` are intentionally absent.
+- Slack files are not accepted or returned. The manifest already requests `files:read` and `files:write`, but no code uses them yet.
 - The first live Slack turn on 2026-09-26 hit a Codex account usage limit. Later Codex turns completed. T3 reports Claude as ready and authenticated, but real Claude turns failed with `provider-api-errors`; Agent Tag does not silently change providers.
