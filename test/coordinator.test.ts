@@ -1401,7 +1401,8 @@ describe("task lifecycle reopen", () => {
 describe("task lifecycle resume workspace", () => {
   /**
    * Runs one turn, closes the task, lets `retire` shape the retired generation-1 row the way cleanup
-   * left it, then reopens with two more turns. Returns every turn.start and the retired row afterwards.
+   * left it, then reopens with two more turns and closes again. Returns every turn.start, the retired
+   * generation-1 row afterwards and the branch recorded for generation 2.
    */
   async function reopenAfter(
     retire: (input: { readonly database: Database; readonly taskId: string; readonly directory: string }) => Promise<void>,
@@ -1409,6 +1410,7 @@ describe("task lifecycle resume workspace", () => {
     readonly taskId: string;
     readonly turns: Extract<T3Command, { type: "thread.turn.start" }>[];
     readonly retired: Record<string, unknown> | null;
+    readonly secondBranch: unknown;
   }> {
     const directory = await mkdtemp(join(tmpdir(), "agent-tag-coordinator-resume-"));
     const path = join(directory, "agent-tag.sqlite");
@@ -1461,7 +1463,11 @@ describe("task lifecycle resume workspace", () => {
       const retired = database
         .query<Record<string, unknown>, [string]>("SELECT * FROM task_retired_t3_threads WHERE task_id = ? AND generation = 1")
         .get(taskId);
-      return { taskId, turns, retired };
+      expect(store.closeTask({ taskId, reason: "admin", actorId: "test", now })).toMatchObject({ kind: "closed" });
+      const secondBranch = database
+        .query<{ branch: string }, [string]>("SELECT branch FROM task_retired_t3_threads WHERE task_id = ? AND generation = 2")
+        .get(taskId)?.branch;
+      return { taskId, turns, retired, secondBranch };
     } finally {
       database.close();
       store.close();
@@ -1481,7 +1487,7 @@ describe("task lifecycle resume workspace", () => {
 
   test("a retained dirty worktree is adopted: same branch and path, no new worktree, one resume note", async () => {
     let worktree = "";
-    const { taskId, turns, retired } = await reopenAfter(async ({ database, taskId, directory }) => {
+    const { taskId, turns, retired, secondBranch } = await reopenAfter(async ({ database, taskId, directory }) => {
       worktree = join(directory, "wt");
       await mkdir(worktree);
       setRetired(database, taskId, {
@@ -1503,6 +1509,8 @@ describe("task lifecycle resume workspace", () => {
     expect(next?.message.text).not.toContain("This Slack thread was resumed");
     // Claimed before the dispatch, so cleanup can no longer remove it.
     expect(retired).toMatchObject({ worktree_state: "adopted", branch_state: "adopted", retain_until: null, next_attempt_at: null, completed_at: now });
+    // The adopting session ran on the adopted branch, so its own retirement (and cleanup) uses that one.
+    expect(secondBranch).toBe(`agent-tag/${taskId}`);
   });
 
   test("a retained worktree that is gone from disk continues from its branch instead", async () => {
@@ -1515,9 +1523,10 @@ describe("task lifecycle resume workspace", () => {
 
   for (const branchState of ["kept-commits", "kept-pr"]) {
     test(`a ${branchState} branch is continued on a new generation branch`, async () => {
-      const { taskId, turns } = await reopenAfter(async ({ database, taskId }) => {
+      const { taskId, turns, secondBranch } = await reopenAfter(async ({ database, taskId }) => {
         setRetired(database, taskId, { branch: `agent-tag/${taskId}`, worktree_state: "removed", branch_state: branchState, completed_at: now });
       });
+      expect(secondBranch).toBe(`agent-tag/${taskId}-g2`);
       expect(turns[1]?.bootstrap?.createThread).toMatchObject({ branch: null, worktreePath: null });
       expect(turns[1]?.bootstrap?.prepareWorktree).toMatchObject({
         projectCwd: "/srv/repos/example",

@@ -385,6 +385,24 @@ describe("CleanupWorker", () => {
     });
   });
 
+  test("a merged PR does not cover later commits, even when the branch's upstream has them", async () => {
+    await withFixture(async (fixture) => {
+      const task = retiredTask(fixture);
+      await writeFile(join(task.worktree, "later.txt"), "later\n");
+      git(task.worktree, "add", "later.txt");
+      git(task.worktree, "commit", "-q", "-m", "after the merge");
+      // Pushed: `git branch -d` would accept the branch because its upstream contains the commit.
+      git(fixture.repo, "remote", "add", "origin", fixture.repo);
+      git(fixture.repo, "update-ref", `refs/remotes/origin/${task.branch}`, task.branch);
+      git(fixture.repo, "config", `branch.${task.branch}.remote`, "origin");
+      git(fixture.repo, "config", `branch.${task.branch}.merge`, `refs/heads/${task.branch}`);
+      fixture.t3.pr = { state: "merged", url: "https://github.com/acme/repo/pull/9" };
+      await fixture.worker().runPass({ limit: null });
+      expect(branchExists(fixture.repo, task.branch)).toBe(true);
+      expect(retiredRow(fixture.database, task.taskId)).toMatchObject({ branch_state: "kept-commits", head_commit_count: 1 });
+    });
+  });
+
   test("a snapshot branch that is not this task's fails the row and removes nothing", async () => {
     await withFixture(async (fixture) => {
       const task = retiredTask(fixture, { snapshotBranch: "feature/someone-else" });
@@ -455,12 +473,13 @@ describe("CleanupWorker", () => {
     });
   });
 
-  test("a worktree T3 already removed counts as removed", async () => {
+  test("a worktree T3 already removed counts as removed; its branch, with no known commit count, is kept", async () => {
     await withFixture(async (fixture) => {
       const task = retiredTask(fixture);
       git(fixture.repo, "worktree", "remove", task.worktree);
       await fixture.worker().runPass({ limit: null });
-      expect(retiredRow(fixture.database, task.taskId)).toMatchObject({ worktree_state: "removed", branch_state: "deleted" });
+      expect(branchExists(fixture.repo, task.branch)).toBe(true);
+      expect(retiredRow(fixture.database, task.taskId)).toMatchObject({ worktree_state: "removed", branch_state: "kept-commits", head_commit_count: null });
       expect(fixture.t3.removals).toEqual([]);
     });
   });
@@ -539,6 +558,7 @@ describe("CleanupWorker", () => {
       const task = retiredTask(fixture, { worktree: false });
       // Checked out in the main worktree: `git branch -d` refuses.
       git(fixture.repo, "checkout", "-q", "-b", task.branch);
+      fixture.database.query("UPDATE task_retired_t3_threads SET head_commit_count = 0 WHERE task_id = ?").run(task.taskId);
       await fixture.worker().runPass({ limit: null });
       expect(branchExists(fixture.repo, task.branch)).toBe(true);
       expect(retiredRow(fixture.database, task.taskId)).toMatchObject({

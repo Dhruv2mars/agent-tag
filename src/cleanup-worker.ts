@@ -305,8 +305,15 @@ export class CleanupWorker {
       step({ branchState: "kept-pr" }, { action: "task.branch.deleted", result: "kept-pr" });
       return;
     }
-    if ((row.headCommitCount ?? 0) > 0 && prState !== "merged") {
-      step({ branchState: "kept-commits" }, { action: "task.branch.deleted", result: "kept-commits" });
+    // Only a verified zero commits ahead lets the branch go: `branch -d` also accepts a branch its
+    // upstream contains, and a merged PR does not cover commits made after it.
+    if (row.headCommitCount !== 0) {
+      // An unknown count with no branch at all: the session never made one (nothing to keep).
+      const missing = row.headCommitCount === null &&
+        (await this.#git.run({ cwd: row.repositoryRoot, args: ["rev-parse", "--verify", "--quiet", `refs/heads/${row.branch}`], timeoutMs: GIT_TIMEOUT_MS }))
+            .exitCode !== 0;
+      if (missing) step({ branchState: "deleted" }, { action: "task.branch.deleted", result: "deleted" });
+      else step({ branchState: "kept-commits" }, { action: "task.branch.deleted", result: "kept-commits" });
       return;
     }
     if (!this.#policy.deleteEmptyBranches) return;
