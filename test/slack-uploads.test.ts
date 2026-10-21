@@ -124,20 +124,35 @@ describe("upload directives", () => {
     expect(parseUploadDirectives(text, 5)).toEqual({ text, requests: [], rejected: [] });
   });
 
+  test("a longer fence holds shorter inner fences, and only a matching bare fence closes it", () => {
+    const parsed = parseUploadDirectives(
+      [
+        "````md",
+        "```",
+        "[[agent-tag:upload out/example.csv]]",
+        "```",
+        "```` not a close",
+        "````",
+        "[[agent-tag:upload out/real.csv]]",
+      ].join("\n"),
+      5,
+    );
+    expect(parsed.requests).toEqual([{ path: "out/real.csv", title: null }]);
+    expect(parsed.text).toBe(["````md", "```", "[[agent-tag:upload out/example.csv]]", "```", "```` not a close", "````"].join("\n"));
+  });
+
   test("caps the count, drops duplicates, and lists what was not queued", () => {
     const parsed = parseUploadDirectives(
       ["[[agent-tag:upload a.csv]]", "[[agent-tag:upload ./a.csv]]", "[[agent-tag:upload b.csv]]", "[[agent-tag:upload c.csv]]"].join("\n"),
       2,
     );
     expect(parsed.requests.map((request) => request.path)).toEqual(["a.csv", "b.csv"]);
-    expect(parsed.rejected).toEqual([
-      { path: "./a.csv", reason: "duplicate" },
-      { path: "c.csv", reason: "over-limit" },
-    ]);
+    expect(parsed.rejected).toEqual([{ path: "c.csv", reason: "over-limit" }]);
     expect(parsed.text).toBe("Sharing 2 files.");
     expect(rejectedUploadsNotice(parsed.rejected, { ...limits, maxFilesPerTurn: 2 })).toBe(
-      ":warning: Didn't share `./a.csv` (listed twice), `c.csv` (only 2 files per reply).",
+      ":warning: Didn't share `c.csv` (only 2 files per reply).",
     );
+    expect(parseUploadDirectives("[[agent-tag:upload `out/c.csv`]]", 5).requests).toEqual([{ path: "out/c.csv", title: null }]);
     expect(rejectedUploadsNotice([{ path: "<!channel>`x", reason: "invalid-path" }], limits)).toBe(
       ":warning: Didn't share `@\u200bchannel'x` (not a path inside the workspace).",
     );
@@ -641,6 +656,19 @@ describe("agent files shared to Slack (PR-L2)", () => {
       });
       expect(slack.calls).toEqual([]);
       expect(outboxTexts(harness.path).map((row) => row.text)).toEqual(["Sharing 1 file."]);
+    });
+  });
+
+  test("turning outbound files off fails rows queued before, without touching Slack", async () => {
+    await withHarness(async (harness) => {
+      await writeFile(join(harness.root, "out", "report.csv"), CSV);
+      await completeTurn(harness, "[[agent-tag:upload out/report.csv]]");
+      await deliverReplies(harness);
+      const off = agentTagConfigSchema.parse({ ...baseConfig, files: { outbound: { enabled: false } } });
+      const slack = fakeSlack();
+      expect(await worker(harness, slack.client, { config: off }).processNext()).toMatchObject({ kind: "failed", errorCode: "outbound-disabled" });
+      expect(slack.calls).toEqual([]);
+      expect(outboxTexts(harness.path).at(-1)?.text).toBe(":warning: Couldn't share `report.csv`: the operator turned file sharing off.");
     });
   });
 

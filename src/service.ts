@@ -485,7 +485,7 @@ export async function createAgentTagService(input: {
         },
         createRetentionWorker({ databasePath, policy: input.config.retention, now }),
         new LifecycleWorker({ store, policy: input.config.lifecycle, now }),
-        // Agent file shares (PR-L2); rows exist only while files.outbound is enabled.
+        // Agent file shares (PR-L2); with files.outbound off it fails any queued row.
         new FileUploadWorker({ config: input.config, store, slack: bridge.uploads, now }),
         {
           processNext: async () => {

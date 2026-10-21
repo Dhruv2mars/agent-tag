@@ -38,7 +38,7 @@ const config = agentTagConfigSchema.parse({
   ],
   routes: [{ conversationId: "C1", profileId: "engineering" }],
   limits: { maxConcurrentTasks: 1 },
-  // Envelope text only; the outbound upload line has its own tests (coordinator-uploads.test.ts).
+  // Envelope text only; the outbound upload line has its own tests (slack-uploads.test.ts).
   files: { outbound: { enabled: false } },
 });
 

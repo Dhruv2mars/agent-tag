@@ -24,10 +24,12 @@ import { escapeSlackText } from "./render.ts";
 export type OutboundFileLimits = AgentTagConfig["files"]["outbound"];
 
 const DIRECTIVE = /^\s*\[\[agent-tag:upload\s+(\S{1,1024}?)(?:\s+"([^"\n]{1,200})")?\]\]\s*$/;
-const FENCE = /^\s*(```|~~~)/;
+// A CommonMark fence: up to 3 spaces, then 3+ backticks or tildes. It closes on the same character, at
+// least as long, with nothing after it.
+const FENCE = /^ {0,3}(`{3,}|~{3,})(.*)$/;
 const MAX_REJECTED_LISTED = 10;
 
-export type RejectedUploadReason = "invalid-path" | "hidden-path" | "over-limit" | "duplicate";
+export type RejectedUploadReason = "invalid-path" | "hidden-path" | "over-limit";
 
 export interface ParsedUploads {
   /** The reply without directive lines. Never empty when directives were found. */
@@ -41,7 +43,9 @@ export interface ParsedUploads {
  * backslash, NUL or control characters are invalid; any segment starting with "." (`.env`, `.ssh/`,
  * `.git/`) is hidden. `./` segments and repeated slashes are dropped so one file has one form.
  */
-export function normalizeUploadPath(path: string): { readonly path: string } | { readonly reason: "invalid-path" | "hidden-path" } {
+export function normalizeUploadPath(input: string): { readonly path: string } | { readonly reason: "invalid-path" | "hidden-path" } {
+  // Models often wrap a path in backticks.
+  const path = input.length > 2 && input.startsWith("`") && input.endsWith("`") ? input.slice(1, -1) : input;
   if (path.startsWith("/") || path.startsWith("~") || path.includes("\\") || /\p{Cc}/u.test(path)) {
     return { reason: "invalid-path" };
   }
@@ -64,7 +68,13 @@ export function parseUploadDirectives(text: string, maxFiles: number): ParsedUpl
     const fenceMatch = FENCE.exec(line);
     if (fenceMatch !== null) {
       const marker = fenceMatch[1] ?? "";
-      fence = fence === null ? marker : fence === marker ? null : fence;
+      const rest = fenceMatch[2] ?? "";
+      if (fence === null) {
+        // A backtick fence's info string may not contain a backtick.
+        if (!(marker.startsWith("`") && rest.includes("`"))) fence = marker;
+      } else if (marker[0] === fence[0] && marker.length >= fence.length && rest.trim() === "") {
+        fence = null;
+      }
       kept.push(line);
       continue;
     }
@@ -78,15 +88,14 @@ export function parseUploadDirectives(text: string, maxFiles: number): ParsedUpl
     if ("reason" in normalized) {
       rejected.push({ path: raw, reason: normalized.reason });
     } else if (requests.some((request) => request.path === normalized.path)) {
-      rejected.push({ path: raw, reason: "duplicate" });
+      // Listed twice: shared once.
     } else if (requests.length >= maxFiles) {
       rejected.push({ path: raw, reason: "over-limit" });
     } else {
       requests.push({ path: normalized.path, title: match[2]?.trim() || null });
     }
   }
-  const found = requests.length + rejected.length;
-  if (found === 0) return { text, requests, rejected };
+  if (kept.length === text.split("\n").length) return { text, requests, rejected };
   const stripped = kept.join("\n").trim();
   const count = requests.length;
   const fallback = count === 0 ? "I couldn't share the files I meant to." : `Sharing ${count} file${count === 1 ? "" : "s"}.`;
@@ -97,7 +106,6 @@ const REJECTED_REASON_TEXT: Readonly<Record<RejectedUploadReason, (limits: Outbo
   "invalid-path": () => "not a path inside the workspace",
   "hidden-path": () => "hidden files are never shared",
   "over-limit": (limits) => `only ${limits.maxFilesPerTurn} files per reply`,
-  duplicate: () => "listed twice",
 };
 
 /** One context line for directives that were not queued, or null when every directive was. */
@@ -368,6 +376,8 @@ export class FileUploadWorker {
 
   async #deliver(upload: ClaimedFileUpload, signal: AbortSignal | undefined): Promise<void> {
     const lease = { uploadId: upload.uploadId, workerId: this.#workerId };
+    // The off switch also stops files queued before it was turned off.
+    if (!this.#config.files.outbound.enabled) throw new OutboundDisabled();
     const task = this.#store.getTaskExecution(upload.taskId);
     requireTaskAuthority({ config: this.#config, task });
     if (upload.conversationId !== task.conversationId) throw new ExecutionAuthorityDenied();
@@ -422,6 +432,7 @@ export class FileUploadWorker {
       return { kind: "failed", uploadId: upload.uploadId, errorCode };
     };
     if (error instanceof ExecutionAuthorityDenied) return fail(error.name, null);
+    if (error instanceof OutboundDisabled) return fail("outbound-disabled", "the operator turned file sharing off");
     if (error instanceof ArtifactError) return fail(error.code, ARTIFACT_NOTICE[error.code]);
     if (error instanceof SecretBlocked) {
       return fail("secret-blocked", "it looks like it contains a credential, so Agent Tag held it back", error.classes);
@@ -453,6 +464,13 @@ export class FileUploadWorker {
 
   #iso(): string {
     return this.#now().toISOString();
+  }
+}
+
+class OutboundDisabled extends Error {
+  constructor() {
+    super("files.outbound is disabled");
+    this.name = "OutboundDisabled";
   }
 }
 
