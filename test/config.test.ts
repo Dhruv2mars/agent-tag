@@ -36,7 +36,7 @@ const baseConfig = {
 describe("Agent Tag config", () => {
   test("defaults and validates the !command settings", () => {
     const parsed = agentTagConfigSchema.parse(baseConfig);
-    expect(parsed.commands).toEqual({ enabled: true, disabled: [], adminOnly: [] });
+    expect(parsed.commands).toEqual({ enabled: true, disabled: [], adminOnly: [], restartTimeoutSeconds: 120 });
     expect(parsed.access.adminUserIds).toEqual([]);
     expect(
       agentTagConfigSchema.parse({
@@ -44,7 +44,8 @@ describe("Agent Tag config", () => {
         access: { ...baseConfig.access, adminUserIds: ["U123"] },
         commands: { disabled: ["mute"], adminOnly: ["unmute"] },
       }).commands,
-    ).toEqual({ enabled: true, disabled: ["mute"], adminOnly: ["unmute"] });
+    ).toEqual({ enabled: true, disabled: ["mute"], adminOnly: ["unmute"], restartTimeoutSeconds: 120 });
+    expect(() => agentTagConfigSchema.parse({ ...baseConfig, commands: { restartTimeoutSeconds: 5 } })).toThrow();
     // Admins must be allowed users.
     expect(() =>
       agentTagConfigSchema.parse({ ...baseConfig, access: { ...baseConfig.access, adminUserIds: ["U999"] } }),

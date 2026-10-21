@@ -64,6 +64,7 @@ import * as reactions from "./reactions.ts";
 import * as attachments from "./attachments.ts";
 import * as status from "./status.ts";
 import * as lifecycle from "./lifecycle.ts";
+import * as restart from "./restart.ts";
 
 export type { AuditAction } from "./schema.ts";
 export type {
@@ -548,6 +549,32 @@ export class AgentTagStore {
 
   getConversationStatus(input: { readonly workspaceId: string; readonly conversationId: string }): commands.ConversationWorkStatus {
     return commands.getConversationStatus(this.#database, input);
+  }
+
+  /** `!stop` (PR-H2): stop, reply and command settlement in one transaction. */
+  stopTaskCommand(input: Parameters<typeof restart.stopTaskCommand>[1]): restart.StopTaskResult {
+    return restart.stopTaskCommand(this.#database, input);
+  }
+
+  /** `!restart` (PR-H2): rotate now, or stop the turn and gate the queue until the worker rotates. */
+  restartTaskCommand(input: Parameters<typeof restart.restartTaskCommand>[1]): restart.RequestTaskRestartResult {
+    return restart.restartTaskCommand(this.#database, input);
+  }
+
+  listPendingRestarts(input: { readonly now: string; readonly limit: number }): readonly restart.PendingRestart[] {
+    return restart.listPendingRestarts(this.#database, input);
+  }
+
+  completeTaskRestart(input: restart.CompleteTaskRestartInput): boolean {
+    return restart.completeTaskRestart(this.#database, input);
+  }
+
+  listPendingSessionStops(input: { readonly now: string; readonly limit: number }): readonly restart.PendingSessionStop[] {
+    return restart.listPendingSessionStops(this.#database, input);
+  }
+
+  recordSessionStop(input: restart.RecordSessionStopInput): void {
+    restart.recordSessionStop(this.#database, input);
   }
 
   findTaskForThread(input: tasks.FindTaskForThreadInput): ActiveTaskBinding | null {

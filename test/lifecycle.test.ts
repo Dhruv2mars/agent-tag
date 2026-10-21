@@ -66,7 +66,7 @@ function settleTurn(store: AgentTagStore, receipt: IngestReceipt, now: string, o
   if (options.started ?? true) {
     store.markOperationTurnDispatched({ operationId: claimed.operationId, workerId: "w", now });
     store.markOperationTurnStarted({ operationId: claimed.operationId, workerId: "w", turnId: null, now });
-    store.markT3ThreadStarted({ taskId: claimed.taskId, now });
+    store.markT3ThreadStarted({ taskId: claimed.taskId, threadId: store.getTaskExecution(claimed.taskId).threadId, now });
   }
   store.completeOperationWithOutbox({
     operationId: claimed.operationId,

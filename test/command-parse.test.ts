@@ -186,7 +186,7 @@ describe("parseAgentCommand bot id validation", () => {
 
 describe("command registry", () => {
   test("IMPLEMENTED_COMMANDS lists the commands with handlers", () => {
-    expect([...IMPLEMENTED_COMMANDS]).toEqual(["help", "status", "mute", "unmute"]);
+    expect([...IMPLEMENTED_COMMANDS]).toEqual(["help", "status", "stop", "restart", "mute", "unmute"]);
   });
 
   test("every implemented command is a known agent command", () => {
