@@ -1,5 +1,6 @@
 // Executes routed `!commands` (PR-H §3.2): ledger claim (dedup), authority, action, reply.
 import type { AgentTagConfig } from "../config.ts";
+import { resolveRoute } from "../policy/access.ts";
 import { effectiveSelection } from "../policy/models.ts";
 import type { ServiceLogger } from "../service.ts";
 import { slackErrorCode } from "../slack/users.ts";
@@ -178,7 +179,7 @@ export class AgentTagCommands {
     const task = this.#store.getTaskExecution(taskId);
     const profile = config.profiles.find((candidate) => candidate.id === task.profileId);
     if (profile === undefined) return null;
-    const route = config.routes.find((candidate) => candidate.conversationId === task.conversationId);
+    const route = resolveRoute(config, task.conversationId, task.ownerUserId);
     const effective = effectiveSelection({
       task: { desired: task.desiredModelSelection, applied: task.appliedModelSelection },
       profile,

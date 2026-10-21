@@ -4,6 +4,7 @@
 import { z } from "zod";
 
 import type { AgentTagConfig } from "../config.ts";
+import { isSteeringAllowed, type AccessDecision } from "../policy/access.ts";
 import { ExecutionAuthorityDenied, requireExecutionAuthority } from "../policy/execution.ts";
 import type { RoutineCancelRef, RoutineIntent } from "../routines/intent.ts";
 import { normalizeRoutineRequest } from "../routines/parse.ts";
@@ -124,6 +125,11 @@ const actionValueSchema = z.object({ scheduleId: z.uuid() });
 
 type Settle = (outcome: "succeeded" | "rejected" | "denied" | "failed", reason: string | null) => void;
 
+/** A DM non-owner gets past the gate so the task check below can tell them the routine isn't theirs. */
+function clickMayProceed(decision: AccessDecision): boolean {
+  return decision.allowed || decision.reason === "dm-owner-denied";
+}
+
 export class SlackRoutines {
   readonly #config: () => AgentTagConfig;
   readonly #store: AgentTagStore;
@@ -180,7 +186,12 @@ export class SlackRoutines {
         repositoryRoot: req.repositoryRoot,
         now: req.receivedAt,
       });
-      requireExecutionAuthority({ config, task: this.#store.getTaskExecution(taskId), actorUserId: req.actorUserId });
+      requireExecutionAuthority({
+        config,
+        task: this.#store.getTaskExecution(taskId),
+        actorUserId: req.actorUserId,
+        purpose: "schedule",
+      });
       const reply = (payload: SlackOutboxPayload): void => {
         this.#store.enqueueOutbox({
           taskId,
@@ -367,8 +378,7 @@ export class SlackRoutines {
     if (
       teamId !== config.slack.workspaceId ||
       channelId === undefined ||
-      !config.access.allowedChannelIds.includes(channelId) ||
-      !config.access.allowedUserIds.includes(userId)
+      !clickMayProceed(isSteeringAllowed({ config, workspaceId: teamId, conversationId: channelId, userId, purpose: "schedule" }))
     ) {
       return "ignored";
     }
@@ -387,7 +397,12 @@ export class SlackRoutines {
     }
     const now = this.#now().toISOString();
     try {
-      requireExecutionAuthority({ config, task: this.#store.getTaskExecution(schedule.taskId), actorUserId: userId });
+      requireExecutionAuthority({
+        config,
+        task: this.#store.getTaskExecution(schedule.taskId),
+        actorUserId: userId,
+        purpose: "schedule",
+      });
     } catch (error) {
       if (!(error instanceof ExecutionAuthorityDenied)) throw error;
       await tell(copy.CANCEL_DENIED);

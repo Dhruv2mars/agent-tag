@@ -241,6 +241,10 @@ export class AgentTagStore {
     return files.restoreBackup(input);
   }
 
+  recordAccessAudit(input: audit.RecordAccessAuditInput): void {
+    audit.recordAccessAudit(this.#database, input);
+  }
+
   listAuditRecords(input: audit.ListAuditRecordsInput = {}): ReadonlyArray<AuditRecord> {
     return audit.listAuditRecords(this.#database, input);
   }
@@ -287,6 +291,10 @@ export class AgentTagStore {
 
   expireMemory(nowInput: string): number {
     return memory.expireMemory(this.#database, nowInput);
+  }
+
+  findTaskConversation(taskId: string): ReturnType<typeof tasks.findTaskConversation> {
+    return tasks.findTaskConversation(this.#database, taskId);
   }
 
   taskBelongsToContext(input: tasks.TaskBelongsToContextInput): boolean {

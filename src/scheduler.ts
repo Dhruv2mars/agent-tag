@@ -1,5 +1,6 @@
 import { z } from "zod";
 
+import { isSteeringAllowed } from "./policy/access.ts";
 import { ExecutionAuthorityDenied, requireExecutionAuthority } from "./policy/execution.ts";
 import type { AgentTagConfig } from "./config.ts";
 import { nextRecurrenceRun, scheduleRecurrenceSchema } from "./routines/cron.ts";
@@ -134,7 +135,18 @@ export class AgentTagSchedules {
   // A closed task keeps its schedules, and a new one may target it: its first run reopens the task.
   #denial(context: ScheduleContext): string | null {
     if (context.workspaceId !== this.#config.slack.workspaceId) return "workspace-denied";
-    if (!this.#config.access.allowedUserIds.includes(context.actorUserId)) return "user-denied";
+    // Any member who may use the channel may list or cancel its routines (Claude Tag parity, PR-Q §3.3).
+    const task = this.#store.findTaskConversation(context.taskId);
+    if (task === null) return "task-denied";
+    const access = isSteeringAllowed({
+      config: this.#config,
+      workspaceId: context.workspaceId,
+      conversationId: task.conversationId,
+      userId: context.actorUserId,
+      purpose: "schedule",
+      dmOwnerUserId: task.ownerUserId,
+    });
+    if (!access.allowed) return access.reason;
     if (!this.#config.profiles.some((profile) => profile.id === context.profileId)) return "profile-denied";
     if (
       !this.#store.taskBelongsToContext({
@@ -170,7 +182,7 @@ export class AgentTagSchedules {
 export type ScheduleWorkerOutcome =
   | { readonly kind: "idle" }
   | {
-      readonly kind: "dispatched" | "missed-skipped" | "overlap-skipped" | "authority-revoked";
+      readonly kind: "dispatched" | "missed-skipped" | "overlap-skipped" | "authority-revoked" | "authority-deferred";
       readonly scheduleId: string;
       readonly dueAt: string;
     };
@@ -229,6 +241,10 @@ export class ScheduleWorker {
       });
     } catch (error) {
       if (!(error instanceof ExecutionAuthorityDenied)) throw error;
+      // No fresh membership snapshot yet (startup, Slack outage): leave the claim to lapse and retry.
+      if (error.reason === "membership-unknown") {
+        return { kind: "authority-deferred", scheduleId: schedule.scheduleId, dueAt: schedule.dueAt };
+      }
       this.#store.revokeClaimedSchedule({ scheduleId: schedule.scheduleId, workerId: this.#workerId, now: current.toISOString() });
       return { kind: "authority-revoked", scheduleId: schedule.scheduleId, dueAt: schedule.dueAt };
     }

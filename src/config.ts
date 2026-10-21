@@ -479,6 +479,34 @@ const commandsSchema = z
   .strict()
   .prefault({});
 
+/** Channel membership snapshots for `channel-members` mode (read with channels:read / groups:read). */
+const accessMembershipSchema = z
+  .object({
+    /** A snapshot older than this is refreshed in the background and before a non-allowlisted actor's event. */
+    ttlSeconds: z.number().int().min(30).max(3_600).default(300),
+    /** Past this age a snapshot answers "unknown", which denies non-allowlisted users (fail closed). */
+    maxStaleSeconds: z.number().int().min(60).max(86_400).default(3_600),
+    /** A channel with more members than this is not snapshotted: only the allowlist works there. */
+    maxMembers: z.number().int().positive().max(20_000).default(5_000),
+    /** Guests (restricted accounts) never approve. `steer-only` lets them start and steer turns. */
+    guests: z.enum(["deny", "steer-only"]).default("deny"),
+  })
+  .strict()
+  .prefault({});
+
+/** Direct message routing. Membership never grants a DM: only the owner, who must be allowlisted. */
+const accessDirectMessagesSchema = z
+  .object({
+    /**
+     * `routed-only`: only DM routes listed in `routes`. `auto-route`: a DM from any allowlisted user
+     * gets a private route on `autoRouteProfileId`. `off`: every DM is ignored and queued DM work is revoked.
+     */
+    mode: z.enum(["routed-only", "auto-route", "off"]).default("routed-only"),
+    autoRouteProfileId: profileId.optional(),
+  })
+  .strict()
+  .prefault({});
+
 /** T3's per-turn and per-attachment caps (src/t3/gateway.ts `t3AttachmentSchema`, `turnStartCommand`). */
 const T3_MAX_TURN_ATTACHMENTS = 8;
 const T3_MAX_IMAGE_BYTES = 10 * 1024 * 1024;
@@ -543,10 +571,19 @@ export const agentTagConfigSchema = z
       ui: slackUiSchema,
     }),
     access: z.object({
-      allowedUserIds: z.array(slackId).min(1),
+      /**
+       * Who may use the agent in an allowed channel: `allowlist` (only allowedUserIds) or
+       * `channel-members` (also any non-guest member of the channel, the way Claude Tag works).
+       */
+      mode: z.enum(["allowlist", "channel-members"]).default("allowlist"),
+      /** Always allowed, in both modes. Required (non-empty) in allowlist mode. */
+      allowedUserIds: z.array(slackId).default([]),
+      /** Where the agent works. Membership never widens this list. */
       allowedChannelIds: z.array(slackId).min(1),
       /** Users who may run `commands.adminOnly` commands. Must be allowed users. */
       adminUserIds: z.array(slackId).default([]),
+      membership: accessMembershipSchema,
+      directMessages: accessDirectMessagesSchema,
     }),
     commands: commandsSchema,
     profiles: z.array(profileSchema).min(1),
@@ -570,6 +607,30 @@ export const agentTagConfigSchema = z
     }
     for (const [index, profile] of config.profiles.entries()) {
       checkAllowedModels(profile, ["profiles", index, "allowedModels"], context);
+    }
+    if (config.access.mode === "allowlist" && config.access.allowedUserIds.length === 0) {
+      context.addIssue({
+        code: "custom",
+        path: ["access", "allowedUserIds"],
+        message: 'access.allowedUserIds must list at least one user in "allowlist" mode',
+      });
+    }
+    const directMessages = config.access.directMessages;
+    if (directMessages.mode === "auto-route") {
+      const autoProfile = profiles.get(directMessages.autoRouteProfileId ?? "");
+      if (directMessages.autoRouteProfileId === undefined || autoProfile === undefined) {
+        context.addIssue({
+          code: "custom",
+          path: ["access", "directMessages", "autoRouteProfileId"],
+          message: 'directMessages "auto-route" needs autoRouteProfileId naming a configured profile',
+        });
+      } else if (!autoProfile.memory.privateDm) {
+        context.addIssue({
+          code: "custom",
+          path: ["access", "directMessages", "autoRouteProfileId"],
+          message: "the auto-route DM profile must enable privateDm memory isolation",
+        });
+      }
     }
     for (const [index, userId] of config.access.adminUserIds.entries()) {
       if (!config.access.allowedUserIds.includes(userId)) {
