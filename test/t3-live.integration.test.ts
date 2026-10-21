@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { z } from "zod";
 
 import { agentTagConfigSchema } from "../src/config.ts";
+import { classifyT3DispatchError } from "../src/t3/dispatch-errors.ts";
 import { AgentTagCoordinator } from "../src/coordinator.ts";
 import { ProviderSelectionError, validateConfiguredProviders } from "../src/policy/provider.ts";
 import { ArtifactError, readWorkspaceArtifact } from "../src/slack/uploads.ts";
@@ -331,6 +332,116 @@ if (!enabled) {
         }
       },
       150_000,
+    );
+
+    test(
+      "thread.session.stop stops a started thread's provider session, replays idempotently and rejects an unknown thread (PR-H2)",
+      async () => {
+        const workspaceRoot = await mkdtemp(join(tmpdir(), "agent-tag-t3-session-stop-"));
+        const projectId = crypto.randomUUID();
+        const threadId = crypto.randomUUID();
+        let created = false;
+        try {
+          await writeFile(join(workspaceRoot, "README.md"), "# Agent Tag session stop fixture\n");
+          await runGit(workspaceRoot, "init", "-b", "main");
+          await runGit(workspaceRoot, "config", "user.name", "Agent Tag Integration");
+          await runGit(workspaceRoot, "config", "user.email", "agent-tag@example.invalid");
+          await runGit(workspaceRoot, "add", "README.md");
+          await runGit(workspaceRoot, "commit", "-m", "test: add session stop fixture");
+          await dispatchT3Command({
+            config,
+            command: {
+              type: "project.create",
+              commandId: crypto.randomUUID(),
+              projectId,
+              title: "Agent Tag session stop fixture",
+              workspaceRoot,
+              createdAt: new Date().toISOString(),
+            },
+          });
+          created = true;
+          const createdAt = new Date().toISOString();
+          await dispatchT3Command({
+            config,
+            command: {
+              type: "thread.turn.start",
+              commandId: crypto.randomUUID(),
+              threadId,
+              message: {
+                messageId: crypto.randomUUID(),
+                role: "user",
+                text: "Reply with exactly fixture-ok. Do not call tools, change files, or use the network.",
+                attachments: [],
+              },
+              modelSelection: { instanceId: "codex", model: "gpt-5.6-sol" },
+              titleSeed: "Agent Tag session stop fixture",
+              runtimeMode: "approval-required",
+              interactionMode: "default",
+              bootstrap: {
+                createThread: {
+                  projectId,
+                  title: "Agent Tag session stop fixture",
+                  modelSelection: { instanceId: "codex", model: "gpt-5.6-sol" },
+                  runtimeMode: "approval-required",
+                  interactionMode: "default",
+                  branch: "main",
+                  worktreePath: workspaceRoot,
+                  createdAt,
+                },
+                runSetupScript: false,
+              },
+              createdAt,
+            },
+          });
+          // Any settled turn leaves a provider session behind; whether the provider answered (or hit a
+          // usage limit) does not matter to the stop contract.
+          let settled = await fetchT3ThreadSnapshot({ config, threadId });
+          const deadline = Date.now() + 120_000;
+          while (
+            !(settled.thread.session !== null && ["ready", "idle", "error", "interrupted"].includes(settled.thread.session.status)) &&
+            Date.now() < deadline
+          ) {
+            await Bun.sleep(250);
+            settled = await fetchT3ThreadSnapshot({ config, threadId });
+          }
+          const before = settled.thread.session?.status;
+          expect(before === undefined || before === "stopped").toBe(false);
+
+          const stop: T3Command = {
+            type: "thread.session.stop",
+            commandId: `${threadId}:g1:session.stop`,
+            threadId,
+            createdAt: new Date().toISOString(),
+          };
+          const first = await dispatchT3Command({ config, command: stop });
+          let stopped = await fetchT3ThreadSnapshot({ config, threadId });
+          for (const until = Date.now() + 30_000; stopped.thread.session?.status !== "stopped" && Date.now() < until;) {
+            await Bun.sleep(250);
+            stopped = await fetchT3ThreadSnapshot({ config, threadId });
+          }
+          expect(stopped.thread.session?.status).toBe("stopped");
+          // The restart worker retries with the same command id: T3 deduplicates it.
+          expect((await dispatchT3Command({ config, command: stop })).sequence).toBe(first.sequence);
+
+          const unknown = await dispatchT3Command({
+            config,
+            command: { ...stop, commandId: crypto.randomUUID(), threadId: crypto.randomUUID() },
+          }).then(() => null, (error: unknown) => error);
+          expect(classifyT3DispatchError(unknown)).toEqual({ kind: "rejected", code: "T3CommandRejected" });
+        } finally {
+          if (created) {
+            await dispatchT3Command({
+              config,
+              command: { type: "project.delete", commandId: crypto.randomUUID(), projectId, force: true },
+            });
+          }
+          if (!workspaceRoot.startsWith(`${tmpdir()}/agent-tag-t3-session-stop-`)) {
+            throw new Error(`refusing to remove unexpected fixture path ${workspaceRoot}`);
+          }
+          await removeFixtureDirectory(workspaceRoot);
+        }
+      },
+      180_000,
     );
 
     test(

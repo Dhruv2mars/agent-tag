@@ -100,6 +100,11 @@ export function claimNextOperation(
                  AND interrupt.state IN ('response-pending', 'inflight')
                  AND interrupt.request_id LIKE 'interrupt:%'
              )
+             -- A pending \`!restart\` holds the queue: the next turn waits for the fresh session (PR-H2).
+             AND NOT EXISTS (
+               SELECT 1 FROM tasks restart
+               WHERE restart.task_id = o.task_id AND restart.restart_requested_at IS NOT NULL
+             )
            ORDER BY o.source_order_key, o.operation_id
            LIMIT 1`,
         )

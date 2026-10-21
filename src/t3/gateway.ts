@@ -139,6 +139,17 @@ const userInputDismissCommand = z.object({
 });
 
 /**
+ * T3 0.0.45 `thread.session.stop` (contracts orchestration.ts ThreadSessionStopCommand): stops the
+ * thread's provider session. Sent for a thread a restart retired (PR-H2); T3 rejects an unknown thread.
+ */
+const threadSessionStopCommand = z.object({
+  type: z.literal("thread.session.stop"),
+  commandId: id,
+  threadId: id,
+  createdAt: isoDateTime,
+});
+
+/**
  * T3 0.0.45 `thread.meta.update` (contracts orchestration.ts ThreadMetaUpdateCommand). Only the
  * `modelSelection` field is used; it is what updates the projected `thread.modelSelection`.
  */
@@ -158,6 +169,7 @@ export const t3CommandSchema = z.discriminatedUnion("type", [
   approvalRespondCommand,
   userInputRespondCommand,
   userInputDismissCommand,
+  threadSessionStopCommand,
 ]);
 export type T3Command = z.infer<typeof t3CommandSchema>;
 

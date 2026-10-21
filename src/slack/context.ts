@@ -1,5 +1,6 @@
 import { z } from "zod";
 
+import { IMPLEMENTED_COMMANDS, isCommandUsage, parseAgentCommand } from "../commands/parse.ts";
 import { slackErrorCode } from "./users.ts";
 
 // The thread window: earlier messages of a Slack thread, read once when the agent is first mentioned
@@ -118,6 +119,17 @@ export function codePointLength(text: string): number {
 }
 
 /**
+ * An `@bot !command` the bot answered instead of treating as a request (`!stop`, `!restart`, ...):
+ * not conversation, so a fresh session rereading the thread never sees it. The bare form counts too
+ * (a DM command); a bare `!word` in a channel is not a request either way.
+ */
+function isAgentCommand(text: string, botUserId: string): boolean {
+  const command = parseAgentCommand(text, { botUserId, allowBare: true });
+  return command !== null && !isCommandUsage(command) &&
+    (IMPLEMENTED_COMMANDS as ReadonlyArray<string>).includes(command.name);
+}
+
+/**
  * Maps one raw reply to a window message, or null when it is not eligible: the agent's own
  * messages, unsupported subtypes, bots and non-allowlisted humans per policy (the root is always
  * kept for humans, and for bots unless the policy is "none").
@@ -142,6 +154,7 @@ export function classifyReply(raw: unknown, context: ThreadWindowContext): Threa
     steeringAllowed = false;
   } else {
     if (reply.user === undefined) return null;
+    if (isAgentCommand(reply.text ?? "", context.botUserId)) return null;
     steeringAllowed = context.allowedUserIds.includes(reply.user);
     if (!steeringAllowed && !context.policy.includeNonAllowedUsers && !isRoot) return null;
     speakerId = reply.user;

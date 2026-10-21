@@ -19,7 +19,7 @@ Work lands on `main` through one squash-merged pull request per change. Use Bun 
 - Slack Socket Mode ingestion, authorization, durable deduplication, T3 dispatch, and Slack replies. Replies are rendered as safe, chunked mrkdwn, and the outbox classifies delivery errors and retries with backoff.
 - An instant :eyes: reaction on accepted mentions (`reactions:write`), and durable `chat.update` edits for messages Agent Tag already posted.
 - Speaker identity in every turn (`users:read`), a window of earlier thread messages on the first mention, and thread updates (other bots, non-allowed people, edits) carried into the next turn.
-- `!help`, `!status`, `!mute`, and `!unmute` commands. Approval and question cards reflect clicks, outcomes, and expiry.
+- `!help`, `!status`, `!mute`, `!unmute`, `!stop`, and `!restart` commands. Approval and question cards reflect clicks, outcomes, and expiry.
 - One shared T3 connection with a thread watcher, a progress-based stall policy, approval expiry, and interaction retries with backoff.
 - Per-profile `allowedModels` and a per-task model that stays sticky across turns.
 - A draft pull request worker (`pullRequests.mode: "auto"`) with a Slack PR card. The live GitHub run is still owner-blocked (PR-01).
