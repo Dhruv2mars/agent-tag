@@ -76,6 +76,9 @@ describe("parseModelDirective", () => {
     ["Use Opus 5.5 for the rest of this thread: refactor x", "match claudeAgent/claude-opus-5-5 | refactor x"],
     ["use opus... fix it", "match claudeAgent/claude-opus-5-5 | fix it"],
     ["use opus: ...", "match claudeAgent/claude-opus-5-5 | "],
+    ["use opus: .env is broken", "match claudeAgent/claude-opus-5-5 | .env is broken"],
+    ["use opus: ./x fails", "match claudeAgent/claude-opus-5-5 | ./x fails"],
+    ["use opus\n.github/ci.yml fails", "match claudeAgent/claude-opus-5-5 | .github/ci.yml fails"],
     // A catalog model the profile does not allow is refused, not run as a prompt.
     ["switch to grok-5", "not-allowed grok/grok-5 | "],
     ["use codex-work/gpt-5.6-sol: x", "not-allowed codex-work/gpt-5.6-sol | x"],

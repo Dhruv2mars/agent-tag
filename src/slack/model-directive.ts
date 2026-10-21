@@ -23,8 +23,8 @@ const VERB =
 const TAIL =
   /^(?:[ \t]+model)?(?:[ \t]+for[ \t]+(?:the[ \t]+rest[ \t]+of[ \t]+)?this[ \t]+thread)?[ \t]*(?:$|\n|[:,;.—])/i;
 const TRAILING_TERMINATORS = /[:,;.—]+$/;
-/** Extra terminators after the one that ended the directive, e.g. "use opus...". */
-const LEADING_TERMINATORS = /^[\s:,;.—]+/;
+/** Extra terminators after the one that ended the directive, e.g. "use opus...", but not the dot of ".env". */
+const LEADING_TERMINATORS = /^\s*[:,;.—]+(?=\s|$)/;
 const QUOTES: Readonly<Record<string, string>> = { "`": "`", '"': '"', "'": "'", "“": "”", "‘": "’" };
 const MAX_TOKENS = 3;
 
