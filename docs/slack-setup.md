@@ -132,7 +132,7 @@ Keep ambient participation disabled for the first run. A normal channel route us
 
 ## 4. Verify and start
 
-Start the pinned T3 Code `0.0.45` server (or use `t3.mode: "managed"`; see [operations](operations.md)), then run:
+Start the pinned T3 Code `0.0.45` server (or use `t3.mode: "managed"`; see [T3 runtime](t3-runtime.md#managed-t3)), then run:
 
 ```sh
 bun install --frozen-lockfile

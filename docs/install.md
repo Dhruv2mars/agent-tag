@@ -26,7 +26,7 @@ The resulting config has a three-line `t3` block. Everything else has a default 
 "t3": { "mode": "managed", "port": 37841, "tokenFile": "/home/me/.agent-tag/secrets/t3-token" }
 ```
 
-Managed mode needs a pinned artifact for the host: macOS arm64, Linux x64 and Linux arm64. T3 `0.0.45` ships no Intel macOS build, so Intel Macs use external mode. The first start downloads about 70 MB from GitHub (`downloadBaseUrl` points at a mirror instead), and each installed version takes about 205 MB on disk. The coding agents themselves (Codex, Claude) run under your OS user and use the logins in your home directory, so sign in to them once as that user. See [operations](operations.md#managed-t3) for `agent-tag t3 status|pair|serve|install`.
+Managed mode needs a pinned artifact for the host: macOS arm64, Linux x64 and Linux arm64. T3 `0.0.45` ships no Intel macOS build, so Intel Macs use external mode. The first start downloads about 70 MB from GitHub (`downloadBaseUrl` points at a mirror instead), and each installed version takes about 205 MB on disk. The coding agents themselves (Codex, Claude) run under your OS user and use the logins in your home directory, so sign in to them once as that user. See [T3 runtime](t3-runtime.md#managed-t3) for `agent-tag t3 status|pair|serve|install`.
 
 **External.** Run T3 yourself and point Agent Tag at it with `"t3": { "baseUrl": "http://127.0.0.1:3773", "tokenFile": "..." }` (a config without `t3.mode` is external). Onboarding picks this when it finds a running T3 in `~/.t3` (or `$T3CODE_HOME`), or when you pass `--t3-url`. The Docker image always uses external mode, because the container does not run T3.
 
