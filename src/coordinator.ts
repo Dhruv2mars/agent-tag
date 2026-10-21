@@ -16,6 +16,7 @@ import { renderStatusMessage } from "./slack/status.ts";
 import { EMPTY_PROGRESS, progressActivity, TurnProgress } from "./progress.ts";
 import { slackErrorCode, unresolvedSpeaker } from "./slack/users.ts";
 import type { AgentTagStore, ClaimedOperation, PrSyncInput, TaskExecutionBinding } from "./store/store.ts";
+import { SESSION_RESTARTED } from "./store/restart.ts";
 import { taskBranchName } from "./store/tasks.ts";
 import { composeTurnText, type TurnWindow } from "./turn-text.ts";
 import {
@@ -145,6 +146,13 @@ class CoordinatorFailure extends Error {
     this.name = code;
     this.userMessage = userMessage;
   }
+}
+
+function sessionRestarted(): CoordinatorFailure {
+  return new CoordinatorFailure(
+    SESSION_RESTARTED,
+    "Agent Tag stopped this request because `!restart` started a fresh session for this thread. Send it again if you still need it.",
+  );
 }
 
 class CoordinatorAborted extends Error {
@@ -797,6 +805,9 @@ export class AgentTagCoordinator {
     polling: TurnPolling,
   ): Promise<CoordinatorOutcome> {
     const task = this.#store.getTaskExecution(operation.taskId);
+    // Sent before a `!restart` that retired its thread: replaying it would reuse its command id on the
+    // fresh thread. Its turn (if T3 has it) ends with the retired thread's session stop.
+    if (operation.threadId !== null && operation.threadId !== task.threadId) throw sessionRestarted();
     const profile = requireExecutionAuthority({
       config: this.#config,
       task,
@@ -824,11 +835,14 @@ export class AgentTagCoordinator {
 
     // Recorded first: if the receipt is lost, T3 may still run the turn, so cancellation has to wait
     // for the replay below to confirm it instead of dropping the operation locally.
-    this.#store.markOperationTurnDispatched({
+    const current = this.#store.markOperationTurnDispatched({
       operationId: operation.operationId,
       workerId: this.#workerId,
+      threadId: task.threadId,
       now: this.#now().toISOString(),
     });
+    // A forced `!restart` rotated the thread while this turn was being prepared.
+    if (!current) throw sessionRestarted();
     const turn = await abortable(this.#t3.dispatch({
       type: "thread.turn.start",
       commandId: operation.commandId,

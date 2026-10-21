@@ -71,7 +71,7 @@ function settleTurn(store: AgentTagStore, receipt: IngestReceipt, now: string, o
   const claimed = store.claimNextOperation({ workerId: "w", now, leaseMs: 10_000, maxConcurrentTasks: 1 });
   if (claimed === null || claimed.operationId !== receipt.operationId) throw new Error("operation was not claimable");
   if (options.started ?? true) {
-    store.markOperationTurnDispatched({ operationId: claimed.operationId, workerId: "w", now });
+    store.markOperationTurnDispatched({ operationId: claimed.operationId, workerId: "w", threadId: store.getTaskExecution(claimed.taskId).threadId, now });
     store.markOperationTurnStarted({ operationId: claimed.operationId, workerId: "w", turnId: null, now });
     store.markT3ThreadStarted({ taskId: claimed.taskId, threadId: store.getTaskExecution(claimed.taskId).threadId, now });
   }
