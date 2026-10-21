@@ -30,6 +30,15 @@ import {
   threadModelSelectionCommand,
 } from "./t3/gateway.ts";
 import type { ThreadWatch, ThreadWatchSource } from "./t3/watcher.ts";
+import {
+  attachedT3Attachments,
+  fileExtension,
+  type InboundFileTransport,
+  materializeInboundFiles,
+  skippedFilesNotice,
+  t3AttachmentUploader,
+  turnFiles,
+} from "./slack/files.ts";
 
 export interface T3CoordinatorGateway {
   /** Implementations should stop the RPC (closing its socket) when `signal` aborts. */
@@ -99,6 +108,8 @@ export interface CoordinatorOptions {
   readonly maxTurnMs?: number;
   /** Git for the draft PR snapshot (PR-M §3.7). Absent: completed turns never touch git. */
   readonly pullRequests?: PullRequestSyncOptions;
+  /** Slack file reads for shared files (PR-L1). Absent: shared files are skipped as unavailable. */
+  readonly inboundFiles?: InboundFileTransport;
   readonly now?: () => Date;
   readonly sleep?: (milliseconds: number) => Promise<void>;
 }
@@ -331,6 +342,7 @@ export class AgentTagCoordinator {
   readonly #now: () => Date;
   readonly #sleep: (milliseconds: number) => Promise<void>;
   readonly #pullRequests: PullRequestSyncOptions | undefined;
+  readonly #inboundFiles: InboundFileTransport;
 
   constructor(options: CoordinatorOptions) {
     this.#config = options.config;
@@ -353,6 +365,7 @@ export class AgentTagCoordinator {
     this.#now = options.now ?? (() => new Date());
     this.#sleep = options.sleep ?? ((milliseconds) => Bun.sleep(milliseconds));
     this.#pullRequests = options.pullRequests;
+    this.#inboundFiles = options.inboundFiles ?? {};
   }
 
   /**
@@ -464,6 +477,7 @@ export class AgentTagCoordinator {
     const lease = { operationId: operation.operationId, workerId: this.#workerId };
     const frozen = this.#store.peekResolvedTurnText({ ...lease, now: this.#now().toISOString() });
     if (frozen !== null) return frozen;
+    const files = await this.#materializeFiles(operation, signal);
     const { actorUserId, text, origin } = operation.payload;
     const window = await this.#readThreadWindow(operation, profile, signal);
     // Updates since the last turn are context for the next human turn; schedule runs leave them pending.
@@ -500,6 +514,7 @@ export class AgentTagCoordinator {
       primaryText: text,
       names,
       ...(this.#slackContext === undefined ? {} : { botUserId: this.#slackContext.botUserId }),
+      attachments: files,
       window,
       notes: notes.length === 0
         ? null
@@ -518,6 +533,71 @@ export class AgentTagCoordinator {
       memoryDigest: memory.digest,
       now: this.#now().toISOString(),
     });
+  }
+
+  /**
+   * Attaches or skips each file shared with the request (PR-L1). Every outcome is recorded under the
+   * lease, so a replay downloads and uploads only files with no outcome yet. Skips post one thread
+   * notice per operation. A lease heartbeat runs during downloads; losing the lease aborts.
+   */
+  async #materializeFiles(
+    operation: ClaimedOperation,
+    signal: AbortSignal | undefined,
+  ): Promise<ReturnType<typeof turnFiles>> {
+    const refs = operation.payload.files;
+    if (refs.length === 0) return [];
+    const lease = { operationId: operation.operationId, workerId: this.#workerId };
+    const limits = this.#config.files.inbound;
+    const leaseLost = new AbortController();
+    const linked = signal === undefined ? leaseLost.signal : AbortSignal.any([signal, leaseLost.signal]);
+    const heartbeat = setInterval(() => {
+      try {
+        this.#store.renewOperationLease({ ...lease, now: this.#now().toISOString(), leaseMs: this.#leaseMs });
+      } catch (error) {
+        leaseLost.abort(error);
+      }
+    }, Math.max(1_000, Math.floor(this.#leaseMs / 3)));
+    let outcomes: Awaited<ReturnType<typeof materializeInboundFiles>>;
+    try {
+      outcomes = await abortable(materializeInboundFiles({
+        refs,
+        recorded: this.#store.listOperationAttachments(operation.operationId),
+        limits,
+        ...(this.#inboundFiles.slack === undefined ? {} : { slack: this.#inboundFiles.slack }),
+        upload: this.#inboundFiles.upload ?? t3AttachmentUploader(this.#config.t3),
+        record: ({ ordinal, ref, outcome, sizeBytes }) =>
+          this.#store.recordOperationAttachment({
+            ...lease,
+            ordinal,
+            slackFileId: ref.id,
+            outcome,
+            extension: fileExtension(ref.name ?? ""),
+            sizeBytes,
+            now: this.#now().toISOString(),
+          }),
+        signal: linked,
+      }), linked);
+    } catch (error) {
+      if (signal?.aborted === true) throw new CoordinatorAborted();
+      if (leaseLost.signal.aborted) throw leaseLost.signal.reason;
+      throw error;
+    } finally {
+      clearInterval(heartbeat);
+    }
+    this.#store.renewOperationLease({ ...lease, now: this.#now().toISOString(), leaseMs: this.#leaseMs });
+    const notice = skippedFilesNotice(refs, outcomes, limits);
+    if (notice !== null) {
+      this.#store.enqueueOutbox({
+        taskId: operation.taskId,
+        correlationId: operation.operationId,
+        conversationId: operation.payload.conversationId,
+        threadTs: operation.payload.threadTs,
+        clientMessageId: `${operation.operationId}:files-skipped`,
+        payload: { text: notice, blocks: [{ type: "section", text: { type: "mrkdwn", text: notice } }] },
+        createdAt: this.#now().toISOString(),
+      });
+    }
+    return turnFiles(refs, outcomes, limits);
   }
 
   /**
@@ -691,7 +771,7 @@ export class AgentTagCoordinator {
         messageId: operation.messageId,
         role: "user",
         text: turnText,
-        attachments: [],
+        attachments: attachedT3Attachments(this.#store.listOperationAttachments(operation.operationId)),
       },
       modelSelection,
       titleSeed: `Slack ${operation.payload.conversationId}/${operation.payload.threadTs}`,
