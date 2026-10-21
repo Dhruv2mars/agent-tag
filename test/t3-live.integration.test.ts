@@ -33,6 +33,20 @@ import {
 const enabled = Bun.env.RUN_T3_INTEGRATION === "1";
 
 /**
+ * The models live runs use (Dhruv's rule: real provider turns only on Luna or Haiku 5.5). Override
+ * with AGENT_TAG_LIVE_{CODEX,CLAUDE}_{INSTANCE,MODEL}, e.g. a second Codex instance when one is
+ * usage-limited.
+ */
+const CODEX = {
+  instanceId: Bun.env.AGENT_TAG_LIVE_CODEX_INSTANCE ?? "codex",
+  model: Bun.env.AGENT_TAG_LIVE_CODEX_MODEL ?? "gpt-6-luna",
+};
+const CLAUDE = {
+  instanceId: Bun.env.AGENT_TAG_LIVE_CLAUDE_INSTANCE ?? "claudeAgent",
+  model: Bun.env.AGENT_TAG_LIVE_CLAUDE_MODEL ?? "claude-haiku-5-5",
+};
+
+/**
  * Removes a fixture directory after the caller's prefix guard. After `project.delete`, T3 0.0.45
  * keeps pruning worktree metadata inside the fixture's `.git` asynchronously, so a single recursive
  * remove can race it and fail with ENOENT while leaving `.git` behind. Retry until the tree is gone.
@@ -102,16 +116,16 @@ if (!enabled) {
 
     test("probes the release and projects authenticated provider capabilities", async () => {
       const info = await inspectT3(config);
-      const codex = info.providers.find((provider) => provider.instanceId === "codex");
-      const claude = info.providers.find((provider) => provider.instanceId === "claudeAgent");
+      const codex = info.providers.find((provider) => provider.instanceId === CODEX.instanceId);
+      const claude = info.providers.find((provider) => provider.instanceId === CLAUDE.instanceId);
       expect(codex).toMatchObject({ installed: true, status: "ready", auth: { status: "authenticated" } });
       expect(claude).toMatchObject({
         installed: true,
         status: "ready",
         auth: { status: "authenticated" },
       });
-      expect(codex?.models.map((model) => model.slug)).toContain("gpt-5.6-sol");
-      expect(claude?.models.map((model) => model.slug)).toContain("claude-sonnet-4-6");
+      expect(codex?.models.map((model) => model.slug)).toContain(CODEX.model);
+      expect(claude?.models.map((model) => model.slug)).toContain(CLAUDE.model);
 
       const selectionConfig = agentTagConfigSchema.parse({
         version: 1,
@@ -127,8 +141,8 @@ if (!enabled) {
           {
             id: "codex-profile",
             repositoryRoots: ["/tmp/codex-profile"],
-            defaultProviderInstanceId: "codex",
-            defaultModel: "gpt-5.6-sol",
+            defaultProviderInstanceId: CODEX.instanceId,
+            defaultModel: CODEX.model,
             runtimeMode: "approval-required",
             isolation: { mode: "trusted-same-user", acknowledgedSharedMachineAccess: true },
             externalWrites: { mode: "deny" },
@@ -137,8 +151,8 @@ if (!enabled) {
           {
             id: "claude-profile",
             repositoryRoots: ["/tmp/claude-profile"],
-            defaultProviderInstanceId: "claudeAgent",
-            defaultModel: "claude-sonnet-4-6",
+            defaultProviderInstanceId: CLAUDE.instanceId,
+            defaultModel: CLAUDE.model,
             runtimeMode: "approval-required",
             isolation: { mode: "trusted-same-user", acknowledgedSharedMachineAccess: true },
             externalWrites: { mode: "deny" },
@@ -263,7 +277,7 @@ if (!enabled) {
                 text: "Reply with exactly fixture-ok. Do not call tools, change files, or use the network.",
                 attachments: [],
               },
-              modelSelection: { instanceId: "codex", model: "gpt-5.6-sol" },
+              modelSelection: CODEX,
               titleSeed: "Agent Tag supervised provider fixture",
               runtimeMode: "approval-required",
               interactionMode: "default",
@@ -271,7 +285,7 @@ if (!enabled) {
                 createThread: {
                   projectId,
                   title: "Agent Tag supervised provider fixture",
-                  modelSelection: { instanceId: "codex", model: "gpt-5.6-sol" },
+                  modelSelection: CODEX,
                   runtimeMode: "approval-required",
                   interactionMode: "default",
                   branch: "main",
@@ -313,7 +327,7 @@ if (!enabled) {
 
           const snapshot = await fetchT3ThreadSnapshot({ config, threadId });
           expect(snapshot.thread.runtimeMode).toBe("approval-required");
-          expect(snapshot.thread.modelSelection).toEqual({ instanceId: "codex", model: "gpt-5.6-sol" });
+          expect(snapshot.thread.modelSelection).toEqual(CODEX);
           expect(snapshot.thread.latestTurn?.state).toBe("completed");
           const assistantMessages = snapshot.thread.messages.filter((message) => message.role === "assistant");
           expect(assistantMessages.at(-1)?.streaming).toBe(false);
@@ -379,7 +393,7 @@ if (!enabled) {
                 text: "Reply with exactly fixture-ok. Do not call tools, change files, or use the network.",
                 attachments: [],
               },
-              modelSelection: { instanceId: "codex", model: "gpt-5.6-sol" },
+              modelSelection: CODEX,
               titleSeed: "Agent Tag session stop fixture",
               runtimeMode: "approval-required",
               interactionMode: "default",
@@ -387,7 +401,7 @@ if (!enabled) {
                 createThread: {
                   projectId,
                   title: "Agent Tag session stop fixture",
-                  modelSelection: { instanceId: "codex", model: "gpt-5.6-sol" },
+                  modelSelection: CODEX,
                   runtimeMode: "approval-required",
                   interactionMode: "default",
                   branch: "main",
@@ -490,7 +504,7 @@ if (!enabled) {
                 text: "Reply with exactly claude-fixture-ok. Do not call tools, change files, or use the network.",
                 attachments: [],
               },
-              modelSelection: { instanceId: "claudeAgent", model: "claude-sonnet-4-6" },
+              modelSelection: CLAUDE,
               titleSeed: "Agent Tag explicit Claude fixture",
               runtimeMode: "approval-required",
               interactionMode: "default",
@@ -498,7 +512,7 @@ if (!enabled) {
                 createThread: {
                   projectId,
                   title: "Agent Tag explicit Claude fixture",
-                  modelSelection: { instanceId: "claudeAgent", model: "claude-sonnet-4-6" },
+                  modelSelection: CLAUDE,
                   runtimeMode: "approval-required",
                   interactionMode: "default",
                   branch: "main",
@@ -515,12 +529,9 @@ if (!enabled) {
             (candidate) => candidate.thread.latestTurn?.state === "completed",
             120_000,
           );
-          expect(snapshot.thread.modelSelection).toEqual({
-            instanceId: "claudeAgent",
-            model: "claude-sonnet-4-6",
-          });
+          expect(snapshot.thread.modelSelection).toEqual(CLAUDE);
           expect(snapshot.thread.session).toMatchObject({
-            providerInstanceId: "claudeAgent",
+            providerInstanceId: CLAUDE.instanceId,
             lastError: null,
           });
           const assistantMessages = snapshot.thread.messages.filter(
@@ -588,7 +599,7 @@ if (!enabled) {
                 text: "Run the command cat README.md, then reply with exactly its contents. Do not change files or use the network.",
                 attachments: [],
               },
-              modelSelection: { instanceId: "codex", model: "gpt-5.6-sol" },
+              modelSelection: CODEX,
               titleSeed: "Agent Tag command approval fixture",
               runtimeMode: "approval-required",
               interactionMode: "default",
@@ -596,7 +607,7 @@ if (!enabled) {
                 createThread: {
                   projectId,
                   title: "Agent Tag command approval fixture",
-                  modelSelection: { instanceId: "codex", model: "gpt-5.6-sol" },
+                  modelSelection: CODEX,
                   runtimeMode: "approval-required",
                   interactionMode: "default",
                   branch: "main",
@@ -701,8 +712,8 @@ if (!enabled) {
                 id: "engineering",
                 repositoryRoots: [workspaceRoot],
                 baseBranch: "main",
-                defaultProviderInstanceId: "codex",
-                defaultModel: "gpt-5.6-sol",
+                defaultProviderInstanceId: CODEX.instanceId,
+                defaultModel: CODEX.model,
                 runtimeMode: "approval-required",
                 isolation: { mode: "trusted-same-user", acknowledgedSharedMachineAccess: true },
                 externalWrites: { mode: "deny" },
@@ -895,7 +906,7 @@ if (!enabled) {
                   text: "Run the command cat README.md, then report whether it succeeded. Do not change files or use the network.",
                   attachments: [],
                 },
-                modelSelection: { instanceId: "codex", model: "gpt-5.6-sol" },
+                modelSelection: CODEX,
                 titleSeed: title,
                 runtimeMode: "approval-required",
                 interactionMode: "default",
@@ -903,7 +914,7 @@ if (!enabled) {
                   createThread: {
                     projectId,
                     title,
-                    modelSelection: { instanceId: "codex", model: "gpt-5.6-sol" },
+                    modelSelection: CODEX,
                     runtimeMode: "approval-required",
                     interactionMode: "default",
                     branch: "main",
@@ -1025,7 +1036,7 @@ if (!enabled) {
               commandId: crypto.randomUUID(),
               threadId,
               message: { messageId: crypto.randomUUID(), role: "user", text: "Reply with exactly fixture-ok. Do not call tools.", attachments: [] },
-              modelSelection: { instanceId: "codex", model: "gpt-5.6-sol" },
+              modelSelection: CODEX,
               titleSeed: "Agent Tag upload fixture",
               runtimeMode: "approval-required",
               interactionMode: "default",
@@ -1033,7 +1044,7 @@ if (!enabled) {
                 createThread: {
                   projectId,
                   title: "Agent Tag upload fixture",
-                  modelSelection: { instanceId: "codex", model: "gpt-5.6-sol" },
+                  modelSelection: CODEX,
                   runtimeMode: "approval-required",
                   interactionMode: "default",
                   branch: null,
@@ -1120,8 +1131,8 @@ if (!enabled) {
               id: "engineering",
               repositoryRoots: [workspaceRoot],
               baseBranch: "main",
-              defaultProviderInstanceId: "claudeAgent",
-              defaultModel: "claude-sonnet-4-6",
+              defaultProviderInstanceId: CLAUDE.instanceId,
+              defaultModel: CLAUDE.model,
               runtimeMode: "approval-required",
               isolation: { mode: "trusted-same-user", acknowledgedSharedMachineAccess: true },
               externalWrites: { mode: "deny" },
@@ -1260,7 +1271,7 @@ if (!enabled) {
         });
         created = true;
         const createdAt = new Date().toISOString();
-        const start = { instanceId: "claudeAgent", model: from };
+        const start = { instanceId: CLAUDE.instanceId, model: from };
         await dispatchT3Command({
           config,
           command: {
@@ -1330,7 +1341,7 @@ if (!enabled) {
       "moves a started thread to another model of the same driver in place, and the next turn runs on it",
       async () => {
         await withStartedClaudeThread("claude-haiku-4-5", async ({ threadId, turn }) => {
-          const target = { instanceId: "claudeAgent", model: "claude-sonnet-4-6" };
+          const target = CLAUDE;
           await dispatchT3Command({
             config,
             command: { type: "thread.meta.update", commandId: crypto.randomUUID(), threadId, modelSelection: target },
@@ -1344,7 +1355,7 @@ if (!enabled) {
             120_000,
           );
           expect(snapshot.thread.modelSelection).toEqual(target);
-          expect(snapshot.thread.session).toMatchObject({ providerInstanceId: "claudeAgent", lastError: null });
+          expect(snapshot.thread.session).toMatchObject({ providerInstanceId: CLAUDE.instanceId, lastError: null });
           expect(snapshot.thread.activities.some((activity) => activity.kind === "provider.turn.start.failed")).toBe(false);
         });
       },
@@ -1355,7 +1366,7 @@ if (!enabled) {
       "refuses a turn that moves a started thread to another driver with provider.turn.start.failed",
       async () => {
         await withStartedClaudeThread("claude-haiku-4-5", async ({ threadId, turn }) => {
-          await turn({ instanceId: "codex", model: "gpt-5.6-sol" }, "Reply with exactly switch-cross-ok.");
+          await turn(CODEX, "Reply with exactly switch-cross-ok.");
           const snapshot = await waitForSnapshot(
             threadId,
             (candidate) => candidate.thread.activities.some((activity) => activity.kind === "provider.turn.start.failed"),
@@ -1365,7 +1376,7 @@ if (!enabled) {
           const detail = z.object({ detail: z.string() }).parse(failure.payload).detail;
           // Agent Tag reads this as a refused switch, so the thread keeps its model (Done 6).
           expect(classifyT3TurnFailure(detail).code).toBe("T3ModelSwitchRejected");
-          expect(snapshot.thread.modelSelection).toEqual({ instanceId: "claudeAgent", model: "claude-haiku-4-5" });
+          expect(snapshot.thread.modelSelection).toEqual({ instanceId: CLAUDE.instanceId, model: "claude-haiku-4-5" });
           console.log(`provider.turn.start.failed detail: ${detail}`);
         });
       },
