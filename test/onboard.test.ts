@@ -837,7 +837,7 @@ describe("agent-tag onboard with managed T3", () => {
     const result = await runOnboard(managedFlags({ force: true, model: "gpt-default", installService: false }), deps);
     expect(result.secrets.t3Token).toBe("missing");
     expect(result.config.t3.mode).toBe("managed");
-    expect(harness.output.join("\n")).toContain("the service retries on start");
+    expect(harness.output.join("\n")).toContain("the service starts managed T3 itself once it is installed");
     expect(fake.stopped).toBe(0);
   });
 

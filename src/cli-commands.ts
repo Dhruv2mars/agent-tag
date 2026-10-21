@@ -303,7 +303,7 @@ function onboardManagedT3(print: (line: string) => void): OnboardManagedT3 {
         t3,
         pin: PINNED_T3,
         logger: (record) => {
-          if (record.event === "t3.runtime.stderr" && record.level !== "error") return;
+          if (record.event === "t3.runtime.stderr") return;
           print(`    ${record.event}${record.detail === undefined ? "" : `: ${record.detail}`}`);
         },
       }),

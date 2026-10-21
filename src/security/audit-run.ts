@@ -251,15 +251,14 @@ export function readAuditInputs(raw: unknown): AuditInputs {
     { name: "slack-bot-token", path: input.slack.botTokenFile },
   ].flatMap(({ name, path }) => (path === undefined ? [] : [{ name, path }]));
   const { dataDir, t3 } = input;
+  const homeDir = t3.homeDir ?? (dataDir === undefined ? undefined : join(dataDir, "t3", "home"));
+  const runtimeDir = t3.runtimeDir ?? (dataDir === undefined ? undefined : join(dataDir, "t3", "runtime"));
   return {
     dataDir,
     t3BaseUrl: t3.baseUrl,
     secretFiles,
-    scanExclusions: t3.mode === "managed" && dataDir !== undefined
-      ? managedT3ScanExclusions({
-          homeDir: t3.homeDir ?? join(dataDir, "t3", "home"),
-          runtimeDir: t3.runtimeDir ?? join(dataDir, "t3", "runtime"),
-        })
+    scanExclusions: t3.mode === "managed" && homeDir !== undefined && runtimeDir !== undefined
+      ? managedT3ScanExclusions({ homeDir, runtimeDir })
       : [],
     access: input.access,
     roots: input.profiles.flatMap((profile) => {

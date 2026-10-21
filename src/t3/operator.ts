@@ -120,7 +120,7 @@ export async function startTransientManagedT3(input: {
   };
   if (live.pid !== null && (live.protocol !== null || (await servesThisHome(live.pid)))) {
     throw new Error(
-      `managed T3 is already running in ${input.t3.managed.homeDir} (pid ${live.pid}); stop the Agent Tag service (or \`agent-tag t3 serve\`) first`,
+      `managed T3 is already running in ${input.t3.managed.homeDir} (pid ${live.pid}); stop the Agent Tag service (or \`agent-tag t3 serve\`) first, or \`kill ${live.pid}\` if neither is running`,
     );
   }
   const installed = input.installed

@@ -660,7 +660,7 @@ async function provisionManagedT3(
     const problem = `managed T3 did not start: ${errorMessage(error)}`;
     if (options.t3Managed === true) throw new Error(problem);
     deps.print(`  ${problem}`);
-    deps.print("  the service retries on start; check with `agent-tag doctor` and `agent-tag t3 status`");
+    deps.print("  fix the problem, then check with `agent-tag doctor` and `agent-tag t3 status`; the service starts managed T3 itself once it is installed");
     return { t3BaseUrl: config.baseUrl, t3: { usable: false, reachable: false, problem }, t3Token: hadToken ? "kept" : "missing", discovered: undefined };
   }
   try {

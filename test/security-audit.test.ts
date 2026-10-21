@@ -354,6 +354,16 @@ describe("config checks", () => {
     expect(readAuditInputs([]).secretFiles).toEqual([]);
   });
 
+  test("a managed T3 with explicit home and runtime dirs is excluded even when dataDir is unusable", () => {
+    const inputs = readAuditInputs({
+      dataDir: "relative/data",
+      t3: { mode: "managed", tokenFile: "/s/t3", homeDir: "/t3/home", runtimeDir: "/t3/runtime" },
+    });
+    expect(inputs.dataDir).toBeUndefined();
+    expect(inputs.scanExclusions).toEqual(["/t3/runtime/versions", "/t3/runtime/downloads", "/t3/home/userdata/secrets"]);
+    expect(readAuditInputs({ t3: { mode: "managed", homeDir: "/t3/home" } }).scanExclusions).toEqual([]);
+  });
+
   test("sorts findings and fails only on high severity", () => {
     const report = summarizeFindings(
       [

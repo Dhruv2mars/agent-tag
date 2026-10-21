@@ -262,6 +262,7 @@ test("the configured scan of a managed install skips T3's release and key pair b
     await writeFile(join(runtime, "versions", "0.0.45", "t3"), `${pem}\n`);
     await writeFile(join(home, "userdata", "secrets", "cloud-link-ed25519-key-pair.bin"), `${pem}\n`);
     await writeFile(join(home, "userdata", "logs", "server.log"), `bearer ${t3Token}\n`);
+    await writeFile(join(runtime, "supervised.json"), JSON.stringify({ token: t3Token }));
     const template = await Bun.file(join(import.meta.dir, "..", "config", "agent-tag.example.json")).json();
     const configPath = join(directory, "agent-tag.json");
     await writeFile(configPath, JSON.stringify({
@@ -276,8 +277,9 @@ test("the configured scan of a managed install skips T3's release and key pair b
     const run = Bun.spawnSync(["bun", "run", join(import.meta.dir, "..", "scripts", "scan-secrets.ts"), "--config", configPath], { stdout: "pipe", stderr: "pipe" });
     if (run.stdout.toString().length === 0) throw new Error(run.stderr.toString());
     const report = JSON.parse(run.stdout.toString());
-    expect(report.findings.map((finding: { path: string; kind: string }) => [finding.path, finding.kind])).toEqual([
+    expect(report.findings.map((finding: { path: string; kind: string }) => [finding.path, finding.kind]).sort()).toEqual([
       [join(home, "userdata", "logs", "server.log"), "exact-secret"],
+      [join(runtime, "supervised.json"), "exact-secret"],
     ]);
     expect(run.stdout.toString()).not.toContain(t3Token);
   } finally {
