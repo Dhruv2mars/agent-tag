@@ -90,7 +90,7 @@ function seedVersionOne(database: Database): void {
 
 test("upgrades every historical SQLite schema while preserving existing work", async () => {
   const versions = STORE_MIGRATIONS.map((migration) => migration.version);
-  expect(versions).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21]);
+  expect(versions).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22]);
   // Each historical prefix, plus a store that applied 14 (from main) before 13 existed: applied
   // versions are tracked as a set, so 13 must still apply on top of it.
   const startingSets: ReadonlyArray<{ readonly label: string; readonly applied: ReadonlyArray<number> }> = [
@@ -676,6 +676,87 @@ test("H1: migration 21 adds the command ledger without a command_kind CHECK and 
     database.close();
   } finally {
     if (!directory.startsWith(`${tmpdir()}/agent-tag-migration-commands-`)) {
+      throw new Error(`refusing to remove unexpected migration fixture path ${directory}`);
+    }
+    await rm(directory, { recursive: true });
+  }
+});
+
+test("K1: migration 22 rebuilds memory with the channel scope, keeps every note and adds the task digest", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-tag-migration-memory-"));
+  const path = join(directory, "agent-tag.sqlite");
+  try {
+    const historical = new Database(path, { create: true, strict: true });
+    historical.exec("PRAGMA foreign_keys = ON");
+    historical.exec("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)");
+    for (const { version } of STORE_MIGRATIONS) {
+      if (version < 22) applyMigration(historical, version);
+    }
+    seedVersionOne(historical);
+    const seedMemory = historical.query(
+      `INSERT INTO memory_entries (memory_id, workspace_id, scope, profile_id, task_id, owner_user_id, content,
+         source_type, source_id, state, version, expires_at, forgotten_at, created_by, created_at, updated_at)
+       VALUES (?, 'T1', ?, ?, ?, ?, ?, 'slack-message', 's', 'active', 1, '2027-01-01T00:00:00.000Z', NULL, 'U1', ?, ?)`,
+    );
+    seedMemory.run("m-shared", "shared", null, null, null, "shared note", createdAt, createdAt);
+    seedMemory.run("m-profile", "profile", "engineering", null, null, "profile note", createdAt, createdAt);
+    seedMemory.run("m-task", "task", null, "task-1", null, "task note", createdAt, createdAt);
+    seedMemory.run("m-private", "private", "engineering", null, "U1", "private note", createdAt, createdAt);
+    historical.close();
+
+    (await AgentTagStore.open(path)).close();
+
+    const database = new Database(path, { strict: true });
+    database.exec("PRAGMA foreign_keys = ON");
+    expect(
+      database
+        .query<{ memory_id: string; scope: string; content: string; conversation_id: string | null; updated_by: string | null }, []>(
+          "SELECT memory_id, scope, content, conversation_id, updated_by FROM memory_entries ORDER BY memory_id",
+        )
+        .all(),
+    ).toEqual([
+      { memory_id: "m-private", scope: "private", content: "private note", conversation_id: null, updated_by: null },
+      { memory_id: "m-profile", scope: "profile", content: "profile note", conversation_id: null, updated_by: null },
+      { memory_id: "m-shared", scope: "shared", content: "shared note", conversation_id: null, updated_by: null },
+      { memory_id: "m-task", scope: "task", content: "task note", conversation_id: null, updated_by: null },
+    ]);
+    const insert = database.query(
+      `INSERT INTO memory_entries (memory_id, workspace_id, scope, profile_id, task_id, owner_user_id, conversation_id,
+         content, source_type, source_id, state, version, expires_at, created_by, created_at, updated_at)
+       VALUES (?, 'T1', ?, NULL, NULL, NULL, ?, 'c', 'slack-message', 's', 'active', 1, ?, 'U1', ?, ?)`,
+    );
+    insert.run("m-channel", "channel", "C1", createdAt, createdAt, createdAt);
+    expect(() => insert.run("m-channel-bad", "channel", null, createdAt, createdAt, createdAt)).toThrow("CHECK constraint failed");
+    expect(() => insert.run("m-shared-bad", "shared", "C1", createdAt, createdAt, createdAt)).toThrow("CHECK constraint failed");
+    expect(
+      database
+        .query<{ name: string }, []>("SELECT name FROM pragma_index_list('memory_entries') ORDER BY name")
+        .all()
+        .map((row) => row.name),
+    ).toEqual(expect.arrayContaining(["memory_entries_conversation_idx", "memory_entries_visibility_idx"]));
+    expect(
+      database.query<{ memory_digest: string | null }, []>("SELECT memory_digest FROM tasks WHERE task_id = 'task-1'").get(),
+    ).toEqual({ memory_digest: null });
+    expect(
+      database.query<{ name: string }, []>("SELECT name FROM sqlite_master WHERE name = 'slack_command_events'").get(),
+    ).toEqual({ name: "slack_command_events" });
+    const memorySchema = (handle: Database) =>
+      handle
+        .query<{ sql: string }, []>(
+          "SELECT sql FROM sqlite_master WHERE tbl_name IN ('memory_entries', 'tasks') AND sql IS NOT NULL ORDER BY name",
+        )
+        .all()
+        .map((row) => row.sql.replace(/\s+/g, " ").replace(/"/g, ""));
+    const upgraded = memorySchema(database);
+    database.close();
+
+    const freshPath = join(directory, "fresh.sqlite");
+    (await AgentTagStore.open(freshPath)).close();
+    const fresh = new Database(freshPath, { readonly: true, strict: true });
+    expect(memorySchema(fresh)).toEqual(upgraded);
+    fresh.close();
+  } finally {
+    if (!directory.startsWith(`${tmpdir()}/agent-tag-migration-memory-`)) {
       throw new Error(`refusing to remove unexpected migration fixture path ${directory}`);
     }
     await rm(directory, { recursive: true });
