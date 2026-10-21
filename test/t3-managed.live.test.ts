@@ -1,6 +1,6 @@
 // Live managed-T3 checks (PR-O Done 3–8): a real download of the pinned release, `t3 serve`, the
 // restricted token, `t3 status`, rotation with revocation, kill -9 recovery, orphan reaping, and the
-// protocol gate against a real fake-T3 process. About 2 minutes; needs network access to GitHub.
+// protocol gate against a real fake-T3 process (and, opt-in, a real protocol-2 T3). About 3 minutes; needs network access to GitHub.
 //   RUN_T3_MANAGED=1 bun test test/t3-managed.live.test.ts
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
@@ -333,5 +333,96 @@ if (!enabled) {
         await rm(root, { recursive: true, force: true });
       }
     }, 120_000);
+  });
+
+  // T3-05 against real releases rather than the fake: the managed pinned T3 is swapped on its port for a
+  // real protocol-2 T3 (v0.1.1 or later), then back. Opt in with the path to that binary:
+  //   AGENT_TAG_LIVE_T3_PROTOCOL2_BINARY=/path/to/t3-0.1.1/t3 RUN_T3_MANAGED=1 bun test test/t3-managed.live.test.ts
+  const protocol2Binary = Bun.env.AGENT_TAG_LIVE_T3_PROTOCOL2_BINARY;
+  describe("managed T3 live (protocol gate against a real protocol-2 T3)", () => {
+    if (protocol2Binary === undefined) {
+      test.skip("set AGENT_TAG_LIVE_T3_PROTOCOL2_BINARY to a real protocol-2 t3 binary", () => {});
+      return;
+    }
+    test("Done 7: a real protocol-2 T3 on the managed port closes the gate, pausing T3 workers while the outbox runs; the pinned T3 reopens it", async () => {
+      const root = await mkdtemp(join(tmpdir(), "agent-tag-t1-gate-"));
+      await chmod(root, 0o700);
+      const settings = { port: await freePort(), homeDir: join(root, "t3", "home"), runtimeDir: join(root, "t3", "runtime") };
+      const protocol2Home = join(root, "t3-protocol2-home");
+      await mkdir(protocol2Home, { recursive: true, mode: 0o700 });
+      const logs: ServiceLogRecord[] = [];
+      const logger = (record: ServiceLogRecord): void => {
+        logs.push(record);
+      };
+      const installed = await installPinnedT3({ pin: PINNED_T3, runtimeDir: settings.runtimeDir });
+      const pinned = (): T3ManagedRuntime => new T3ManagedRuntime({ settings, installed: { binary: installed.binary, version: PINNED_T3.version }, logger });
+      let runtime: T3ManagedRuntime | undefined = pinned();
+      let protocol2: ReturnType<typeof Bun.spawn> | undefined;
+      const store = await AgentTagStore.open(join(root, "agent-tag.sqlite"));
+      const calls = { coordinator: 0, outbox: 0 };
+      const gate = new T3RuntimeGate({ baseUrl: `http://127.0.0.1:${settings.port}`, pinnedVersion: PINNED_T3.version, logger });
+      const service = new AgentTagService({
+        store,
+        bridge: {
+          start: async () => {},
+          stop: async () => {},
+          deliverNextOutbox: async () => {
+            calls.outbox += 1;
+            return { kind: "idle" };
+          },
+        },
+        coordinators: [{ processNext: async () => {
+          calls.coordinator += 1;
+          return { kind: "idle" };
+        } }],
+        interactionWorkers: [{ processNext: async () => ({ kind: "idle" }) }],
+        maintenanceWorkers: [createT3GateWorker({ gate })],
+        idleMs: 20,
+        logger,
+        gate,
+      });
+      try {
+        await runtime.start();
+        await service.start();
+        await until(() => gate.open && calls.coordinator > 0, 10_000, "the gate to open on the pinned T3");
+
+        await runtime.stop();
+        runtime = undefined;
+        protocol2 = Bun.spawn([protocol2Binary, "serve", "--host", "127.0.0.1", "--port", String(settings.port), "--base-dir", protocol2Home], { stdout: "ignore", stderr: "ignore" });
+        const descriptor = async (): Promise<boolean> => {
+          try {
+            return (await fetchT3EnvironmentDescriptor({ baseUrl: `http://127.0.0.1:${settings.port}` })).orchestrationProtocol === 2;
+          } catch {
+            return false;
+          }
+        };
+        await until(descriptor, 60_000, "the real protocol-2 T3 to serve its descriptor");
+        const servingAt = Date.now();
+        await until(() => gate.reason?.includes("protocol 2") === true, 75_000, "the gate to close on protocol 2");
+        const closedAfter = Date.now() - servingAt;
+        const paused = { ...calls };
+        await Bun.sleep(1_000);
+        expect(calls.coordinator).toBe(paused.coordinator);
+        expect(calls.outbox).toBeGreaterThan(paused.outbox);
+        expect(logs.some((record) => record.event === "t3.gate.closed" && record.detail?.includes("protocol 2") === true)).toBe(true);
+
+        protocol2.kill();
+        await protocol2.exited;
+        protocol2 = undefined;
+        runtime = pinned();
+        const restoredAt = Date.now();
+        await runtime.start();
+        await until(() => gate.open && calls.coordinator > paused.coordinator, 20_000, "the gate to reopen on the pinned T3");
+        console.log(`[t1-live] real protocol-2 T3 closed the gate ${closedAfter} ms after it started serving; the pinned T3 reopened it ${Date.now() - restoredAt} ms after restart`);
+        console.log(`[t1-live] gate events: ${JSON.stringify(logs.filter((record) => record.event.startsWith("t3.gate.")))}`);
+      } finally {
+        protocol2?.kill();
+        await protocol2?.exited;
+        await service.stop();
+        await runtime?.stop();
+        store.close();
+        await rm(root, { recursive: true, force: true });
+      }
+    }, 600_000);
   });
 }
