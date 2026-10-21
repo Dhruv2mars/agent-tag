@@ -122,7 +122,18 @@ const threads = new Map<string, Map<string, Revision[]>>();
 const standIns = new Set<string>();
 const rootReactions = new Map<string, { readonly name: string; readonly seenAt: string }[]>();
 async function record(threadTs: string): Promise<SlackMessage[]> {
-  const page = (await slack.conversations.replies({ channel, ts: threadTs, limit: 200 })) as { messages?: SlackMessage[] };
+  let page: { messages?: SlackMessage[] };
+  for (;;) {
+    try {
+      page = (await slack.conversations.replies({ channel, ts: threadTs, limit: 200 })) as { messages?: SlackMessage[] };
+      break;
+    } catch (error) {
+      // conversations.replies is Tier 3; back off on a 429 instead of failing the run.
+      const retryAfter = (error as { retryAfter?: number }).retryAfter;
+      if (retryAfter === undefined) throw error;
+      await Bun.sleep(retryAfter * 1_000);
+    }
+  }
   const messages = page.messages ?? [];
   const seenAt = new Date().toISOString();
   const byTs = threads.get(threadTs) ?? new Map<string, Revision[]>();
@@ -158,7 +169,7 @@ const recorder = (async () => {
         console.error(`recorder: ${String(error)}`);
       }
     }
-    await Bun.sleep(400);
+    await Bun.sleep(1_000);
   }
 })();
 
@@ -205,6 +216,11 @@ function stopButton(blocks: ReadonlyArray<Block>): string | undefined {
     }
   }
   return undefined;
+}
+
+/** Slack folds line breaks in a block message's returned `text`; compare without whitespace runs. */
+function flat(text: string): string {
+  return text.replace(/\s+/g, " ").trim();
 }
 
 function sectionText(revision: Revision | undefined): string {
@@ -260,7 +276,7 @@ try {
     const model = (await t3.fetchThread(store.getTaskExecution(store.getStatusMessageView(turnA.operationId)?.taskId ?? "").threadId)).thread.modelSelection;
     check(
       "7 footer",
-      footerText.includes(model.model) && footerText.includes(model.instanceId) && sectionText(final) === (final?.text ?? "") && (final?.text ?? "").length > 0,
+      footerText.includes(model.model) && footerText.includes(model.instanceId) && flat(sectionText(final)) === flat(final?.text ?? "") && (final?.text ?? "").length > 0,
       `footer ${footerText}; snapshot ${model.model} · ${model.instanceId}`,
     );
     const done = revisions.at(-1)?.text ?? "";
