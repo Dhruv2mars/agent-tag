@@ -176,15 +176,32 @@ function defaultLaunchdHost(): LaunchdHost {
   return { run: runCommand, sleep: (milliseconds) => Bun.sleep(milliseconds), uid: requireMacOS(), plistPath: plistPath() };
 }
 
+/** Where the LaunchAgent sends stdout and stderr; launchd appends forever, so the service caps them. */
+export function launchAgentLogPaths(): { readonly stdoutPath: string; readonly stderrPath: string } {
+  const logDirectory = join(homedir(), "Library", "Logs", "AgentTag");
+  return {
+    stdoutPath: join(logDirectory, "service.stdout.log"),
+    stderrPath: join(logDirectory, "service.stderr.log"),
+  };
+}
+
+/**
+ * The log files to cap when this process is the LaunchAgent (launchd sets XPC_SERVICE_NAME to the
+ * label); none otherwise, so a foreground `agent-tag run` never touches the service's logs.
+ */
+export function launchAgentLogPathsForProcess(env: Readonly<Record<string, string | undefined>> = process.env): string[] {
+  if (env.XPC_SERVICE_NAME !== AGENT_TAG_LAUNCHD_LABEL) return [];
+  const { stdoutPath, stderrPath } = launchAgentLogPaths();
+  return [stdoutPath, stderrPath];
+}
+
 async function definition(configPathInput: string): Promise<LaunchAgentDefinition> {
   const configPath = resolve(configPathInput);
   await loadConfig(configPath);
-  const logDirectory = join(homedir(), "Library", "Logs", "AgentTag");
   return {
     label: AGENT_TAG_LAUNCHD_LABEL,
     ...(await currentServiceUnitPaths(configPath)),
-    stdoutPath: join(logDirectory, "service.stdout.log"),
-    stderrPath: join(logDirectory, "service.stderr.log"),
+    ...launchAgentLogPaths(),
   };
 }
 
@@ -329,13 +346,6 @@ export async function launchAgentUnitState(configPath: string): Promise<ServiceU
 }
 
 export function launchAgentLogsCommand(input: { readonly lines: number; readonly follow: boolean }): string[] {
-  const logDirectory = join(homedir(), "Library", "Logs", "AgentTag");
-  return [
-    "/usr/bin/tail",
-    "-n",
-    String(input.lines),
-    ...(input.follow ? ["-F"] : []),
-    join(logDirectory, "service.stdout.log"),
-    join(logDirectory, "service.stderr.log"),
-  ];
+  const { stdoutPath, stderrPath } = launchAgentLogPaths();
+  return ["/usr/bin/tail", "-n", String(input.lines), ...(input.follow ? ["-F"] : []), stdoutPath, stderrPath];
 }
