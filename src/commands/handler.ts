@@ -273,12 +273,14 @@ export class AgentTagCommands {
       commandOrderKey: ctx.messageTs,
       profileId: ctx.profileId,
       replies: {
-        ready: replies.restartReadyReply({
-          actorUserId: ctx.actorUserId,
-          rereads: profile?.threadContext.enabled ?? false,
-          forced: false,
-        }),
-        restarting: replies.restartingReply(ctx.actorUserId),
+        ready: (dropped) =>
+          replies.restartReadyReply({
+            actorUserId: ctx.actorUserId,
+            rereads: profile?.threadContext.enabled ?? false,
+            forced: false,
+            dropped,
+          }),
+        restarting: (dropped) => replies.restartingReply(ctx.actorUserId, dropped),
       },
       now: this.#now().toISOString(),
     });
