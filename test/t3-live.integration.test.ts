@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -7,10 +8,12 @@ import { z } from "zod";
 
 import { agentTagConfigSchema } from "../src/config.ts";
 import { classifyT3DispatchError } from "../src/t3/dispatch-errors.ts";
-import { AgentTagCoordinator } from "../src/coordinator.ts";
+import { AgentTagCoordinator, classifyT3TurnFailure } from "../src/coordinator.ts";
 import { ProviderSelectionError, validateConfiguredProviders } from "../src/policy/provider.ts";
 import { ArtifactError, readWorkspaceArtifact } from "../src/slack/uploads.ts";
 import { AgentTagStore } from "../src/store/store.ts";
+import { runTasksCommand } from "../src/tasks-cli.ts";
+import { T3Connection } from "../src/t3/connection.ts";
 import {
   dispatchT3Command,
   uploadT3Attachment,
@@ -23,6 +26,7 @@ import {
   pendingT3Approvals,
   watchT3Thread,
   type T3Command,
+  T3ThreadNotFoundError,
   type T3ThreadSnapshot,
 } from "../src/t3/gateway.ts";
 
@@ -46,13 +50,15 @@ async function removeFixtureDirectory(directory: string): Promise<void> {
   }
 }
 
-async function runGit(cwd: string, ...args: readonly string[]): Promise<void> {
+async function runGit(cwd: string, ...args: readonly string[]): Promise<string> {
   const process = Bun.spawn(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
-  const [exitCode, stderr] = await Promise.all([
+  const [exitCode, stdout, stderr] = await Promise.all([
     process.exited,
+    new Response(process.stdout).text(),
     new Response(process.stderr).text(),
   ]);
   if (exitCode !== 0) throw new Error(`git ${args.join(" ")} failed: ${stderr.trim()}`);
+  return stdout.trim();
 }
 
 if (!enabled) {
@@ -1085,6 +1091,285 @@ if (!enabled) {
         }
       },
       120_000,
+    );
+    test(
+      "lifecycle cleanup: tasks close + tasks cleanup --once retire a real thread, worktree and branch; a dirty worktree is kept (PR-N Done 5)",
+      async () => {
+        const fixtureRoot = await mkdtemp(join(tmpdir(), "agent-tag-t3-lifecycle-"));
+        const workspaceRoot = join(fixtureRoot, "repo");
+        const dataDirectory = join(fixtureRoot, "data");
+        const configPath = join(fixtureRoot, "agent-tag.json");
+        let store: AgentTagStore | null = null;
+        let projectId: string | null = null;
+        try {
+          await mkdir(workspaceRoot);
+          await mkdir(dataDirectory, { mode: 0o700 });
+          await writeFile(join(workspaceRoot, "README.md"), "# Agent Tag lifecycle fixture\n");
+          await runGit(workspaceRoot, "init", "-b", "main");
+          await runGit(workspaceRoot, "config", "user.name", "Agent Tag Integration");
+          await runGit(workspaceRoot, "config", "user.email", "agent-tag@example.invalid");
+          await runGit(workspaceRoot, "add", "README.md");
+          await runGit(workspaceRoot, "commit", "-m", "test: add lifecycle fixture");
+          const rawConfig = {
+            version: 1,
+            dataDir: dataDirectory,
+            t3: config,
+            slack: { workspaceId: "T1", appTokenFile: join(fixtureRoot, "slack-app-token"), botTokenFile: join(fixtureRoot, "slack-bot-token") },
+            access: { allowedUserIds: ["U1"], allowedChannelIds: ["C1"] },
+            profiles: [{
+              id: "engineering",
+              repositoryRoots: [workspaceRoot],
+              baseBranch: "main",
+              defaultProviderInstanceId: "claudeAgent",
+              defaultModel: "claude-sonnet-4-6",
+              runtimeMode: "approval-required",
+              isolation: { mode: "trusted-same-user", acknowledgedSharedMachineAccess: true },
+              externalWrites: { mode: "deny" },
+              memory: { shared: true, privateDm: false, retentionDays: 30 },
+            }],
+            routes: [{ conversationId: "C1", profileId: "engineering" }],
+            limits: { maxConcurrentTasks: 1 },
+          };
+          await writeFile(configPath, JSON.stringify(rawConfig));
+          const serviceConfig = agentTagConfigSchema.parse(rawConfig);
+          store = await AgentTagStore.open(join(dataDirectory, "agent-tag.sqlite"));
+          const coordinator = new AgentTagCoordinator({ config: serviceConfig, store, workerId: `live-lifecycle-${crypto.randomUUID()}`, pollMs: 250, stallMs: 60_000 });
+
+          // One real turn per task; each bootstraps its own worktree on agent-tag/<taskId>.
+          const tasks: Array<{ taskId: string; threadId: string; worktree: string; branch: string }> = [];
+          for (const threadTs of ["1000.000001", "2000.000001"]) {
+            const receipt = store.ingestSlackEvent({
+              deliveryId: crypto.randomUUID(),
+              eventKey: `C1:${threadTs}`,
+              workspaceId: "T1",
+              conversationId: "C1",
+              threadTs,
+              actorUserId: "U1",
+              conversationType: "channel",
+              profileId: "engineering",
+              repositoryRoot: workspaceRoot,
+              text: "Reply with exactly lifecycle-fixture-ok. Do not call tools, change files, or use the network.",
+              receivedAt: new Date().toISOString(),
+              sourceOrderKey: threadTs,
+            });
+            const binding = store.getTaskExecution(receipt.taskId);
+            projectId = binding.projectId;
+            expect(await coordinator.processNext()).toMatchObject({ kind: "completed", operationId: receipt.operationId });
+            for (let row = store.claimNextOutbox({ workerId: "slack-live", now: new Date().toISOString(), leaseMs: 10_000 }); row !== null;
+              row = store.claimNextOutbox({ workerId: "slack-live", now: new Date().toISOString(), leaseMs: 10_000 })) {
+              store.markOutboxDelivered({ outboxId: row.outboxId, workerId: "slack-live", slackMessageTs: `${threadTs}9`, now: new Date().toISOString() });
+            }
+            const snapshot = await fetchT3ThreadSnapshot({ config, threadId: binding.threadId });
+            const worktree = z.string().parse(snapshot.thread.worktreePath);
+            const branch = `agent-tag/${receipt.taskId}`;
+            expect(snapshot.thread.branch).toBe(branch);
+            expect(existsSync(worktree)).toBe(true);
+            tasks.push({ taskId: receipt.taskId, threadId: binding.threadId, worktree, branch });
+          }
+          const [clean, dirty] = tasks;
+          if (clean === undefined || dirty === undefined) throw new Error("fixture tasks were not created");
+          await writeFile(join(dirty.worktree, "uncommitted.txt"), "keep me\n");
+          store.close();
+          store = null;
+
+          const cli = async (argv: readonly string[]) => {
+            const lines: string[] = [];
+            const exitCode = await runTasksCommand(argv, { write: (line) => lines.push(line) });
+            return { exitCode, lines };
+          };
+          for (const task of tasks) {
+            expect(await cli(["close", task.taskId, configPath])).toEqual({
+              exitCode: 0,
+              lines: [`closed ${task.taskId} (generation 1); the next reply in its thread starts a new session`],
+            });
+          }
+          const cleanup = await cli(["cleanup", configPath, "--once"]);
+          console.log(cleanup.lines.join("\n"));
+          expect(cleanup.exitCode).toBe(0);
+          expect(cleanup.lines).toContain(`${clean.taskId} g1 (admin): worktree removed, branch deleted, done`);
+          expect(cleanup.lines.some((line) => line.startsWith(`${dirty.taskId} g1 (admin): worktree retained-dirty, branch unknown, kept until `))).toBe(true);
+
+          // The clean task: worktree, branch and T3 thread are gone.
+          expect(existsSync(clean.worktree)).toBe(false);
+          expect(await runGit(workspaceRoot, "branch", "--list", clean.branch)).toBe("");
+          await expect(fetchT3ThreadSnapshot({ config, threadId: clean.threadId })).rejects.toBeInstanceOf(T3ThreadNotFoundError);
+          const connection = new T3Connection({ config });
+          try {
+            const bindings = await connection.worktreeBindings();
+            expect(bindings.map((binding) => binding.threadId)).not.toContain(clean.threadId);
+            expect(bindings.map((binding) => binding.threadId)).not.toContain(dirty.threadId);
+          } finally {
+            await connection.close();
+          }
+
+          // The dirty task: its T3 thread is gone, its worktree and branch are kept.
+          expect(existsSync(join(dirty.worktree, "uncommitted.txt"))).toBe(true);
+          expect(await runGit(workspaceRoot, "branch", "--list", dirty.branch)).not.toBe("");
+          store = await AgentTagStore.open(join(dataDirectory, "agent-tag.sqlite"));
+          const states = Object.fromEntries(
+            store.listPendingRetiredThreads().map((row) => [row.taskId, row.worktreeState]),
+          );
+          expect(states).toEqual({ [dirty.taskId]: "retained-dirty" });
+          expect(store.lifecycleCounts()).toMatchObject({ closedTasks: 2, retainedDirty: 1, cleanupFailures: 0 });
+        } finally {
+          store?.close();
+          if (projectId !== null) {
+            await dispatchT3Command({
+              config,
+              command: { type: "project.delete", commandId: crypto.randomUUID(), projectId, force: true },
+            }).catch(() => undefined);
+          }
+          if (!fixtureRoot.startsWith(`${tmpdir()}/agent-tag-t3-lifecycle-`)) {
+            throw new Error(`refusing to remove unexpected fixture path ${fixtureRoot}`);
+          }
+          await removeFixtureDirectory(fixtureRoot);
+        }
+      },
+      240_000,
+    );
+
+    /**
+     * PR-P2 Done 7: what T3 0.0.45 does with a model change on a started thread. Starts a Claude
+     * thread on `from`, then runs `act` on it; the fixture project is deleted afterwards.
+     */
+    async function withStartedClaudeThread(
+      from: string,
+      act: (input: { readonly threadId: string; readonly turn: (model: { instanceId: string; model: string }, text: string) => Promise<void> }) => Promise<void>,
+    ): Promise<void> {
+      const workspaceRoot = await mkdtemp(join(tmpdir(), "agent-tag-t3-switch-"));
+      const projectId = crypto.randomUUID();
+      const threadId = crypto.randomUUID();
+      let created = false;
+      try {
+        await writeFile(join(workspaceRoot, "README.md"), "# Agent Tag model switch fixture\n");
+        await runGit(workspaceRoot, "init", "-b", "main");
+        await runGit(workspaceRoot, "config", "user.name", "Agent Tag Integration");
+        await runGit(workspaceRoot, "config", "user.email", "agent-tag@example.invalid");
+        await runGit(workspaceRoot, "add", "README.md");
+        await runGit(workspaceRoot, "commit", "-m", "test: add model switch fixture");
+        await dispatchT3Command({
+          config,
+          command: {
+            type: "project.create",
+            commandId: crypto.randomUUID(),
+            projectId,
+            title: "Agent Tag model switch fixture",
+            workspaceRoot,
+            createdAt: new Date().toISOString(),
+          },
+        });
+        created = true;
+        const createdAt = new Date().toISOString();
+        const start = { instanceId: "claudeAgent", model: from };
+        await dispatchT3Command({
+          config,
+          command: {
+            type: "thread.turn.start",
+            commandId: crypto.randomUUID(),
+            threadId,
+            message: {
+              messageId: crypto.randomUUID(),
+              role: "user",
+              text: "Reply with exactly switch-one-ok. Do not call tools, change files, or use the network.",
+              attachments: [],
+            },
+            modelSelection: start,
+            titleSeed: "Agent Tag model switch fixture",
+            runtimeMode: "approval-required",
+            interactionMode: "default",
+            bootstrap: {
+              createThread: {
+                projectId,
+                title: "Agent Tag model switch fixture",
+                modelSelection: start,
+                runtimeMode: "approval-required",
+                interactionMode: "default",
+                branch: "main",
+                worktreePath: workspaceRoot,
+                createdAt,
+              },
+              runSetupScript: false,
+            },
+            createdAt,
+          },
+        });
+        await waitForSnapshot(threadId, (candidate) => candidate.thread.latestTurn?.state === "completed", 120_000);
+        await act({
+          threadId,
+          turn: async (modelSelection, text) => {
+            await dispatchT3Command({
+              config,
+              command: {
+                type: "thread.turn.start",
+                commandId: crypto.randomUUID(),
+                threadId,
+                message: { messageId: crypto.randomUUID(), role: "user", text, attachments: [] },
+                modelSelection,
+                runtimeMode: "approval-required",
+                interactionMode: "default",
+                createdAt: new Date().toISOString(),
+              },
+            });
+          },
+        });
+      } finally {
+        if (created) {
+          await dispatchT3Command({
+            config,
+            command: { type: "project.delete", commandId: crypto.randomUUID(), projectId, force: true },
+          });
+        }
+        if (!workspaceRoot.startsWith(`${tmpdir()}/agent-tag-t3-switch-`)) {
+          throw new Error(`refusing to remove unexpected fixture path ${workspaceRoot}`);
+        }
+        await removeFixtureDirectory(workspaceRoot);
+      }
+    }
+
+    test(
+      "moves a started thread to another model of the same driver in place, and the next turn runs on it",
+      async () => {
+        await withStartedClaudeThread("claude-haiku-4-5", async ({ threadId, turn }) => {
+          const target = { instanceId: "claudeAgent", model: "claude-sonnet-4-6" };
+          await dispatchT3Command({
+            config,
+            command: { type: "thread.meta.update", commandId: crypto.randomUUID(), threadId, modelSelection: target },
+          });
+          await turn(target, "Reply with exactly switch-two-ok. Do not call tools, change files, or use the network.");
+          const snapshot = await waitForSnapshot(
+            threadId,
+            (candidate) =>
+              candidate.thread.latestTurn?.state === "completed" &&
+              candidate.thread.messages.some((message) => message.role === "assistant" && !message.streaming && message.text.includes("switch-two-ok")),
+            120_000,
+          );
+          expect(snapshot.thread.modelSelection).toEqual(target);
+          expect(snapshot.thread.session).toMatchObject({ providerInstanceId: "claudeAgent", lastError: null });
+          expect(snapshot.thread.activities.some((activity) => activity.kind === "provider.turn.start.failed")).toBe(false);
+        });
+      },
+      300_000,
+    );
+
+    test(
+      "refuses a turn that moves a started thread to another driver with provider.turn.start.failed",
+      async () => {
+        await withStartedClaudeThread("claude-haiku-4-5", async ({ threadId, turn }) => {
+          await turn({ instanceId: "codex", model: "gpt-5.6-sol" }, "Reply with exactly switch-cross-ok.");
+          const snapshot = await waitForSnapshot(
+            threadId,
+            (candidate) => candidate.thread.activities.some((activity) => activity.kind === "provider.turn.start.failed"),
+            60_000,
+          );
+          const failure = snapshot.thread.activities.find((activity) => activity.kind === "provider.turn.start.failed")!;
+          const detail = z.object({ detail: z.string() }).parse(failure.payload).detail;
+          // Agent Tag reads this as a refused switch, so the thread keeps its model (Done 6).
+          expect(classifyT3TurnFailure(detail).code).toBe("T3ModelSwitchRejected");
+          expect(snapshot.thread.modelSelection).toEqual({ instanceId: "claudeAgent", model: "claude-haiku-4-5" });
+          console.log(`provider.turn.start.failed detail: ${detail}`);
+        });
+      },
+      240_000,
     );
   });
 }

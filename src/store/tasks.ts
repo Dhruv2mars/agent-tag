@@ -418,21 +418,30 @@ export interface SetTaskModelSelectionInput {
   /** The selection the user chose; null returns the task to the route or profile default. */
   readonly selection: T3ModelSelection | null;
   readonly selectedBy: string;
+  /** The Slack event that made the choice; defaults to the task id. */
+  readonly correlationId?: string;
   readonly now: string;
 }
 
-/** Records a user's model choice for a task's next turns, audited as `task.model.selected`. */
+/**
+ * Records a user's model choice for a task's next turns, audited as `task.model.selected`. A closed
+ * task keeps the choice for the session its next request reopens.
+ */
 export function setTaskModelSelection(database: Database, input: SetTaskModelSelectionInput): void {
   const taskId = requiredId(input.taskId, "taskId");
   const selectedBy = requiredId(input.selectedBy, "selectedBy");
   const now = isoDateTime.parse(input.now);
   const json = selectionJson(input.selection);
   database.transaction(() => {
-    const current = taskModelRow(database, taskId);
+    const row = z.object({ model_selection_json: z.string().nullable() }).nullable().parse(
+      database.query("SELECT model_selection_json FROM tasks WHERE task_id = ?").get(taskId),
+    );
+    if (row === null) throw new Error("task not found");
+    const current = { desired: storedModelSelection(row.model_selection_json) };
     database
       .query(
         `UPDATE tasks SET model_selection_json = ?, model_selected_by = ?, model_selected_at = ?, updated_at = ?
-         WHERE task_id = ? AND state = 'active'`,
+         WHERE task_id = ?`,
       )
       .run(json, selectedBy, now, now, taskId);
     writeAudit(database, {
@@ -443,11 +452,53 @@ export function setTaskModelSelection(database: Database, input: SetTaskModelSel
       target: taskId,
       action: "task.model.selected",
       result: "accepted",
-      correlationId: taskId,
+      correlationId: input.correlationId === undefined ? taskId : requiredId(input.correlationId, "correlationId"),
       metadata: selectionMetadata(input.selection, current.desired),
       createdAt: now,
     });
   }).immediate();
+}
+
+export interface RecordModelDeniedInput {
+  readonly taskId: string;
+  readonly actorUserId: string;
+  /** The model asked for, when it names one. */
+  readonly target: T3ModelSelection | null;
+  /** The thread's model at the time, kept as `previous*`. */
+  readonly current: T3ModelSelection | null;
+  /** A stable refusal code (`SwitchRefusalCode`). */
+  readonly code: string;
+  readonly correlationId: string;
+  readonly now: string;
+}
+
+/** Audits a model switch the thread did not take (`task.model.denied`); no task column changes. */
+export function recordModelDenied(database: Database, input: RecordModelDeniedInput): void {
+  writeAudit(database, {
+    actorType: "slack-user",
+    actorId: requiredId(input.actorUserId, "actorUserId"),
+    authority: "task-model",
+    source: "slack",
+    target: requiredId(input.taskId, "taskId"),
+    action: "task.model.denied",
+    result: "refused",
+    correlationId: requiredId(input.correlationId, "correlationId"),
+    metadata: selectionMetadata(input.target, input.current, requiredId(input.code, "code")),
+    createdAt: isoDateTime.parse(input.now),
+  });
+}
+
+/**
+ * Whether a turn of the task is claimed or was sent to T3 and awaits replay, so it may have started the
+ * thread before `t3_thread_started_at` was recorded.
+ */
+export function hasInflightOperation(database: Database, taskIdInput: string): boolean {
+  return database
+    .query(
+      `SELECT 1 FROM operations WHERE task_id = ?
+         AND (status = 'inflight' OR (status = 'pending' AND t3_turn_dispatched_at IS NOT NULL)) LIMIT 1`,
+    )
+    .get(requiredId(taskIdInput, "taskId")) !== null;
 }
 
 export interface RecordAppliedModelSelectionInput {

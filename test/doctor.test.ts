@@ -5,6 +5,7 @@ import { join } from "node:path";
 
 import {
   checkBunVersion,
+  checkLifecycle,
   checkServiceState,
   compareVersions,
   type DoctorCheck,
@@ -759,6 +760,35 @@ describe("agent-tag doctor", () => {
       dependencies: dependencies(world, undefined),
     });
     expect(check(report, "service").status).toBe("skip");
+  });
+});
+
+describe("lifecycle check", () => {
+  const counts = {
+    activeTasks: 3,
+    releasedTasks: 1,
+    closedTasks: 4,
+    pendingCleanup: 2,
+    retainedDirty: 0,
+    oldestRetainUntil: null,
+    cleanupFailures: 0,
+  };
+
+  test("summarises tasks and retired threads", () => {
+    expect(checkLifecycle(counts)).toEqual({
+      id: "lifecycle",
+      status: "pass",
+      summary: "tasks: 3 active (1 released), 4 closed; retired threads: 2 pending cleanup, no dirty worktrees kept, 0 cleanup failure(s)",
+    });
+    expect(checkLifecycle({ ...counts, retainedDirty: 2, oldestRetainUntil: "2026-11-01T00:00:00.000Z" }).summary)
+      .toContain("2 dirty worktree(s) kept, oldest until 2026-11-01T00:00:00.000Z");
+  });
+
+  test("warns on cleanup failures and points at the audit rows", () => {
+    expect(checkLifecycle({ ...counts, cleanupFailures: 1 })).toMatchObject({
+      status: "warn",
+      hint: expect.stringContaining("task.cleanup.failed"),
+    });
   });
 });
 

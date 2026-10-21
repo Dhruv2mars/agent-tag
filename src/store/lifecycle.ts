@@ -83,6 +83,15 @@ export function retireCurrentThread(
   if (task.t3_project_id === null || task.t3_thread_id === null) return;
   const generation = task.session_generation;
   const created = task.t3_thread_started_at !== null;
+  // A session that adopted the previous generation's worktree ran on that generation's branch.
+  const adopted = z.object({ branch: nonEmpty }).nullable().parse(
+    database
+      .query(
+        `SELECT branch FROM task_retired_t3_threads WHERE task_id = ? AND generation < ? AND worktree_state = 'adopted'
+         AND generation = (SELECT MAX(generation) FROM task_retired_t3_threads WHERE task_id = ? AND generation < ?)`,
+      )
+      .get(taskId, generation, taskId, generation),
+  );
   database
     .query(
       `INSERT INTO task_retired_t3_threads (
@@ -97,7 +106,7 @@ export function retireCurrentThread(
       task.t3_project_id,
       task.t3_thread_id,
       task.repository_root,
-      taskBranchName(taskId, generation),
+      adopted?.branch ?? taskBranchName(taskId, generation),
       input.reason,
       now,
       created ? 1 : 0,

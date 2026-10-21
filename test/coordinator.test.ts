@@ -1,5 +1,6 @@
+import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -1394,5 +1395,164 @@ describe("task lifecycle reopen", () => {
       }
       await rm(directory, { recursive: true });
     }
+  });
+});
+
+describe("task lifecycle resume workspace", () => {
+  /**
+   * Runs one turn, closes the task, lets `retire` shape the retired generation-1 row the way cleanup
+   * left it, then reopens with two more turns and closes again. Returns every turn.start, the retired
+   * generation-1 row afterwards and the branch recorded for generation 2.
+   */
+  async function reopenAfter(
+    retire: (input: { readonly database: Database; readonly taskId: string; readonly directory: string }) => Promise<void>,
+  ): Promise<{
+    readonly taskId: string;
+    readonly turns: Extract<T3Command, { type: "thread.turn.start" }>[];
+    readonly retired: Record<string, unknown> | null;
+    readonly secondBranch: unknown;
+  }> {
+    const directory = await mkdtemp(join(tmpdir(), "agent-tag-coordinator-resume-"));
+    const path = join(directory, "agent-tag.sqlite");
+    const store = await AgentTagStore.open(path);
+    const database = new Database(path, { strict: true });
+    const commands: T3Command[] = [];
+    let messageId: string | undefined;
+    const t3: T3CoordinatorGateway = {
+      dispatch: async (command) => {
+        commands.push(command);
+        if (command.type === "thread.turn.start") messageId = command.message.messageId;
+        return { sequence: commands.length };
+      },
+      fetchThread: async (threadId) => completedSnapshot(threadId, "done", messageId),
+    };
+    const coordinator = new AgentTagCoordinator({ config, store, t3, workerId: "worker-a", now: () => new Date(now), sleep: async () => {} });
+    const event = (n: number) => ({
+      deliveryId: `delivery-${n}`,
+      eventKey: `C1:1000.00000${n}`,
+      workspaceId: "T1",
+      conversationId: "C1",
+      threadTs: "1000.000001",
+      actorUserId: "U1",
+      conversationType: "channel" as const,
+      profileId: "engineering",
+      repositoryRoot: "/srv/repos/example",
+      text: `request ${n}`,
+      receivedAt: now,
+      sourceOrderKey: `1000.00000${n}`,
+    });
+    const drainOutbox = () => {
+      for (let row = store.claimNextOutbox({ workerId: "slack", now, leaseMs: 10_000 }); row !== null;
+        row = store.claimNextOutbox({ workerId: "slack", now, leaseMs: 10_000 })) {
+        store.markOutboxDelivered({ outboxId: row.outboxId, workerId: "slack", slackMessageTs: "1000.999999", now });
+      }
+    };
+    try {
+      const { taskId } = store.ingestSlackEvent(event(1));
+      expect((await coordinator.processNext()).kind).toBe("completed");
+      drainOutbox();
+      expect(store.closeTask({ taskId, reason: "admin", actorId: "test", now })).toMatchObject({ kind: "closed" });
+      await retire({ database, taskId, directory });
+      for (const n of [2, 3]) {
+        store.ingestSlackEvent(event(n));
+        expect((await coordinator.processNext()).kind).toBe("completed");
+        drainOutbox();
+      }
+      const turns = commands.filter((command): command is Extract<T3Command, { type: "thread.turn.start" }> => command.type === "thread.turn.start");
+      expect(turns).toHaveLength(3);
+      const retired = database
+        .query<Record<string, unknown>, [string]>("SELECT * FROM task_retired_t3_threads WHERE task_id = ? AND generation = 1")
+        .get(taskId);
+      expect(store.closeTask({ taskId, reason: "admin", actorId: "test", now })).toMatchObject({ kind: "closed" });
+      const secondBranch = database
+        .query<{ branch: string }, [string]>("SELECT branch FROM task_retired_t3_threads WHERE task_id = ? AND generation = 2")
+        .get(taskId)?.branch;
+      return { taskId, turns, retired, secondBranch };
+    } finally {
+      database.close();
+      store.close();
+      if (!directory.startsWith(`${tmpdir()}/agent-tag-coordinator-resume-`)) {
+        throw new Error(`refusing to remove unexpected fixture path ${directory}`);
+      }
+      await rm(directory, { recursive: true });
+    }
+  }
+
+  const setRetired = (database: Database, taskId: string, columns: Record<string, string | null>) => {
+    const names = Object.keys(columns);
+    database
+      .query(`UPDATE task_retired_t3_threads SET ${names.map((name) => `${name} = ?`).join(", ")} WHERE task_id = ? AND generation = 1`)
+      .run(...names.map((name) => columns[name] ?? null), taskId);
+  };
+
+  test("a retained dirty worktree is adopted: same branch and path, no new worktree, one resume note", async () => {
+    let worktree = "";
+    const { taskId, turns, retired, secondBranch } = await reopenAfter(async ({ database, taskId, directory }) => {
+      worktree = join(directory, "wt");
+      await mkdir(worktree);
+      setRetired(database, taskId, {
+        branch: `agent-tag/${taskId}`,
+        worktree_path: worktree,
+        worktree_state: "retained-dirty",
+        retain_until: "2026-12-01T00:00:00.000Z",
+        next_attempt_at: "2026-12-01T00:00:00.000Z",
+        thread_deleted_at: now,
+      });
+    });
+    const [, reopened, next] = turns;
+    expect(reopened?.bootstrap?.createThread).toMatchObject({ branch: `agent-tag/${taskId}`, worktreePath: worktree });
+    expect(reopened?.bootstrap?.prepareWorktree).toBeUndefined();
+    expect(reopened?.message.text).toContain(
+      `[agent-tag] This Slack thread was resumed after its previous session closed. Workspace: reused the previous session's worktree on agent-tag/${taskId}, uncommitted changes included.`,
+    );
+    expect(next?.bootstrap).toBeUndefined();
+    expect(next?.message.text).not.toContain("This Slack thread was resumed");
+    // Claimed before the dispatch, so cleanup can no longer remove it.
+    expect(retired).toMatchObject({ worktree_state: "adopted", branch_state: "adopted", retain_until: null, next_attempt_at: null, completed_at: now });
+    // The adopting session ran on the adopted branch, so its own retirement (and cleanup) uses that one.
+    expect(secondBranch).toBe(`agent-tag/${taskId}`);
+  });
+
+  test("a retained worktree that is gone from disk continues from its branch instead", async () => {
+    const { taskId, turns } = await reopenAfter(async ({ database, taskId, directory }) => {
+      setRetired(database, taskId, { branch: `agent-tag/${taskId}`, worktree_path: join(directory, "missing"), worktree_state: "retained-dirty" });
+    });
+    expect(turns[1]?.bootstrap?.prepareWorktree).toMatchObject({ baseBranch: `agent-tag/${taskId}`, branch: `agent-tag/${taskId}-g2` });
+    expect(turns[1]?.message.text).toContain(`Workspace: a new worktree on agent-tag/${taskId}-g2, continued from branch agent-tag/${taskId}.`);
+  });
+
+  for (const branchState of ["kept-commits", "kept-pr"]) {
+    test(`a ${branchState} branch is continued on a new generation branch`, async () => {
+      const { taskId, turns, secondBranch } = await reopenAfter(async ({ database, taskId }) => {
+        setRetired(database, taskId, { branch: `agent-tag/${taskId}`, worktree_state: "removed", branch_state: branchState, completed_at: now });
+      });
+      expect(secondBranch).toBe(`agent-tag/${taskId}-g2`);
+      expect(turns[1]?.bootstrap?.createThread).toMatchObject({ branch: null, worktreePath: null });
+      expect(turns[1]?.bootstrap?.prepareWorktree).toMatchObject({
+        projectCwd: "/srv/repos/example",
+        baseBranch: `agent-tag/${taskId}`,
+        branch: `agent-tag/${taskId}-g2`,
+      });
+      expect(turns[1]?.message.text).toContain("continued from branch");
+      expect(turns[2]?.message.text).not.toContain("This Slack thread was resumed");
+    });
+  }
+
+  test("a cleaned-up generation starts fresh from the base branch and says so", async () => {
+    const { taskId, turns } = await reopenAfter(async ({ database, taskId }) => {
+      setRetired(database, taskId, { branch: `agent-tag/${taskId}`, worktree_state: "removed", branch_state: "deleted", completed_at: now });
+    });
+    expect(turns[1]?.bootstrap?.prepareWorktree).toMatchObject({ baseBranch: "main", branch: `agent-tag/${taskId}-g2` });
+    expect(turns[1]?.message.text).toContain(`Workspace: a fresh worktree on agent-tag/${taskId}-g2 from main.`);
+  });
+
+  test("a session !restart retired gets no resume note and no adoption", async () => {
+    const { taskId, turns } = await reopenAfter(async ({ database, taskId, directory }) => {
+      const worktree = join(directory, "wt");
+      await mkdir(worktree);
+      setRetired(database, taskId, { reason: "restart", branch: `agent-tag/${taskId}`, worktree_path: worktree, worktree_state: "retained-dirty" });
+    });
+    expect(turns[1]?.bootstrap?.prepareWorktree).toMatchObject({ baseBranch: "main", branch: `agent-tag/${taskId}-g2` });
+    expect(turns[1]?.message.text).not.toContain("This Slack thread was resumed");
   });
 });

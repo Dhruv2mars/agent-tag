@@ -568,6 +568,11 @@ const lifecycleSchema = z
     closeIdleAfterHours: z.number().int().min(1).max(24 * 90).default(168),
     sweepIntervalSeconds: z.number().int().min(10).max(3_600).default(60),
     maxClosesPerSweep: z.number().int().min(1).max(500).default(20),
+    /** A closed session's dirty worktree is kept this long for a reopen to pick up; null keeps it forever. */
+    dirtyWorktreeRetentionDays: z.number().int().min(1).max(365).nullable().default(14),
+    /** Delete a retired session's local branch with `git branch -d` when it has no commits or PR. */
+    deleteEmptyBranches: z.boolean().default(true),
+    maxCleanupsPerSweep: z.number().int().min(1).max(100).default(5),
   })
   .strict()
   .prefault({});

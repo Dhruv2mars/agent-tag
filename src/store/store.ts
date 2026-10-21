@@ -17,6 +17,7 @@
  *   reactions.ts    Slack reaction queue (instant ack)
  *   status.ts       live status message per turn (state, progress, throttled edits)
  *   lifecycle.ts    task idle/operator close, retired T3 threads, task listing
+ *   cleanup.ts      retired-thread cleanup queue, worktree adoption, lifecycle counts
  *   schema.ts       zod schemas                            types.ts        public types (re-exported)
  */
 import type { Database } from "bun:sqlite";
@@ -66,6 +67,7 @@ import * as fileUploads from "./file-uploads.ts";
 import * as status from "./status.ts";
 import * as lifecycle from "./lifecycle.ts";
 import * as restart from "./restart.ts";
+import * as cleanup from "./cleanup.ts";
 
 export type { AuditAction } from "./schema.ts";
 export type {
@@ -150,6 +152,17 @@ export type {
   TaskCloseReason,
   TaskSummary,
 } from "./lifecycle.ts";
+export type {
+  BranchState,
+  ClaimRetiredThreadInput,
+  LifecycleCounts,
+  RecordRetiredStepInput,
+  ResumeCandidate,
+  RetiredThread,
+  RetiredThreadPatch,
+  WorktreeState,
+} from "./cleanup.ts";
+export { RetiredLeaseLostError } from "./cleanup.ts";
 export type {
   ClaimNextOperationInput,
   RenewOperationLeaseInput,
@@ -637,6 +650,30 @@ export class AgentTagStore {
     return lifecycle.listTasks(this.#database, input);
   }
 
+  claimNextRetiredThread(input: cleanup.ClaimRetiredThreadInput): cleanup.RetiredThread | null {
+    return cleanup.claimNextRetiredThread(this.#database, input);
+  }
+
+  recordRetiredStep(input: cleanup.RecordRetiredStepInput): cleanup.RetiredThread {
+    return cleanup.recordRetiredStep(this.#database, input);
+  }
+
+  listPendingRetiredThreads(): readonly cleanup.RetiredThread[] {
+    return cleanup.listPendingRetiredThreads(this.#database);
+  }
+
+  getResumeCandidate(taskId: string, generation: number): cleanup.ResumeCandidate | null {
+    return cleanup.getResumeCandidate(this.#database, taskId, generation);
+  }
+
+  adoptRetiredWorktree(input: { readonly taskId: string; readonly generation: number; readonly now: string }): boolean {
+    return cleanup.adoptRetiredWorktree(this.#database, input);
+  }
+
+  lifecycleCounts(): cleanup.LifecycleCounts {
+    return cleanup.lifecycleCounts(this.#database);
+  }
+
   getTaskExecution(taskIdInput: string): TaskExecutionBinding {
     return tasks.getTaskExecution(this.#database, taskIdInput);
   }
@@ -647,6 +684,14 @@ export class AgentTagStore {
 
   setTaskModelSelection(input: tasks.SetTaskModelSelectionInput): void {
     tasks.setTaskModelSelection(this.#database, input);
+  }
+
+  recordModelDenied(input: tasks.RecordModelDeniedInput): void {
+    tasks.recordModelDenied(this.#database, input);
+  }
+
+  hasInflightOperation(taskId: string): boolean {
+    return tasks.hasInflightOperation(this.#database, taskId);
   }
 
   recordAppliedModelSelection(input: tasks.RecordAppliedModelSelectionInput): boolean {
