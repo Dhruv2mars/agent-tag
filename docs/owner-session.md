@@ -18,9 +18,9 @@ Dhruv's rule (2026-10-21): an install that answers in Slack runs only `codex` / 
 
 - every profile (including `routine-fail` in step 1): `"defaultProviderInstanceId": "codex"`, `"defaultModel": "gpt-6-luna"`;
 - no route `defaultModel`;
-- `allowedModels` on the session profile: `{ "instanceId": "codex", "model": "gpt-6-luna", "label": "Luna", "aliases": ["luna"] }`, plus `{ "instanceId": "claudeAgent", "model": "claude-haiku-5-5", "label": "Haiku 5.5", "aliases": ["haiku"] }` only if step 0 shows T3 lists `claude-haiku-5-5`.
+- `allowedModels` on every profile: `{ "instanceId": "codex", "model": "gpt-6-luna", "label": "Luna", "aliases": ["luna"] }` and `{ "instanceId": "claudeAgent", "model": "claude-haiku-5-5", "label": "Haiku 5.5", "aliases": ["haiku"] }`.
 
-On 2026-10-21, T3 0.0.45's `claudeAgent` catalog listed `claude-haiku-4-5` and no `claude-haiku-5-5`. Agent Tag refuses a profile default T3 does not list (`model-missing`, so the service does not start), so the Claude model is never a profile default here. Using `claude-haiku-4-5` instead needs Dhruv's decision O-5 in step 12. Until then it is not used.
+T3 0.0.45 does not list `claude-haiku-5-5` (its `claudeAgent` catalog stops at `claude-haiku-4-5`, checked 2026-10-21), so the session runs on the T3 v0.1.1 pin from lane T1. `claude-haiku-4-5` is never a substitute.
 
 The agent keeps `agent-tag audit CONFIG` running into a file for the whole session and quotes only action names, IDs and timestamps from it in evidence: never message text, tokens or file contents.
 
@@ -45,10 +45,11 @@ Run them in this order. Step 1 starts first because its routines need time to fi
 - **Expect:**
   - `agent-tag version --json` names the rc build.
   - `agent-tag doctor CONFIG --json`: every check passes and there is no `missing_scope`.
-  - `agent-tag t3 status CONFIG` reports T3 `0.0.45`.
+  - `agent-tag t3 status CONFIG` reports the pinned T3 `v0.1.1` (the version in `t3.lock.json`), installed and verified.
   - `agent-tag security audit CONFIG --json` has no findings. `bun run scan:secrets` passes on the release commit.
   - `agent-tag service status CONFIG` shows the service running.
-  - The model rule holds: `jq '[.profiles[] | [.defaultProviderInstanceId, .defaultModel]], [.profiles[].allowedModels[]? | [.instanceId, .model]], [.routes[].defaultModel? | select(. != null)]' CONFIG` prints only `codex`/`gpt-6-luna` and, if present, `claudeAgent`/`claude-haiku-5-5`, and no route default. `agent-tag doctor CONFIG --json` reports `gpt-6-luna` as `available`; the `claude-haiku-5-5` entry stays in `allowedModels` only if doctor reports it `available`, otherwise the agent removes it and restarts.
+  - The model rule holds: `jq '[.profiles[] | [.defaultProviderInstanceId, .defaultModel]], [.profiles[].allowedModels[]? | [.instanceId, .model]], [.routes[].defaultModel? | select(. != null)]' CONFIG` prints only `codex`/`gpt-6-luna` and `claudeAgent`/`claude-haiku-5-5`, and no route default.
+  - T3 lists both slugs and can serve them: `agent-tag doctor CONFIG --json` reports both `allowedModels` entries as `available` (doctor checks each against the live T3 catalog). If either is unavailable, stop the session.
 - **Agent captures:** the outputs above, with any secret-looking values redacted → `docs/evidence/<date>-owner-preflight.md`. The Build string for every row in this session comes from `version --json`.
 - **Fallback:** if `doctor` fails, stop the session and fix that first. Nothing after this step is valid on a broken install.
 
@@ -154,15 +155,14 @@ Run them in this order. Step 1 starts first because its routines need time to fi
 - **Matrix rows:** MOD-01
 - **Who:** agent-CU (owner account)
 - **Models:** only the two in [Models](#models-slack-model-rule). With one allowed model per driver, a same-driver switch in place cannot run in Slack; that half of MOD-01 rests on the live T3 run in `docs/evidence/2026-10-21-model-switch.md`.
-- **Send (always):**
+- **Send:**
   1. In a new thread: `@Agent Tag use luna: reply with exactly ok`.
   2. In that thread, now started: `@Agent Tag use opus`. Opus is not in `allowedModels`, so this is refused and runs nothing.
-- **Send (only if `claude-haiku-5-5` passed step 0):**
   3. In a new thread: `@Agent Tag use haiku: reply with exactly ok`.
   4. In the started Codex thread from 1: `@Agent Tag use haiku`.
-- **Expect:** 1: the reply's footer reads `gpt-6-luna · codex`. 2: refused as not allowed, the reply lists Luna (and Haiku 5.5), and the thread keeps `gpt-6-luna`. 3: the turn runs on Haiku 5.5 and its footer says so. 4: refused as a cross-driver switch on a started thread; the thread keeps `gpt-6-luna`.
+- **Expect:** 1: the reply's footer reads `gpt-6-luna · codex`. 2: refused as not allowed, the reply lists Luna and Haiku 5.5, and the thread keeps `gpt-6-luna`. 3: the turn runs on `claudeAgent`/`claude-haiku-5-5` and its footer says so. 4: refused as a cross-driver switch on a started thread; the thread keeps `gpt-6-luna`.
 - **Agent captures:** `task.model.selected`, `task.model.denied` (with codes) → `docs/evidence/<date>-owner-p2.md`.
-- **Fallback:** `FAIL` MOD-01, continue. Without steps 3 and 4, the Slack half of MOD-01 cannot show the cross-driver refusal, and MOD-01 stays `UNCONFIRMED` unless Dhruv accepts O-5.
+- **Fallback:** `FAIL` MOD-01, continue.
 
 ### 10. Channel-members access (Q1)
 
@@ -194,7 +194,6 @@ Run them in this order. Step 1 starts first because its routines need time to fi
   - **O-2** T3-05 linux-x64 stays `UNCONFIRMED` without P4 [yes].
   - **O-3** v0.1.0 claims darwin-arm64 as live-verified and the other three targets as smoke-tested only [yes].
   - **O-4** the GA claim is "self-hosted, single trusted team" [yes].
-  - **O-5** if T3 does not list `claude-haiku-5-5`: allow `claudeAgent`/`claude-haiku-4-5` as the session's Claude model and re-run step 9 parts 3 and 4, or leave MOD-01 `UNCONFIRMED` [leave it].
   - **LIC-01** provider terms in `docs/provider-licensing.md` are acceptable for this use [yes].
   - **PR-I questions:** Cancel/Stop follows `approvers` [no]; `allowSelfApproval` defaults to false in `approval-required` [no]; approval cards are ephemeral [no, public].
   - **Pull requests:** `pullRequests.mode` default for new profiles, `auto` or `button` [auto].

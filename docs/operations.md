@@ -260,6 +260,15 @@ bun run status -- /absolute/path/to/agent-tag.json
 
 This status covers only events already stored by Agent Tag. [Slack's Events API](https://docs.slack.dev/apis/events-api/) is best effort, and [Socket Mode requires an acknowledgement](https://docs.slack.dev/apis/events-api/using-socket-mode/). A sleeping or disconnected host may miss events that never enter the local store; `status` cannot detect those gaps. After an outage, compare the affected Slack threads with the Agent Tag audit log before claiming recovery.
 
+## Upgrading
+
+1. Back up the store (see [Audit and backup](#audit-and-backup)): `agent-tag backup CONFIG /private/backup/agent-tag-before-upgrade.sqlite`.
+2. Replace the code: `agent-tag update` for a binary install ([install](install.md#version-and-update)), or check out the new commit and run `bun install --frozen-lockfile` in a source checkout.
+3. Restart onto it: `agent-tag service upgrade CONFIG`. It reruns `doctor`, rewrites a stale unit and restarts the service. The new release applies its store migrations when it opens the database.
+4. Run `agent-tag doctor CONFIG` and `agent-tag status CONFIG`.
+
+An older release does not refuse a store that a newer one has migrated, and migrations are not reversible. To roll back, restore the step 1 backup into a new data directory, point the config at it and start the older release; work done after the upgrade is lost.
+
 ## Audit and backup
 
 Export the complete structured audit log as newline-delimited JSON. [Audit actions](audit-actions.md) lists every action, when it is written, and its metadata keys.
