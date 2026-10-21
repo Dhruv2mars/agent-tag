@@ -38,8 +38,12 @@ test("the checked-in Slack manifest is the least-privilege runtime contract", as
   expect(manifest.oauth_config.scopes.bot).toEqual([
     "app_mentions:read",
     "channels:history",
+    "channels:read",
     "chat:write",
+    "files:read",
+    "files:write",
     "groups:history",
+    "groups:read",
     "im:history",
     "reactions:write",
     "users:read",
