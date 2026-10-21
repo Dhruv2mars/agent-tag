@@ -639,6 +639,14 @@ export class AgentTagStore {
     tasks.setTaskModelSelection(this.#database, input);
   }
 
+  recordModelDenied(input: tasks.RecordModelDeniedInput): void {
+    tasks.recordModelDenied(this.#database, input);
+  }
+
+  hasInflightOperation(taskId: string): boolean {
+    return tasks.hasInflightOperation(this.#database, taskId);
+  }
+
   recordAppliedModelSelection(input: tasks.RecordAppliedModelSelectionInput): boolean {
     return tasks.recordAppliedModelSelection(this.#database, input);
   }

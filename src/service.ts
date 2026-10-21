@@ -449,7 +449,7 @@ export async function createAgentTagService(input: {
     runtime?.onStateChange((state) => {
       if (state === "ready" || state === "restarting") void gate.check();
     });
-    const bridge = await SlackSocketBridge.create({ config: input.config, store, logger });
+    const bridge = await SlackSocketBridge.create({ config: input.config, store, catalog, logger });
     let nextMemoryExpiryAt = 0;
     let nextT3StatsAt = now().getTime() + 60_000;
     // Draft PR workflow (PR-M §3.7): off unless github is configured and a profile has mode "auto".
