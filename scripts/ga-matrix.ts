@@ -148,7 +148,7 @@ export function checkGaMatrix(inputs: MatrixInputs): string[] {
         problems.push(`${where} is ${row.Status} but no "ga" row in docs/audit/decisions.tsv names it`);
       }
     }
-    if (inputs.gate && row.Status.startsWith("PENDING")) problems.push(`${where} is ${row.Status}; AGENT_TAG_GA_GATE=1 requires every row resolved`);
+    if (inputs.gate && (row.Status.startsWith("PENDING") || row.Status === "FAIL")) problems.push(`${where} is ${row.Status}; AGENT_TAG_GA_GATE=1 requires every row resolved`);
 
     if (kinds.includes("owner-session") && !new RegExp(`\\b${row.ID}\\b`).test(inputs.ownerSession)) {
       problems.push(`${where} needs an owner session but docs/owner-session.md never names it`);

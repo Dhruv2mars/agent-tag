@@ -29,7 +29,7 @@ It is modelled on [Claude Tag](https://claude.com/docs/claude-tag/users/getting-
 | Using it in Slack | [Using Agent Tag in Slack](docs/slack-usage.md) |
 | Reviewing its security | [SECURITY.md](SECURITY.md), [provider access and licensing](docs/provider-licensing.md) |
 | Comparing it with Claude Tag | [Parity](docs/parity.md) |
-| Tracking the release | [GA acceptance matrix](docs/ga-acceptance.md), [owner session](docs/owner-session.md), [evidence](docs/evidence/) |
+| Tracking the release | [GA acceptance matrix](docs/ga-acceptance.md), [owner session](docs/owner-session.md), [evidence](docs/evidence/), [releasing](docs/releasing.md) |
 
 Provider authentication is not a license grant. Review [provider access and licensing](docs/provider-licensing.md) before making an authenticated provider available to other Slack users.
 

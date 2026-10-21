@@ -121,6 +121,15 @@ describe("GA matrix", () => {
     ]);
   });
 
+  test("FAIL passes without the gate and fails under it", () => {
+    const failing = withRow(fixture(), "| automated-real | PASS | 0.1.0-rc.1 |", "| automated-real | FAIL | 0.1.0-rc.1 |");
+    const decided = { ...failing, decisions: `${failing.decisions}2026-01-01T00:00:00Z\tga\tT3-01 fails until the rerun\twhy\tdocs/evidence/2026-01-01-real.md\theld\n` };
+    expect(checkGaMatrix(decided)).toEqual([]);
+    expect(checkGaMatrix({ ...decided, gate: true })).toContain(
+      "matrix row T3-01 (line 5) is FAIL; AGENT_TAG_GA_GATE=1 requires every row resolved",
+    );
+  });
+
   test("a GA-critical PR ID missing from Spec Done fails", () => {
     const problems = checkGaMatrix(withRow(fixture(), ",U1)", ")"));
     expect(problems).toEqual(["GA-critical PR U1 is not named in any row's Spec Done column"]);

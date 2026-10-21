@@ -384,7 +384,7 @@ A running service picks up the new token file on its next T3 call; it checks the
 
 ### Slack says "T3 refused to move this thread to the requested model; it stays on …"
 
-**Cause.** T3 0.0.45 cannot move a started conversation to that provider, or to a model whose resume state differs (for example another instance of the same driver with a different home). Code: `T3ModelSwitchRejected`. The thread keeps its model. See [the cross-provider rule](operations.md#the-cross-provider-rule).
+**Cause.** T3 0.0.45 cannot move a started conversation to that provider, or to a model whose resume state differs (for example another instance of the same driver with a different home). Code: `T3ModelSwitchRejected`. The thread keeps its model. See [the cross-provider rule](slack-usage.md#the-cross-provider-rule).
 
 **Fix.** Start a new thread with the model you want: `@<bot name> use <model>: <request>`.
 

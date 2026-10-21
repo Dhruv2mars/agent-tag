@@ -12,6 +12,16 @@ This is the one live Slack session that resolves the GA matrix rows a test canno
 
 Every Slack message below goes to channel `C0C2RHJ1BUP` (`#agent-tag-test`) unless it says DM. The owner's DM with the bot is `D0C4MK74G02`. `@Agent Tag` is the bot mention. `CONFIG` is the live host config. The session agent edits it only with Dhruv's go-ahead, given at the start of the session, and restores it in step 12. Every config change is followed by `agent-tag service restart CONFIG`.
 
+## Models (Slack model rule)
+
+Dhruv's rule (2026-10-21): an install that answers in Slack runs only `codex` / `gpt-6-luna` or `claudeAgent` / `claude-haiku-5-5`. No other model may answer in Slack during this session, including in a refusal test. For the whole session, `CONFIG` holds:
+
+- every profile (including `routine-fail` in step 1): `"defaultProviderInstanceId": "codex"`, `"defaultModel": "gpt-6-luna"`;
+- no route `defaultModel`;
+- `allowedModels` on the session profile: `{ "instanceId": "codex", "model": "gpt-6-luna", "label": "Luna", "aliases": ["luna"] }`, plus `{ "instanceId": "claudeAgent", "model": "claude-haiku-5-5", "label": "Haiku 5.5", "aliases": ["haiku"] }` only if step 0 shows T3 lists `claude-haiku-5-5`.
+
+On 2026-10-21, T3 0.0.45's `claudeAgent` catalog listed `claude-haiku-4-5` and no `claude-haiku-5-5`. Agent Tag refuses a profile default T3 does not list (`model-missing`, so the service does not start), so the Claude model is never a profile default here. Using `claude-haiku-4-5` instead needs Dhruv's decision O-5 in step 12. Until then it is not used.
+
 The agent keeps `agent-tag audit CONFIG` running into a file for the whole session and quotes only action names, IDs and timestamps from it in evidence: never message text, tokens or file contents.
 
 ## Prerequisites
@@ -38,6 +48,7 @@ Run them in this order. Step 1 starts first because its routines need time to fi
   - `agent-tag t3 status CONFIG` reports T3 `0.0.45`.
   - `agent-tag security audit CONFIG --json` has no findings. `bun run scan:secrets` passes on the release commit.
   - `agent-tag service status CONFIG` shows the service running.
+  - The model rule holds: `jq '[.profiles[] | [.defaultProviderInstanceId, .defaultModel]], [.profiles[].allowedModels[]? | [.instanceId, .model]], [.routes[].defaultModel? | select(. != null)]' CONFIG` prints only `codex`/`gpt-6-luna` and, if present, `claudeAgent`/`claude-haiku-5-5`, and no route default. `agent-tag doctor CONFIG --json` reports `gpt-6-luna` as `available`; the `claude-haiku-5-5` entry stays in `allowedModels` only if doctor reports it `available`, otherwise the agent removes it and restarts.
 - **Agent captures:** the outputs above, with any secret-looking values redacted → `docs/evidence/<date>-owner-preflight.md`. The Build string for every row in this session comes from `version --json`.
 - **Fallback:** if `doctor` fails, stop the session and fix that first. Nothing after this step is valid on a broken install.
 
@@ -46,7 +57,7 @@ Run them in this order. Step 1 starts first because its routines need time to fi
 - **Matrix rows:** JOB-01, JOB-02
 - **Who:** agent (config), agent-CU (Slack, owner account)
 - **Preconditions:** `routines.autoDisable.minFailureSpanSeconds` lowered to `600` for the session; restart.
-- **Failing routine (agent):** a run counts as failed only when its operation fails, and a prompt that merely reports an error succeeds. So the agent adds a profile `routine-fail` whose only repository root is a throwaway git repository with `baseBranch` set to a branch that does not exist, restarts, and adds an every-5-minutes routine on that profile with `agent-tag schedule-add CONFIG <task> <owner user id> routine-fail <spec file>` (5 minutes is the shortest interval). Three failed runs over at least 10 minutes turn it off. Rehearse this on a private T3 before the session; if the run does not fail there, pick another persistent start failure and record which one in the evidence.
+- **Failing routine (agent):** a run counts as failed only when its operation fails, and a prompt that merely reports an error succeeds. So the agent adds a profile `routine-fail` (on `codex`/`gpt-6-luna`, like every profile) whose only repository root is a throwaway git repository with `baseBranch` set to a branch that does not exist, restarts, and adds an every-5-minutes routine on that profile with `agent-tag schedule-add CONFIG <task> <owner user id> routine-fail <spec file>` (5 minutes is the shortest interval). Three failed runs over at least 10 minutes turn it off. Rehearse this on a private T3 before the session; if the run does not fail there, pick another persistent start failure and record which one in the evidence.
 - **Send, in order:**
   1. (none: the failing routine above is added from the CLI)
   2. `@Agent Tag every weekday at 9am summarize open PRs`
@@ -69,7 +80,7 @@ Run them in this order. Step 1 starts first because its routines need time to fi
   1. `@Agent Tag write a 300-word summary of README.md` (keeps the only coordinator busy), then within a few seconds, in a new thread: `@Agent Tag say hello`.
   2. In a new thread, three turns: `@Agent Tag list the files in src/slack`, then two follow-up replies in the same thread that ask small questions about those files.
   3. In a new thread: `@Agent Tag read every file in src and summarize each one`, then press **Stop** after a few seconds.
-- **Expect:** 1: the second mention gets 👀 within 2 s while the first is still running. 2: one status message per turn, at least 3 visible edits to a status message, a `Done in …` line, and a footer with the model and provider on each reply. 3: the status reads "Stopped by @Dhruv" and no final reply is posted.
+- **Expect:** 1: the second mention gets 👀 within 2 s while the first is still running. 2: one status message per turn, at least 3 visible edits to a status message, a `Done in …` line, and a footer with the model and provider on each reply (`gpt-6-luna · codex`; any other model in a footer stops the session). 3: the status reads "Stopped by @Dhruv" and no final reply is posted.
 - **Agent captures:** `slack.reaction.added` time vs `slack.event.ingested` time, `status.opened` / `status.terminal`, `task.stop.requested` → `docs/evidence/<date>-owner-f.md`. Restore `maxConcurrentTasks`.
 - **Fallback:** `FAIL` SLK-06 with the evidence, continue.
 
@@ -142,10 +153,16 @@ Run them in this order. Step 1 starts first because its routines need time to fi
 
 - **Matrix rows:** MOD-01
 - **Who:** agent-CU (owner account)
-- **Send:** `@Agent Tag use sonnet: reply with exactly ok` in a new thread; in a started Claude thread, `@Agent Tag use opus` and then a short request; in a started Codex thread, `@Agent Tag use sonnet`.
-- **Expect:** the first reply names Sonnet and the turn runs on it; the same-driver switch applies to the next turn; the cross-driver switch is refused with a reason and the thread keeps its model. Footers show the model.
-- **Agent captures:** `task.model.selected`, `task.model.denied` → `docs/evidence/<date>-owner-p2.md`.
-- **Fallback:** `FAIL` MOD-01, continue.
+- **Models:** only the two in [Models](#models-slack-model-rule). With one allowed model per driver, a same-driver switch in place cannot run in Slack; that half of MOD-01 rests on the live T3 run in `docs/evidence/2026-10-21-model-switch.md`.
+- **Send (always):**
+  1. In a new thread: `@Agent Tag use luna: reply with exactly ok`.
+  2. In that thread, now started: `@Agent Tag use opus`. Opus is not in `allowedModels`, so this is refused and runs nothing.
+- **Send (only if `claude-haiku-5-5` passed step 0):**
+  3. In a new thread: `@Agent Tag use haiku: reply with exactly ok`.
+  4. In the started Codex thread from 1: `@Agent Tag use haiku`.
+- **Expect:** 1: the reply's footer reads `gpt-6-luna · codex`. 2: refused as not allowed, the reply lists Luna (and Haiku 5.5), and the thread keeps `gpt-6-luna`. 3: the turn runs on Haiku 5.5 and its footer says so. 4: refused as a cross-driver switch on a started thread; the thread keeps `gpt-6-luna`.
+- **Agent captures:** `task.model.selected`, `task.model.denied` (with codes) → `docs/evidence/<date>-owner-p2.md`.
+- **Fallback:** `FAIL` MOD-01, continue. Without steps 3 and 4, the Slack half of MOD-01 cannot show the cross-driver refusal, and MOD-01 stays `UNCONFIRMED` unless Dhruv accepts O-5.
 
 ### 10. Channel-members access (Q1)
 
@@ -177,6 +194,7 @@ Run them in this order. Step 1 starts first because its routines need time to fi
   - **O-2** T3-05 linux-x64 stays `UNCONFIRMED` without P4 [yes].
   - **O-3** v0.1.0 claims darwin-arm64 as live-verified and the other three targets as smoke-tested only [yes].
   - **O-4** the GA claim is "self-hosted, single trusted team" [yes].
+  - **O-5** if T3 does not list `claude-haiku-5-5`: allow `claudeAgent`/`claude-haiku-4-5` as the session's Claude model and re-run step 9 parts 3 and 4, or leave MOD-01 `UNCONFIRMED` [leave it].
   - **LIC-01** provider terms in `docs/provider-licensing.md` are acceptable for this use [yes].
   - **PR-I questions:** Cancel/Stop follows `approvers` [no]; `allowSelfApproval` defaults to false in `approval-required` [no]; approval cards are ephemeral [no, public].
   - **Pull requests:** `pullRequests.mode` default for new profiles, `auto` or `button` [auto].

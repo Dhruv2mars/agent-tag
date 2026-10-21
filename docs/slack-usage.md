@@ -17,16 +17,89 @@ Each turn gets one status message in the thread (no extra scope: `chat:write` co
 
 The last message of each final reply ends with a small footer naming the model and provider instance that answered and how long the turn took, e.g. `gpt-5.6-sol · codex · 3m 12s`. The model comes from the T3 thread, so a per-thread model switch shows up there. Set `slack.ui.footer` to `"none"` to leave replies plain.
 
-## Stopping, muting and other commands
+## Commands
 
-Mention Agent Tag with a command at the start: `@Agent Tag !status`. The commands are `!help`, `!status`, `!stop`, `!restart`, `!mute` and `!unmute`. Details and the operator settings that limit them are in [operations](operations.md#commands).
+A message that starts with `@Agent Tag !<command>` runs a command instead of a request. In a DM route the owner can drop the mention and send `!status` directly. The command word must come right after the mention; `@Agent Tag please !help` is an ordinary request.
 
-## Memory, routines and models
+| Command | Where | What it does |
+| --- | --- | --- |
+| `!help` | anywhere | Lists the commands enabled here. Only the sender sees it. |
+| `!status` | anywhere | In a thread: whether the agent is working, waiting on an approval or question, or has requests queued, plus the thread's model and mute state. At the top level: a count across the channel's threads. Only the sender sees it. |
+| `!mute` | a thread the agent is part of | Stops the agent answering unmentioned replies in that thread. Posts a public notice. |
+| `!unmute` | a thread the agent is part of | Reverses `!mute`. Any message that mentions the agent in a muted thread also unmutes it. |
+| `!stop` | a thread the agent is working in | Stops the running turn, the same way as the status message's Stop button: the status message turns into "Stopped by @you". Requests in that thread sent before `!stop` and not started yet are dropped, with one public note saying how many. Requests sent after it still run. |
+| `!restart` | a thread the agent is part of | Starts a fresh T3 session for the thread: a new T3 thread on a new worktree branch (`agent-tag/<task>-g2`, `-g3`, ...) from the profile's base branch. With nothing running it happens at once. Requests queued before `!restart` are dropped, and its notice says how many. Otherwise the running turn is stopped first, new messages wait, and the agent confirms in the thread once the fresh session is ready (after at most `commands.restartTimeoutSeconds`, default 120; past that the old turn may still post a late reply; if its worker restarts, the agent says it stopped that request instead of resuming it on the fresh session, and the old T3 thread's session is stopped once the turn ends). The first request on the fresh session rereads the earlier thread messages (without `!commands` and the agent's own replies) when `threadContext` is enabled. |
 
-- **Memory:** `@Agent Tag remember: we deploy on Tuesdays` saves a note for the channel, and `forget <ref>` removes it. See [operations](operations.md#managing-memory-from-slack).
-- **Routines:** `@Agent Tag every weekday at 9am summarize open PRs` or `@Agent Tag remind me in 10 minutes to check the deploy`; `list routines` and `cancel routine <id>` manage them. See [operations](operations.md#routines-from-slack).
-- **Models:** `@Agent Tag use sonnet: <request>` picks a model for a new thread, and `@Agent Tag use opus` switches a started thread to another model of the same provider. See [operations](operations.md#switching-models-from-slack).
-- **Draft pull requests:** when the operator has turned them on for a repository, a request that changes code ends with a draft PR card, and follow-ups in the thread push to the same PR. See [operations](operations.md#github-pull-requests-draft-prs-auto-mode).
+An operator can turn commands off or limit some to admins; see [operations](operations.md#commands).
+
+## Managing memory from Slack
+
+Mention the bot, write in your DM with it, or reply in a thread it is part of:
+
+| Say | What happens |
+|---|---|
+| `remember: …` or `remember for this channel: …` | Saves a channel note (a DM note in a DM) and replies with its 8-character ref |
+| `remember for the workspace: …` | Saves a workspace note; only from a public channel |
+| `what do you remember?` or `!memory` | Lists this conversation's notes, workspace notes and operator notes, with author and date |
+| `forget a1b2c3d4` | Forgets the note with that ref |
+| `forget: deploy` | Forgets the one note here whose text contains "deploy", or lists the candidates |
+| `update memory a1b2c3d4: …` | Replaces the note's text and bumps its version |
+
+A colon or a `!` is always required, so sentences like "remember that outage last week?" or "forget it" stay ordinary requests. Unmentioned top-level channel messages are never memory commands. `!remember …`, `!remember --workspace …`, `!forget <ref>` and `!memory edit <ref> …` work too.
+
+These phrases never start a T3 turn and reply in the thread. Each Slack message runs at most once: the note, its reply and its `slack_command_events` row (kinds `memory-remember|list|forget|edit`) commit together, so a redelivery or the duplicate `message` event for one mention is answered once. A ref for a note from another channel, or another person's DM, answers "I don't have a note … here". Workspace notes are read-only outside public channels, and operator notes are read-only from Slack. An operator can set `memory.slackCommands: false` on a profile to send every phrase to the agent instead. How notes are stored, scoped and kept is in [operations](operations.md#memory).
+
+## Switching models from Slack
+
+Mention the bot, write in your DM with it, or reply in a thread it is part of:
+
+| Say | What happens |
+|---|---|
+| `use opus` | Switches this thread to Opus and replies in the thread; no turn runs |
+| `use opus: fix the flaky test` | Switches, then runs the request on the new model |
+| `switch to gpt-5.6-mini`, `change the model to sonnet` | Same as `use …` |
+| `use Opus 5.5 for the rest of this thread` | Same; the tail is optional |
+| `model: sonnet` | Same |
+
+A model is named by its alias, label, slug, or `instance/model`. The directive ends at a `:`, `,`, `;`, `.`, `—` or a new line; anything after it is the request. A message only counts as a switch when the words right after the verb name a model, so "use the README to fix the install docs" or "switch to dark mode" stay ordinary requests. Unmentioned top-level channel messages, including ambient ones, are never parsed. `!commands` come first, then a switch, then memory phrases, then the request.
+
+The choice belongs to the thread and lasts for the rest of it, across closing, reopening and `!restart`. `!status` shows the model the next turn will use. Each Slack message switches at most once: the choice, its `task.model.selected` audit row, the reply, its `slack_command_events` row (kind `model-switch`) and any request after it commit together, so a redelivery or the duplicate `message` event for one mention is answered once.
+
+Refusals reply in the thread, say which model the thread stays on, and are audited as `task.model.denied` with a code. A request that came with a refused switch is not run:
+
+- a name outside the allowlist (`not-allowed`, the reply lists what is allowed) or one that matches several entries (`ambiguous`);
+- a provider T3 doesn't report as ready (`unavailable`);
+- switching turned off (`switch-disabled`) or `crossProvider: "deny"` (`cross-provider-denied`).
+
+A name that is neither an allowed model nor a model T3 reports (say `use sonnet` when no allowed entry is called that) is not a switch, so the whole message runs as a request on the thread's current model.
+
+### The cross-provider rule
+
+T3 0.0.45 keeps a started conversation on its provider's session, so Agent Tag only moves a started thread where T3 can follow it:
+
+- **Before the first turn** (a new thread, or a closed one whose next request starts a fresh session) any allowed model works, and the first turn starts on it.
+- **On a started thread** the switch must stay on the same driver and the same resume state (for example `codex` to `codex`, not `codex` to `codex-work` with another home). It is applied in place with `thread.meta.update` before the next turn.
+- **Anything else** is refused (`cross-provider-started`, or `requires-new-thread` for a driver that needs a new thread for any model change, or `incompatible-continuation`). The reply offers a new thread (`@Agent Tag use opus: <request>`) or, when `!restart` is enabled for the person, `!restart` in the thread followed by the switch. A fresh session does not remember the conversation.
+
+A turn already sent to T3 counts as started, even before its reply arrives. If T3 still rejects a switch at turn time, the thread keeps the model it had and says so (`task.model.reverted`). When a config change removes a thread's model from the allowlist, the next turn falls back to the default only when T3 can make that move, and otherwise stays on what the thread already runs; both are audited as `task.model.reverted`.
+
+Tested live on T3 0.0.45: the `codex` and `claudeAgent` drivers ([evidence](evidence/2026-10-21-model-switch.md)). Other drivers (for example `grok` or `opencode`) follow the capabilities T3 reports for them but have not been run live.
+
+## Routines from Slack
+
+Mention the bot (or write in your DM with it) to manage routines in that conversation:
+
+- **Create:** `@Agent Tag every weekday at 9am summarize open PRs`, `@Agent Tag remind me tomorrow at 3pm to deploy`, `@Agent Tag schedule tomorrow at 3pm: run the release checklist`. A one-off agent run needs the `schedule` lead; a recurring lead (`every`, `daily`, `weekdays`, …) or `remind` is enough otherwise. The routine binds to the thread it was requested in, and its results post there.
+- **List:** `@Agent Tag list routines` shows the conversation's active routines (up to 20, each with a Cancel button) and any turned off for repeated failures in the last 7 days.
+- **Cancel:** `@Agent Tag cancel routine a1b2c3` (the ID from the confirmation or list), `cancel routine 2` (list number), `cancel this routine` (in the routine's thread), `cancel the reminder about deploys` (prompt text), or the Cancel button on any confirmation or list.
+
+Times use the requester's Slack profile time zone (`users.info` `tz`, needs `users:read`). Name a zone to override it (`… at 9am in Europe/London`, `9am PT`). Without `users:read`, or when the profile has no zone, `routines.defaultTimeZone` (default `UTC`) applies and the confirmation says so. Unmentioned channel messages and ambient triggers are never treated as routine requests. A free-text cancel that matches no routine ("remove the schedule field from the API") stays a normal prompt.
+
+Anyone allowed in a shared channel can list and cancel that channel's routines. DM routines belong to the DM owner. A Socket Mode redelivery or the duplicate `message` event for one mention is answered once.
+
+## Draft pull requests
+
+When the operator has turned them on for a repository, a request that changes code ends with a draft PR card, and follow-ups in the thread push to the same PR. Setup is in [operations](operations.md#github-pull-requests-draft-prs-auto-mode).
 
 ## Files
 

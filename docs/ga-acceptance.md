@@ -1,6 +1,8 @@
 # GA acceptance matrix
 
-Agent Tag v0.1.0 is generally available when every row below is `PASS`, or is `UNCONFIRMED` / `OUT-OF-SCOPE` with an owner-approved decision. `test/ga-matrix.test.ts` parses this table. With `AGENT_TAG_GA_GATE=1` it fails on any `PENDING-*` row, so a stable tag cannot publish with open rows.
+Agent Tag v0.1.0 is generally available when every row below is `PASS`, or is `UNCONFIRMED` / `OUT-OF-SCOPE` with an owner-approved decision. `test/ga-matrix.test.ts` checks this table on every `bun run check`. `AGENT_TAG_GA_GATE=1 bun run scripts/ga-matrix.ts` is the release gate: it also fails on any `PENDING-*` or `FAIL` row. The release workflow does not run the gate yet, so run it by hand before a stable tag ([Releasing](releasing.md)).
+
+Slack evidence counts only from an install whose profiles answered on `codex`/`gpt-6-luna` or `claudeAgent`/`claude-haiku-5-5` (Dhruv's Slack model rule, 2026-10-21; see [owner session](owner-session.md#models-slack-model-rule)).
 
 How each column works:
 
