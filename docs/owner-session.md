@@ -66,7 +66,7 @@ Run them in this order. Step 1 starts first because its routines need time to fi
   4. `@Agent Tag every day at 9am standup notes in Europe/London`
   5. `@Agent Tag list routines`
   6. `@Agent Tag cancel routine <id from step 5>`
-  7. Press **Cancel** on another routine's card.
+  7. Press **Cancel routine** on another routine's card, then **Cancel routine** in the confirmation.
   8. DM: `list routines`
 - **Expect:** each creation is confirmed with its next run time in the right zone (step 4 in Europe/London). The reminder fires about 10 minutes later. The list matches what was created. Both cancels are confirmed and the routine stops appearing. The DM list shows only DM routines, including the failing one until it is turned off. The failing routine is turned off after its third failure, with a notice in its thread. Remove the `routine-fail` profile in step 12.
 - **Agent captures:** `schedule.created`, `schedule.cancelled`, `schedule.run.outcome`, `schedule.auto-disabled` → fill in `docs/evidence/2026-10-21-routines-slack.md` §Owner session.
@@ -123,11 +123,11 @@ Run them in this order. Step 1 starts first because its routines need time to fi
 - **Who:** agent (config, restart), agent-CU: app (Dhruv)
 - **Preconditions:** the profile's `runtimeMode: "approval-required"` and `limits.interactionExpirySeconds: 60`; restart.
 - **Send:**
-  1. `@Agent Tag create a file notes/approval-test.txt containing "ok"`. Press **Allow once** on the card.
+  1. `@Agent Tag create a file notes/approval-test.txt containing "ok"`. Press **Approve** on the card.
   2. Repeat with `notes/expiry-test.txt`, and do not answer for 60 s.
-  3. Repeat with `notes/restart-test.txt`. While the card is pending, the agent runs `agent-tag service restart CONFIG`. After the service is back, press **Allow once**.
-  4. Repeat with `notes/decline-test.txt` and press **Decline**.
-  5. In a new thread: `@Agent Tag use haiku: use your question tool to ask me whether the file should be called red.txt or blue.txt, then create notes/<answer>`. Press **blue.txt** on the question card, then **Allow once** on the approval card.
+  3. Repeat with `notes/restart-test.txt`. While the card is pending, the agent runs `agent-tag service restart CONFIG`. After the service is back, press **Approve**.
+  4. Repeat with `notes/decline-test.txt` and press **Reject**.
+  5. In a new thread: `@Agent Tag use haiku: use your question tool to ask me whether the file should be called red.txt or blue.txt, then create notes/<answer>`. Press **blue.txt** on the question card, then **Approve** on the approval card.
   6. Repeat 5 with `green.txt or gold.txt`, and press **Stop** while the question card is pending.
 - **Expect:** 1: the card updates to the decision within 2 s and the turn completes. 2: the card shows Expired. 3: the click after the restart is honoured exactly once and the turn completes. 4: the card shows the decline and the turn ends without the file. 5: the question card lists both choices, updates to the answer, and the turn creates `notes/blue.txt` on `claude-haiku-5-5`. 6: the question card closes and the turn stops without a file.
 - **Agent captures:** `interaction.approval.requested`, `interaction.user-input.requested`, `interaction.response.*`, `interaction.expired`, `interaction.adopted`, `interaction.closed`, `task.stop.requested` → `docs/evidence/<date>-owner-i.md`. Restore `runtimeMode` and `interactionExpirySeconds`.
@@ -181,7 +181,7 @@ Run them in this order. Step 1 starts first because its routines need time to fi
 - **Matrix rows:** ACL-02, ACL-01
 - **Who:** agent (config), agent-CU: Helium (tester) for the mentions and the Allow click, app (Dhruv) for removing and re-inviting the tester
 - **Preconditions:** `access.mode: "channel-members"`, and the tester is **not** in `access.allowedUserIds`; restart.
-- **Send:** the four steps in `docs/evidence/2026-10-21-q1-access.md` §2: the tester mentions the bot; the tester presses Allow on an approval card; the owner removes the tester from the channel and waits `ttlSeconds` (300 s); the tester mentions again. Afterwards the owner re-invites the tester.
+- **Send:** the four steps in `docs/evidence/2026-10-21-q1-access.md` §2: the tester mentions the bot; the tester presses Approve on an approval card; the owner removes the tester from the channel and waits `ttlSeconds` (300 s); the tester mentions again. Afterwards the owner re-invites the tester.
 - **Expect:** a turn runs; the approval is honoured; after removal the mention is ignored and audit shows `access.denied` with `user-denied`.
 - **Agent captures:** fill in that file.
 - **Fallback:** `FAIL` ACL-02, continue.

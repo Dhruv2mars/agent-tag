@@ -16,12 +16,12 @@ Run only in the owner's own workspace (dhruv2mars), in a test channel and the ow
 
 | Step | Slack message | Expected | Observed (redacted IDs) |
 | --- | --- | --- | --- |
-| 1 | `@Agent Tag every weekday at 9am summarize open PRs` | One confirmation in the thread: "Routine scheduled", *When* in the profile zone, *Next*, *ID*, "Using your Slack time zone.", Cancel button | |
+| 1 | `@Agent Tag every weekday at 9am summarize open PRs` | One confirmation in the thread: "Routine scheduled", *When* in the profile zone, *Next*, *ID*, "Using your Slack time zone.", a Cancel routine button | |
 | 2 | `@Agent Tag remind me in 10 minutes to check the deploy` | ":alarm_clock: I'll remind @you once on …"; the reminder arrives in the thread about 10 minutes later | |
 | 3 | `@Agent Tag every day at 9am standup notes in Europe/London` | Confirmation names Europe/London | |
-| 4 | `@Agent Tag list routines` (new thread) | "*Routines in this channel* (3 active)" with creators as names (no pings) and a Cancel button per row | |
+| 4 | `@Agent Tag list routines` (new thread) | "*Routines in this channel* (3 active)" with creators as names (no pings) and a Cancel routine button per row | |
 | 5 | `@Agent Tag cancel routine <id from step 3>` | ":wastebasket: @you cancelled routine `…`" | |
-| 6 | Click Cancel on the step 1 card, confirm | One notice in the thread; clicking again gives an only-you "no longer active" note and no second notice | |
+| 6 | Click Cancel routine on the step 1 card, then Cancel routine in the confirmation | One notice in the thread; clicking again gives an only-you "no longer active" note and no second notice | |
 | 7 | In the DM: `list routines` | "No routines in this DM yet." | |
 
 ## 2. Store and audit

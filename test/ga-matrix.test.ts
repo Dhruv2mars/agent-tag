@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { resolve } from "node:path";
-import { checkGaMatrix, GA_CRITICAL_PR_IDS, readRepositoryInputs, type MatrixInputs } from "../scripts/ga-matrix.ts";
+import { checkGaMatrix, GA_CRITICAL_PR_IDS, parseMatrix, readRepositoryInputs, type MatrixInputs } from "../scripts/ga-matrix.ts";
 
 const REPOSITORY = resolve(import.meta.dir, "..");
 
@@ -48,10 +48,12 @@ describe("GA matrix", () => {
     expect(checkGaMatrix(await readRepositoryInputs(REPOSITORY, false))).toEqual([]);
   });
 
-  test("the release gate rejects the repository's open rows until the owner session resolves them", async () => {
-    const problems = checkGaMatrix(await readRepositoryInputs(REPOSITORY, true));
-    expect(problems.length).toBeGreaterThan(0);
-    expect(problems.every((problem) => problem.includes("AGENT_TAG_GA_GATE=1"))).toBe(true);
+  test("the release gate rejects exactly the repository's open rows", async () => {
+    const inputs = await readRepositoryInputs(REPOSITORY, true);
+    const open = parseMatrix(inputs.matrix).rows.filter((row) => row.Status.startsWith("PENDING") || row.Status === "FAIL");
+    expect(checkGaMatrix(inputs)).toEqual(
+      open.map((row) => `matrix row ${row.ID} (line ${row.line}) is ${row.Status}; AGENT_TAG_GA_GATE=1 requires every row resolved`),
+    );
   });
 
   test("a well-formed fixture passes", () => {
