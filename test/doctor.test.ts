@@ -6,7 +6,6 @@ import { join } from "node:path";
 import {
   checkBunVersion,
   checkServiceState,
-  checkT3Runtime,
   compareVersions,
   type DoctorCheck,
   type DoctorDependencies,
@@ -14,8 +13,8 @@ import {
   formatDoctorReport,
   runDoctor,
   SLACK_BOT_SCOPES,
-  type T3RuntimeProbe,
 } from "../src/doctor.ts";
+import { checkT3Runtime, type T3RuntimeProbe } from "../src/doctor-t3-runtime.ts";
 import type { ManagedT3Config } from "../src/t3/operator.ts";
 import type { CommandResult } from "../src/command.ts";
 import { AGENT_TAG_LAUNCHD_LABEL } from "../src/launchd.ts";
@@ -840,6 +839,10 @@ describe("t3-runtime", () => {
 
   test("warns about a T3 that runs without the service or under another parent", () => {
     expect(checkT3Runtime(t3, service(false), runtimeProbe())).toMatchObject({ status: "warn", summary: expect.stringContaining("without the Agent Tag service") });
+    expect(checkT3Runtime(t3, service(true), runtimeProbe({ parentPid: null }))).toMatchObject({
+      status: "warn",
+      summary: expect.stringContaining("parent pid could not be read"),
+    });
     expect(checkT3Runtime(t3, service(true), runtimeProbe({ parentPid: 1 }))).toMatchObject({
       status: "warn",
       summary: expect.stringContaining("its parent is pid 1, not service pid 4242"),

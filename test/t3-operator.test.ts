@@ -292,3 +292,21 @@ describe("startTransientManagedT3 with the fake T3 CLI", () => {
     expect(logs.join("\n")).not.toContain(FAKE_PAIRING_TOKEN);
   });
 });
+
+describe("startTransientManagedT3 next to a running managed T3", () => {
+  test("refuses to start, leaving the running T3 alone", async () => {
+    const config = await liveManagedConfig();
+    const installed = { binary: FAKE_T3_BINARY, version: PINNED_T3.version };
+    const running = new T3ManagedRuntime({ settings: config.managed, installed, logger: () => {}, timing: FAST });
+    await running.start();
+    try {
+      const pid = running.status().pid as number;
+      await expect(
+        startTransientManagedT3({ t3: config, pin: PINNED_T3, logger: () => {}, installed, runtimeOptions: { timing: FAST } }),
+      ).rejects.toThrow(`managed T3 is already running in ${config.managed.homeDir} (pid ${pid}); stop the Agent Tag service`);
+      expect(alive(pid)).toBe(true);
+    } finally {
+      await running.stop();
+    }
+  });
+});

@@ -30,7 +30,7 @@ import {
   type T3SessionFacts,
 } from "./audit.ts";
 import { readSecretFile } from "./secret-file.ts";
-import { scanForSecrets, type SecretCanary } from "./secret-scan.ts";
+import { managedT3ScanExclusions, scanForSecrets, type SecretCanary } from "./secret-scan.ts";
 
 /** Where the launchd service (src/launchd.ts) points the macOS LaunchAgent logs. Other hosts pass `--log-dir`. */
 export function defaultLogDirectory(home: string): string {
@@ -181,7 +181,15 @@ const optionalDays = z.number().int().positive().optional().catch(undefined);
 
 const auditInputSchema = z.object({
   dataDir: optionalAbsolutePath,
-  t3: z.object({ baseUrl: optionalString, tokenFile: optionalAbsolutePath }).catch({}),
+  t3: z
+    .object({
+      mode: optionalString,
+      baseUrl: optionalString,
+      tokenFile: optionalAbsolutePath,
+      homeDir: optionalAbsolutePath,
+      runtimeDir: optionalAbsolutePath,
+    })
+    .catch({}),
   slack: z.object({ appTokenFile: optionalAbsolutePath, botTokenFile: optionalAbsolutePath }).catch({}),
   access: z
     .object({
@@ -222,6 +230,8 @@ interface AuditInputs {
   readonly dataDir: string | undefined;
   readonly t3BaseUrl: string | undefined;
   readonly secretFiles: ReadonlyArray<{ readonly name: string; readonly path: string }>;
+  /** Managed T3's release and key pair under `dataDir`, which the secret scan skips. */
+  readonly scanExclusions: readonly string[];
   readonly access: {
     readonly allowedUserIds: string[];
     readonly allowedChannelIds: string[];
@@ -240,10 +250,17 @@ export function readAuditInputs(raw: unknown): AuditInputs {
     { name: "slack-app-token", path: input.slack.appTokenFile },
     { name: "slack-bot-token", path: input.slack.botTokenFile },
   ].flatMap(({ name, path }) => (path === undefined ? [] : [{ name, path }]));
+  const { dataDir, t3 } = input;
   return {
-    dataDir: input.dataDir,
-    t3BaseUrl: input.t3.baseUrl,
+    dataDir,
+    t3BaseUrl: t3.baseUrl,
     secretFiles,
+    scanExclusions: t3.mode === "managed" && dataDir !== undefined
+      ? managedT3ScanExclusions({
+          homeDir: t3.homeDir ?? join(dataDir, "t3", "home"),
+          runtimeDir: t3.runtimeDir ?? join(dataDir, "t3", "runtime"),
+        })
+      : [],
     access: input.access,
     roots: input.profiles.flatMap((profile) => {
       const parsed = profileRootsSchema.safeParse(profile);
@@ -462,9 +479,10 @@ export async function runSecurityAudit(options: SecurityAuditOptions): Promise<S
         }
       }
     }
-    const excludedPaths = facts
-      .filter((item) => item.role === "secret-file" && item.state.kind === "file")
-      .map((item) => item.path);
+    const excludedPaths = [
+      ...facts.filter((item) => item.role === "secret-file" && item.state.kind === "file").map((item) => item.path),
+      ...inputs.scanExclusions,
+    ];
     try {
       // The scanner reports resolved paths, so match the store files under the resolved data directory.
       const databasePaths =

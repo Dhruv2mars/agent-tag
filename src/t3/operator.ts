@@ -107,6 +107,13 @@ export async function startTransientManagedT3(input: {
   readonly runtimeOptions?: Partial<Omit<T3ManagedRuntimeOptions, "settings" | "installed" | "logger">>;
   readonly run?: CommandRunner;
 }): Promise<TransientManagedT3> {
+  // Starting would reap a live runtime in this home as an orphan, taking T3 away from a running service.
+  const live = await inspectManagedT3Runtime({ t3: input.t3, pinnedVersion: input.pin.version });
+  if (live.pid !== null) {
+    throw new Error(
+      `managed T3 is already running in ${input.t3.managed.homeDir} (pid ${live.pid}); stop the Agent Tag service (or \`agent-tag t3 serve\`) first`,
+    );
+  }
   const installed = input.installed
     ?? (await prepareManagedT3Binary({ settings: input.t3.managed, pin: input.pin, logger: input.logger }));
   const runtime = new T3ManagedRuntime({
