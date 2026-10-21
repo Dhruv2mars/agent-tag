@@ -10,7 +10,12 @@ import t3Lock from "../t3.lock.json" with { type: "json" };
 
 import { type AgentTagConfig, agentTagConfigSchema } from "./config.ts";
 import { checkGitHubAccess, checkGitVersion, defaultGitVersion } from "./github/doctor-check.ts";
-import { type AllowedModelReport, reportAllowedModels, validateConfiguredProviders } from "./policy/provider.ts";
+import {
+  type AllowedModelReport,
+  ProviderSelectionError,
+  reportAllowedModels,
+  validateConfiguredProviders,
+} from "./policy/provider.ts";
 import { SecretString } from "./security/secret-file.ts";
 import { type AccessReport, checkAccess } from "./doctor-access.ts";
 import type { ServiceManager } from "./service-manager.ts";
@@ -562,11 +567,18 @@ async function inspectT3Providers(
       server,
     };
   } catch (error) {
-    return { check: { id: "t3-providers", status: "fail", summary: errorMessage(error), hint: PROVIDER_HINT }, server };
+    const hint = error instanceof ProviderSelectionError && error.code === "model-missing" ? MODEL_MISSING_HINT : PROVIDER_HINT;
+    return { check: { id: "t3-providers", status: "fail", summary: errorMessage(error), hint }, server };
   }
 }
 
 const PROVIDER_HINT = "authenticate the provider in T3 or change the profile's provider/model";
+/**
+ * T3 0.0.45 lists models from a manifest it fetches from GitHub but only applies on its next start,
+ * so a model released after T3 started (claude-haiku-5-5 on 2026-10-21) is missing until a restart.
+ */
+const MODEL_MISSING_HINT =
+  "if the model is new, T3's model manifest may be stale: restart T3 (managed: `agent-tag service restart`) and rerun doctor; otherwise change the profile's provider/model";
 
 /** Allowed models T3 cannot run only warn: a request for one is refused, and defaults are checked by t3-providers. */
 export function checkAllowedModels(models: readonly AllowedModelReport[]): DoctorCheck {
@@ -579,7 +591,9 @@ export function checkAllowedModels(models: readonly AllowedModelReport[]): Docto
     id: "t3-models",
     status: "warn",
     summary: unavailable.map((entry) => `${name(entry)} (${entry.status})`).join(", "),
-    hint: "switching a thread to these models is refused until T3 can run them; fix the provider in T3 or remove the allowedModels entry",
+    hint: unavailable.some((entry) => entry.status === "model-missing")
+      ? `switching a thread to these models is refused until T3 can run them; ${MODEL_MISSING_HINT.replace("profile's provider/model", "allowedModels entry")}`
+      : "switching a thread to these models is refused until T3 can run them; fix the provider in T3 or remove the allowedModels entry",
   };
 }
 
