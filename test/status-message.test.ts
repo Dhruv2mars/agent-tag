@@ -336,6 +336,56 @@ describe("live status message (F3)", () => {
     });
   });
 
+  test("a turn that keeps using tools shows several live revisions and then exactly one final reply", async () => {
+    await withHarness(async ({ store, calls, drain }) => {
+      let clock = Date.parse(now);
+      let threadId = "not-dispatched";
+      let messageId: string | undefined;
+      let polls = 0;
+      const coordinator = new AgentTagCoordinator({
+        config,
+        store,
+        t3: {
+          dispatch: async (command) => {
+            if (command.type === "thread.turn.start") {
+              threadId = command.threadId;
+              messageId = command.message.messageId;
+            }
+            return { sequence: 1 };
+          },
+          fetchThread: async () => {
+            await drain(new Date(clock).toISOString());
+            polls += 1;
+            const activities = Array.from({ length: Math.min(polls, 8) }, (_, index) =>
+              activity(`tool-${index}`, "tool.completed", `Ran step ${index}`, "turn-1"));
+            return snapshot({
+              threadId,
+              state: polls > 8 ? "completed" : "running",
+              turnId: "turn-1",
+              userMessageId: messageId,
+              text: "the answer",
+              activities,
+            });
+          },
+        },
+        workerId: "worker-a",
+        now: () => new Date(clock),
+        sleep: async (ms) => {
+          clock += ms;
+        },
+      });
+      ingest(store, 1);
+      expect((await coordinator.processNext()).kind).toBe("completed");
+      await drain(new Date(clock).toISOString());
+
+      const [status] = statusMessages(calls);
+      const live = (status?.revisions ?? []).filter((call) => hasActions(call.blocks));
+      expect(new Set(live.map((call) => JSON.stringify(call.blocks))).size).toBeGreaterThanOrEqual(3);
+      expect(status?.revisions.at(-1)?.text).toMatch(/^Done in \d+s$/);
+      expect(calls.filter((call) => call.method === "post").map((call) => call.text)).toEqual(["Working on it…", "the answer"]);
+    });
+  });
+
   test("a Stop button left on an earlier turn's message never stops a later turn", async () => {
     await withHarness(async ({ store }) => {
       const first = ingest(store, 1);
