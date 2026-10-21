@@ -181,7 +181,12 @@ describe("agent-tag onboard (non-interactive)", () => {
       tokenFile: join(harness.home, "secrets", "t3-token"),
       watch: { enabled: true, safetyPollMs: 15_000, lingerMs: 30_000 },
     });
-    expect(config.access).toEqual({ allowedUserIds: ["U0ALICE", "U0BOB"], allowedChannelIds: ["C0ENG", "G0PRIVATE"], adminUserIds: [] });
+    expect(config.access).toMatchObject({
+      mode: "allowlist",
+      allowedUserIds: ["U0ALICE", "U0BOB"],
+      allowedChannelIds: ["C0ENG", "G0PRIVATE"],
+      adminUserIds: [],
+    });
     expect(config.profiles[0]).toMatchObject({
       id: "default",
       repositoryRoots: [harness.repo],

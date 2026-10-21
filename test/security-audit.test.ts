@@ -342,7 +342,7 @@ describe("config checks", () => {
     expect(inputs.dataDir).toBeUndefined();
     expect(inputs.t3BaseUrl).toBe("http://10.0.0.5");
     expect(inputs.secretFiles).toEqual([{ name: "t3-service-token", path: "/s/t3" }]);
-    expect(inputs.access).toEqual({ allowedUserIds: ["*"], allowedChannelIds: [] });
+    expect(inputs.access).toEqual({ allowedUserIds: ["*"], allowedChannelIds: [], mode: "allowlist" });
     expect(inputs.roots).toEqual([
       { profileId: "a", root: "/" },
       { profileId: "(unnamed)", root: "/srv/b" },

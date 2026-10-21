@@ -51,6 +51,35 @@ export function writeAudit(
     );
 }
 
+export interface RecordAccessAuditInput {
+  readonly action: "access.denied" | "access.membership.degraded";
+  /** Slack user for a denial; "agent-tag" for a degraded channel. */
+  readonly actorId: string;
+  readonly conversationId: string;
+  /** Denial reason or membership state. */
+  readonly result: string;
+  /** Delivery or action id for a denial; the channel for a degraded snapshot. */
+  readonly source: string;
+  readonly metadata?: Readonly<Record<string, string | number | boolean | null>>;
+  readonly createdAt: string;
+}
+
+/** Access-policy audit rows: denied explicit requests and channels that fell back to allowlist-only. */
+export function recordAccessAudit(database: Database, input: RecordAccessAuditInput): void {
+  writeAudit(database, {
+    actorType: input.action === "access.denied" ? "slack-user" : "agent-tag",
+    actorId: input.actorId,
+    authority: "access",
+    source: input.source,
+    target: input.conversationId,
+    action: input.action,
+    result: input.result,
+    correlationId: input.source,
+    metadata: input.metadata ?? {},
+    createdAt: input.createdAt,
+  });
+}
+
 export interface ListAuditRecordsInput {
   readonly after?: AuditCursor;
   readonly limit?: number;
