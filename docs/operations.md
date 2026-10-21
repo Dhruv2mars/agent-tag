@@ -448,7 +448,7 @@ This command authenticates the real Slack bot, uses a temporary fixture store, r
 
 Every Slack thread the agent works in is one task. A task closes after `lifecycle.closeIdleAfterHours` (default 168, seven days) without activity. Activity is an accepted message, or any turn or approval changing state. A task closes only when nothing is queued or running: no pending or in-flight turn, no open approval or question, and no undelivered Slack reply, reaction or PR job. Idle close is silent; nothing is posted to the thread.
 
-A closed task keeps its Slack thread, schedules and task memory. The next message in its thread (a plain reply is enough, no mention needed) reopens the same task as a new session generation. The new generation starts a new T3 thread with a fresh worktree on the branch `agent-tag/<task-id>-g<generation>`, and the agent rereads the Slack thread for context. A scheduled run on a closed task reopens it the same way. A closed task still refuses a message routed to a different profile or repository.
+A closed task keeps its Slack thread, schedules and task memory. The next message in its thread (a plain reply is enough, no mention needed) reopens the same task as a new session generation. The new generation starts a new T3 thread with a fresh worktree on the branch `agent-tag/<task-id>-g<generation>`, and the agent rereads the Slack thread for context. A scheduled run on a closed task reopens it the same way, and a routine can still be created there. A closed task still refuses a message routed to a different profile or repository.
 
 Closing records the old T3 thread in `task_retired_t3_threads`, with its generation and branch. Agent Tag does not yet stop or delete that T3 thread, or remove its worktree or branch; that cleanup comes in a later release, and the rows are kept for it. Closes are audited as `task.closed`, reopens as `task.reopened`.
 
@@ -465,9 +465,30 @@ Both read the local store only, so they work while the service or T3 is down. `t
 
 After upgrading, every task idle for longer than `closeIdleAfterHours` becomes due at once. The sweep closes at most `maxClosesPerSweep` per `sweepIntervalSeconds`, so a large backlog drains over a few minutes. Each close is a single local transaction.
 
+## Routines from Slack
+
+Mention the bot (or write in your DM with it) to manage routines in that conversation:
+
+- **Create:** `@Agent Tag every weekday at 9am summarize open PRs`, `@Agent Tag remind me tomorrow at 3pm to deploy`, `@Agent Tag schedule tomorrow at 3pm: run the release checklist`. A one-off agent run needs the `schedule` lead; a recurring lead (`every`, `daily`, `weekdays`, …) or `remind` is enough otherwise. The routine binds to the thread it was requested in, and its results post there.
+- **List:** `@Agent Tag list routines` shows the conversation's active routines (up to 20, each with a Cancel button) and any turned off for repeated failures in the last 7 days.
+- **Cancel:** `@Agent Tag cancel routine a1b2c3` (the ID from the confirmation or list), `cancel routine 2` (list number), `cancel this routine` (in the routine's thread), `cancel the reminder about deploys` (prompt text), or the Cancel button on any confirmation or list.
+
+Times use the requester's Slack profile time zone (`users.info` `tz`, needs `users:read`). Name a zone to override it (`… at 9am in Europe/London`, `9am PT`). Without `users:read`, or when the profile has no zone, `routines.defaultTimeZone` (default `UTC`) applies and the confirmation says so. Unmentioned channel messages and ambient triggers are never treated as routine requests. A free-text cancel that matches no routine ("remove the schedule field from the API") stays a normal prompt.
+
+Anyone allowed in a shared channel can list and cancel that channel's routines. DM routines belong to the DM owner. Every request is recorded in `slack_command_events` (kinds `routine-create|list|cancel`) with a `slack.command.executed` or `slack.command.denied` audit row, and a Socket Mode redelivery or the duplicate `message` event for one mention is answered once.
+
+```jsonc
+"routines": {
+  "enabled": true,                  // false: routine phrases are ordinary prompts
+  "defaultTimeZone": "UTC",         // IANA zone when the requester's Slack zone is unknown
+  "maxActivePerConversation": 25,   // per channel or DM; the workspace cap is limits.maxActiveSchedules
+  "autoDisable": { "consecutiveFailures": 3, "minFailureSpanSeconds": 3600 }
+}
+```
+
 ## Schedules
 
-Schedules belong to an existing active Agent Tag task. Create a JSON spec such as:
+Schedules belong to an existing Agent Tag task; one created on a closed task reopens it on its first run. Create a JSON spec such as:
 
 ```json
 {
