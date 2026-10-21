@@ -31,6 +31,12 @@ function projectMemoryRow(raw: unknown): MemoryRecord {
   };
 }
 
+/** Who an audit row names as acting; defaults to a Slack user. The operator CLI passes its own. */
+export interface MemoryAuditActor {
+  readonly type: "operator";
+  readonly authority: string;
+}
+
 export interface CreateMemoryInput {
   readonly workspaceId: string;
   readonly scope: MemoryScope;
@@ -42,6 +48,7 @@ export interface CreateMemoryInput {
   readonly sourceType: string;
   readonly sourceId: string;
   readonly actorUserId: string;
+  readonly actor?: MemoryAuditActor;
   readonly expiresAt: string;
   readonly now: string;
 }
@@ -96,9 +103,9 @@ export function createMemory(database: Database, input: CreateMemoryInput): Memo
         now,
       );
     writeAudit(database, {
-      actorType: "slack-user",
+      actorType: input.actor?.type ?? "slack-user",
       actorId: input.actorUserId,
-      authority: `memory:${input.scope}`,
+      authority: input.actor?.authority ?? `memory:${input.scope}`,
       source: input.sourceId,
       target: memoryId,
       action: "memory.created",
@@ -218,6 +225,45 @@ export function findMemoryByRef(database: Database, input: FindMemoryByRefInput)
     .map(projectMemoryRow);
 }
 
+export interface ListMemoryEntriesInput {
+  readonly workspaceId: string;
+  /** Narrows to one store or scope; omitted dimensions match any value. */
+  readonly scope?: MemoryScope;
+  readonly profileId?: string;
+  readonly ownerUserId?: string;
+  readonly conversationId?: string;
+  readonly now: string;
+  readonly limit?: number;
+}
+
+/** Active, unexpired notes across every scope, for the operator; no visibility filter. Newest first. */
+export function listMemoryEntries(database: Database, input: ListMemoryEntriesInput): ReadonlyArray<MemoryRecord> {
+  const limit = input.limit ?? 1_000;
+  if (!Number.isSafeInteger(limit) || limit <= 0 || limit > 10_000) {
+    throw new Error("memory list limit must be between 1 and 10000");
+  }
+  const filters: string[] = [];
+  const values: string[] = [];
+  const filter = (column: string, value: string | undefined, name: string) => {
+    if (value === undefined) return;
+    filters.push(`${column} = ?`);
+    values.push(requiredId(value, name));
+  };
+  filter("scope", input.scope, "scope");
+  filter("profile_id", input.profileId, "profileId");
+  filter("owner_user_id", input.ownerUserId, "ownerUserId");
+  filter("conversation_id", input.conversationId, "conversationId");
+  return database
+    .query(
+      `SELECT ${MEMORY_COLUMNS} FROM memory_entries
+       WHERE workspace_id = ? AND state = 'active' AND expires_at > ?${filters.map((clause) => ` AND ${clause}`).join("")}
+       ORDER BY updated_at DESC, memory_id
+       LIMIT ?`,
+    )
+    .all(requiredId(input.workspaceId, "workspaceId"), isoDateTime.parse(input.now), ...values, limit)
+    .map(projectMemoryRow);
+}
+
 /** One store of notes: a scope plus the dimensions that key it (as in the table CHECK). */
 export interface MemoryStoreKey {
   readonly workspaceId: string;
@@ -299,6 +345,7 @@ export interface UpdateMemoryInput {
   readonly memoryId: string;
   readonly actorUserId: string;
   readonly content: string;
+  readonly actor?: MemoryAuditActor;
   /** A new retention deadline; an edit from Slack refreshes retention. Omitted keeps it. */
   readonly expiresAt?: string;
   readonly now: string;
@@ -326,9 +373,9 @@ export function updateMemory(database: Database, input: UpdateMemoryInput): Memo
     const record = getMemory(database, input.memoryId);
     if (record === null) throw new Error("updated memory not found");
     writeAudit(database, {
-      actorType: "slack-user",
+      actorType: input.actor?.type ?? "slack-user",
       actorId: input.actorUserId,
-      authority: "memory-edit",
+      authority: input.actor?.authority ?? "memory-edit",
       source: input.memoryId,
       target: input.memoryId,
       action: "memory.updated",
@@ -345,34 +392,49 @@ export function updateMemory(database: Database, input: UpdateMemoryInput): Memo
 export interface ForgetMemoryInput {
   readonly memoryId: string;
   readonly actorUserId: string;
+  readonly actor?: MemoryAuditActor;
   readonly now: string;
+}
+
+function forgetOne(database: Database, input: ForgetMemoryInput, now: string): void {
+  const memory = getMemory(database, input.memoryId);
+  if (memory === null) throw new Error("active memory not found");
+  database
+    .query(
+      `UPDATE memory_entries SET state = 'forgotten', forgotten_at = ?, updated_by = ?, updated_at = ?
+       WHERE memory_id = ? AND state = 'active'`,
+    )
+    .run(now, requiredId(input.actorUserId, "actorUserId"), now, memory.memoryId);
+  writeAudit(database, {
+    actorType: input.actor?.type ?? "slack-user",
+    actorId: input.actorUserId,
+    authority: input.actor?.authority ?? "memory-forget",
+    source: input.memoryId,
+    target: input.memoryId,
+    action: "memory.forgotten",
+    result: "forgotten",
+    correlationId: input.memoryId,
+    metadata: { scope: memory.scope },
+    createdAt: now,
+  });
 }
 
 export function forgetMemory(database: Database, input: ForgetMemoryInput): void {
   const now = isoDateTime.parse(input.now);
-  const forget = database.transaction(() => {
-    const memory = getMemory(database, input.memoryId);
-    if (memory === null) throw new Error("active memory not found");
-    database
-      .query(
-        `UPDATE memory_entries SET state = 'forgotten', forgotten_at = ?, updated_by = ?, updated_at = ?
-         WHERE memory_id = ? AND state = 'active'`,
-      )
-      .run(now, requiredId(input.actorUserId, "actorUserId"), now, memory.memoryId);
-    writeAudit(database, {
-      actorType: "slack-user",
-      actorId: input.actorUserId,
-      authority: "memory-forget",
-      source: input.memoryId,
-      target: input.memoryId,
-      action: "memory.forgotten",
-      result: "forgotten",
-      correlationId: input.memoryId,
-      metadata: { scope: memory.scope },
-      createdAt: now,
-    });
-  });
-  forget.immediate();
+  database.transaction(() => forgetOne(database, input, now)).immediate();
+}
+
+/** Forgets several notes in one transaction (all or none), one audit row each. */
+export function forgetMemoryEntries(
+  database: Database,
+  input: Omit<ForgetMemoryInput, "memoryId"> & { readonly memoryIds: readonly string[] },
+): void {
+  const now = isoDateTime.parse(input.now);
+  database
+    .transaction(() => {
+      for (const memoryId of input.memoryIds) forgetOne(database, { ...input, memoryId }, now);
+    })
+    .immediate();
 }
 
 export function expireMemory(database: Database, nowInput: string): number {
@@ -414,15 +476,16 @@ export interface RecordMemoryDenialInput {
   readonly sourceId: string;
   readonly reason: string;
   readonly workspaceId: string;
+  readonly actor?: MemoryAuditActor;
   readonly now: string;
 }
 
 export function recordMemoryDenial(database: Database, input: RecordMemoryDenialInput): void {
   const now = isoDateTime.parse(input.now);
   writeAudit(database, {
-    actorType: "slack-user",
+    actorType: input.actor?.type ?? "slack-user",
     actorId: requiredId(input.actorUserId, "actorUserId"),
-    authority: "memory-policy",
+    authority: input.actor?.authority ?? "memory-policy",
     source: requiredId(input.sourceId, "sourceId"),
     target: requiredId(input.workspaceId, "workspaceId"),
     action: "memory.denied",

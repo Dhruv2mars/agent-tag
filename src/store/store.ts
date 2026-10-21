@@ -110,6 +110,8 @@ export type {
   CreateMemoryInput,
   ListVisibleMemoryInput,
   FindMemoryByRefInput,
+  ListMemoryEntriesInput,
+  MemoryAuditActor,
   MemoryStoreKey,
   UpdateMemoryInput,
   ForgetMemoryInput,
@@ -286,6 +288,14 @@ export class AgentTagStore {
 
   forgetMemory(input: memory.ForgetMemoryInput): void {
     memory.forgetMemory(this.#database, input);
+  }
+
+  forgetMemoryEntries(input: Parameters<typeof memory.forgetMemoryEntries>[1]): void {
+    memory.forgetMemoryEntries(this.#database, input);
+  }
+
+  listMemoryEntries(input: memory.ListMemoryEntriesInput): ReadonlyArray<MemoryRecord> {
+    return memory.listMemoryEntries(this.#database, input);
   }
 
   expireMemory(nowInput: string): number {

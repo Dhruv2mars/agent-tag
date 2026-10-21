@@ -61,6 +61,7 @@ export interface SlackMemoryCommandsOptions {
 }
 
 const LABEL_LOOKUP_MS = 3_000;
+const SLACK_USER_ID = /^[UW][A-Z0-9]+$/;
 const COMMAND_KIND = {
   remember: "memory-remember",
   list: "memory-list",
@@ -250,7 +251,10 @@ export class SlackMemoryCommands {
     const users = this.#users;
     if (users === undefined) return new Map();
     const ids = new Set(
-      [...groups.channel, ...groups.dm, ...groups.workspace, ...groups.operator].map((record) => record.updatedBy ?? record.createdBy),
+      [...groups.channel, ...groups.dm, ...groups.workspace, ...groups.operator]
+        .map((record) => record.updatedBy ?? record.createdBy)
+        // Notes from the operator CLI name a local account, not a Slack user; it renders as is.
+        .filter((userId) => SLACK_USER_ID.test(userId)),
     );
     const signal = AbortSignal.timeout(LABEL_LOOKUP_MS);
     const entries = await Promise.all(
