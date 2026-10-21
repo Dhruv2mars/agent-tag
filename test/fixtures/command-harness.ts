@@ -118,7 +118,12 @@ export async function withCommandHarness(
       },
       claim: () => store.claimNextOperation({ workerId: "w", now: iso(), leaseMs: 60_000, maxConcurrentTasks: 2 }),
       startTurn: (operation) => {
-        store.markOperationTurnDispatched({ operationId: operation.operationId, workerId: "w", now: iso() });
+        store.markOperationTurnDispatched({
+          operationId: operation.operationId,
+          workerId: "w",
+          threadId: store.getTaskExecution(operation.taskId).threadId,
+          now: iso(),
+        });
         store.markOperationTurnStarted({ operationId: operation.operationId, workerId: "w", turnId: null, now: iso() });
         store.markT3ThreadStarted({
           taskId: operation.taskId,

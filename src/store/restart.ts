@@ -465,6 +465,10 @@ export function listPendingSessionStops(database: Database, input: { readonly no
         .query(
           `SELECT task_id, generation, t3_thread_id, session_stop_command_id, retired_at FROM task_retired_t3_threads
            WHERE session_stopped_at IS NULL AND thread_created = 1 AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+             -- A turn still on the thread (left running by a forced restart) may yet create it or
+             -- start its session: stop once it has settled, so the stop cannot land first.
+             AND NOT EXISTS (SELECT 1 FROM operations o WHERE o.task_id = task_retired_t3_threads.task_id
+               AND o.t3_thread_id = task_retired_t3_threads.t3_thread_id AND o.status IN ('pending', 'inflight'))
            ORDER BY retired_at, task_id, generation LIMIT ?`,
         )
         .all(now, z.number().int().positive().parse(input.limit)),

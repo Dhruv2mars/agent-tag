@@ -753,4 +753,14 @@ export const STORE_MIGRATIONS: readonly StoreMigration[] = [
       CREATE INDEX slack_file_uploads_ready_idx ON slack_file_uploads(state, created_at);
     `,
   },
+  {
+    // `!restart` follow-up (PR-H2): the T3 thread a turn was sent to, pinned when it is first
+    // dispatched. A turn left on a thread that `!restart` retired is never replayed against the fresh
+    // thread, and the retired thread's session stop waits for it (it may still create the thread).
+    // New column only, so it applies in any order relative to other versions.
+    version: 28,
+    sql: `
+      ALTER TABLE operations ADD COLUMN t3_thread_id TEXT;
+    `,
+  },
 ];

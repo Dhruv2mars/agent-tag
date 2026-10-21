@@ -517,8 +517,8 @@ export class AgentTagStore {
   }
 
   /** Records that `thread.turn.start` is about to be sent, before its outcome is known. */
-  markOperationTurnDispatched(input: operations.MarkOperationTurnDispatchedInput): void {
-    operations.markOperationTurnDispatched(this.#database, input);
+  markOperationTurnDispatched(input: operations.MarkOperationTurnDispatchedInput): boolean {
+    return operations.markOperationTurnDispatched(this.#database, input);
   }
 
   /** Records that the operation's T3 turn was dispatched (and its turn id once known). */

@@ -627,6 +627,81 @@ describe("coordinator thread window", () => {
     });
   });
 
+  test("a turn sent before a forced !restart is never replayed on the fresh thread; its thread's stop waits for it (PR-H2)", async () => {
+    await withStore(async (store) => {
+      const clock = () => new Date(start);
+      const { t3, commands } = recordingT3(clock);
+      const coordinator = new AgentTagCoordinator({
+        config,
+        store,
+        t3,
+        slackContext: countingSlack().source,
+        workerId: "worker-a",
+        now: clock,
+        sleep: async () => {},
+      });
+      const first = store.ingestSlackEvent(slackEvent({ ts: ROOT_TS, threadTs: ROOT_TS, text: "investigate the flaky build" }));
+      const oldThread = store.getTaskExecution(first.taskId).threadId;
+      // Another worker sent the first turn and is still waiting for its receipt: T3 may be creating
+      // the thread right now.
+      const claimed = store.claimNextOperation({ workerId: "worker-old", now: start, leaseMs: 600_000, maxConcurrentTasks: 1 });
+      if (claimed === null) throw new Error("operation was not claimable");
+      expect(store.markOperationTurnDispatched({
+        operationId: claimed.operationId,
+        workerId: "worker-old",
+        threadId: oldThread,
+        now: start,
+      })).toBe(true);
+      expect(store.beginCommand({
+        workspaceId: "T1",
+        eventKey: "C1:1000.000003",
+        deliveryId: "Ev-restart",
+        conversationId: "C1",
+        threadTs: ROOT_TS,
+        actorUserId: "U0A1",
+        commandKind: "restart",
+        taskId: first.taskId,
+        now: start,
+      })).toBe("accepted");
+      expect(store.restartTaskCommand({
+        taskId: first.taskId,
+        workspaceId: "T1",
+        conversationId: "C1",
+        threadTs: ROOT_TS,
+        actorUserId: "U0A1",
+        commandKey: "C1:1000.000003",
+        commandOrderKey: "1000.000003",
+        profileId: "engineering",
+        replies: { ready: () => ({ text: "ready" }), restarting: () => ({ text: "restarting" }) },
+        now: start,
+      })).toMatchObject({ kind: "pending" });
+      expect(store.completeTaskRestart({
+        taskId: first.taskId,
+        commandKey: "C1:1000.000003",
+        forced: true,
+        ready: { text: "ready" },
+        now: start,
+      })).toBe(true);
+      const newThread = store.getTaskExecution(first.taskId).threadId;
+      // The retired thread counts as created, but its session stop waits until the turn has settled.
+      expect(store.listPendingSessionStops({ now: start, limit: 10 })).toEqual([]);
+      expect(store.releaseOperation({ operationId: claimed.operationId, workerId: "worker-old", now: start })).toBe(true);
+
+      expect(await coordinator.processNext()).toMatchObject({ kind: "failed", errorCode: "session-restarted" });
+      expect(commands).toEqual([]);
+      expect(store.getTaskExecution(first.taskId)).toMatchObject({ threadId: newThread, threadStarted: false });
+      expect(store.listPendingSessionStops({ now: start, limit: 10 })).toMatchObject([{ threadId: oldThread, generation: 1 }]);
+      // The next request bootstraps the fresh thread.
+      store.ingestSlackEvent(slackEvent({ ts: "1000.000006", threadTs: ROOT_TS, text: "try again" }));
+      expect((await coordinator.processNext()).kind).toBe("completed");
+      const [turn] = commands;
+      if (turn?.type !== "thread.turn.start") throw new Error("turn not dispatched");
+      expect(turn.threadId).toBe(newThread);
+      expect(turn.bootstrap?.createThread).toBeDefined();
+      expect(store.getTaskExecution(first.taskId)).toMatchObject({ threadId: newThread, threadStarted: true });
+    });
+  });
+
   test("a 300-message thread keeps the root and the newest 29 replies (D2)", async () => {
     await withStore(async (store) => {
       const clock = () => new Date(start);

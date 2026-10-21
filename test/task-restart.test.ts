@@ -163,6 +163,28 @@ describe("!restart", () => {
     });
   });
 
+  test("a turn still being prepared when a forced restart rotates never goes out on the retired thread", async () => {
+    await withCommandHarness(config, async (h) => {
+      await h.send(message(THREAD, "<@U0BOT> investigate"));
+      const turn = h.claim();
+      if (turn === null) throw new Error("no operation");
+      const oldThread = task(h).t3_thread_id;
+      await h.send(message("1000.000003", "<@U0BOT> !restart"));
+      h.clock.now += 31_000;
+      h.store.renewOperationLease({ operationId: turn.operationId, workerId: "w", now: h.iso(), leaseMs: 60_000 });
+      expect(await worker(h).processNext()).toEqual({ kind: "restarts-completed", count: 1 });
+      // Nothing was sent to the retired thread, so it needs no session stop or cleanup.
+      expect(retired(h)[0]).toMatchObject({ t3_thread_id: oldThread, thread_created: 0 });
+      expect(h.store.markOperationTurnDispatched({ operationId: turn.operationId, workerId: "w", threadId: oldThread, now: h.iso() }))
+        .toBe(false);
+      expect(h.db.query("SELECT t3_turn_dispatched_at, t3_thread_id FROM operations").get())
+        .toEqual({ t3_turn_dispatched_at: null, t3_thread_id: null });
+      // The worker's lease is untouched, so its failure path still settles the operation.
+      expect(() => h.store.markOperationTurnDispatched({ operationId: turn.operationId, workerId: "other", threadId: oldThread, now: h.iso() }))
+        .toThrow();
+    });
+  });
+
   test("a busy restart names the queued requests it dropped in the restarting notice", async () => {
     await withCommandHarness(config, async (h) => {
       await runningTurn(h);
