@@ -226,7 +226,7 @@ function normalizedMime(mime: string | undefined): string | null {
   if (mime === undefined) return null;
   const base = mime.split(";")[0]?.trim().toLowerCase() ?? "";
   if (base === "image/jpg") return "image/jpeg";
-  return MIME_TYPE.test(base) ? base : null;
+  return base.length <= 100 && MIME_TYPE.test(base) ? base : null;
 }
 
 /** The skip reason decidable from metadata alone (before any download), or null to download. */
