@@ -268,8 +268,14 @@ export interface RequestTaskRestartInput {
   readonly actorUserId: string;
   readonly commandKey: string;
   readonly commandOrderKey: string;
-  /** The confirmation once rotated (`cmd:<key>:ready`), and the notice while the turn stops (`cmd:<key>`). */
-  readonly replies: { readonly ready: SlackOutboxPayload; readonly restarting: SlackOutboxPayload };
+  /**
+   * The confirmation once rotated (`cmd:<key>:ready`), and the notice while the turn stops (`cmd:<key>`),
+   * given how many queued requests the restart dropped.
+   */
+  readonly replies: {
+    readonly ready: (dropped: number) => SlackOutboxPayload;
+    readonly restarting: (dropped: number) => SlackOutboxPayload;
+  };
   readonly now: string;
 }
 
@@ -322,7 +328,7 @@ export function requestTaskRestart(database: Database, input: RequestTaskRestart
   const stop = stopTask(database, { ...input, now });
   if (stop.kind !== "interrupting") {
     const generation = rotateTaskSession(database, { taskId, forced: false, actorId: actorUserId, now });
-    outbox(":ready", input.replies.ready);
+    outbox(":ready", input.replies.ready(stop.dropped));
     return { kind: "rotated", generation, dropped: stop.dropped };
   }
   database
@@ -331,7 +337,7 @@ export function requestTaskRestart(database: Database, input: RequestTaskRestart
        WHERE task_id = ? AND state = 'active' AND restart_requested_at IS NULL`,
     )
     .run(now, actorUserId, commandKey, now, taskId);
-  outbox("", input.replies.restarting);
+  outbox("", input.replies.restarting(stop.dropped));
   return { kind: "pending" };
 }
 
@@ -501,7 +507,7 @@ export function recordSessionStop(database: Database, input: RecordSessionStopIn
         `UPDATE task_retired_t3_threads SET session_stopped_at = ?, next_attempt_at = NULL, last_error_code = ?
          WHERE task_id = ? AND generation = ? AND session_stopped_at IS NULL`,
       )
-      .run(now, input.outcome === "rejected" ? (input.errorCode ?? "rejected") : null, taskId, generation);
+      .run(now, null, taskId, generation);
     if (result.changes !== 1) return;
     writeAudit(database, {
       actorType: "service",

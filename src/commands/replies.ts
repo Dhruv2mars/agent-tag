@@ -168,18 +168,32 @@ export function stopDroppedReply(input: { readonly actorUserId: string; readonly
   );
 }
 
-export function restartReadyReply(input: { readonly actorUserId: string; readonly rereads: boolean; readonly forced: boolean }): SlackOutboxPayload {
+/** Requests queued before `!restart` never run on the new session, so the restart notice says so. */
+function restartDropped(dropped: number): string[] {
+  return dropped === 0 ? [] : [`Dropped ${requests(dropped)} sent before the restart.`];
+}
+
+export function restartReadyReply(input: {
+  readonly actorUserId: string;
+  readonly rereads: boolean;
+  readonly forced: boolean;
+  readonly dropped?: number;
+}): SlackOutboxPayload {
   const parts = [
     `:arrows_counterclockwise: Started a fresh session for this thread (requested by <@${input.actorUserId}>).`,
     input.rereads ? "It will reread this thread on the next request." : "It starts without the earlier conversation.",
   ];
   if (input.forced) parts.push("The previous run didn't stop cleanly and may still post a late reply.");
+  parts.push(...restartDropped(input.dropped ?? 0));
   return payload(parts.join(" "));
 }
 
-export function restartingReply(actorUserId: string): SlackOutboxPayload {
+export function restartingReply(actorUserId: string, dropped = 0): SlackOutboxPayload {
   return payload(
-    `:arrows_counterclockwise: Restarting this thread's session (requested by <@${actorUserId}>). I'll confirm here when it's ready.`,
+    [
+      `:arrows_counterclockwise: Restarting this thread's session (requested by <@${actorUserId}>). I'll confirm here when it's ready.`,
+      ...restartDropped(dropped),
+    ].join(" "),
   );
 }
 
