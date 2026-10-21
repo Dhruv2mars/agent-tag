@@ -9,7 +9,7 @@ import { parseArguments } from "./cli-args.ts";
 import { runCommand } from "./command.ts";
 import { loadConfig } from "./config.ts";
 import { defaultDoctorDependencies, formatDoctorReport, runDoctor } from "./doctor.ts";
-import { defaultAgentTagHome, type OnboardOptions, runOnboard } from "./onboard.ts";
+import { defaultAgentTagHome, type OnboardManagedT3, type OnboardOptions, runOnboard } from "./onboard.ts";
 import { createReadlinePrompter, nonInteractivePrompter } from "./prompt.ts";
 import { isServiceAction, SERVICE_ACTIONS, serviceManagerFor } from "./service-manager.ts";
 import {
@@ -20,7 +20,7 @@ import {
 } from "./t3/auth.ts";
 import { inspectT3 } from "./t3/gateway.ts";
 import { defaultT3RuntimeDir, inspectInstalledT3, installPinnedT3, parseT3DownloadBaseUrl } from "./t3/install.ts";
-import { PINNED_T3 } from "./t3/lock.ts";
+import { PINNED_T3, t3ArtifactFor } from "./t3/lock.ts";
 import { inspectT3TokenStatus, T3_CREDENTIAL_STATE_FILE } from "./t3/credentials.ts";
 import {
   type ExternalT3AdminFlags,
@@ -29,6 +29,7 @@ import {
   runManagedT3Pair,
   runManagedT3Serve,
   runT3Rotate,
+  startTransientManagedT3,
 } from "./t3/operator.ts";
 import { fetchT3EnvironmentDescriptor, t3DescriptorProblem } from "./t3/protocol.ts";
 
@@ -224,6 +225,7 @@ const ONBOARD_BOOLEANS = [
   "force",
   "skip-slack-check",
   "t3-issue-token",
+  "t3-managed",
   "install-service",
   "no-install-service",
 ] as const;
@@ -235,6 +237,7 @@ const ONBOARD_VALUES = [
   "t3-base-dir",
   "t3-bin",
   "t3-admin-token-file",
+  "t3-port",
   "repo",
   "base-branch",
   "provider",
@@ -264,6 +267,7 @@ export function onboardOptionsFromArguments(argv: readonly string[], stdinIsTty:
     force: args.flags.has("force"),
     skipSlackCheck: args.flags.has("skip-slack-check"),
     t3IssueToken: args.flags.has("t3-issue-token"),
+    ...(args.flags.has("t3-managed") ? { t3Managed: true } : {}),
     ...(args.flags.has("install-service") ? { installService: true } : {}),
     ...(args.flags.has("no-install-service") ? { installService: false } : {}),
     ...pick("home", "dir"),
@@ -273,6 +277,7 @@ export function onboardOptionsFromArguments(argv: readonly string[], stdinIsTty:
     ...pick("t3BaseDir", "t3-base-dir"),
     ...pick("t3Bin", "t3-bin"),
     ...pick("t3AdminTokenFile", "t3-admin-token-file"),
+    ...pick("t3Port", "t3-port"),
     ...pick("repositoryRoots", "repo"),
     ...pick("baseBranch", "base-branch"),
     ...pick("providerInstanceId", "provider"),
@@ -282,6 +287,26 @@ export function onboardOptionsFromArguments(argv: readonly string[], stdinIsTty:
     ...pick("allowedUserIds", "users"),
     ...pick("allowedChannelIds", "channels"),
     ...pick("maxConcurrentTasks", "max-concurrent-tasks"),
+  };
+}
+
+/** Onboarding's managed T3: the pinned release, with runtime and token events printed as one line each. */
+function onboardManagedT3(print: (line: string) => void): OnboardManagedT3 {
+  const target = `${process.platform}-${process.arch}`;
+  return {
+    version: PINNED_T3.version,
+    unsupported: t3ArtifactFor(PINNED_T3) === undefined
+      ? `managed T3 is unavailable on ${target} (T3 ${PINNED_T3.version} ships no ${target} build); run your own T3 and pass --t3-url`
+      : undefined,
+    start: (t3) =>
+      startTransientManagedT3({
+        t3,
+        pin: PINNED_T3,
+        logger: (record) => {
+          if (record.event === "t3.runtime.stderr") return;
+          print(`    ${record.event}${record.detail === undefined ? "" : `: ${record.detail}`}`);
+        },
+      }),
   };
 }
 
@@ -308,6 +333,7 @@ export async function runOnboardCommand(argv: readonly string[]): Promise<number
       installService: manager === undefined ? undefined : (configPath) => manager.install(configPath),
       template: configTemplate,
       manifest: slackManifest,
+      managedT3: onboardManagedT3((line) => console.log(line)),
     });
   } finally {
     prompter.close();

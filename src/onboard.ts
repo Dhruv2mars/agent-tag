@@ -4,7 +4,7 @@ import { dirname, isAbsolute, join, resolve } from "node:path";
 import { z } from "zod";
 
 import type { CommandRunner } from "./command.ts";
-import { type AgentTagConfig, agentTagConfigSchema } from "./config.ts";
+import { type AgentTagConfig, agentTagConfigSchema, resolveManagedT3Config } from "./config.ts";
 import { checkT3Environment } from "./doctor.ts";
 import type { Prompter } from "./prompt.ts";
 import { createSecretFile, readSecretFile, SecretString } from "./security/secret-file.ts";
@@ -16,6 +16,7 @@ import {
   t3AdminSessionRevokeCommand,
 } from "./t3/admin-session.ts";
 import type { T3ServerInfo } from "./t3/gateway.ts";
+import type { ManagedT3Config, TransientManagedT3 } from "./t3/operator.ts";
 
 export const SLACK_APP_TOKEN_ENV = "AGENT_TAG_SLACK_APP_TOKEN";
 export const SLACK_BOT_TOKEN_ENV = "AGENT_TAG_SLACK_BOT_TOKEN";
@@ -39,6 +40,10 @@ export interface OnboardOptions {
   readonly t3Bin?: string;
   readonly t3AdminTokenFile?: string;
   readonly t3IssueToken: boolean;
+  /** `--t3-managed`: Agent Tag installs and runs its own T3. Also the default when no T3 server is found. */
+  readonly t3Managed?: boolean;
+  /** Loopback port for managed T3 (default 37841). */
+  readonly t3Port?: string;
   readonly repositoryRoots?: string;
   readonly baseBranch?: string;
   readonly providerInstanceId?: string;
@@ -67,9 +72,24 @@ export interface OnboardDependencies {
   readonly installService: ((configPath: string) => Promise<ServiceStatusReport>) | undefined;
   /** Parsed `config/agent-tag.example.json`; supplies profile, memory, and limit defaults. */
   readonly template: unknown;
+  /** Managed T3 support; undefined keeps onboarding on an operator-run T3. */
+  readonly managedT3?: OnboardManagedT3;
+  /** Waits between provider catalog reads while a just-started managed T3 probes its providers. */
+  readonly sleep?: (milliseconds: number) => Promise<void>;
   /** Parsed `config/slack-manifest.example.json`. */
   readonly manifest: unknown;
 }
+
+export interface OnboardManagedT3 {
+  /** The pinned T3 version (t3.lock.json). */
+  readonly version: string;
+  /** Why managed T3 cannot run on this platform, or undefined when it can. */
+  readonly unsupported: string | undefined;
+  /** Installs and starts the pinned T3 and makes sure the restricted token exists; `stop` ends it. */
+  readonly start: (t3: ManagedT3Config) => Promise<TransientManagedT3>;
+}
+
+export const DEFAULT_MANAGED_T3_PORT = 37_841;
 
 export type SecretOutcome = "created" | "kept" | "missing";
 
@@ -201,6 +221,8 @@ export function t3BaseDirMismatch(input: {
 export interface OnboardAnswers {
   readonly paths: OnboardPaths;
   readonly t3BaseUrl: string;
+  /** Set for managed T3: the config gets `t3.mode: "managed"` on this port instead of `t3BaseUrl`. */
+  readonly t3Managed?: { readonly port: number };
   readonly workspaceId: string;
   readonly allowedUserIds: readonly string[];
   readonly allowedChannelIds: readonly string[];
@@ -223,7 +245,9 @@ export function buildOnboardConfig(template: unknown, answers: OnboardAnswers): 
   const candidate = {
     version: 1,
     dataDir: answers.paths.dataDir,
-    t3: { baseUrl: answers.t3BaseUrl, tokenFile: answers.paths.t3TokenFile },
+    t3: answers.t3Managed === undefined
+      ? { baseUrl: answers.t3BaseUrl, tokenFile: answers.paths.t3TokenFile }
+      : { mode: "managed", port: answers.t3Managed.port, tokenFile: answers.paths.t3TokenFile },
     slack: {
       workspaceId: answers.workspaceId,
       appTokenFile: answers.paths.appTokenFile,
@@ -522,13 +546,35 @@ interface ProviderDiscovery {
   readonly providerInstanceId?: string;
 }
 
-async function discoverProviders(context: Context, t3: Pick<AgentTagConfig["t3"], "baseUrl" | "tokenFile">): Promise<ProviderDiscovery | undefined> {
+/** Reads per attempt while a just-started managed T3 re-probes its providers (its first catalog is stale). */
+const MANAGED_PROVIDER_ATTEMPTS = 15;
+const MANAGED_PROVIDER_DELAY_MS = 2_000;
+
+async function discoverProviders(
+  context: Context,
+  t3: Pick<AgentTagConfig["t3"], "baseUrl" | "tokenFile">,
+  attempts = 1,
+): Promise<ProviderDiscovery | undefined> {
   const { deps } = context;
+  const sleep = deps.sleep ?? ((milliseconds: number) => Bun.sleep(milliseconds));
   try {
-    const server = await deps.listT3Providers(t3);
-    const ready = server.providers.filter(
-      (provider) => provider.enabled && provider.installed && provider.status === "ready" && provider.auth.status === "authenticated",
-    );
+    let server: T3ServerInfo;
+    let ready: T3Provider[];
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        server = await deps.listT3Providers(t3);
+      } catch (error) {
+        if (attempt >= attempts) throw error;
+        await sleep(MANAGED_PROVIDER_DELAY_MS);
+        continue;
+      }
+      ready = server.providers.filter(
+        (provider) => provider.enabled && provider.installed && provider.status === "ready" && provider.auth.status === "authenticated",
+      );
+      if (ready.length > 0 || attempt >= attempts) break;
+      if (attempt === 1) deps.print("  waiting for T3 to finish probing its providers…");
+      await sleep(MANAGED_PROVIDER_DELAY_MS);
+    }
     if (ready.length === 0) {
       deps.print("  T3 reports no ready, authenticated provider; authenticate one in T3 before starting");
       return { providers: server.providers };
@@ -541,6 +587,94 @@ async function discoverProviders(context: Context, t3: Pick<AgentTagConfig["t3"]
   } catch (error) {
     deps.print(`  could not list T3 providers: ${errorMessage(error)}`);
     return undefined;
+  }
+}
+
+const EXTERNAL_T3_FLAGS = [
+  ["t3BaseUrl", "--t3-url"],
+  ["t3BaseDir", "--t3-base-dir"],
+  ["t3Bin", "--t3-bin"],
+  ["t3AdminTokenFile", "--t3-admin-token-file"],
+] as const;
+
+/**
+ * Managed T3 when `--t3-managed` is passed, or by default when no T3 server is running and no
+ * external T3 flag was given (interactive runs confirm first). Returns the port, or undefined for
+ * an operator-run T3.
+ */
+async function chooseManagedT3(
+  context: Context,
+  input: { readonly detected: string | undefined; readonly baseDir: string },
+): Promise<{ readonly port: number } | undefined> {
+  const { options, deps } = context;
+  const external: string[] = EXTERNAL_T3_FLAGS.filter(([key]) => options[key] !== undefined).map(([, flag]) => flag);
+  if (options.t3IssueToken) external.push("--t3-issue-token");
+  const managedT3 = deps.managedT3;
+  let managed: boolean;
+  if (options.t3Managed === true) {
+    if (external.length > 0) throw new Error(`--t3-managed cannot be combined with ${external.join(", ")}`);
+    if (managedT3 === undefined) throw new Error("--t3-managed: managed T3 is not available in this build");
+    if (managedT3.unsupported !== undefined) throw new Error(`--t3-managed: ${managedT3.unsupported}`);
+    managed = true;
+  } else if (external.length > 0 || input.detected !== undefined || managedT3 === undefined || managedT3.unsupported !== undefined) {
+    managed = false;
+  } else if (options.interactive) {
+    managed = await deps.prompter.confirm(
+      `  No running T3 server found in ${input.baseDir}. Let Agent Tag install T3 ${managedT3.version} and run it itself (managed mode)?`,
+      true,
+    );
+  } else {
+    deps.print(`  no running T3 server found in ${input.baseDir}; using managed T3 (pass --t3-url to use your own T3 server)`);
+    managed = true;
+  }
+  if (!managed) {
+    if (options.t3Port !== undefined) throw new Error("--t3-port only applies to managed T3 (--t3-managed)");
+    return undefined;
+  }
+  const raw = options.t3Port ?? String(DEFAULT_MANAGED_T3_PORT);
+  const port = Number(raw.trim());
+  if (!Number.isInteger(port) || port < 1_024 || port > 65_535) throw new Error("--t3-port: must be an integer from 1024 to 65535");
+  return { port };
+}
+
+/**
+ * Installs and starts the pinned T3 under `<dataDir>/t3`, mints the restricted token, lists providers,
+ * and stops it again; the service starts it for real. Without `--t3-managed` a failed start only warns.
+ */
+async function provisionManagedT3(
+  context: Context,
+  input: { readonly paths: OnboardPaths; readonly port: number },
+): Promise<{ readonly t3BaseUrl: string; readonly t3: T3Probe; readonly t3Token: SecretOutcome; readonly discovered: ProviderDiscovery | undefined }> {
+  const { options, deps } = context;
+  const managedT3 = deps.managedT3!;
+  const tokenFile = input.paths.t3TokenFile;
+  const config = resolveManagedT3Config({ mode: "managed", port: input.port, tokenFile }, input.paths.dataDir);
+  deps.print(
+    `  managed T3: installing T3 ${managedT3.version} into ${config.managed.runtimeDir} and starting it on ${config.baseUrl} (home ${config.managed.homeDir})`,
+  );
+  const hadToken = await exists(tokenFile);
+  let started: TransientManagedT3;
+  try {
+    started = await managedT3.start(config);
+  } catch (error) {
+    const problem = `managed T3 did not start: ${errorMessage(error)}`;
+    if (options.t3Managed === true) throw new Error(problem);
+    deps.print(`  ${problem}`);
+    deps.print("  fix the problem, then check with `agent-tag doctor` and `agent-tag t3 status`; the service starts managed T3 itself once it is installed");
+    return { t3BaseUrl: config.baseUrl, t3: { usable: false, reachable: false, problem }, t3Token: hadToken ? "kept" : "missing", discovered: undefined };
+  }
+  try {
+    deps.print(`  managed T3 ${started.version ?? managedT3.version} is running on ${config.baseUrl}`);
+    deps.print(
+      started.token === "enrolled"
+        ? `  wrote restricted T3 token (orchestration:read, orchestration:operate) to ${tokenFile}`
+        : `  keeping existing T3 token at ${tokenFile}`,
+    );
+    const discovered = await discoverProviders(context, config, MANAGED_PROVIDER_ATTEMPTS);
+    return { t3BaseUrl: config.baseUrl, t3: { usable: true }, t3Token: started.token === "enrolled" ? "created" : "kept", discovered };
+  } finally {
+    await started.stop();
+    deps.print("  stopped the onboarding T3; the Agent Tag service starts it from now on");
   }
 }
 
@@ -642,40 +776,49 @@ export async function runOnboard(options: OnboardOptions, deps: OnboardDependenc
   const t3BaseDir = resolve(deps.cwd, options.t3BaseDir ?? defaultT3BaseDir(deps.env, deps.homeDirectory));
   const detectedT3 = await detectT3Runtime(t3BaseDir);
   if (detectedT3 !== undefined) print(`  detected a running T3 server at ${detectedT3} (${t3BaseDir})`);
-  const t3BaseUrl = await resolveValue(context, {
-    flag: "t3-url",
-    value: options.t3BaseUrl,
-    question: "T3 base URL (loopback only)",
-    ...(detectedT3 !== undefined
-      ? { defaultValue: detectedT3 }
-      : options.interactive
-        ? { defaultValue: template.t3.baseUrl }
-        : {}),
-    parse: (raw) => {
-      if (!isLoopbackUrl(raw.trim())) throw new Error("T3 must use a loopback http(s) URL such as http://127.0.0.1:3773");
-      return new URL(raw.trim()).origin;
-    },
-  });
-  const t3 = await probeT3(context, t3BaseUrl);
-  if (!t3.usable && (options.t3AdminTokenFile !== undefined || options.t3IssueToken)) {
-    throw new Error(`cannot enroll a T3 token: ${t3.problem}`);
-  }
-  const t3Token = t3.usable
-    ? await provisionT3Token(context, {
-      baseUrl: t3BaseUrl,
-      baseDir: t3BaseDir,
-      path: paths.t3TokenFile,
-      baseDirMismatch: t3BaseDirMismatch({ baseUrl: t3BaseUrl, baseDir: t3BaseDir, detected: detectedT3 }),
-    })
-    : (await exists(paths.t3TokenFile))
-      ? "kept"
-      : "missing";
-  if (!t3.usable) {
-    print(
-      t3.reachable
-        ? "  skipping T3 token and provider setup: run the T3 version pinned in t3.lock.json, then `bun run enroll:t3` and `agent-tag doctor`"
-        : "  skipping T3 token and provider setup: start T3, then mint a token with `bun run enroll:t3` and run `agent-tag doctor`",
-    );
+  const managed = await chooseManagedT3(context, { detected: detectedT3, baseDir: t3BaseDir });
+  let t3BaseUrl: string;
+  let t3: T3Probe;
+  let t3Token: SecretOutcome;
+  let managedDiscovery: ProviderDiscovery | undefined;
+  if (managed !== undefined) {
+    ({ t3BaseUrl, t3, t3Token, discovered: managedDiscovery } = await provisionManagedT3(context, { paths, port: managed.port }));
+  } else {
+    t3BaseUrl = await resolveValue(context, {
+      flag: "t3-url",
+      value: options.t3BaseUrl,
+      question: "T3 base URL (loopback only)",
+      ...(detectedT3 !== undefined
+        ? { defaultValue: detectedT3 }
+        : options.interactive
+          ? { defaultValue: template.t3.baseUrl }
+          : {}),
+      parse: (raw) => {
+        if (!isLoopbackUrl(raw.trim())) throw new Error("T3 must use a loopback http(s) URL such as http://127.0.0.1:3773");
+        return new URL(raw.trim()).origin;
+      },
+    });
+    t3 = await probeT3(context, t3BaseUrl);
+    if (!t3.usable && (options.t3AdminTokenFile !== undefined || options.t3IssueToken)) {
+      throw new Error(`cannot enroll a T3 token: ${t3.problem}`);
+    }
+    t3Token = t3.usable
+      ? await provisionT3Token(context, {
+        baseUrl: t3BaseUrl,
+        baseDir: t3BaseDir,
+        path: paths.t3TokenFile,
+        baseDirMismatch: t3BaseDirMismatch({ baseUrl: t3BaseUrl, baseDir: t3BaseDir, detected: detectedT3 }),
+      })
+      : (await exists(paths.t3TokenFile))
+        ? "kept"
+        : "missing";
+    if (!t3.usable) {
+      print(
+        t3.reachable
+          ? "  skipping T3 token and provider setup: run the T3 version pinned in t3.lock.json, then `bun run enroll:t3` and `agent-tag doctor`"
+          : "  skipping T3 token and provider setup: start T3, then mint a token with `bun run enroll:t3` and run `agent-tag doctor`",
+      );
+    }
   }
 
   // 4. Repositories and provider.
@@ -704,8 +847,11 @@ export async function runOnboard(options: OnboardOptions, deps: OnboardDependenc
       return raw.trim();
     },
   });
-  const discovered =
-    !t3.usable || t3Token === "missing" ? undefined : await discoverProviders(context, { baseUrl: t3BaseUrl, tokenFile: paths.t3TokenFile });
+  const discovered = managed !== undefined
+    ? managedDiscovery
+    : !t3.usable || t3Token === "missing"
+      ? undefined
+      : await discoverProviders(context, { baseUrl: t3BaseUrl, tokenFile: paths.t3TokenFile });
   const providerInstanceId = await resolveValue(context, {
     flag: "provider",
     value: options.providerInstanceId,
@@ -798,6 +944,7 @@ export async function runOnboard(options: OnboardOptions, deps: OnboardDependenc
   const built = buildOnboardConfig(deps.template, {
     paths,
     t3BaseUrl,
+    ...(managed === undefined ? {} : { t3Managed: managed }),
     workspaceId,
     allowedUserIds,
     allowedChannelIds,
@@ -844,5 +991,6 @@ export async function runOnboard(options: OnboardOptions, deps: OnboardDependenc
   print(`  2. Check everything: agent-tag doctor ${paths.configPath}`);
   if (service === undefined) print(`  3. Start it: agent-tag service install ${paths.configPath}  (or: agent-tag run ${paths.configPath})`);
   else print("  3. Mention the bot in an allowed channel.");
+  if (managed !== undefined) print(`  The service runs T3 itself; watch agent threads in its web UI with: agent-tag t3 pair ${paths.configPath}`);
   return { configPath: paths.configPath, config: built.config, secrets, ...(service === undefined ? {} : { service }) };
 }

@@ -342,3 +342,16 @@ export async function scanForSecrets(input: {
     findings: [...findings.values()],
   };
 }
+
+/**
+ * Paths a managed T3 keeps under the data directory that are not leaks: the verified T3 release and its
+ * download staging (the binary and web bundle contain credential-shaped strings) and T3's own key pair.
+ * Agent Tag's own runtime state files, T3's logs and its database are still scanned.
+ */
+export function managedT3ScanExclusions(managed: { readonly homeDir: string; readonly runtimeDir: string }): string[] {
+  return [
+    join(managed.runtimeDir, "versions"),
+    join(managed.runtimeDir, "downloads"),
+    join(managed.homeDir, "userdata", "secrets"),
+  ];
+}

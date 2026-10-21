@@ -16,7 +16,7 @@ import { T3_FATAL_EXIT_CODE, waitForShutdownOrFatal } from "./t3/operator.ts";
 
 // One leading "usage: agent-tag" line, continuation lines aligned under it.
 const USAGE = [
-  "usage: agent-tag onboard [--yes --accept-risk ...]",
+  "usage: agent-tag onboard [--yes --accept-risk --t3-managed ...]",
   "       agent-tag doctor [CONFIG] [--fix] [--json]",
   "       agent-tag service <install|upgrade|uninstall|status|restart|logs> [CONFIG] [--lines N] [--follow]",
   "       agent-tag t3 <install|status> [CONFIG] [--download-base-url URL]",

@@ -11,6 +11,7 @@ import {
   defaultT3BaseDir,
   detectT3Runtime,
   type OnboardDependencies,
+  type OnboardManagedT3,
   type OnboardOptions,
   parseSlackIdList,
   runOnboard,
@@ -23,6 +24,7 @@ import { nonInteractivePrompter, parseYesNo, type Prompter } from "../src/prompt
 import { SecretString } from "../src/security/secret-file.ts";
 import type { ServiceStatusReport } from "../src/service-manager.ts";
 import type { T3ServerInfo } from "../src/t3/gateway.ts";
+import type { ManagedT3Config } from "../src/t3/operator.ts";
 
 const root = join(import.meta.dir, "..");
 const template: unknown = await Bun.file(join(root, "config", "agent-tag.example.json")).json();
@@ -676,5 +678,207 @@ describe("onboarding helpers", () => {
     expect(resolveConfigPath(undefined, { AGENT_TAG_CONFIG: "/c/d.json" }, "/home/u")).toBe("/c/d.json");
     expect(resolveConfigPath(undefined, { AGENT_TAG_HOME: "/srv/at" }, "/home/u")).toBe("/srv/at/agent-tag.json");
     expect(resolveConfigPath(undefined, {}, "/home/u")).toBe("/home/u/.agent-tag/agent-tag.json");
+  });
+});
+
+describe("agent-tag onboard with managed T3", () => {
+  let harness: Harness;
+
+  beforeEach(async () => {
+    harness = await createHarness();
+  });
+
+  afterEach(async () => {
+    await rm(harness.directory, { recursive: true, force: true });
+  });
+
+  /** Flags for a host with no T3 of its own: no base dir, no admin-session issuing. */
+  function managedFlags(extra: Partial<OnboardOptions> = {}): OnboardOptions {
+    const { t3BaseDir: _baseDir, ...rest } = flags(harness, { t3IssueToken: false, ...extra });
+    return rest;
+  }
+
+  interface FakeManaged {
+    readonly started: ManagedT3Config[];
+    stopped: number;
+    readonly managedT3: OnboardManagedT3;
+  }
+
+  function fakeManaged(input: { readonly fail?: Error; readonly unsupported?: string } = {}): FakeManaged {
+    const fake: FakeManaged = {
+      started: [],
+      stopped: 0,
+      managedT3: {
+        version: "0.0.45",
+        unsupported: input.unsupported,
+        start: async (t3) => {
+          fake.started.push(t3);
+          if (input.fail !== undefined) throw input.fail;
+          await writeFile(t3.tokenFile, RESTRICTED_TOKEN, { mode: 0o600 });
+          return { version: "0.0.45", token: "enrolled", stop: async () => void (fake.stopped += 1) };
+        },
+      },
+    };
+    return fake;
+  }
+
+  /** The first catalog of a just-started T3 is stale (codex still probing); the second is ready. */
+  function staleThenReady(seen: string[]): OnboardDependencies["listT3Providers"] {
+    return async (t3) => {
+      seen.push(t3.baseUrl);
+      if (seen.length > 1) return server;
+      return { ...server, providers: server.providers.map((provider) => ({ ...provider, status: "error" as const })) };
+    };
+  }
+
+  test("--t3-managed writes a managed config, mints the token through a transient runtime, and stops it", async () => {
+    const fake = fakeManaged();
+    const seen: string[] = [];
+    const sleeps: number[] = [];
+    const result = await runOnboard(managedFlags({ t3Managed: true, t3Port: "37900", installService: true }), {
+      ...harness.deps,
+      managedT3: fake.managedT3,
+      listT3Providers: staleThenReady(seen),
+      sleep: async (milliseconds) => void sleeps.push(milliseconds),
+    });
+    const dataDir = join(harness.home, "data");
+    const tokenFile = join(harness.home, "secrets", "t3-token");
+    expect(result.secrets.t3Token).toBe("created");
+    expect(result.config.t3).toEqual({
+      mode: "managed",
+      baseUrl: "http://127.0.0.1:37900",
+      tokenFile,
+      watch: { enabled: true, safetyPollMs: 15_000, lingerMs: 30_000 },
+      managed: {
+        port: 37900,
+        homeDir: join(dataDir, "t3", "home"),
+        runtimeDir: join(dataDir, "t3", "runtime"),
+        autoInstall: true,
+        rotation: { rotateBeforeDays: 7, revokeGraceMinutes: 15 },
+      },
+    });
+    // The written file round-trips to the same config and stays minimal.
+    const written = JSON.parse(await readFile(result.configPath, "utf8"));
+    expect(written.t3).toEqual({ mode: "managed", port: 37900, tokenFile });
+    expect(agentTagConfigSchema.parse(written).t3).toEqual(result.config.t3);
+    expect(fake.started).toEqual([result.config.t3 as ManagedT3Config]);
+    expect(fake.stopped).toBe(1);
+    expect(seen).toEqual(["http://127.0.0.1:37900", "http://127.0.0.1:37900"]);
+    expect(sleeps).toEqual([2_000]);
+    expect(result.config.profiles[0]).toMatchObject({ defaultProviderInstanceId: "codex", defaultModel: "gpt-default" });
+    // No admin session is issued from a T3 base dir: the managed runtime mints its own token.
+    expect(harness.commands).toEqual([]);
+    expect(harness.installs).toEqual([result.configPath]);
+    const printed = harness.output.join("\n");
+    expect(printed).toContain("managed T3 0.0.45 is running on http://127.0.0.1:37900");
+    expect(printed).toContain(`agent-tag t3 pair ${result.configPath}`);
+    expect(printed).not.toContain(RESTRICTED_TOKEN);
+  });
+
+  test("is the default when no T3 server runs and no external T3 flag is given", async () => {
+    const fake = fakeManaged();
+    const result = await runOnboard(managedFlags(), { ...harness.deps, managedT3: fake.managedT3 });
+    expect(result.config.t3).toMatchObject({ mode: "managed", baseUrl: "http://127.0.0.1:37841" });
+    expect(harness.output.join("\n")).toContain("using managed T3 (pass --t3-url to use your own T3 server)");
+
+    // A detected T3, an explicit external flag, or an unsupported platform keeps the external path.
+    const detected = await runOnboard(flags(harness, { force: true }), { ...harness.deps, managedT3: fake.managedT3 });
+    expect(detected.config.t3.mode).toBe("external");
+    await expect(
+      runOnboard(managedFlags({ force: true }), { ...harness.deps, managedT3: fakeManaged({ unsupported: "no darwin-x64 build" }).managedT3 }),
+    ).rejects.toThrow("missing --t3-url");
+    expect(fake.started).toHaveLength(1);
+  });
+
+  test("asks before choosing managed T3 interactively", async () => {
+    const fake = fakeManaged();
+    const asked: string[] = [];
+    const prompter: Prompter = {
+      ...nonInteractivePrompter(),
+      confirm: async (question, defaultValue) => {
+        asked.push(question);
+        return question.includes("managed mode") ? false : defaultValue;
+      },
+      ask: async (question, defaultValue) => {
+        asked.push(question);
+        return defaultValue ?? "";
+      },
+    };
+    const result = await runOnboard(managedFlags({ interactive: true, installService: false }), { ...harness.deps, prompter, managedT3: fake.managedT3 });
+    expect(result.config.t3.mode).toBe("external");
+    expect(asked.some((question) => question.includes("Let Agent Tag install T3 0.0.45 and run it itself"))).toBe(true);
+    expect(asked).toContain("T3 base URL (loopback only)");
+    expect(fake.started).toEqual([]);
+  });
+
+  test("rejects conflicting flags and unusable platforms before touching T3", async () => {
+    const fake = fakeManaged();
+    const deps = { ...harness.deps, managedT3: fake.managedT3 };
+    await expect(runOnboard(flags(harness, { t3Managed: true }), deps)).rejects.toThrow(
+      "--t3-managed cannot be combined with --t3-base-dir, --t3-issue-token",
+    );
+    await rm(harness.home, { recursive: true, force: true });
+    await expect(runOnboard(flags(harness, { t3Port: "37900" }), deps)).rejects.toThrow("--t3-port only applies to managed T3");
+    await rm(harness.home, { recursive: true, force: true });
+    await expect(runOnboard(managedFlags({ t3Managed: true, t3Port: "80" }), deps)).rejects.toThrow("--t3-port: must be an integer from 1024 to 65535");
+    await rm(harness.home, { recursive: true, force: true });
+    await expect(
+      runOnboard(managedFlags({ t3Managed: true }), { ...deps, managedT3: fakeManaged({ unsupported: "no darwin-x64 build" }).managedT3 }),
+    ).rejects.toThrow("--t3-managed: no darwin-x64 build");
+    expect(fake.started).toEqual([]);
+  });
+
+  test("never starts managed T3 in a home that is the desktop T3's $T3CODE_HOME", async () => {
+    const fake = fakeManaged();
+    const previous = process.env.T3CODE_HOME;
+    process.env.T3CODE_HOME = join(harness.home, "data", "t3", "home");
+    try {
+      await expect(runOnboard(managedFlags({ t3Managed: true }), { ...harness.deps, managedT3: fake.managedT3 })).rejects.toThrow(
+        "managed T3 must not share the desktop T3 base dir",
+      );
+    } finally {
+      if (previous === undefined) delete process.env.T3CODE_HOME;
+      else process.env.T3CODE_HOME = previous;
+    }
+    expect(fake.started).toEqual([]);
+  });
+
+  test("a failed start fails --t3-managed, but only warns when managed T3 was the default", async () => {
+    const fake = fakeManaged({ fail: new Error("port 37841 is already in use") });
+    const deps = { ...harness.deps, managedT3: fake.managedT3 };
+    await expect(runOnboard(managedFlags({ t3Managed: true }), deps)).rejects.toThrow(
+      "managed T3 did not start: port 37841 is already in use",
+    );
+    const result = await runOnboard(managedFlags({ force: true, model: "gpt-default", installService: false }), deps);
+    expect(result.secrets.t3Token).toBe("missing");
+    expect(result.config.t3.mode).toBe("managed");
+    expect(harness.output.join("\n")).toContain("the service starts managed T3 itself once it is installed");
+    expect(fake.stopped).toBe(0);
+  });
+
+  test("stops the transient runtime even when listing providers keeps failing", async () => {
+    const fake = fakeManaged();
+    let calls = 0;
+    const result = await runOnboard(managedFlags({ model: "gpt-default" }), {
+      ...harness.deps,
+      managedT3: fake.managedT3,
+      sleep: async () => {},
+      listT3Providers: async () => {
+        calls += 1;
+        throw new Error("catalog unavailable");
+      },
+    });
+    expect(calls).toBe(15);
+    expect(fake.stopped).toBe(1);
+    expect(result.config.profiles[0]).toMatchObject({ defaultProviderInstanceId: "codex", defaultModel: "gpt-default" });
+    expect(harness.output.join("\n")).toContain("could not list T3 providers: catalog unavailable");
+  });
+
+  test("parses --t3-managed and --t3-port", () => {
+    expect(onboardOptionsFromArguments(["--yes", "--t3-managed", "--t3-port", "37900"], false)).toMatchObject({
+      t3Managed: true,
+      t3Port: "37900",
+    });
+    expect(onboardOptionsFromArguments(["--yes"], false)).not.toHaveProperty("t3Managed");
   });
 });

@@ -2,7 +2,7 @@ import { resolve } from "node:path";
 
 import { loadConfig } from "../src/config.ts";
 import { readSecretFile } from "../src/security/secret-file.ts";
-import { scanForSecrets, type SecretCanary } from "../src/security/secret-scan.ts";
+import { managedT3ScanExclusions, scanForSecrets, type SecretCanary } from "../src/security/secret-scan.ts";
 
 function usage(): never {
   throw new Error("usage: scan-secrets [--config CONFIG] ROOT [ROOT ...]");
@@ -27,6 +27,7 @@ if (configPath !== undefined) {
     { name: "slack-bot-token", path: config.slack.botTokenFile },
   ];
   configuredRoots.push(config.dataDir, ...config.profiles.flatMap((profile) => profile.repositoryRoots));
+  if (config.t3.mode === "managed") excludedPaths.push(...managedT3ScanExclusions(config.t3.managed));
   for (const secretFile of secretFiles) {
     const secret = await readSecretFile(secretFile.path);
     canaries.push({ name: secretFile.name, secret });

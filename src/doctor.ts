@@ -20,6 +20,8 @@ import { AgentTagStore, type LifecycleCounts } from "./store/store.ts";
 import { readT3CredentialState, T3_CREDENTIAL_STATE_FILE, type T3CredentialState } from "./t3/credentials.ts";
 import { assertRestrictedOrchestrationSession, inspectT3Session, type T3Session } from "./t3/auth.ts";
 import { inspectT3, type T3ServerInfo } from "./t3/gateway.ts";
+import { checkT3Runtime, probeManagedT3Runtime, type T3RuntimeProbe } from "./doctor-t3-runtime.ts";
+import type { ManagedT3Config } from "./t3/operator.ts";
 import { parseT3Pin, type T3Pin } from "./t3/pin.ts";
 import {
   fetchT3EnvironmentDescriptor,
@@ -72,6 +74,8 @@ export interface DoctorDependencies {
   readonly gitVersion?: () => Promise<string | undefined>;
   /** The running service's `<dataDir>/service-state.json`. Defaults to reading it. */
   readonly serviceState?: (dataDir: string) => Promise<ServiceStateReport | undefined>;
+  /** Managed mode: the install and the running server. Defaults to `probeManagedT3Runtime`. */
+  readonly t3Runtime?: (t3: ManagedT3Config, pin: T3Pin) => Promise<T3RuntimeProbe>;
 }
 
 export const T3_ORCHESTRATION_PROTOCOL_VERSION = SUPPORTED_T3_ORCHESTRATION_PROTOCOL;
@@ -863,6 +867,11 @@ export async function runDoctor(input: {
     }
   }
 
+  checks.push(
+    config.t3.mode === "managed"
+      ? checkT3Runtime(config.t3, serviceState, await (dependencies.t3Runtime ?? probeManagedT3Runtime)(config.t3, dependencies.pin))
+      : skipped("t3-runtime", "external T3: Agent Tag does not run it"),
+  );
   checks.push(await checkT3TokenRotation(config, dependencies.now()));
 
   const botToken = secrets.get("secret:slack-bot-token");
