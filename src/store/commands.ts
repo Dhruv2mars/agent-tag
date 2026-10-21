@@ -15,7 +15,7 @@ import type { SlackOutboxPayload } from "./types.ts";
  * Ledger kinds. The column has no CHECK (the table is shared with PR-K2's memory commands), so this
  * list is the validation: later lanes append their kinds here.
  */
-export const SLACK_COMMAND_KINDS = [...AGENT_COMMANDS] as const;
+export const SLACK_COMMAND_KINDS = [...AGENT_COMMANDS, "routine-create", "routine-list", "routine-cancel"] as const;
 export const slackCommandKindSchema = z.enum(SLACK_COMMAND_KINDS);
 export type SlackCommandKind = z.infer<typeof slackCommandKindSchema>;
 export const COMMAND_OUTCOMES = ["started", "succeeded", "denied", "rejected", "failed"] as const;

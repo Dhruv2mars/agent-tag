@@ -4,6 +4,7 @@ import { isAbsolute, join, resolve } from "node:path";
 import { z } from "zod";
 
 import { AGENT_COMMANDS } from "./commands/parse.ts";
+import { isValidTimeZone } from "./routines/zoned.ts";
 import { parseT3DownloadBaseUrl } from "./t3/install.ts";
 
 const absolutePath = z.string().min(1).refine(isAbsolute, "must be an absolute path");
@@ -439,6 +440,12 @@ function checkAllowedModels(
  */
 const routinesSchema = z
   .object({
+    /** false: routine phrases in Slack are ordinary prompts (the CLI still manages schedules). */
+    enabled: z.boolean().default(true),
+    /** Used when the request names no zone and the requester's Slack time zone is unavailable. */
+    defaultTimeZone: z.string().min(1).default("UTC").refine(isValidTimeZone, "invalid IANA time zone"),
+    /** Active routines one channel or DM may hold (at most limits.maxActiveSchedules). */
+    maxActivePerConversation: z.number().int().positive().max(1_000).default(25),
     autoDisable: z
       .object({
         consecutiveFailures: z.number().int().min(1).max(50).default(3),
