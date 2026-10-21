@@ -49,8 +49,8 @@ type PlainEvent = z.infer<typeof plainEvent>;
 type Route = AgentTagConfig["routes"][number];
 type Profile = AgentTagConfig["profiles"][number];
 
-/** Human subtypes that may trigger a turn. `file_share` stays ignored until file support lands. */
-const TRIGGER_SUBTYPES = new Set([undefined, "thread_broadcast"]);
+/** Human subtypes that may trigger a turn. A `file_share` carries its files to the turn (PR-L). */
+const TRIGGER_SUBTYPES = new Set([undefined, "thread_broadcast", "file_share"]);
 /** Bot subtypes recorded as context notes. */
 const BOT_NOTE_SUBTYPES = new Set([undefined, "bot_message", "thread_broadcast"]);
 
@@ -398,6 +398,7 @@ export class SlackEventRouter {
       sourceOrderKey: event.ts,
       messageTs: event.ts,
       origin: "slack",
+      files: event.files ?? [],
       ...(this.#config.slack.ui.ackReaction === null ? {} : { ackReaction: this.#config.slack.ui.ackReaction }),
       ...(threadContext === undefined ? {} : { threadContext }),
       ...(binding !== null && explicitMention ? { unmuteThread: true } : {}),

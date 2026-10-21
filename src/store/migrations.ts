@@ -563,4 +563,25 @@ export const STORE_MIGRATIONS: readonly StoreMigration[] = [
       );
     `,
   },
+  {
+    // Slack files in (PR-L1): one row per file ref in an operation's payload, written as each file is
+    // attached to T3 or skipped. A replayed operation reuses these rows instead of downloading or
+    // uploading again, so its `thread.turn.start` carries the same attachment ids. Metadata only: file
+    // bytes never touch SQLite. New table only, so it applies in any order relative to other versions.
+    version: 22,
+    sql: `
+      CREATE TABLE operation_attachments (
+        operation_id TEXT NOT NULL REFERENCES operations(operation_id) ON DELETE CASCADE,
+        ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+        slack_file_id TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('attached', 'skipped')),
+        t3_attachment_json TEXT,
+        skip_reason TEXT,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (operation_id, ordinal),
+        CHECK ((state = 'attached') = (t3_attachment_json IS NOT NULL)),
+        CHECK ((state = 'skipped') = (skip_reason IS NOT NULL))
+      );
+    `,
+  },
 ];

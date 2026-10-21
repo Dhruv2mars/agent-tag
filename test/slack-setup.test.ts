@@ -39,6 +39,7 @@ test("the checked-in Slack manifest is the least-privilege runtime contract", as
     "app_mentions:read",
     "channels:history",
     "chat:write",
+    "files:read",
     "groups:history",
     "im:history",
     "reactions:write",

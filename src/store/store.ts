@@ -59,6 +59,7 @@ import * as threadNotes from "./thread-notes.ts";
 import * as pullRequests from "./pull-requests.ts";
 import * as commands from "./commands.ts";
 import * as reactions from "./reactions.ts";
+import * as attachments from "./attachments.ts";
 
 export type { AuditAction } from "./schema.ts";
 export type {
@@ -184,6 +185,7 @@ export type {
   RetryReactionInput,
   SettleReactionInput,
 } from "./reactions.ts";
+export type { InboundSkipReason, OperationAttachment, RecordOperationAttachmentInput } from "./attachments.ts";
 export type { EnqueueMessageEditInput, EnqueueMessageRefreshInput, MessageEditResult } from "./message-edits.ts";
 
 export class AgentTagStore {
@@ -265,6 +267,14 @@ export class AgentTagStore {
 
   recordThreadContextAudit(input: operations.RecordThreadContextAuditInput): void {
     operations.recordThreadContextAudit(this.#database, input);
+  }
+
+  listOperationAttachments(operationId: string): attachments.OperationAttachment[] {
+    return attachments.listOperationAttachments(this.#database, operationId);
+  }
+
+  recordOperationAttachment(input: attachments.RecordOperationAttachmentInput): attachments.OperationAttachment {
+    return attachments.recordOperationAttachment(this.#context, input);
   }
 
   recordThreadNote(input: threadNotes.RecordThreadNoteInput): threadNotes.RecordThreadNoteResult {

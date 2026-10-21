@@ -53,6 +53,7 @@ function eventBody(input: {
   readonly teamId?: string;
   readonly subtype?: string;
   readonly botId?: string;
+  readonly files?: readonly unknown[];
 }): unknown {
   return {
     type: "event_callback",
@@ -67,6 +68,7 @@ function eventBody(input: {
       ...(input.threadTs === undefined ? {} : { thread_ts: input.threadTs }),
       ...(input.subtype === undefined ? {} : { subtype: input.subtype }),
       ...(input.botId === undefined ? {} : { bot_id: input.botId }),
+      ...(input.files === undefined ? {} : { files: input.files }),
     },
   };
 }
@@ -950,9 +952,8 @@ describe("bot, self and edit routing", () => {
     });
   });
 
-  test("ignores file_share messages from an allowed user without any write", async () => {
+  test("a file_share reply in a bound thread becomes one turn carrying its file refs (L1)", async () => {
     await withBoundThread(({ store, router }) => {
-      const before = store.diagnostics();
       expect(
         router.ingest(
           eventBody({
@@ -963,10 +964,50 @@ describe("bot, self and edit routing", () => {
             threadTs: "1000.000001",
             subtype: "file_share",
             text: "here is a file",
+            files: [
+              { id: "F0PNG", name: "chart.png", mimetype: "image/png", filetype: "png", size: 68, mode: "hosted", url_private_download: "https://files.slack.com/x" },
+              { id: "F0CSV", name: "data.csv", mimetype: "text/csv", filetype: "csv", size: 12, mode: "hosted" },
+              { name: "no id is dropped" },
+            ],
           }),
         ),
-      ).toEqual({ kind: "ignored", reason: "message-subtype" });
+      ).toMatchObject({ kind: "accepted" });
+      const claim = () =>
+        store.claimNextOperation({ workerId: "w", now: receivedAt, leaseMs: 10_000, maxConcurrentTasks: 2 });
+      const first = claim();
+      expect(first?.payload.files).toEqual([]);
+      store.completeOperation({ operationId: first?.operationId ?? "", workerId: "w", resultSequence: 1, now: receivedAt });
+      // Refs keep the id and display metadata only; URLs are re-read with files.info at turn time.
+      expect(claim()?.payload.files).toEqual([
+        { id: "F0PNG", name: "chart.png", mimetype: "image/png", filetype: "png", size: 68, mode: "hosted" },
+        { id: "F0CSV", name: "data.csv", mimetype: "text/csv", filetype: "csv", size: 12, mode: "hosted" },
+      ]);
+    });
+  });
+
+  test("other message subtypes stay ignored without any write", async () => {
+    await withBoundThread(({ store, router }) => {
+      const before = store.diagnostics();
+      for (const subtype of ["channel_join", "me_message", "file_comment"]) {
+        expect(
+          router.ingest(
+            eventBody({ eventId: `Ev-${subtype}`, type: "message", ts: "1000.000002", threadTs: "1000.000001", subtype }),
+          ),
+        ).toEqual({ kind: "ignored", reason: "message-subtype" });
+      }
       expect(store.diagnostics()).toEqual(before);
+    });
+  });
+
+  test("an app_mention with files carries the refs", async () => {
+    await withRouter(({ store, router }) => {
+      expect(
+        router.ingest(
+          eventBody({ eventId: "EvMention", type: "app_mention", files: [{ id: "F0LOG", name: "build.log", size: 9 }] }),
+        ),
+      ).toMatchObject({ kind: "accepted" });
+      const claimed = store.claimNextOperation({ workerId: "w", now: receivedAt, leaseMs: 10_000, maxConcurrentTasks: 1 });
+      expect(claimed?.payload.files).toEqual([{ id: "F0LOG", name: "build.log", size: 9 }]);
     });
   });
 });

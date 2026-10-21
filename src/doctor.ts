@@ -83,6 +83,7 @@ export const SLACK_BOT_SCOPES: readonly string[] = [
   "app_mentions:read",
   "channels:history",
   "chat:write",
+  "files:read",
   "groups:history",
   "im:history",
   "reactions:write",

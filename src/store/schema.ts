@@ -5,6 +5,28 @@ import { scheduleRecurrenceSchema, type ScheduleRecurrence } from "../routines/c
 // Zod schemas for store inputs, stored JSON and the rows read back from SQLite.
 export const nonEmpty = z.string().min(1);
 export const isoDateTime = z.iso.datetime();
+/**
+ * A Slack file shared with the triggering message (PR-L): metadata only. Download URLs are not stored;
+ * the coordinator re-reads them through `files.info` when it attaches the file.
+ */
+export const inboundFileRefSchema = z.object({
+  id: z.string().regex(/^F[A-Z0-9]+$/),
+  name: z.string().max(1_000).optional(),
+  mimetype: z.string().max(200).optional(),
+  filetype: z.string().max(100).optional(),
+  size: z.number().int().nonnegative().optional(),
+  mode: z.string().max(50).optional(),
+});
+export type InboundFileRef = z.infer<typeof inboundFileRefSchema>;
+
+/** Refs for the Slack file objects with a valid id, in order; unknown keys (URLs, previews) are dropped. */
+export function inboundFileRefs(files: readonly unknown[]): InboundFileRef[] {
+  return files.slice(0, 20).flatMap((file) => {
+    const parsed = inboundFileRefSchema.safeParse(file);
+    return parsed.success ? [parsed.data] : [];
+  });
+}
+
 export const operationPayloadSchema = z.object({
   text: z.string(),
   actorUserId: nonEmpty,
@@ -18,6 +40,8 @@ export const operationPayloadSchema = z.object({
   origin: z.enum(["slack", "schedule"]).optional(),
   /** Seed for the thread window: set only on the first mention in an existing, unbound thread. */
   threadContext: z.object({ rootTs: nonEmpty, beforeTs: nonEmpty }).optional(),
+  /** Slack files shared with the triggering message, in Slack's order. Rows written before PR-L have none. */
+  files: z.array(inboundFileRefSchema).max(20).default([]),
 });
 export const plainTextObjectSchema = z.object({ type: z.literal("plain_text"), text: z.string(), emoji: z.boolean().optional() });
 export const mrkdwnObjectSchema = z.object({ type: z.literal("mrkdwn"), text: z.string() });
@@ -239,6 +263,8 @@ export const AUDIT_ACTIONS = [
   "slack.command.executed",
   "slack.delivery.duplicate",
   "slack.event.ingested",
+  "slack.file.attached",
+  "slack.file.skipped",
   "slack.outbox.claimed",
   "slack.outbox.delivered",
   "slack.outbox.enqueued",

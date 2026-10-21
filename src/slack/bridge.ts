@@ -11,6 +11,7 @@ import { renderInteractionCard } from "./cards.ts";
 import type { SlackContextSource } from "./context-source.ts";
 import { THREAD_CONTEXT_TIMEOUT_MS, type SlackRepliesPage } from "./context.ts";
 import { SlackEventRouter } from "./events.ts";
+import { downloadSlackFile, parseSlackFileInfo, type SlackFileClient } from "./files.ts";
 import { deliverNextSlackOutbox, type RefreshRenderers, type SlackOutboxOutcome } from "./outbox.ts";
 import { classifySlackDeliveryError } from "./outbox-policy.ts";
 import { deliverNextSlackReaction, type SlackReactionOutcome } from "./reactions.ts";
@@ -124,6 +125,38 @@ export async function createSlackUserDirectory(input: {
     maxOutstandingLookups: SLACK_LOOKUP_CLIENT_OPTIONS.maxRequestConcurrency * 2,
     ...(input.logger === undefined ? {} : { logger: input.logger }),
   });
+}
+
+/**
+ * Shared-file reads (PR-L1): `files.info` on its own Web API client and token-bearing downloads of
+ * `url_private_download`. Needs the `files:read` scope; without it `files.info` fails with
+ * `missing_scope` and the file is skipped with a reinstall hint.
+ */
+export async function createSlackFileClient(input: {
+  readonly botToken: { exposeToBoundary(): string };
+  /** Tests point this at a local fake. */
+  readonly slackApiUrl?: string;
+  readonly fetch?: (url: URL, init: RequestInit) => Promise<Response>;
+}): Promise<SlackFileClient> {
+  const { LogLevel, webApi } = await import("@slack/bolt");
+  const client = new webApi.WebClient(input.botToken.exposeToBoundary(), {
+    ...SLACK_LOOKUP_CLIENT_OPTIONS,
+    retryConfig: { ...SLACK_LOOKUP_CLIENT_OPTIONS.retryConfig },
+    logLevel: LogLevel.WARN,
+    ...(input.slackApiUrl === undefined ? {} : { slackApiUrl: input.slackApiUrl }),
+  });
+  return {
+    // The Web API client has no per-call abort; the materializer checks the signal between files.
+    info: async (fileId) => parseSlackFileInfo(await client.files.info({ file: fileId })),
+    download: (url, maxBytes, signal) =>
+      downloadSlackFile({
+        url,
+        token: input.botToken,
+        maxBytes,
+        ...(signal === undefined ? {} : { signal }),
+        ...(input.fetch === undefined ? {} : { fetch: input.fetch }),
+      }),
+  };
 }
 
 /** Longest Retry-After an only-you command reply waits for its single retry. */
@@ -251,18 +284,22 @@ export class SlackSocketBridge {
   readonly #refreshRenderers: RefreshRenderers;
   /** Read-only Slack lookups for turn composition (speaker labels, thread window). */
   readonly contextSource: SlackContextSource;
+  /** Shared-file reads for the coordinator (PR-L1). */
+  readonly files: SlackFileClient;
 
   private constructor(
     app: SlackApp,
     store: AgentTagStore,
     config: AgentTagConfig,
     contextSource: SlackContextSource,
+    files: SlackFileClient,
   ) {
     this.#app = app;
     this.#store = store;
     this.#config = config;
     this.#refreshRenderers = refreshRenderers(store, config);
     this.contextSource = contextSource;
+    this.files = files;
   }
 
   static async create(input: {
@@ -340,7 +377,8 @@ export class SlackSocketBridge {
       users,
       replies,
     };
-    return new SlackSocketBridge(app, input.store, input.config, contextSource);
+    const files = await createSlackFileClient({ botToken });
+    return new SlackSocketBridge(app, input.store, input.config, contextSource, files);
   }
 
   async start(): Promise<void> {
