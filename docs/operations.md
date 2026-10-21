@@ -511,20 +511,41 @@ Every Slack thread the agent works in is one task. A task closes after `lifecycl
 
 A closed task keeps its Slack thread, schedules and task memory. The next message in its thread (a plain reply is enough, no mention needed) reopens the same task as a new session generation. The new generation starts a new T3 thread with a fresh worktree on the branch `agent-tag/<task-id>-g<generation>`, and the agent rereads the Slack thread for context. A scheduled run on a closed task reopens it the same way, and a routine can still be created there. A closed task still refuses a message routed to a different profile or repository.
 
-Closing records the old T3 thread in `task_retired_t3_threads`, with its generation and branch. Agent Tag does not yet stop or delete that T3 thread, or remove its worktree or branch; that cleanup comes in a later release, and the rows are kept for it. Closes are audited as `task.closed`, reopens as `task.reopened`.
+Closing records the old T3 thread in `task_retired_t3_threads`, with its generation and branch, and audits `task.closed` (reopens are `task.reopened`). Once the session is stopped, a background cleanup worker retires the rest, one row at a time under a lease:
+
+1. It reads the thread's worktree and branch from T3. A branch that is not this task's (`agent-tag/<task-id>` or `-g<generation>`) fails the row and nothing is removed.
+2. It deletes the T3 thread (`thread.delete`).
+3. A clean worktree is removed (`vcs.removeWorktree`). A dirty one is kept for `lifecycle.dirtyWorktreeRetentionDays` (default 14; `null` keeps it forever) and the Slack thread gets one notice, unless the task has moved on, the thread is muted or its repository root was deleted. The notice always comes at least a day before the worktree is force-removed.
+4. The local branch is deleted with `git branch -d` only when it has no commits ahead of the default branch and no open PR; otherwise it is kept (`kept-commits`, `kept-pr`). `lifecycle.deleteEmptyBranches: false` keeps every branch.
+
+Cleanup never removes the repository root, the data directory, the home directory or an ancestor of any of them; a path git does not list as the branch's worktree; or a worktree another T3 thread (live or archived) is bound to. Those rows fail at once and keep their worktree and branch. Transient errors retry with backoff (30 seconds doubling to an hour) and fail after 10 attempts. Each step is audited: `task.thread.deleted`, `task.worktree.removed`, `task.worktree.retained`, `task.branch.deleted`, `task.cleanup.completed`, `task.cleanup.failed`.
+
+A reply in a closed thread resumes from what cleanup left. A kept dirty worktree is adopted: the new T3 thread reuses it, uncommitted changes included, and cleanup no longer touches it. A kept branch is continued: the new worktree branches from it. Otherwise the new generation starts fresh from the base branch. The first turn of the resumed session tells the agent which of the three it got. A session retired by `!restart` resumes as before, with no note.
 
 ```sh
 agent-tag tasks list [CONFIG] [--state active|closed] [--limit N] [--json]
 agent-tag tasks close TASK_ID [CONFIG]
+agent-tag tasks cleanup [CONFIG] --dry-run|--once
 ```
 
-Both read the local store only, so they work while the service or T3 is down. `tasks close` closes a quiet task at once. A task with work in flight is marked close-requested (`task.close.requested`) and closes when that work settles; in-flight work is never cancelled.
+`tasks list`, `tasks close` and `tasks cleanup --dry-run` read the local store only, so they work while the service or T3 is down. `tasks close` closes a quiet task at once. A task with work in flight is marked close-requested (`task.close.requested`) and closes when that work settles; in-flight work is never cancelled. `tasks cleanup --dry-run` prints what cleanup would do to each pending retired thread. `tasks cleanup --once` stops any due sessions and runs one cleanup pass over every due row, ignoring `maxCleanupsPerSweep`; it needs T3 and exits 1 when a row fails. It is safe to run beside the service: rows are leased.
 
 ```json
-{ "lifecycle": { "closeIdleAfterHours": 168, "sweepIntervalSeconds": 60, "maxClosesPerSweep": 20 } }
+{
+  "lifecycle": {
+    "closeIdleAfterHours": 168,
+    "sweepIntervalSeconds": 60,
+    "maxClosesPerSweep": 20,
+    "dirtyWorktreeRetentionDays": 14,
+    "deleteEmptyBranches": true,
+    "maxCleanupsPerSweep": 5
+  }
+}
 ```
 
-After upgrading, every task idle for longer than `closeIdleAfterHours` becomes due at once. The sweep closes at most `maxClosesPerSweep` per `sweepIntervalSeconds`, so a large backlog drains over a few minutes. Each close is a single local transaction.
+After upgrading, every task idle for longer than `closeIdleAfterHours` becomes due at once. The sweep closes at most `maxClosesPerSweep` per `sweepIntervalSeconds`, so a large backlog drains over a few minutes. Each close is a single local transaction. Cleanup runs on the same interval, at most `maxCleanupsPerSweep` rows a sweep.
+
+`agent-tag doctor` reports a `lifecycle` check: active (and released) and closed tasks, retired threads pending cleanup, kept dirty worktrees with the earliest expiry, and cleanup failures. Failures make it a warning; the cause is in the `task.cleanup.failed` audit rows. `agent-tag status --json` carries the same counts under `lifecycle`.
 
 ## Routines from Slack
 

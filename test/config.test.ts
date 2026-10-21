@@ -34,6 +34,22 @@ const baseConfig = {
 };
 
 describe("Agent Tag config", () => {
+  test("defaults and validates the lifecycle cleanup settings", () => {
+    expect(agentTagConfigSchema.parse(baseConfig).lifecycle).toEqual({
+      closeIdleAfterHours: 168,
+      sweepIntervalSeconds: 60,
+      maxClosesPerSweep: 20,
+      dirtyWorktreeRetentionDays: 14,
+      deleteEmptyBranches: true,
+      maxCleanupsPerSweep: 5,
+    });
+    expect(agentTagConfigSchema.parse({ ...baseConfig, lifecycle: { dirtyWorktreeRetentionDays: null, deleteEmptyBranches: false } }).lifecycle)
+      .toMatchObject({ dirtyWorktreeRetentionDays: null, deleteEmptyBranches: false });
+    for (const lifecycle of [{ dirtyWorktreeRetentionDays: 0 }, { dirtyWorktreeRetentionDays: 1.5 }, { maxCleanupsPerSweep: 101 }]) {
+      expect(() => agentTagConfigSchema.parse({ ...baseConfig, lifecycle })).toThrow();
+    }
+  });
+
   test("defaults and validates the !command settings", () => {
     const parsed = agentTagConfigSchema.parse(baseConfig);
     expect(parsed.commands).toEqual({ enabled: true, disabled: [], adminOnly: [], restartTimeoutSeconds: 120 });

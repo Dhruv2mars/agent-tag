@@ -114,6 +114,9 @@
   "lifecycle": {
     "closeIdleAfterHours": 168,
     "sweepIntervalSeconds": 60,
-    "maxClosesPerSweep": 20
+    "maxClosesPerSweep": 20,
+    "dirtyWorktreeRetentionDays": 14,
+    "deleteEmptyBranches": true,
+    "maxCleanupsPerSweep": 5
   }
 }
