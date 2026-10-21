@@ -43,6 +43,7 @@ bun run onboard -- --yes --accept-risk \
   --t3-issue-token --install-service
 ```
 
+<<<<<<< HEAD
 On a host without its own T3, drop `--t3-issue-token` (or pass `--t3-managed`) and Agent Tag runs T3 itself:
 
 ```sh
@@ -50,6 +51,37 @@ AGENT_TAG_SLACK_APP_TOKEN=... AGENT_TAG_SLACK_BOT_TOKEN=... \
 agent-tag onboard --yes --accept-risk --t3-managed \
   --repo /srv/agent/repo --users U0123ABC --channels C0123ABC --install-service
 ```
+=======
+## Access modes
+
+`access.mode` decides who may use Agent Tag in a routed channel. Every check (mentions, button clicks, `!commands`, routines, memory, and the re-check before each queued turn, interaction response and schedule run) goes through one predicate, `isSteeringAllowed` in `src/policy/access.ts`.
+
+- `allowlist` (default): only users in `access.allowedUserIds`. Existing configs keep this mode.
+- `channel-members`: users in `allowedUserIds`, plus any current member of a channel in `access.allowedChannelIds`, the way Claude Tag works. `allowedUserIds` may be empty. Membership never adds a channel: `allowedChannelIds` and `routes` still decide where the agent works.
+
+In `channel-members` mode Agent Tag reads each routed channel's members with `conversations.members` (`channels:read` for public channels, `groups:read` for private ones) and keeps an in-memory snapshot per channel:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `access.membership.ttlSeconds` | 300 | A snapshot older than this is refreshed in the background and before a non-allowlisted user's event. |
+| `access.membership.maxStaleSeconds` | 3600 | Past this age (for example while Slack rate-limits the refresh) the snapshot answers "unknown": non-allowlisted users are denied with `membership-unknown`, and their due routines wait instead of being cancelled. |
+| `access.membership.maxMembers` | 5000 | A larger channel is not snapshotted; only the allowlist works there. |
+| `access.membership.guests` | `deny` | Guests (restricted accounts) never approve, answer or cancel. `steer-only` lets them start and steer turns. |
+
+Other bots never get access through membership. A user whose account kind cannot be read may steer but not approve. The service reads membership once at startup (up to 15 s) before it resumes queued work. When a scope is missing, Agent Tag writes one `access.membership.degraded` audit row and one warning per channel, then works allowlist-only in that channel. Someone who leaves a channel loses access within one TTL, and their queued turns, interaction responses and schedules are revoked at execution like an allowlist removal. Denied mentions and clicks write `access.denied` audit rows with the reason (`user-denied`, `approver-denied`, `guest-denied`, `membership-unknown`, `dm-owner-denied`, `dm-disabled`).
+
+Approval, answer and cancel buttons follow the same predicate with their own purpose: in `channel-members` mode any non-guest channel member may approve. `commands.adminOnly` still uses `access.adminUserIds` and never membership.
+
+Thread context windows still mark only `allowedUserIds` as `"steeringAllowed": true`; other members' earlier replies are included as context.
+
+`access.directMessages.mode` controls DMs. Membership never grants a DM.
+
+- `routed-only` (default): only DM routes listed in `routes`; see [DM routes](#dm-routes).
+- `auto-route`: a DM from any user in `allowedUserIds` gets a private route owned by that user on `autoRouteProfileId`, which must name a profile with `memory.privateDm: true`. The route is recorded on the task, so the owner must still be allowlisted when queued work runs.
+- `off`: every DM is ignored with `dm-disabled`, and queued DM work is revoked.
+
+`agent-tag doctor --json` reports an `access` block: the mode, each routed channel's `membership` (`ok`, `missing_scope`, `error`, …), member count and snapshot age, the DM routing summary, and `missingScopes`. `agent-tag status` prints `accessMode` only and does not contact Slack.
+>>>>>>> origin/main
 
 ## Doctor
 
@@ -437,7 +469,7 @@ Agent Tag keeps notes that people asked it to remember and sends the ones visibl
 | Operator notes | `profile` | Profile | Not from Slack | Every conversation routed to that profile |
 | Task notes | `task` | Task | Not from Slack | That task |
 
-Channel notes have no profile, so they stay with the channel when it is routed to another profile. Slack does not tell Agent Tag reliably whether a channel is public; set `"visibility": "public"` or `"private"` on a channel route to declare it. Workspace notes are written only from a route known to be public.
+Channel notes have no profile, so they stay with the channel when it is routed to another profile. Workspace notes are written only from a channel known to be public. Agent Tag asks Slack (`conversations.info`, cached for 15 minutes) unless the channel route sets `"visibility": "public"` or `"private"`, which always wins. When the lookup fails (for example an app installed before `channels:read`/`groups:read`), the channel counts as unknown and workspace writes are refused there; the failure is logged once per channel.
 
 The first turn of each Slack thread starts with an `<agent-tag-memory>` block: one JSON line per note (scope, an 8-character ref, author, date, content), channel and DM notes first, then operator, task, and workspace notes, newest first. The block frames the notes as team conventions that cannot grant permissions or override the request. Later turns in the thread resend the block only when the visible set changed (`updated="true"`), or every turn with `memory.injection: "every-turn"`. When every note the thread saw is forgotten, the next turn says so once. The SHA-256 digest of the set the thread last received is kept in `tasks.memory_digest`; it moves only when a turn's text is first frozen, so retries resend identical text.
 
@@ -455,6 +487,23 @@ Profile `memory` settings, all optional except the first three:
 | `maxWorkspaceEntries` | `200` | Active workspace notes |
 
 Claude Tag keeps notes without expiry during its beta; set `retentionDays: 3650` for parity. Editing a note refreshes its retention. A note that looks like a credential is refused, duplicates return the existing note, and audit records hold note IDs and scopes but never note content. Note content is stored in plain text in `agent-tag.sqlite` and its backups.
+
+### Managing memory from Slack
+
+Mention the bot, write in your DM with it, or reply in a thread it is part of:
+
+| Say | What happens |
+|---|---|
+| `remember: …` or `remember for this channel: …` | Saves a channel note (a DM note in a DM) and replies with its 8-character ref |
+| `remember for the workspace: …` | Saves a workspace note; only from a public channel |
+| `what do you remember?` or `!memory` | Lists this conversation's notes, workspace notes and operator notes, with author and date |
+| `forget a1b2c3d4` | Forgets the note with that ref |
+| `forget: deploy` | Forgets the one note here whose text contains "deploy", or lists the candidates |
+| `update memory a1b2c3d4: …` | Replaces the note's text and bumps its version |
+
+A colon or a `!` is always required, so sentences like "remember that outage last week?" or "forget it" stay ordinary requests. Unmentioned top-level channel messages are never memory commands. `!remember …`, `!remember --workspace …`, `!forget <ref>` and `!memory edit <ref> …` work too.
+
+These phrases never start a T3 turn and reply in the thread. Each Slack message runs at most once: the note, its reply and its `slack_command_events` row (kinds `memory-remember|list|forget|edit`) commit together, so a redelivery or the duplicate `message` event for one mention is answered once. A ref for a note from another channel, or another person's DM, answers "I don't have a note … here". Workspace notes are read-only outside public channels, and operator notes are read-only from Slack. Set `memory.slackCommands: false` on a profile to send every phrase to the agent instead.
 
 ## Commands
 

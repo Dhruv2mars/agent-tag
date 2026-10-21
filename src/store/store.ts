@@ -239,6 +239,10 @@ export class AgentTagStore {
     return files.restoreBackup(input);
   }
 
+  recordAccessAudit(input: audit.RecordAccessAuditInput): void {
+    audit.recordAccessAudit(this.#database, input);
+  }
+
   listAuditRecords(input: audit.ListAuditRecordsInput = {}): ReadonlyArray<AuditRecord> {
     return audit.listAuditRecords(this.#database, input);
   }
@@ -285,6 +289,10 @@ export class AgentTagStore {
 
   expireMemory(nowInput: string): number {
     return memory.expireMemory(this.#database, nowInput);
+  }
+
+  findTaskConversation(taskId: string): ReturnType<typeof tasks.findTaskConversation> {
+    return tasks.findTaskConversation(this.#database, taskId);
   }
 
   taskBelongsToContext(input: tasks.TaskBelongsToContextInput): boolean {
@@ -513,6 +521,13 @@ export class AgentTagStore {
 
   settleCommand(input: commands.SettleCommandInput): void {
     commands.settleCommand(this.#database, input);
+  }
+
+  runThreadCommand<T extends commands.ThreadCommandResult>(
+    input: Parameters<typeof commands.runThreadCommand>[1],
+    execute: (taskId: string) => T,
+  ): commands.ThreadCommandReceipt<T> {
+    return commands.runThreadCommand(this.#context, input, execute);
   }
 
   isCommandEvent(input: { readonly workspaceId: string; readonly eventKey: string }): boolean {

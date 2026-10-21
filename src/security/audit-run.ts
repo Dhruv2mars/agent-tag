@@ -188,8 +188,9 @@ const auditInputSchema = z.object({
       allowedUserIds: stringList,
       allowedChannelIds: stringList,
       adminUserIds: z.array(z.string()).optional().catch(undefined),
+      mode: z.enum(["allowlist", "channel-members"]).catch("allowlist"),
     })
-    .catch({ allowedUserIds: [], allowedChannelIds: [] }),
+    .catch({ allowedUserIds: [], allowedChannelIds: [], mode: "allowlist" as const }),
   profiles: z.array(z.unknown()).catch([]),
   retention: z.object({ auditDays: optionalDays, outboxDays: optionalDays, messageDays: optionalDays }).catch({}),
 });
@@ -221,7 +222,12 @@ interface AuditInputs {
   readonly dataDir: string | undefined;
   readonly t3BaseUrl: string | undefined;
   readonly secretFiles: ReadonlyArray<{ readonly name: string; readonly path: string }>;
-  readonly access: { readonly allowedUserIds: string[]; readonly allowedChannelIds: string[]; readonly adminUserIds?: string[] | undefined };
+  readonly access: {
+    readonly allowedUserIds: string[];
+    readonly allowedChannelIds: string[];
+    readonly adminUserIds?: string[] | undefined;
+    readonly mode: "allowlist" | "channel-members";
+  };
   readonly roots: ReadonlyArray<{ readonly profileId: string; readonly root: string }>;
   readonly profiles: ReadonlyArray<ProfileSecurityFacts>;
   readonly retention: RetentionPolicy;

@@ -3,8 +3,11 @@ import { z } from "zod";
 import type { CommandIngress } from "../commands/context.ts";
 import { IMPLEMENTED_COMMANDS, isCommandUsage, parseAgentCommand } from "../commands/parse.ts";
 import type { AgentTagConfig } from "../config.ts";
+import { isSteeringAllowed } from "../policy/access.ts";
 import { detectRoutineIntent } from "../routines/intent.ts";
 import { AgentTagStore, type ActiveTaskBinding, type IngestReceipt } from "../store/store.ts";
+import type { MemoryIngress } from "./memory-commands.ts";
+import { parseMemoryCommand } from "./memory-grammar.ts";
 import { matchCancelTargets, type RoutineIngress } from "./routines.ts";
 
 const slackId = z.string().regex(/^[A-Z][A-Z0-9]+$/);
@@ -64,6 +67,8 @@ export type SlackIngressResult =
   | CommandIngress
   /** A routine create/list/cancel request: no ingest, no operation. The bridge runs it (slack/routines.ts). */
   | RoutineIngress
+  /** A memory phrase (remember, list, forget, update): no ingest, no operation. The bridge runs it (slack/memory-commands.ts). */
+  | MemoryIngress
   | {
       readonly kind: "ignored";
       readonly reason:
@@ -150,9 +155,15 @@ export class SlackEventRouter {
     return message.user === this.#botUserId || (this.#selfBotId !== undefined && message.bot_id === this.#selfBotId);
   }
 
-  /** One place decides who may steer, so a later access mode swaps a single function. */
-  #isSteeringAllowed(userId: string): boolean {
-    return this.#config.access.allowedUserIds.includes(userId);
+  /** One place decides who may steer: the shared access predicate (policy/access.ts). */
+  #isSteeringAllowed(userId: string, route: Route): boolean {
+    return isSteeringAllowed({
+      config: this.#config,
+      workspaceId: this.#config.slack.workspaceId,
+      conversationId: route.conversationId,
+      userId,
+      purpose: "steer",
+    }).allowed;
   }
 
   /** `<@BOT>` or `<@BOT|label>` anywhere in the text. */
@@ -214,7 +225,7 @@ export class SlackEventRouter {
     }
     if (message.user === undefined) return "invalid-event";
     if (route.conversationType === "dm" && message.user !== route.ownerUserId) return "dm-owner-denied";
-    if (this.#isSteeringAllowed(message.user)) {
+    if (this.#isSteeringAllowed(message.user, route)) {
       return { speakerKind: "human", speakerId: message.user, speakerLabel: null, steeringAllowed: true };
     }
     if (route.conversationType !== "channel" || !profile.threadContext.includeNonAllowedUsers) return "user-denied";
@@ -307,7 +318,7 @@ export class SlackEventRouter {
     if (!TRIGGER_SUBTYPES.has(event.subtype)) return ignored("message-subtype");
     if (event.user === undefined) return ignored("invalid-event");
     const actorUserId = event.user;
-    if (!this.#isSteeringAllowed(actorUserId)) {
+    if (!this.#isSteeringAllowed(actorUserId, route)) {
       // In a DM only the owner counts, so anyone else is a DM denial rather than an allowlist one.
       if (route.conversationType === "dm") {
         return ignored(actorUserId === route.ownerUserId ? "user-denied" : "dm-owner-denied");
@@ -404,6 +415,29 @@ export class SlackEventRouter {
       ? { rootTs: threadTs, beforeTs: event.ts }
       : undefined;
     const text = event.text.replaceAll(`<@${this.#botUserId}>`, "").trim();
+    // Memory phrases only when addressed: a mention, a DM, or a reply in a bound thread. Ambient
+    // top-level chatter never writes memory.
+    if (profile.memory.slackCommands && (explicitMention || route.conversationType === "dm" || binding !== null)) {
+      const memoryCommand = parseMemoryCommand(text);
+      if (memoryCommand !== null) {
+        return {
+          kind: "memory",
+          command: memoryCommand,
+          request: {
+            deliveryId,
+            eventKey,
+            workspaceId,
+            conversationId: event.channel,
+            conversationType: route.conversationType,
+            threadTs,
+            actorUserId,
+            profileId,
+            repositoryRoot,
+            receivedAt,
+          },
+        };
+      }
+    }
     // Routines only on a direct request: a mention, or any message in a DM. Ambient triggers and
     // unmentioned thread replies always stay prompts.
     if (this.#config.routines.enabled && (explicitMention || route.conversationType === "dm")) {

@@ -12,6 +12,7 @@ import { type AgentTagConfig, agentTagConfigSchema } from "./config.ts";
 import { checkGitHubAccess, checkGitVersion, defaultGitVersion } from "./github/doctor-check.ts";
 import { type AllowedModelReport, reportAllowedModels, validateConfiguredProviders } from "./policy/provider.ts";
 import { SecretString } from "./security/secret-file.ts";
+import { type AccessReport, checkAccess } from "./doctor-access.ts";
 import type { ServiceManager } from "./service-manager.ts";
 import { readServiceState, type ServiceStateReport } from "./service-state.ts";
 import { describeInstalledProgram } from "./service-unit.ts";
@@ -50,6 +51,8 @@ export interface DoctorReport {
   readonly checks: readonly DoctorCheck[];
   /** Every model each profile may run, with whether T3 can run it (`unchecked` when T3 was not inspected). */
   readonly models: readonly AllowedModelReport[];
+  /** Access mode and, in `channel-members` mode, each routed channel's membership read. Absent without a config. */
+  readonly access?: AccessReport;
 }
 
 export interface DoctorDependencies {
@@ -149,7 +152,7 @@ function modeText(mode: number): string {
   return `0${(mode & 0o777).toString(8)}`;
 }
 
-async function fetchWithTimeout(
+export async function fetchWithTimeout(
   dependencies: Pick<DoctorDependencies, "fetch">,
   url: string | URL,
   init: RequestInit = {},
@@ -809,7 +812,7 @@ export async function checkService(
 
 // ---------------------------------------------------------------------------------------------
 
-function skipped(id: string, reason: string): DoctorCheck {
+export function skipped(id: string, reason: string): DoctorCheck {
   return { id, status: "skip", summary: reason };
 }
 
@@ -848,11 +851,13 @@ export async function runDoctor(input: {
   const { dependencies, fix } = input;
   const checks: DoctorCheck[] = [];
   let models: readonly AllowedModelReport[] = [];
+  let access: AccessReport | undefined;
   const finish = (): DoctorReport => ({
     ok: checks.every((check) => check.status !== "fail"),
     configPath,
     checks,
     models,
+    ...(access === undefined ? {} : { access }),
   });
 
   checks.push(checkBunVersion(dependencies));
@@ -940,6 +945,9 @@ export async function runDoctor(input: {
       ? skipped("slack-bot-auth", "Slack bot token is not usable")
       : await checkSlackBot(config, botToken, dependencies),
   );
+  const accessResult = await checkAccess(config, botToken, dependencies);
+  checks.push(accessResult.check);
+  access = accessResult.report;
   const appToken = secrets.get("secret:slack-app-token");
   checks.push(
     appToken === undefined

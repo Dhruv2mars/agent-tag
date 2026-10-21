@@ -142,6 +142,8 @@ interface FakeWorld {
   /** Sent as the x-oauth-scopes header on auth.test; undefined omits the header. */
   slackScopes?: string | undefined;
   slackApp: unknown;
+  /** conversations.members pages per channel, served in order by cursor; an object is a whole response. */
+  members?: Record<string, ReadonlyArray<unknown>>;
   server: T3ServerInfo;
   readonly seenAuthorization: string[];
   /** Every authenticated T3 call (session inspection, provider/model listing); each one carries the token. */
@@ -181,6 +183,11 @@ function dependencies(world: FakeWorld, service: ServiceManager | undefined): Do
         return new Response(JSON.stringify(world.slackAuth), { headers });
       }
       if (url === "https://slack.com/api/apps.connections.open") return json(world.slackApp);
+      if (url === "https://slack.com/api/conversations.members") {
+        const form = new URLSearchParams(String(init?.body ?? ""));
+        const pages = world.members?.[form.get("channel") ?? ""] ?? [{ ok: false, error: "channel_not_found" }];
+        return json(pages[Number(form.get("cursor") ?? "0")]);
+      }
       throw new Error(`unexpected fetch ${url}`);
     },
     bunVersion: "1.3.13",
@@ -271,6 +278,7 @@ describe("agent-tag doctor", () => {
       ["t3-runtime", "skip"],
       ["t3-token-rotation", "skip"],
       ["slack-bot-auth", "pass"],
+      ["access", "pass"],
       ["slack-app-auth", "pass"],
       ["service-state", "skip"],
       ["service", "pass"],
@@ -278,7 +286,54 @@ describe("agent-tag doctor", () => {
     expect(world.seenAuthorization).toEqual([`Bearer ${BOT_TOKEN}`, `Bearer ${APP_TOKEN}`]);
     const output = `${formatDoctorReport(report)}\n${JSON.stringify(report)}`;
     for (const secret of [APP_TOKEN, BOT_TOKEN, T3_TOKEN]) expect(output).not.toContain(secret);
-    expect(formatDoctorReport(report)).toContain("15 passed, 0 warning(s), 0 failed, 3 skipped");
+    expect(formatDoctorReport(report)).toContain("16 passed, 0 warning(s), 0 failed, 3 skipped");
+  });
+
+  test("reports the access block: allowlist mode reads no membership", async () => {
+    const report = await run();
+    expect(report.access).toEqual({
+      mode: "allowlist",
+      channels: [],
+      directMessages: { mode: "routed-only", routed: 0, autoRouteProfileId: null },
+      missingScopes: [],
+    });
+    expect(check(report, "access")).toMatchObject({ status: "pass", summary: "access mode allowlist (1 user(s)); DMs routed-only" });
+  });
+
+  test("channel-members mode walks each routed channel and warns, without failing, where membership is unreadable", async () => {
+    await rewriteConfig((config) => {
+      config.access = { mode: "channel-members", allowedUserIds: ["U0OWNER"], allowedChannelIds: ["C0FIXTURE", "G0PRIVATE", "D0OWNER"] };
+      config.profiles[0].memory.privateDm = true;
+      config.routes = [
+        { conversationId: "C0FIXTURE", profileId: "default" },
+        { conversationId: "G0PRIVATE", profileId: "default" },
+        { conversationId: "D0OWNER", conversationType: "dm", ownerUserId: "U0OWNER", profileId: "default" },
+      ];
+    });
+    world.members = {
+      C0FIXTURE: [
+        { ok: true, members: ["U1", "U2"], response_metadata: { next_cursor: "1" } },
+        { ok: true, members: ["U3"], response_metadata: { next_cursor: "" } },
+      ],
+      G0PRIVATE: [{ ok: false, error: "missing_scope", needed: "groups:read" }],
+    };
+    const report = await run();
+    expect(report.ok).toBe(true);
+    expect(report.access).toEqual({
+      mode: "channel-members",
+      channels: [
+        { id: "C0FIXTURE", membership: "ok", members: 3, ageSeconds: 0 },
+        { id: "G0PRIVATE", membership: "missing_scope", members: null, ageSeconds: null },
+      ],
+      directMessages: { mode: "routed-only", routed: 1, autoRouteProfileId: null },
+      missingScopes: ["groups:read"],
+    });
+    expect(check(report, "access")).toMatchObject({
+      status: "warn",
+      summary: "access mode channel-members; allowlist-only in G0PRIVATE (missing_scope)",
+      hint: "grant groups:read (reinstall the Slack app from config/slack-manifest.example.json)",
+    });
+    expect(JSON.stringify(report)).not.toContain(BOT_TOKEN);
   });
 
   test("reports every allowed model, and warns without failing when one is unavailable", async () => {
@@ -377,9 +432,9 @@ describe("agent-tag doctor", () => {
     expect(report.checks.map((item) => item.id)).toEqual([
       "bun-version", "config", "data-dir", "secret:slack-app-token", "secret:slack-bot-token", "secret:t3-token",
       "store", "t3-environment", "t3-version", "t3-session", "t3-providers", "t3-models", "t3-runtime", "t3-token-rotation", "slack-bot-auth",
-      "slack-app-auth", "service-state", "service",
+      "access", "slack-app-auth", "service-state", "service",
     ]);
-    expect(JSON.parse(JSON.stringify(report)).checks).toHaveLength(18);
+    expect(JSON.parse(JSON.stringify(report)).checks).toHaveLength(19);
   }
 
   test.skipIf(process.getuid?.() === 0)("reports a data dir without owner search permission as a failed check instead of aborting", async () => {
