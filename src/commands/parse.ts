@@ -17,7 +17,7 @@ export const AGENT_COMMANDS = [
 export type AgentCommandName = (typeof AGENT_COMMANDS)[number];
 
 /** Commands with a handler today. The rest parse, but the router treats them as ordinary prompts. */
-export const IMPLEMENTED_COMMANDS = ["help", "status", "mute", "unmute"] as const satisfies ReadonlyArray<AgentCommandName>;
+export const IMPLEMENTED_COMMANDS = ["help", "status", "stop", "restart", "mute", "unmute"] as const satisfies ReadonlyArray<AgentCommandName>;
 export type ImplementedCommandName = (typeof IMPLEMENTED_COMMANDS)[number];
 
 export type ParsedAgentCommand =

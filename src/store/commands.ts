@@ -106,7 +106,7 @@ export interface SettleCommandInput {
 }
 
 /** Settles a started ledger row and writes its audit row. Runs inside the caller's transaction. */
-function settleCommandRow(database: Database, input: SettleCommandInput): void {
+export function settleCommandRow(database: Database, input: SettleCommandInput): void {
   const now = isoDateTime.parse(input.now);
   const reason = input.reason === null ? null : commandReasonSchema.parse(input.reason);
   const row = z
@@ -374,6 +374,8 @@ export interface ThreadWorkStatus {
   readonly waitingSince: string | null;
   /** Requests not started yet. */
   readonly queued: number;
+  /** A `!restart` is waiting for the running turn to stop (PR-H2). */
+  readonly restarting: boolean;
 }
 
 const OPEN_INTERACTIONS_SQL = `
@@ -392,6 +394,7 @@ const taskWorkRowSchema = z.object({
   working_since: isoDateTime.nullable(),
   waiting_since: isoDateTime.nullable(),
   queued: z.number().int().nonnegative(),
+  restarting: z.number().int().optional(),
 });
 
 /** Store-only, so it answers while T3 is down. Never reads message text. */
@@ -399,7 +402,8 @@ export function getThreadStatus(database: Database, input: ThreadKey & { readonl
   const row = taskWorkRowSchema.nullable().parse(
     database
       .query(
-        `SELECT (${WORKING_SQL}) AS working_since, (${OPEN_INTERACTIONS_SQL}) AS waiting_since, (${QUEUED_SQL}) AS queued
+        `SELECT (${WORKING_SQL}) AS working_since, (${OPEN_INTERACTIONS_SQL}) AS waiting_since, (${QUEUED_SQL}) AS queued,
+                t.restart_requested_at IS NOT NULL AS restarting
          FROM tasks t WHERE t.task_id = ?`,
       )
       .get(requiredId(input.taskId, "taskId")),
@@ -410,6 +414,7 @@ export function getThreadStatus(database: Database, input: ThreadKey & { readonl
     workingSince: row.working_since,
     waitingSince: row.waiting_since,
     queued: row.queued,
+    restarting: row.restarting === 1,
   };
 }
 

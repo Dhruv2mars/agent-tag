@@ -706,4 +706,17 @@ export const STORE_MIGRATIONS: readonly StoreMigration[] = [
       );
     `,
   },
+  {
+    // `!restart` (PR-H2): a restart requested while a turn holds the old session. The claim gate
+    // (claimNextOperation) holds the task's queue while it is set; the restart worker rotates the T3
+    // thread once the turn ends (or after `commands.restartTimeoutSeconds`) and clears it. The
+    // retired thread goes to N1's task_retired_t3_threads. New columns only, so any order applies.
+    version: 26,
+    sql: `
+      ALTER TABLE tasks ADD COLUMN restart_requested_at TEXT;
+      ALTER TABLE tasks ADD COLUMN restart_requested_by TEXT;
+      ALTER TABLE tasks ADD COLUMN restart_command_key TEXT;
+      CREATE INDEX tasks_restart_idx ON tasks(restart_requested_at) WHERE restart_requested_at IS NOT NULL;
+    `,
+  },
 ];
