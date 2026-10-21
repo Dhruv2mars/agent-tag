@@ -178,7 +178,6 @@ export type {
   RetryOutboxInput,
   ExhaustOutboxRetriesInput,
 } from "./outbox.ts";
-export { REFRESH_KINDS } from "./message-edits.ts";
 export { isTerminalStatus, STATUS_STATES, statusPostId } from "./status.ts";
 export type {
   OpenStatusMessageInput,

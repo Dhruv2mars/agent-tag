@@ -38,6 +38,15 @@ const config = agentTagConfigSchema.parse({
   limits: { maxConcurrentTasks: 2 },
 });
 
+/** The next queued post, delivering status/card refresh edits on the way (they edit earlier posts). */
+function claimNextPost(store: AgentTagStore, at: string) {
+  for (let edits = 1; ; edits += 1) {
+    const next = store.claimNextOutbox({ workerId: "slack-a", now: at, leaseMs: 10_000 });
+    if (next === null || next.refreshKind === null) return next;
+    store.markOutboxDelivered({ outboxId: next.outboxId, workerId: "slack-a", slackMessageTs: `9000.${String(edits).padStart(6, "0")}`, now: at });
+  }
+}
+
 function completedSnapshot(threadId: string, text: string, userMessageId?: string): T3ThreadSnapshot {
   return {
     snapshotSequence: 9,
@@ -254,10 +263,10 @@ describe("Agent Tag coordinator", () => {
       });
       expect(turnCommandIds).toHaveLength(2);
       expect(turnCommandIds[1]).toBe(turnCommandIds[0]);
-      expect(store.diagnostics().outbox).toBe(2);
+      expect(store.diagnostics().outbox).toBe(3);
       const outboxNow = new Date(currentTime).toISOString();
       const progress = store.claimNextOutbox({ workerId: "slack-a", now: outboxNow, leaseMs: 10_000 });
-      expect(progress?.payload.text).toBe("Agent Tag is working on this request.");
+      expect(progress?.payload.text).toBe("Working on it…");
       if (progress === null) throw new Error("stalled-turn progress reply was not queued");
       store.markOutboxDelivered({
         outboxId: progress.outboxId,
@@ -265,7 +274,7 @@ describe("Agent Tag coordinator", () => {
         slackMessageTs: "1000.000010",
         now: outboxNow,
       });
-      const failure = store.claimNextOutbox({ workerId: "slack-a", now: outboxNow, leaseMs: 10_000 });
+      const failure = claimNextPost(store, outboxNow);
       expect(failure?.payload.text).toContain("no progress for 2 seconds on each of 2 attempts");
     } finally {
       store.close();
@@ -324,7 +333,7 @@ describe("Agent Tag coordinator", () => {
       });
       expect(await coordinator.processNext()).toMatchObject({ kind: "failed", errorCode: "T3ProviderLimit" });
       expect(await coordinator.processNext()).toEqual({ kind: "idle" });
-      expect(store.diagnostics().outbox).toBe(2);
+      expect(store.diagnostics().outbox).toBe(3);
     } finally {
       store.close();
       if (!directory.startsWith(`${tmpdir()}/agent-tag-coordinator-limit-`)) {
@@ -496,7 +505,7 @@ describe("Agent Tag coordinator", () => {
         }).kind,
       ).toBe("accepted");
       const first = await coordinator.processNext();
-      expect(first.kind).toBe("completed");
+      if (first.kind !== "completed") throw new Error(`first turn ended ${first.kind}`);
       expect(commands[0]).toMatchObject({
         type: "project.create",
         workspaceRoot: "/srv/repos/example",
@@ -513,7 +522,7 @@ describe("Agent Tag coordinator", () => {
       expect(commands[1].message.text).toContain("first request");
       expect(commands[1].message.text).toContain("remember the durable boundary");
       expect(commands[1].message.text).toContain("untrusted context");
-      const firstProgress = store.claimNextOutbox({ workerId: "slack-a", now, leaseMs: 10_000 });
+      const firstProgress = claimNextPost(store, now);
       expect(firstProgress?.clientMessageId).toBe(`${first.operationId}:status`);
       expect(firstProgress?.payload.text).toBe("Working on it…");
       expect(firstProgress?.payload.blocks?.at(-1)).toMatchObject({
@@ -527,7 +536,7 @@ describe("Agent Tag coordinator", () => {
         slackMessageTs: "1000.000010",
         now,
       });
-      const firstOutbox = store.claimNextOutbox({ workerId: "slack-a", now, leaseMs: 10_000 });
+      const firstOutbox = claimNextPost(store, now);
       expect(firstOutbox?.payload.text).toBe("first-result");
       if (firstOutbox === null) throw new Error("first final reply was not queued");
       store.markOutboxDelivered({
@@ -562,7 +571,7 @@ describe("Agent Tag coordinator", () => {
       expect(commands[3].message.text).toContain("second request");
       expect(commands[3].message.text).toContain("remember the durable boundary");
       expect(commands[3].bootstrap).toBeUndefined();
-      const secondProgress = store.claimNextOutbox({ workerId: "slack-a", now, leaseMs: 10_000 });
+      const secondProgress = claimNextPost(store, now);
       if (secondProgress === null) throw new Error("second progress reply was not queued");
       store.markOutboxDelivered({
         outboxId: secondProgress.outboxId,
@@ -570,7 +579,7 @@ describe("Agent Tag coordinator", () => {
         slackMessageTs: "1000.000012",
         now,
       });
-      const secondOutbox = store.claimNextOutbox({ workerId: "slack-a", now, leaseMs: 10_000 });
+      const secondOutbox = claimNextPost(store, now);
       expect(secondOutbox?.payload.text).toBe("second-result");
 
       const nextTask = store.ingestSlackEvent({
@@ -647,7 +656,7 @@ describe("Agent Tag coordinator", () => {
         questionCount: 1,
       });
       expect(await coordinator.processNext()).toEqual({ kind: "idle" });
-      expect(store.diagnostics().outbox).toBe(3);
+      expect(store.diagnostics().outbox).toBe(4);
     } finally {
       store.close();
       if (!directory.startsWith(`${tmpdir()}/agent-tag-coordinator-waiting-`)) {
