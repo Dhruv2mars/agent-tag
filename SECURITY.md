@@ -38,7 +38,7 @@ Credentials and state:
 
 - The Slack app token, Slack bot token, and T3 service token each live in a separate file. Every file must be mode `0600` (or stricter), sit in a directory with no group or world access, and be owned by the service user. Agent Tag refuses to read a secret file that breaks these rules.
 - The data directory (`dataDir`) must be `0700`. The SQLite store is created as `0600`. It contains Slack message text, agent replies, approval prompts, memory entries, schedules, and the audit log.
-- The T3 credential is a **restricted** token with exactly `orchestration:read` and `orchestration:operate`. `bun run enroll:t3` mints it from a T3 administrative token. The admin token is used only during enrollment and should not be stored on the host afterwards. Enrollment verifies that T3's administrative endpoints deny the new token, and `doctor` and every gateway call reject a service token with any other scope. Restricted tokens expire, and there is no automatic rotation yet.
+- The T3 credential is a **restricted** token with exactly `orchestration:read` and `orchestration:operate`. `bun run enroll:t3` mints it from a T3 administrative token. The admin token is used only during enrollment and should not be stored on the host afterwards. Enrollment verifies that T3's administrative endpoints deny the new token, and `doctor` and every gateway call reject a service token with any other scope. Restricted tokens expire. With a managed T3, Agent Tag rotates the token before it expires and revokes the replaced one; with an external T3, run `agent-tag t3 rotate`.
 - Retiring a closed task's session uses that same token: `thread.delete`, `vcs.refreshStatus` and `vcs.removeWorktree` are `orchestration:operate` calls, so cleanup needs no new scope. Before removing a worktree, Agent Tag checks that the path is absolute, is not the repository root, the data directory, the home directory or an ancestor of one, is listed by `git worktree list` on the task's own branch, and is bound to no other T3 thread. A branch is deleted only with `git branch -d` (never `-D`) and only when its name is the task's own `agent-tag/<task-id>[-g<n>]`.
 - T3 must be reached over a loopback URL. The config schema rejects any other host.
 - macOS LaunchAgent logs are written to `~/Library/Logs/AgentTag` (`0700` directory, `0600` files). They contain structured lifecycle records and error class names, not message text or credentials.
@@ -53,6 +53,32 @@ Use tier 2 if Slack users must not get the operator's own account, or if a compr
 4. Treat each container or account as compromised once it has run untrusted input. Rebuild it rather than cleaning it.
 
 Even in tier 2, the agent can still push to anything its own credentials reach, and it can exfiltrate any repository content it can read over the network unless you add egress controls.
+
+### Request path
+
+What happens to one Slack mention, and which check applies at each hop:
+
+| Hop | What crosses it | Check |
+| --- | --- | --- |
+| Slack → Agent Tag | The event over Socket Mode (outbound WebSocket; no inbound port) | Workspace id; user, channel and route authority (`access.*`, `routes`); DM owner; duplicate delivery |
+| Agent Tag → SQLite | Message text, task, operation, audit row | Store is `0600` in a `0700` `dataDir`; audit metadata is redacted |
+| Agent Tag → T3 | The turn: prompt, thread context, memory block, attachments | Loopback URL only; restricted token with exactly `orchestration:read orchestration:operate`; authority re-checked before every queued turn |
+| T3 → provider | Prompt and repository content | The provider's own terms ([provider licensing](docs/provider-licensing.md)); runs as the host OS user |
+| Agent → host | Shell, files, network | None beyond the OS user (tier 1). `approval-required` runtime mode asks in Slack before T3 runs a command or edit |
+| Agent Tag → GitHub | `git push` and the draft PR API call | Configured repository only; token passed through `GIT_ASKPASS` to one `git` child, never in argv, git config or a remote URL; secret scan of the diff |
+| Agent Tag → Slack | Replies, status edits, cards, shared files | Authority re-checked before each reply; upload path and secret-scan gates (below) |
+
+### Credentials
+
+| Credential | Where it lives | Who reads it | Rotation |
+| --- | --- | --- | --- |
+| Slack app token (`xapp-`) | `slack.appTokenFile`, mode `0600` | Agent Tag | Regenerate in the Slack app settings, replace the file, `agent-tag service restart` |
+| Slack bot token (`xoxb-`) | `slack.botTokenFile`, mode `0600` | Agent Tag | Reinstall the app, replace the file, restart |
+| T3 restricted token | `t3.tokenFile`, mode `0600` | Agent Tag | Managed T3 (`t3.mode: "managed"`): Agent Tag mints, rotates before expiry and revokes replaced tokens itself. External T3: `agent-tag t3 rotate CONFIG --admin-token-file F`, or `bun run enroll:t3` |
+| GitHub fine-grained token | `github.auth.tokenFile`, mode `0600` | Agent Tag only, for one `git push` child at a time and the PR API | Create a new token on GitHub, replace the file. Limit it to the sandbox or target repositories |
+| Provider logins (Codex, Claude) | The provider CLIs' own files in the host user's home | T3 and every agent process | With each provider's CLI |
+
+In tier 1 every agent process runs as the same OS user, so it can read all of these files. The modes stop other local users, not the agent.
 
 ### What Agent Tag protects
 
@@ -76,6 +102,19 @@ Even in tier 2, the agent can still push to anything its own credentials reach, 
 - Provider-side data handling. Prompts and repository content go to whichever model provider the profile selects.
 - A compromised host, OS account, T3 server, or Slack workspace admin.
 - Denial of service by an allowed user. Concurrency, schedule count, and ambient rate limits apply, but there are no per-user quotas.
+
+### What Agent Tag does not guarantee, compared with Claude Tag
+
+Claude Tag runs each thread in an Anthropic-hosted sandbox and injects credentials at a proxy, so the sandbox holds none ([security and data](https://claude.com/docs/claude-tag/concepts/security-and-data)). Agent Tag runs on your host, so these guarantees do not carry over. Each is a row in the [GA matrix](docs/ga-acceptance.md), proposed as out of scope for v0.1.0 (owner decision O-1):
+
+| Row | Claude Tag | Agent Tag |
+| --- | --- | --- |
+| ISO-01 | A separate sandbox per thread, discarded when idle | A separate git worktree per task, same OS user, no filesystem or network isolation between tasks |
+| ISO-02 | External writes go through a proxy that enforces approval | `externalWrites` is recorded, not enforced where the tool runs. `approval-required` asks before T3 runs a command, but the command itself is not sandboxed |
+| TOOL-01 | Connections with scoped credentials, managed by an admin ([add connections](https://claude.com/docs/claude-tag/admins/add-connections)) | No connection layer. Tools use whatever credentials the host user has |
+| AMB-01 | Claude may join a conversation unprompted when enabled ([when Claude responds](https://claude.com/docs/claude-tag/users/when-claude-responds)) | Off by default; experimental, planned to be finished after GA |
+
+The GA claim is "self-hosted, for a single trusted team" (tier 1). See [parity](docs/parity.md) for every other difference.
 
 ## Checking a deployment
 

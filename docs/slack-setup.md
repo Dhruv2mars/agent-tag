@@ -1,52 +1,102 @@
 # Slack setup
 
-This is the shortest supported path to a live Agent Tag mention. Files shared with a request are read with `files:read`; files the agent shares back are posted with `files:write`.
+This is the shortest supported path to a live Agent Tag mention: create the Slack app, store its two tokens, configure one route, and verify. What people can then do in Slack is in [Slack usage](slack-usage.md).
 
 `bun run onboard` automates steps 1–3. It prints a create-from-manifest link, stores both tokens at mode `0600` under `~/.agent-tag/secrets/`, checks `auth.test`, and writes a config with one route per channel. See [Onboarding](operations.md#onboarding). For unattended runs, pass the tokens through `AGENT_TAG_SLACK_APP_TOKEN` and `AGENT_TAG_SLACK_BOT_TOKEN` in a process environment that is not logged, and never as command-line arguments. The manual steps below remain the reference.
 
 ## 1. Create the app
 
-In Slack's app dashboard, create an app from [`config/slack-manifest.example.json`](../config/slack-manifest.example.json). The manifest enables Socket Mode, interactivity, and a writable App Home Messages tab for DMs. Its bot token scopes are exactly:
+In Slack's app dashboard, choose **Create New App > From an app manifest**, pick the workspace, and paste [`config/slack-manifest.example.json`](../config/slack-manifest.example.json):
 
-- `app_mentions:read`
-- `channels:history`
-- `channels:read`
-- `chat:write`
-- `files:read`
-- `files:write`
-- `groups:history`
-- `groups:read`
-- `im:history`
-- `reactions:write`
-- `users:read`
+```json
+{
+  "display_information": {
+    "name": "Agent Tag",
+    "description": "A T3-backed Slack coworker for authorized engineering tasks",
+    "background_color": "#1f2937"
+  },
+  "features": {
+    "app_home": {
+      "home_tab_enabled": false,
+      "messages_tab_enabled": true,
+      "messages_tab_read_only_enabled": false
+    },
+    "bot_user": {
+      "display_name": "Agent Tag",
+      "always_online": false
+    }
+  },
+  "oauth_config": {
+    "scopes": {
+      "bot": [
+        "app_mentions:read",
+        "channels:history",
+        "channels:read",
+        "chat:write",
+        "files:read",
+        "files:write",
+        "groups:history",
+        "groups:read",
+        "im:history",
+        "reactions:write",
+        "users:read"
+      ]
+    }
+  },
+  "settings": {
+    "event_subscriptions": {
+      "bot_events": ["app_mention", "message.channels", "message.groups", "message.im"]
+    },
+    "interactivity": {
+      "is_enabled": true
+    },
+    "org_deploy_enabled": false,
+    "socket_mode_enabled": true,
+    "token_rotation_enabled": false
+  }
+}
+```
 
-`channels:read` and `groups:read` let `access.mode: "channel-members"` read the members of routed public and private channels (see [Access modes](operations.md#access-modes)), and let Agent Tag check whether a routed channel is public (`conversations.info`) before it saves a workspace note; without them, workspace notes are refused outside channels whose route sets `visibility`, and `channel-members` mode works allowlist-only. `agent-tag doctor` warns until an app installed from an older manifest is reinstalled.
+The manifest enables Socket Mode (Agent Tag opens an outbound WebSocket; it needs no public URL), interactivity for buttons and cards, and a writable App Home Messages tab for DMs. Agent Tag must be a customer-built internal app like this one, not a distributed app: Slack limits non-Marketplace distributed apps to one `conversations.replies` call per minute.
 
-`reactions:write` lets Agent Tag react with :eyes: to a mention as soon as it is accepted, before any work starts, even when all coordinators are busy. Set `slack.ui.ackReaction` to another emoji name, or to `null` to turn the reaction off. An app installed before this scope existed must be reinstalled from the updated manifest. Until then Agent Tag logs one `slack.reaction.failed` warning with `errorCode: "missing_scope"` per process and otherwise keeps working. `agent-tag doctor` warns about the missing scope in the same way.
+### For the Slack admin
 
-`files:read` lets Agent Tag read files shared in a mention, or in a reply in a thread it follows, and attach them to that turn in T3. Each file is looked up with `files.info` and downloaded from `files.slack.com` with the bot token (redirects are followed only to Slack hosts, and the token is never sent anywhere else). PNG, JPEG, GIF and WebP files, identified by their bytes rather than their declared type, are sent as images; everything else is sent as a file. `files.inbound` in the config sets the limits: `maxFilesPerMessage` (default 5, at most 8), `maxImageBytes` (default and maximum 10 MiB; a larger image is sent as a file), `maxFileBytes` (default 25 MiB, at most 50 MiB), `deniedExtensions` (lowercase, without the dot) and `enabled`. A file over a limit, stored outside Slack, deleted, a canvas, of a denied type, or declared as an image whose bytes are not that image is skipped: the turn still starts, the model is told which files were skipped and why, and the thread gets one notice listing them. Each outcome is recorded, so a retried turn never uploads a file twice. An app installed before this scope existed must be reinstalled from the updated manifest; until then shared files are skipped with a note that the app lacks the permission, and `agent-tag doctor` warns about the missing scope.
+Agent Tag asks for these 11 bot token scopes and no others:
 
-`files:write` lets the agent share files it wrote back to the thread. Each turn's text tells the agent to end its reply with one line per file, `[[agent-tag:upload out/report.csv]]` (optionally followed by a quoted title). Agent Tag removes those lines from the reply, posts the reply, then reads each file from the task's T3 worktree and uploads it to the same thread with Slack's external upload flow (`files.getUploadURLExternal`, then `files.completeUploadExternal`). Paths outside the worktree, hidden files (any path part starting with `.`), files over the limit and files containing a known credential shape are not shared; the thread gets a short notice naming each one and why. `files.outbound` sets `maxFilesPerTurn` (default 5, at most 10), `maxFileBytes` (default 25 MiB, at most 50 MiB), `scanForSecrets` (default `true`) and `enabled`. Slack rate limits and network errors are retried with backoff; after a crash, Agent Tag asks Slack (`files.info`, which needs `files:read`) whether a file already reached the thread before uploading it again. Without `files:write` each file fails once with a notice asking the operator to reinstall the app.
+| Scope | Why Agent Tag needs it |
+| --- | --- |
+| `app_mentions:read` | Receive `@Agent Tag` mentions in channels it was invited to. |
+| `channels:history` | Read replies in public-channel threads Agent Tag follows, and earlier thread messages when it is mentioned partway into a thread. |
+| `channels:read` | Read the members of a routed public channel (`access.mode: "channel-members"`) and check that a channel is public before saving a workspace memory note. |
+| `chat:write` | Post replies, status messages and cards, and edit them in place. |
+| `files:read` | Read files people share with a request, and check whether an upload already reached the thread after a crash. |
+| `files:write` | Share files the agent wrote back into the same thread. |
+| `groups:history` | The same as `channels:history`, for private channels Agent Tag was invited to. |
+| `groups:read` | The same as `channels:read`, for private channels. |
+| `im:history` | Read direct messages sent to Agent Tag. |
+| `reactions:write` | React with :eyes: as soon as a mention is accepted. |
+| `users:read` | Show the model who is speaking by name, render `<@U…>` mentions as names, use a person's time zone for routines, and tell guests and bots apart from members. |
 
-To add scopes to an app that is already installed, paste the updated manifest under **App Manifest** (or add the scopes under **OAuth & Permissions > Bot Token Scopes**), then click **Reinstall to Workspace** and approve. The bot token keeps its value, so no secret file changes. File sharing picks up the new scopes on its next call; name lookups turn themselves off for the process after `missing_scope`, so restart the service after adding `users:read`. `agent-tag doctor` stops warning once Slack reports the new scopes. The dhruv2mars workspace (`T0BS9MA4BUP`) was reinstalled this way with `files:read` and `files:write` on 2026-10-21. Limits, retries and cleanup for shared files are in [Slack files](operations.md#slack-files).
+What these scopes do not grant:
 
-Each turn gets one status message in the thread (no extra scope: `chat:write` covers `chat.update`). While the turn runs it shows the agent's plan, its last few tool lines and a **Stop** button; when the turn ends it is edited in place to `Done in 3m 12s` (plus `· 4 files changed` when T3 recorded a diff), `Stopped by @user`, `Failed` or `Expired`, and the Stop button is removed. Any allowed user can press Stop in an allowed channel (in a DM, only its owner), and the audit log records who did. Edits are throttled to one per `slack.ui.statusUpdateIntervalMs` (default 2000, minimum 1000) per message and `slack.ui.statusUpdatesPerMinute` (default 40) progress edits across all messages; the final edit is never delayed by the budget. Tool lines can contain shell commands and file paths; set `slack.ui.statusProgress` to `false` to show only the headline and the Stop button.
+- No `channels:join`: Agent Tag reads only conversations it was invited to, and it cannot add itself to one.
+- No `search:read`: it cannot search the workspace.
+- No `users:read.email`: it never reads email addresses.
+- No user token: it acts only as its own bot user, never on behalf of a person.
+- No Slack Connect support: channels shared with other organizations are not tested or supported.
+- Who may use it is set in Agent Tag's config (`access.allowedUserIds`, `access.allowedChannelIds`, `access.mode`), not by Slack.
 
-The last message of each final reply ends with a small footer naming the model and provider instance that answered and how long the turn took, e.g. `gpt-5.6-sol · codex · 3m 12s`. The model comes from the T3 thread, so a per-thread model switch shows up there. Set `slack.ui.footer` to `"none"` to leave replies plain.
+Bot events are exactly `app_mention`, `message.channels`, `message.groups` and `message.im`. Draft pull requests use a separate GitHub token on the host, not a Slack permission ([operations](operations.md#github-pull-requests-draft-prs-auto-mode)).
 
-`users:read` lets Agent Tag call `users.info` to show the model who is speaking, as `Alice Chen (U0A1)`, and to render `<@U0A1>` mentions as names. `users:read.email` is not requested, and no email address is read. Names are cached in memory for one hour and are never written to the database, except inside the frozen text of a turn already sent to T3. The same lookup supplies the requester's profile time zone (`tz`) for routines created from Slack; a routine stores the zone it was created in.
+### Reinstall after a scope change
 
-If the bot token lacks `users:read` (an app installed before this scope was added), Agent Tag logs one `slack.users.disabled` warning with `errorCode: "missing_scope"` per process and keeps working with raw user IDs such as `U0A1`. Routines then use `routines.defaultTimeZone` and say so in the confirmation. Reinstall the app from the updated manifest to restore names and profile time zones. A failed or slow lookup for one user also falls back to the ID and is retried after five minutes. Name lookups for one turn stop after at most five seconds (a quarter of the operation lease if that is shorter) and resolve at most 50 users; anyone not resolved by then appears as a raw ID.
+To add scopes to an app that is already installed, paste the updated manifest under **App Manifest** (or add the scopes under **OAuth & Permissions > Bot Token Scopes**), then click **Reinstall to Workspace** and approve. The bot token keeps its value, so no secret file changes. File sharing picks up the new scopes on its next call; name lookups turn themselves off for the process after `missing_scope`, so restart the service after adding `users:read`. `agent-tag doctor` stops warning once Slack reports the new scopes. Limits, retries and cleanup for shared files are in [Slack files](operations.md#slack-files).
 
-Each turn sent to T3 starts with `Slack message from <name> (<user ID>):`, or `Scheduled routine run (created by <name> (<user ID>)):` for a routine. The user ID is always present, so two people with the same display name stay distinct. Display names are treated as untrusted: control, bidirectional and zero-width characters, Slack markup characters, and line breaks are removed, parentheses become brackets so a name cannot imitate the `(U…)` suffix, and names are capped at 64 characters. A line of message text that looks like Agent Tag framing (`Slack message from …`, `Scheduled routine run …`, `[Agent Tag …`, `Agent Tag reference memory …`, or an `<agent-tag-memory>` tag) is prefixed with `\` so it cannot pass for a header. Scheduled routine prompts are plain text and are sent verbatim, apart from that escaping; Slack markup and entities in them are not interpreted. The text is frozen on first dispatch, so retries resend identical text without calling Slack.
+Without a scope, the feature that needs it degrades and the rest keeps working: no :eyes: without `reactions:write`, raw user IDs and `routines.defaultTimeZone` without `users:read`, skipped files with a notice without `files:read`, a failed upload notice without `files:write`, and `channel-members` mode working allowlist-only without `channels:read`/`groups:read`. `agent-tag doctor` warns about each missing scope.
 
-When someone mentions Agent Tag partway into an existing thread, the first turn also carries a window of the thread's earlier messages, read with `conversations.replies` (covered by the existing `channels:history`, `groups:history` and `im:history` scopes). The window holds the thread's first message plus the newest replies before the mention: at most `threadContext.maxMessages` messages (default 30) and `maxChars` characters (default 12,000), each message capped at `maxMessageChars` (default 2,000). Agent Tag's own messages are never included. Other bots' replies are left out by default (`includeBotMessages: "root-only"` keeps a bot-posted first message, such as an alert); `"none"` drops bots entirely and `"all"` keeps them. Replies from people outside `access.allowedUserIds` are included as context marked `"steeringAllowed": false` unless `includeNonAllowedUsers` is false (the first message is always kept). Shared files appear by name only. Each message is one JSON line under an `[Agent Tag: earlier messages …]` header that labels it untrusted context, so message text cannot pose as a request. Set `threadContext.enabled: false` on a profile to turn this off. Top-level mentions and replies in a thread Agent Tag already follows read no history.
+### Tokens
 
-The read is bounded to eight seconds (a third of the operation lease if that is shorter) and at most ten pages of 200 replies. A thread longer than that is marked as incomplete in the header. If Slack refuses or times out, the turn still runs with the line `[Agent Tag could not load earlier thread messages: <code>]`, and an audit row `thread-context.unavailable` records the code; a successful read writes `thread-context.loaded` with counts only. A rate-limited read is retried once when Slack asks for a wait of three seconds or less. Slack's 2025 limit of one `conversations.replies` request per minute applies only to commercially distributed apps that are not in the Marketplace. Agent Tag must be installed as a customer-built internal app (what the manifest and `agent-tag onboard` create), which keeps the normal Tier 3 limit.
-
-After Agent Tag follows a thread, it keeps note of what happens there between turns, without starting a turn. These thread updates are other bots' replies (unless `includeBotMessages` is `"none"`), replies from people outside `access.allowedUserIds` (unless `includeNonAllowedUsers` is false), and edits to any message in the thread. Edits never start a turn, even when the edited message mentions Agent Tag. A reply from an allowed person that shares a file (`file_share`) starts a turn like any other reply, with the file attached. The next turn started by an allowed person carries the pending updates, oldest first, under an `[Agent Tag: thread updates since your last turn …]` header, as untrusted JSON lines in the same budget as the earlier-messages window; an edit shows its text before and after. Updates beyond that budget are dropped, newest kept, and the header counts how many were omitted. At most 50 updates wait per thread; older ones are dropped with a `thread-note.dropped` audit row. Scheduled runs in the thread leave updates pending for the next human turn. In a DM, only the owner's messages are read; anyone else gets `dm-owner-denied`. Agent Tag ignores its own messages and edits by matching its bot user and bot ID.
-
-Its bot events are exactly `app_mention`, `message.channels`, `message.groups`, and `message.im`. Slack documents `connections:write` for Socket Mode app-level tokens and requires an `xapp` token to establish the WebSocket connection. See [Using Socket Mode](https://docs.slack.dev/apis/events-api/using-socket-mode/).
+Slack documents `connections:write` for Socket Mode app-level tokens and requires an `xapp` token to establish the WebSocket connection. See [Using Socket Mode](https://docs.slack.dev/apis/events-api/using-socket-mode/).
 
 Install the app to the target workspace. Under **Basic Information > App-Level Tokens**, create one token with only `connections:write`. This is the app token and begins with `xapp-`. Under **OAuth & Permissions**, copy the bot token created by the workspace install. It begins with `xoxb-`.
 
@@ -82,7 +132,7 @@ Keep ambient participation disabled for the first run. A normal channel route us
 
 ## 4. Verify and start
 
-Start the pinned T3 Code `0.0.45` server, then run:
+Start the pinned T3 Code `0.0.45` server (or use `t3.mode: "managed"`; see [operations](operations.md)), then run:
 
 ```sh
 bun install --frozen-lockfile
@@ -91,13 +141,16 @@ bun run doctor -- /absolute/path/to/agent-tag.json
 bun run start -- /absolute/path/to/agent-tag.json
 ```
 
-`doctor` opens and migrates SQLite, checks that T3 speaks orchestration protocol 1, verifies the restricted T3 session, checks every configured provider and model, calls Slack `auth.test`, and rejects a bot installed in the wrong workspace. `start` repeats the T3/provider checks before opening Socket Mode.
+With the release binary, the same checks are `agent-tag doctor CONFIG` and `agent-tag run CONFIG` (or `agent-tag service install CONFIG`).
 
-Mention the app in an allowed channel. Agent Tag should acknowledge work in the message thread, dispatch through T3, and post the final result to that same thread. A DM route does not require a mention. Approval, question, and cancel controls use Slack interactivity over the same Socket Mode connection.
+`doctor` opens and migrates SQLite, checks that T3 speaks orchestration protocol 1, verifies the restricted T3 session, checks every configured provider and model, calls Slack `auth.test`, rejects a bot installed in the wrong workspace, and lists any missing scope. `start` repeats the T3 and provider checks before opening Socket Mode.
 
-## Known live blockers
+Then check each of these in Slack:
 
-- A Codex-backed mention and a same-thread follow-up completed with final Slack replies. Independent human acceptance remains open; see [live Slack evidence](evidence/2026-09-28-slack-live.md).
-- The App Home Messages tab was made writable, and one owner-bound Codex DM completed with a final reply. Independent human and cross-identity privacy exercises, plus Assistant Threads, remain open; see [DM evidence](evidence/2026-09-29-dm-live.md).
-- Shared files in both directions are covered by fixture tests and a live T3 run only ([files evidence](evidence/2026-10-21-slack-files.md)); the human Slack round trip (SLK-05) is still pending.
-- The first live Slack turn on 2026-09-26 hit a Codex account usage limit. Later Codex turns completed. T3 reports Claude as ready and authenticated, but real Claude turns failed with `provider-api-errors`; Agent Tag does not silently change providers.
+| Check | Passed when | If not |
+| --- | --- | --- |
+| `doctor` | Every check is `PASS` (or `SKIP` for features you did not configure) and no scope is reported missing. | Fix the failing check first; see [troubleshooting](troubleshooting.md). |
+| Mention | `@Agent Tag say hello` in a routed channel gets :eyes:, a status message, and a reply in the thread with a footer naming the model. | No :eyes: but a reply: `reactions:write` is missing. Nothing at all: the bot is not in the channel, the channel or user is not allowed, or there is no route; `agent-tag audit CONFIG` shows an `access.denied` row with the reason. |
+| Follow-up | A reply in the same thread, without a mention, starts the next turn of the same task. | The replier is not in `access.allowedUserIds` (or not a channel member in `channel-members` mode). |
+| Stop | Pressing **Stop** during a turn edits the status to `Stopped by @you`. | Check that interactivity is enabled in the app settings. |
+| DM (if routed) | A message in the bot's Messages tab gets a reply without a mention. | The DM is not routed to that owner, or the Messages tab is read-only; reinstall from the manifest. |

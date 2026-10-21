@@ -1,98 +1,59 @@
 # Agent Tag
 
-Agent Tag is an open-source Slack coworker that delegates work to agents running through T3 Code on an organization-controlled machine.
+Agent Tag is a Slack coworker you host yourself. Mention it in a thread and it hands the work to a coding agent (Codex or Claude, or any provider T3 Code supports) running through [T3 Code](https://github.com/pingdotgg/t3code) on your own machine. It replies in the thread, asks before risky steps when you want it to, remembers notes, runs routines, shares files and can open draft pull requests.
 
-This repository is under active development. It is not yet generally available. See [the acceptance matrix](docs/ga-acceptance.md) for the evidence required before that claim changes.
+It is modelled on [Claude Tag](https://claude.com/docs/claude-tag/users/getting-started), with two differences: you choose the agent and model, and it runs on your host instead of a hosted sandbox. [Parity](docs/parity.md) lists every difference.
 
-For a concise continuation guide, current verified behavior, and the next required work, read [project status](docs/project-status.md).
+**Status:** under active development and not yet generally available. v0.1.0 is gated on the [GA acceptance matrix](docs/ga-acceptance.md): every row must cite real evidence. It is meant for a single trusted team; read [SECURITY.md](SECURITY.md) before inviting anyone, because every allowed Slack user can make the agent run code as the host's OS user.
 
-## Install
+## Quickstart
 
-Install a prebuilt binary (macOS arm64/x64, Linux x64/arm64) without cloning:
+1. **Install** a prebuilt binary (macOS arm64/x64, Linux x64/arm64). Until GA every release is a prerelease, so pin one from [the releases page](https://github.com/Dhruv2mars/agent-tag/releases):
 
-```sh
-curl -fsSL https://raw.githubusercontent.com/Dhruv2mars/agent-tag/main/install.sh | AGENT_TAG_VERSION=0.1.0-rc.1 sh
-agent-tag version
-```
+   ```sh
+   curl -fsSL https://raw.githubusercontent.com/Dhruv2mars/agent-tag/main/install.sh | AGENT_TAG_VERSION=0.1.0-rc.1 sh
+   agent-tag version
+   ```
 
-No release has been tagged yet, so this command fails until the first prerelease is published; until then, use a [source checkout](#development). Until GA every release is a prerelease, and the installer's default (`latest`) only finds stable releases, so pin one from [the releases page](https://github.com/Dhruv2mars/agent-tag/releases) with `AGENT_TAG_VERSION`. For the same reason, move between prereleases with `agent-tag update --version X` rather than a bare `agent-tag update`. After the first stable release, drop the pin and use `agent-tag update --check`.
+   No release has been tagged yet, so this fails until the first prerelease is published; until then use a [source checkout](#development). The installer verifies `SHA256SUMS` and installs to `~/.local/bin` (`AGENT_TAG_INSTALL_DIR` changes it). Docker and updates are in [install](docs/install.md).
+2. **Onboard:** `agent-tag onboard` walks through the Slack app (a create-from-manifest link), T3, the config at `~/.agent-tag/agent-tag.json`, and the background service. Every prompt also has a flag for scripted installs ([operations](docs/operations.md#onboarding)).
+3. **Check:** `agent-tag doctor` reports SQLite, T3, providers, Slack scopes and the service. `--fix` repairs file modes, a missing data directory, a drifted unit and a stopped service.
+4. **Run:** `agent-tag service install` (LaunchAgent on macOS, `systemd --user` on Linux), or `agent-tag run CONFIG` in the foreground.
+5. **Try it:** invite the bot to a routed channel and send `@Agent Tag say hello`. You should see :eyes:, a status message and a reply with a footer naming the model. [Slack setup](docs/slack-setup.md#4-verify-and-start) lists what to check next.
 
-The installer verifies the release's `SHA256SUMS` and installs to `~/.local/bin`. Set `AGENT_TAG_INSTALL_DIR` to change the destination. Then run `agent-tag onboard` (see [Quickstart](#quickstart)): it walks through the [Slack app](docs/slack-setup.md), T3, and the config, and can install the background service, whose unit runs the installed binary directly. Check everything with `agent-tag doctor`. A Docker image is also available. See [install](docs/install.md) for both, plus self-update and how releases are cut.
+## Docs
+
+| You are | Read |
+| --- | --- |
+| Setting it up | [Install](docs/install.md), [Slack setup](docs/slack-setup.md) (including the scope table for your Slack admin), [operations](docs/operations.md), [troubleshooting](docs/troubleshooting.md) |
+| Using it in Slack | [Using Agent Tag in Slack](docs/slack-usage.md) |
+| Reviewing its security | [SECURITY.md](SECURITY.md), [provider access and licensing](docs/provider-licensing.md) |
+| Comparing it with Claude Tag | [Parity](docs/parity.md) |
+| Tracking the release | [GA acceptance matrix](docs/ga-acceptance.md), [owner session](docs/owner-session.md), [evidence](docs/evidence/) |
+
+Provider authentication is not a license grant. Review [provider access and licensing](docs/provider-licensing.md) before making an authenticated provider available to other Slack users.
 
 ## Development
 
-Requirements:
-
-- Bun
-- T3 Code `0.0.45` (orchestration protocol 1; `0.0.42`–`0.0.45` are accepted)
-- macOS or Linux for background operation
+Requirements: Bun, and T3 Code `0.0.45` (orchestration protocol 1; `0.0.42`–`0.0.45` are accepted) for live checks. Background operation needs macOS or Linux.
 
 ```sh
 bun install
 bun run verify:t3-pin
-bun run test      # bun test with a 20 s per-test budget for I/O-heavy fixtures
-bun run typecheck
+bun run check            # typecheck + tests (20 s per-test budget for I/O-heavy fixtures)
+bun run onboard          # the wizard, from the checkout
+bun run start -- /absolute/path/to/agent-tag.json
 ```
 
-Verify the exact committed tree from a fresh archive and frozen dependency install with:
+`bun link` puts `agent-tag` on your `PATH`. A service installed from a checkout runs `bun run src/cli.ts`; one installed from the binary runs the binary, so `agent-tag update` then `agent-tag service restart` picks up a new version. `doctor --fix` never switches a service between the two.
+
+Verify the committed tree from a fresh archive with a frozen install:
 
 ```sh
 bun run verify:clean-install
 ```
 
-## Quickstart
-
-With T3 Code running, the onboarding wizard writes `~/.agent-tag/agent-tag.json`, creates the data directory, prints a create-from-manifest link for the Slack app, stores the Slack tokens in mode-`0600` files, mints a restricted T3 token, and offers to install the background service:
-
-```sh
-bun run onboard
-```
-
-Every prompt also has a flag, so CI and scripted installs can run without a TTY (see [operations](docs/operations.md#onboarding)):
-
-```sh
-AGENT_TAG_SLACK_APP_TOKEN=... AGENT_TAG_SLACK_BOT_TOKEN=... \
-bun run onboard -- --yes --accept-risk --repo /srv/repo --users U0123 --channels C0123 --t3-issue-token --install-service
-```
-
-Check the install. `--fix` repairs safe problems: file modes, a missing data directory, a drifted unit template, and a stopped service. It never moves the service to a different checkout, Bun, or binary.
-
-```sh
-bun run doctor            # or: bun run doctor -- /absolute/path/to/agent-tag.json --fix
-```
-
-Manage the per-user background service. It uses a LaunchAgent on macOS and a `systemd --user` unit on Linux:
-
-```sh
-bun run service:install -- /absolute/path/to/agent-tag.json
-bun run service:status
-bun run service:logs -- --follow
-```
-
-To run it in the foreground instead:
-
-```sh
-bun run start -- /absolute/path/to/agent-tag.json
-```
-
-`bun link` puts the `agent-tag` command on your `PATH`, so `agent-tag onboard|doctor|service ...` work the same way. A release binary from `install.sh` takes the same subcommands without Bun or a checkout:
-
-```sh
-agent-tag onboard
-agent-tag doctor --fix
-agent-tag service install      # LaunchAgent on macOS, systemd --user unit on Linux
-agent-tag service logs --follow
-```
-
-A service installed from a checkout runs `bun run src/cli.ts`; one installed from the binary runs the binary itself, so `agent-tag update` followed by `agent-tag service restart` picks up the new version. `doctor --fix` never switches an existing service between the two.
-
-The service validates every configured provider/model against T3 before connecting to Slack, writes structured JSON lifecycle records to stdout/stderr, and shuts down on `SIGINT` or `SIGTERM`. See [operations](docs/operations.md) for upgrade, uninstall, recovery, and host constraints.
-
-Provider authentication is not a license grant. Review [provider access and licensing](docs/provider-licensing.md) before making an authenticated provider available to other Slack users.
-
-For the exact Slack manifest, scopes, token files, route fields, and first live mention without the wizard, follow [Slack setup](docs/slack-setup.md). The checked-in manifest requests `files:read` for files shared with a request, and `files:write` for files the agent shares back to the thread.
-
-With the pinned T3 server running and an exact-scope service token configured:
+With a pinned T3 server and an exact-scope service token, run the live T3 suite:
 
 ```sh
 AGENT_TAG_T3_URL=http://127.0.0.1:37841 \
@@ -100,10 +61,10 @@ AGENT_TAG_T3_TOKEN_FILE=/absolute/path/to/t3-token \
 bun run test:t3
 ```
 
-Read [SECURITY.md](SECURITY.md) before inviting anyone: every allowed Slack user can make the agent run code as the service's OS user. Check a deployment with:
+Check a deployment's security controls:
 
 ```sh
 bun run security:audit -- /absolute/path/to/agent-tag.json
 ```
 
-Agent Tag uses T3 as its only execution backend. It does not contain an independent agent loop or provider manager.
+Agent Tag uses T3 as its only execution backend. It has no agent loop or provider manager of its own.
