@@ -43,6 +43,8 @@ describe("parseMemoryCommand", () => {
     ["Please remember for all channels: a", { kind: "remember", target: "workspace", content: "a" }],
     ["!remember --workspace main is default", { kind: "remember", target: "workspace", content: "main is default" }],
     ["!remember -w main", { kind: "remember", target: "workspace", content: "main" }],
+    ["!remember -wow this works", { kind: "remember", target: "here", content: "-wow this works" }],
+    ["!remember --workspaces are neat", { kind: "remember", target: "here", content: "--workspaces are neat" }],
     ["!remember workspace: main", { kind: "remember", target: "workspace", content: "main" }],
     // list
     ["what do you remember?", { kind: "list" }],
@@ -63,6 +65,7 @@ describe("parseMemoryCommand", () => {
     ["forget a1b2c3d4-e5f6", { kind: "forget", ref: "a1b2c3d4-e5f6" }],
     ["forget: tables", { kind: "forget-match", match: "tables" }],
     ["forget : the deploy rule", { kind: "forget-match", match: "the deploy rule" }],
+    ["forget: a -&gt; b &amp; c", { kind: "forget-match", match: "a -> b & c" }],
     // edit
     ["update memory a1b2c3d4: reports go out as CSV", { kind: "edit", ref: "a1b2c3d4", content: "reports go out as CSV" }],
     ["update memory `a1b2c3d4`: x", { kind: "edit", ref: "a1b2c3d4", content: "x" }],
@@ -464,6 +467,13 @@ describe("memory phrases from Slack", () => {
       expect(h.texts()[4]).toStartWith("Forgot `");
       await h.send(event({ text: "forget: nothing like this" }));
       expect(h.texts()[5]).toBe('I don\'t have a note matching "nothing like this" here that I can forget.');
+      expect(h.notes()).toHaveLength(2);
+      // Slack entity-encodes & < >: the note is stored decoded and the match decodes too.
+      await h.send(event({ text: "remember: a -&gt; b &amp; c" }));
+      expect(h.texts()[6]).toContain(": a -&gt; b &amp; c\n");
+      await h.send(event({ text: "forget: -&gt; b &amp;" }));
+      expect(h.texts()[7]).toStartWith("Forgot `");
+      expect(h.texts()[7]).toEndWith(": a -&gt; b &amp; c");
       expect(h.notes()).toHaveLength(2);
     });
   });

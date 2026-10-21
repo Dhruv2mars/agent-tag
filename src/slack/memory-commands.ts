@@ -139,7 +139,7 @@ export class SlackMemoryCommands {
       if (receipt.result.ephemeral !== undefined) await this.#ephemeral(req, receipt.result.ephemeral);
       return { kind: "executed", outcome: receipt.result.outcome, reason: receipt.result.reason };
     } catch (error) {
-      // Everything rolled back, so a Slack redelivery may run it again.
+      // Everything rolled back; Bolt already acked the event, so the user retries by sending it again.
       this.#log("memory.command.failed", command.kind, error instanceof Error ? error.name : "unknown");
       await this.#ephemeral(req, copy.MEMORY_COMMAND_FAILED);
       return { kind: "executed", outcome: "failed", reason: "internal-error" };

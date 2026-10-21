@@ -16,7 +16,7 @@ const REF_TOKEN = `(?:\`(?<quoted>${REF})\`|#(?<hashed>${REF})|(?<bare>${REF}))`
 
 const REMEMBER_HERE = /^(?:please\s+)?remember(?:\s+(?:this\s+)?for\s+(?:this\s+channel|here|this\s+dm|me))?\s*:\s*(?<c>.+)$/is;
 const REMEMBER_WORKSPACE = /^(?:please\s+)?remember\s+(?:this\s+)?for\s+(?:the\s+)?(?:workspace|everyone|all\s+channels)\s*:\s*(?<c>.+)$/is;
-const BANG_REMEMBER = /^!remember\s+(?:(?<w>--workspace|-w|workspace\s*:)|(?:channel|here)\s*:)?\s*(?<c>.+)$/is;
+const BANG_REMEMBER = /^!remember\s+(?:(?<w>--workspace\s+|-w\s+|workspace\s*:)|(?:channel|here)\s*:)?\s*(?<c>.+)$/is;
 const LIST = [
   /^what\s+do\s+you\s+remember(?:\s+(?:about\s+)?(?:this\s+channel|here|me|this\s+dm))?\s*\??$/i,
   /^(?:show|list)\s+(?:your\s+)?memor(?:y|ies)\s*\??$/i,
@@ -76,7 +76,8 @@ export function parseMemoryCommand(text: string): MemoryCommand | null {
   }
   const match = FORGET_MATCH.exec(s);
   if (match !== null) {
-    const m = content(match.groups?.["m"]);
+    // Slack sends `&`, `<`, `>` as entities; notes are stored decoded, so match against decoded text.
+    const m = content(match.groups?.["m"]?.replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&"));
     return m === null ? null : { kind: "forget-match", match: m };
   }
   for (const pattern of EDIT) {
