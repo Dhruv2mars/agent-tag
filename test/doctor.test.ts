@@ -5,6 +5,7 @@ import { join } from "node:path";
 
 import {
   checkBunVersion,
+  checkServiceState,
   compareVersions,
   type DoctorCheck,
   type DoctorDependencies,
@@ -15,6 +16,7 @@ import {
 } from "../src/doctor.ts";
 import type { CommandResult } from "../src/command.ts";
 import { AGENT_TAG_LAUNCHD_LABEL } from "../src/launchd.ts";
+import type { ServiceStateReport } from "../src/service-state.ts";
 import { launchdServiceManager, type ServiceManager, type ServiceStatusReport, type ServiceUnitState } from "../src/service-manager.ts";
 import type { T3Session } from "../src/t3/auth.ts";
 import type { T3ServerInfo } from "../src/t3/gateway.ts";
@@ -254,12 +256,13 @@ describe("agent-tag doctor", () => {
       ["slack-bot-auth", "pass"],
       ["access", "pass"],
       ["slack-app-auth", "pass"],
+      ["service-state", "skip"],
       ["service", "pass"],
     ]);
     expect(world.seenAuthorization).toEqual([`Bearer ${BOT_TOKEN}`, `Bearer ${APP_TOKEN}`]);
     const output = `${formatDoctorReport(report)}\n${JSON.stringify(report)}`;
     for (const secret of [APP_TOKEN, BOT_TOKEN, T3_TOKEN]) expect(output).not.toContain(secret);
-    expect(formatDoctorReport(report)).toContain("16 passed, 0 warning(s), 0 failed, 1 skipped");
+    expect(formatDoctorReport(report)).toContain("16 passed, 0 warning(s), 0 failed, 2 skipped");
   });
 
   test("reports the access block: allowlist mode reads no membership", async () => {
@@ -405,9 +408,9 @@ describe("agent-tag doctor", () => {
     expect(report.checks.map((item) => item.id)).toEqual([
       "bun-version", "config", "data-dir", "secret:slack-app-token", "secret:slack-bot-token", "secret:t3-token",
       "store", "t3-environment", "t3-version", "t3-session", "t3-providers", "t3-models", "t3-token-rotation", "slack-bot-auth",
-      "access", "slack-app-auth", "service",
+      "access", "slack-app-auth", "service-state", "service",
     ]);
-    expect(JSON.parse(JSON.stringify(report)).checks).toHaveLength(17);
+    expect(JSON.parse(JSON.stringify(report)).checks).toHaveLength(18);
   }
 
   test.skipIf(process.getuid?.() === 0)("reports a data dir without owner search permission as a failed check instead of aborting", async () => {
@@ -501,6 +504,59 @@ describe("agent-tag doctor", () => {
     expect(check(report, "t3-session").status).toBe("skip");
     expect(check(report, "t3-providers").status).toBe("skip");
     expect(check(report, "t3-version").status).toBe("skip");
+    expect(check(report, "t3-environment").hint).toContain("the service waits and resumes on its own");
+  });
+
+  const waitingState = (alive: boolean): ServiceStateReport => ({
+    state: "waiting-for-t3",
+    pid: 4242,
+    since: "2026-10-05T23:50:00.000Z",
+    updatedAt: "2026-10-05T23:59:00.000Z",
+    t3: { baseUrl: "http://127.0.0.1:37841", attempts: 9, lastError: "Unable to connect", nextAttemptAt: "2026-10-06T00:00:00.000Z" },
+    alive,
+  });
+
+  test("service-state fails with the wait's details while a live service waits for T3", async () => {
+    world.environment = new Error("connect ECONNREFUSED");
+    const report = await runDoctor({
+      configPath: fixture.configPath,
+      fix: false,
+      dependencies: { ...dependencies(world, service), serviceState: async () => waitingState(true) },
+    });
+    expect(check(report, "service-state")).toMatchObject({
+      status: "fail",
+      summary: "service pid 4242 has been waiting for T3 at http://127.0.0.1:37841 since 2026-10-05T23:50:00.000Z " +
+        "(9 attempt(s); last error: Unable to connect; next attempt 2026-10-06T00:00:00.000Z)",
+    });
+    expect(check(report, "service-state").hint).toContain("start the external T3 server");
+    expect(report.ok).toBe(false);
+  });
+
+  test("service-state skips a stale record and passes a running service", () => {
+    expect(checkServiceState({ t3: { mode: "external" } } as never, waitingState(false)).status).toBe("skip");
+    expect(checkServiceState({ t3: { mode: "external" } } as never, { ...waitingState(true), state: "running", t3: undefined }))
+      .toMatchObject({ status: "pass", summary: "service pid 4242 running since 2026-10-05T23:50:00.000Z" });
+  });
+
+  test("managed T3 that is down with the service is a warning, so service install can start it", async () => {
+    await rewriteConfig((config) => {
+      config.t3 = { mode: "managed", port: 37841, tokenFile: config.t3.tokenFile };
+    });
+    world.environment = new Error("connect ECONNREFUSED");
+    const report = await run();
+    expect(check(report, "t3-environment")).toMatchObject({
+      status: "warn",
+      summary: "managed T3 is not running at http://127.0.0.1:37841; the Agent Tag service starts it",
+    });
+    expect(check(report, "t3-session").status).toBe("skip");
+    expect(report.ok).toBe(true);
+    // With the service up, a down managed T3 is a real failure again.
+    const live = await runDoctor({
+      configPath: fixture.configPath,
+      fix: false,
+      dependencies: { ...dependencies(world, service), serviceState: async () => ({ ...waitingState(true), state: "running" }) },
+    });
+    expect(check(live, "t3-environment").status).toBe("fail");
   });
 
   test("enforces orchestration protocol 1, treating a missing field as 1", async () => {

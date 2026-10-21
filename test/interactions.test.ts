@@ -985,7 +985,7 @@ describe("interaction retries and cancellation", () => {
           "SELECT payload_json FROM slack_outbox WHERE client_message_id = ?",
           `${seeded.operationId}:cancelled`,
         ),
-      ).toEqual([{ payload_json: JSON.stringify({ text: "Cancelled." }) }]);
+      ).toEqual([{ payload_json: JSON.stringify({ text: "Stopped by <@U1>." }) }]);
       expect(
         store.claimNextOperation({ workerId: "coordinator-a", now, leaseMs: 10_000, maxConcurrentTasks: 2 }),
       ).toBeNull();

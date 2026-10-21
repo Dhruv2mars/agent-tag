@@ -14,6 +14,9 @@ const slackActionIdSchema = z.enum([
   "agent-tag.user-input.answer",
   "agent-tag.user-input.open",
   "agent-tag.user-input.dismiss",
+  // Stop on a turn's live status message (value {taskId, operationId}).
+  "agent-tag.turn.stop",
+  // Cancel on the "working" line of versions before the status message; still in old threads.
   "agent-tag.turn.cancel",
   // Link button on the draft PR card: Slack opens the URL and still sends block_actions, which is acked only.
   "agent-tag.pr.view",
@@ -24,6 +27,7 @@ export const USER_INPUT_MODAL_CALLBACK_ID = "agent-tag.user-input.submit";
 export const USER_INPUT_OPTIONS_BLOCK_ID = "agent-tag.user-input.options";
 export const USER_INPUT_TEXT_BLOCK_ID = "agent-tag.user-input.text";
 const USER_INPUT_ELEMENT_ACTION_ID = "value";
+const stopValueSchema = z.object({ taskId: z.string().min(1), operationId: z.string().min(1) });
 
 const actionSchema = z.object({
   type: z.literal("block_actions"),
@@ -216,9 +220,13 @@ export class SlackActionRouter {
     if (denied !== null) return { kind: "ignored", reason: denied };
     const threadTs = body.message.thread_ts ?? body.message.ts;
     const sourceActionId = `${body.team.id}:${body.user.id}:${action.action_ts}:${action.action_id}`;
-    if (action.action_id === "agent-tag.turn.cancel") {
+    if (action.action_id === "agent-tag.turn.cancel" || action.action_id === "agent-tag.turn.stop") {
+      // Stop names its turn, so a button left on an older turn's message never stops a later one.
+      const stop = action.action_id === "agent-tag.turn.stop" ? decodeJson(action.value, stopValueSchema) : null;
+      if (action.action_id === "agent-tag.turn.stop" && stop === null) return { kind: "ignored", reason: "invalid-action" };
       const result = this.#store.requestTaskCancellation({
-        taskId: action.value,
+        taskId: stop?.taskId ?? action.value,
+        ...(stop === null ? {} : { operationId: stop.operationId }),
         workspaceId: body.team.id,
         conversationId: body.channel.id,
         threadTs,

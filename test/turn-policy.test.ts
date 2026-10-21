@@ -287,7 +287,7 @@ describe("progress-based stall policy (B3)", () => {
       expect(await coordinator.processNext()).toMatchObject({ kind: "completed", operationId: receipt.operationId });
       expect(harness.clock.ms - startMs).toBeGreaterThanOrEqual(2 * HOUR);
       expect(drainOutboxTexts(harness.store, harness.clock.ms)).toEqual([
-        "Agent Tag is working on this request.",
+        "Working on it…",
         "long-result",
       ]);
       const operation = readOperation(harness.path, receipt.operationId);
