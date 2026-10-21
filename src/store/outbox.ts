@@ -127,7 +127,8 @@ export function activeOutboxRateLimit(database: Database, now: string): string |
 /** Claim order for a row; also used to keep later rows of a thread behind an earlier blocked row. */
 const CLAIM_ORDER_COLUMNS = (alias: string): string =>
   `${alias}.created_at, ${alias}.correlation_id,
-    CASE WHEN ${alias}.client_message_id LIKE '%:started' THEN 0 ELSE 1 END, ${alias}.outbox_id`;
+    CASE WHEN ${alias}.client_message_id LIKE '%:status' OR ${alias}.client_message_id LIKE '%:started' THEN 0 ELSE 1 END,
+    ${alias}.outbox_id`;
 
 /**
  * Claims the next deliverable pending row. Rows waiting out a retry backoff (`blocked_until` in the

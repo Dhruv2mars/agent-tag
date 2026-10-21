@@ -8,6 +8,8 @@ import { fetchThreadWindow, SlackContextUnavailable, THREAD_CONTEXT_TIMEOUT_MS }
 import { approvalMessage, describeDuration, questionMessage } from "./slack/cards.ts";
 import { collectMentionedUserIds, type SpeakerIdentity } from "./slack/markup.ts";
 import { escapeSlackText, markdownToMrkdwn, splitForSlack } from "./slack/render.ts";
+import { renderStatusMessage } from "./slack/status.ts";
+import { EMPTY_PROGRESS, progressActivity, TurnProgress } from "./progress.ts";
 import { slackErrorCode, unresolvedSpeaker } from "./slack/users.ts";
 import type { AgentTagStore, ClaimedOperation, PrSyncInput, SlackOutboxPayload, TaskExecutionBinding } from "./store/store.ts";
 import { composeTurnText, type TurnWindow } from "./turn-text.ts";
@@ -669,41 +671,45 @@ export class AgentTagCoordinator {
       now: this.#now().toISOString(),
     });
     let turnIdRecorded = false;
-    this.#store.enqueueOutbox({
+    // One status message per turn replaces the old "working" line: it carries the Stop button while
+    // the turn runs and every settle path edits it to its outcome (see store/status.ts). A resumed
+    // claim re-attaches to it.
+    const showProgress = this.#config.slack.ui.statusProgress;
+    this.#store.openStatusMessage({
+      operationId: operation.operationId,
       taskId: operation.taskId,
-      correlationId: operation.operationId,
       conversationId: operation.payload.conversationId,
       threadTs: operation.payload.threadTs,
-      clientMessageId: `${operation.operationId}:started`,
-      payload: {
-        text: "Agent Tag is working on this request.",
-        blocks: [
-          {
-            type: "section",
-            text: { type: "mrkdwn", text: "Agent Tag is working on this request." },
-          },
-          {
-            type: "actions",
-            elements: [
-              {
-                type: "button",
-                text: { type: "plain_text", text: "Cancel" },
-                style: "danger",
-                action_id: "agent-tag.turn.cancel",
-                value: operation.taskId,
-                confirm: {
-                  title: { type: "plain_text", text: "Cancel this task?" },
-                  text: { type: "mrkdwn", text: "The active T3 turn will be interrupted." },
-                  confirm: { type: "plain_text", text: "Cancel task" },
-                  deny: { type: "plain_text", text: "Keep running" },
-                  style: "danger",
-                },
-              },
-            ],
-          },
-        ],
-      },
-      createdAt: this.#now().toISOString(),
+      message: (view) => renderStatusMessage(view, { showProgress }),
+      intervalMs: this.#config.slack.ui.statusUpdateIntervalMs,
+      now: this.#now().toISOString(),
+    });
+    const progress = new TurnProgress();
+    let publishedProgress = JSON.stringify(EMPTY_PROGRESS);
+    const publishProgress = () => {
+      if (!showProgress) return;
+      const view = progress.view();
+      const json = JSON.stringify(view);
+      if (json === publishedProgress) return;
+      publishedProgress = json;
+      try {
+        this.#store.updateStatusProgress({
+          operationId: operation.operationId,
+          progress: view,
+          intervalMs: this.#config.slack.ui.statusUpdateIntervalMs,
+          perMinute: this.#config.slack.ui.statusUpdatesPerMinute,
+          now: this.#now().toISOString(),
+        });
+      } catch {
+        // Progress is cosmetic: a failed write must not fail the turn. The next change retries.
+        publishedProgress = "";
+      }
+    };
+    // Tool progress does not wake the loop (see watcher.ts), so the stream feeds it directly.
+    polling.watch?.onItem((item) => {
+      if (item.kind !== "event" || item.activity === undefined) return;
+      progress.add(item.activity);
+      publishProgress();
     });
 
     // Stall means "no T3 progress for the stall window", not "not finished yet": a long turn that
@@ -777,6 +783,12 @@ export class AgentTagCoordinator {
           selection: modelSelection,
           now: this.#now().toISOString(),
         });
+      }
+      if (snapshot.thread.latestTurn !== null) {
+        // A message-mode answer can continue in a new turn; progress follows T3's latest one.
+        progress.setTurn(snapshot.thread.latestTurn.turnId);
+        for (const activity of snapshot.thread.activities) progress.add(progressActivity(activity));
+        publishProgress();
       }
       const approvals = pendingT3Approvals(snapshot);
       const userInputs = pendingT3UserInputs(snapshot);

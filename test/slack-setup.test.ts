@@ -54,7 +54,7 @@ test("the checked-in Slack manifest is the least-privilege runtime contract", as
   ]);
   expect(manifest.settings.socket_mode_enabled).toBe(true);
   expect(manifest.settings.interactivity.is_enabled).toBe(true);
-  expect(SLACK_ACTION_IDS).toHaveLength(8);
+  expect(SLACK_ACTION_IDS).toHaveLength(9);
 });
 
 test("doctor's required bot scopes match the checked-in manifest", async () => {

@@ -514,10 +514,11 @@ describe("Agent Tag coordinator", () => {
       expect(commands[1].message.text).toContain("remember the durable boundary");
       expect(commands[1].message.text).toContain("untrusted context");
       const firstProgress = store.claimNextOutbox({ workerId: "slack-a", now, leaseMs: 10_000 });
-      expect(firstProgress?.payload.text).toBe("Agent Tag is working on this request.");
-      expect(firstProgress?.payload.blocks?.[1]).toMatchObject({
+      expect(firstProgress?.clientMessageId).toBe(`${first.operationId}:status`);
+      expect(firstProgress?.payload.text).toBe("Working on it…");
+      expect(firstProgress?.payload.blocks?.at(-1)).toMatchObject({
         type: "actions",
-        elements: [{ action_id: "agent-tag.turn.cancel" }],
+        elements: [{ action_id: "agent-tag.turn.stop" }],
       });
       if (firstProgress === null) throw new Error("first progress reply was not queued");
       store.markOutboxDelivered({
