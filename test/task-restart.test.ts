@@ -1,16 +1,19 @@
 import { describe, expect, test } from "bun:test";
 
 import * as replies from "../src/commands/replies.ts";
-import { TaskRestartWorker } from "../src/restart-worker.ts";
+import { SessionStopWorker, TaskRestartWorker } from "../src/restart-worker.ts";
 import type { T3Command } from "../src/t3/gateway.ts";
 import { type CommandHarness, makeConfig, message, THREAD, withCommandHarness } from "./fixtures/command-harness.ts";
 
 const config = makeConfig({ commands: { restartTimeoutSeconds: 30 } });
 
-function worker(h: CommandHarness, dispatched: T3Command[] = [], fail?: (command: T3Command) => unknown) {
-  return new TaskRestartWorker({
+function worker(h: CommandHarness) {
+  return new TaskRestartWorker({ store: h.store, config: () => config, now: () => new Date(h.clock.now) });
+}
+
+function sessionStops(h: CommandHarness, dispatched: T3Command[], fail?: (command: T3Command) => unknown) {
+  return new SessionStopWorker({
     store: h.store,
-    config: () => config,
     dispatch: async (command) => {
       dispatched.push(command);
       const error = fail?.(command);
@@ -129,7 +132,7 @@ describe("!restart", () => {
       expect(h.claim()).toBeNull();
 
       h.clock.now += 1_000;
-      expect(await worker(h).processNext()).toMatchObject({ kind: "progressed", rotated: 1 });
+      expect(await worker(h).processNext()).toEqual({ kind: "restarts-completed", count: 1 });
       const rotated = task(h);
       expect(rotated).toMatchObject({ session_generation: 2, restart_requested_at: null, t3_thread_started_at: null });
       expect(rotated.t3_thread_id).not.toBe(oldThread);
@@ -150,7 +153,7 @@ describe("!restart", () => {
       expect(await worker(h).processNext()).toEqual({ kind: "idle" });
       h.store.renewOperationLease({ operationId: turn.operationId, workerId: "w", now: h.iso(), leaseMs: 60_000 });
       h.clock.now += 2_000;
-      expect(await worker(h).processNext()).toMatchObject({ kind: "progressed", rotated: 1 });
+      expect(await worker(h).processNext()).toEqual({ kind: "restarts-completed", count: 1 });
       expect(h.outboxTexts().at(-1)).toBe(ready(true, true));
       expect(h.auditActions()).toContain("task.session.rotated");
       // The turn kept its live lease and still runs on the retired thread.
@@ -173,7 +176,7 @@ describe("!restart", () => {
       });
       await h.send(message("1000.000003", "<@U0BOT> !restart"));
       h.clock.now += 61_000;
-      expect(await worker(h).processNext()).toMatchObject({ kind: "progressed", rotated: 1 });
+      expect(await worker(h).processNext()).toEqual({ kind: "restarts-completed", count: 1 });
       expect(h.outboxTexts().at(-1)).toBe(ready(true));
       expect(h.operations()[0]).toMatchObject({ status: "failed", last_error_code: "user-cancelled" });
       expect(h.db.query("SELECT state, actor_user_id FROM status_messages").get()).toEqual({ state: "stopped", actor_user_id: "U1" });
@@ -246,7 +249,37 @@ describe("!restart", () => {
   });
 });
 
+describe("restart and lifecycle", () => {
+  test("a task with a pending restart does not close before the restart completes", async () => {
+    await withCommandHarness(config, async (h) => {
+      const turn = await runningTurn(h);
+      await h.send(message("1000.000003", "<@U0BOT> !restart"));
+      h.store.cancelOperationWithOutbox({
+        operationId: turn.operationId,
+        taskId: turn.taskId,
+        workerId: "w",
+        conversationId: "C1",
+        threadTs: THREAD,
+        now: h.iso(),
+      });
+      for (let row = h.store.claimNextOutbox({ workerId: "o", now: h.iso(), leaseMs: 10_000 }); row !== null;
+        row = h.store.claimNextOutbox({ workerId: "o", now: h.iso(), leaseMs: 10_000 })) {
+        h.store.markOutboxDelivered({ outboxId: row.outboxId, workerId: "o", slackMessageTs: "1000.999999", now: h.iso() });
+      }
+      h.db.query("DELETE FROM slack_reactions").run();
+      h.db.query("UPDATE interactions SET state = 'resolved'").run();
+      expect(h.store.closeTask({ taskId: turn.taskId, reason: "admin", actorId: "test", now: h.iso() })).toEqual({ kind: "busy" });
+      expect(await worker(h).processNext()).toEqual({ kind: "restarts-completed", count: 1 });
+    });
+  });
+});
+
 describe("retired session stop", () => {
+  test("runs only while the T3 gate is open; restarts complete without T3", () => {
+    expect(new SessionStopWorker({ store: {} as never, dispatch: async () => ({}) }).requiresT3).toBe(true);
+    expect(new TaskRestartWorker({ store: {} as never, config: () => config }).requiresT3).toBe(false);
+  });
+
   test("stops each retired thread's session once, with its stable command id", async () => {
     await withCommandHarness(config, async (h) => {
       await runningTurn(h);
@@ -254,13 +287,16 @@ describe("retired session stop", () => {
       await h.send(message("1000.000003", "<@U0BOT> !restart"));
       h.clock.now += 61_000;
       const dispatched: T3Command[] = [];
-      expect(await worker(h, dispatched).processNext()).toMatchObject({ rotated: 1, sessionsStopped: 1 });
+      expect(await sessionStops(h, dispatched).processNext()).toEqual({ kind: "idle" });
+      expect(await worker(h).processNext()).toEqual({ kind: "restarts-completed", count: 1 });
+      h.clock.now += 1_000;
+      expect(await sessionStops(h, dispatched).processNext()).toEqual({ kind: "sessions-stopped", count: 1 });
       expect(dispatched).toEqual([
         { type: "thread.session.stop", commandId: `${taskId}:g1:session.stop`, threadId: oldThread, createdAt: h.iso() },
       ]);
       expect(retired(h)[0]?.session_stopped_at).toBe(h.iso());
       h.clock.now += 1_000;
-      expect(await worker(h, dispatched).processNext()).toEqual({ kind: "idle" });
+      expect(await sessionStops(h, dispatched).processNext()).toEqual({ kind: "idle" });
       expect(dispatched).toHaveLength(1);
       expect(h.auditActions()).toContain("task.session.stopped");
     });
@@ -272,17 +308,18 @@ describe("retired session stop", () => {
       await h.send(message("1000.000003", "<@U0BOT> !restart"));
       h.clock.now += 61_000;
       const dispatched: T3Command[] = [];
-      await worker(h, dispatched, () => new Error("socket closed")).processNext();
+      await worker(h).processNext();
+      await sessionStops(h, dispatched, () => new Error("socket closed")).processNext();
       expect(retired(h)[0]).toMatchObject({
         session_stopped_at: null,
         last_error_code: "Error",
         next_attempt_at: new Date(h.clock.now + 30_000).toISOString(),
       });
       h.clock.now += 10_000;
-      await worker(h, dispatched).processNext();
+      await sessionStops(h, dispatched).processNext();
       expect(dispatched).toHaveLength(1);
       h.clock.now += 21_000;
-      await worker(h, dispatched, () => ({
+      await sessionStops(h, dispatched, () => ({
         _tag: "OrchestrationDispatchCommandError",
         message: "Orchestration command invariant failed (thread.session.stop): thread does not exist",
       })).processNext();

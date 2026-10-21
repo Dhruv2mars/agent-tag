@@ -11,10 +11,10 @@ import { writeAudit } from "./audit.ts";
 import { settleCommandRow } from "./commands.ts";
 import { requiredId } from "./context.ts";
 import { closeOperationInteractions, OPERATION_SETTLED, requestTaskCancellation } from "./interactions.ts";
+import { retirableTaskSchema, retireCurrentThread } from "./lifecycle.ts";
 import { insertOutboxMessage } from "./outbox.ts";
 import { isoDateTime, nonEmpty, outboxPayloadSchema } from "./schema.ts";
 import { settleStatusMessage } from "./status.ts";
-import { taskBranchName } from "./tasks.ts";
 import type { SlackOutboxPayload } from "./types.ts";
 
 /** Error code of an operation the restart ended: its T3 thread was retired under it. */
@@ -185,14 +185,7 @@ export interface RotateTaskSessionInput {
 export function rotateTaskSession(database: Database, input: RotateTaskSessionInput): number {
   const now = isoDateTime.parse(input.now);
   const taskId = requiredId(input.taskId, "taskId");
-  const task = z.object({
-    state: z.enum(["active", "closed"]),
-    session_generation: z.number().int().positive(),
-    t3_project_id: nonEmpty.nullable(),
-    t3_thread_id: nonEmpty.nullable(),
-    t3_thread_started_at: isoDateTime.nullable(),
-    repository_root: nonEmpty,
-  }).parse(
+  const task = retirableTaskSchema.extend({ state: z.enum(["active", "closed"]) }).parse(
     database
       .query(
         `SELECT state, session_generation, t3_project_id, t3_thread_id, t3_thread_started_at, repository_root
@@ -202,33 +195,7 @@ export function rotateTaskSession(database: Database, input: RotateTaskSessionIn
   );
   if (task.state !== "active") throw new Error("only an active task can restart");
   const generation = task.session_generation;
-  if (task.t3_project_id !== null && task.t3_thread_id !== null) {
-    const created = task.t3_thread_started_at !== null;
-    database
-      .query(
-        `INSERT INTO task_retired_t3_threads (
-          task_id, generation, t3_project_id, t3_thread_id, repository_root, branch, reason, retired_at,
-          thread_created, session_stop_command_id, delete_command_id, worktree_state, branch_state, completed_at, pr_url
-        ) VALUES (?, ?, ?, ?, ?, ?, 'restart', ?, ?, ?, ?, ?, ?, ?,
-          (SELECT pr_url FROM task_pull_requests WHERE task_id = ?))`,
-      )
-      .run(
-        taskId,
-        generation,
-        task.t3_project_id,
-        task.t3_thread_id,
-        task.repository_root,
-        taskBranchName(taskId, generation),
-        now,
-        created ? 1 : 0,
-        `${taskId}:g${generation}:session.stop`,
-        `${taskId}:g${generation}:thread.delete`,
-        created ? "unknown" : "none",
-        created ? "unknown" : "deleted",
-        created ? null : now,
-        taskId,
-      );
-  }
+  retireCurrentThread(database, { taskId, task, reason: "restart", now });
   const next = generation + 1;
   const threadId = `agent-tag-thread-${crypto.randomUUID()}`;
   // Like a reopen (tasks.ts reopenTask): the applied model, the injected memory digest and the PR
