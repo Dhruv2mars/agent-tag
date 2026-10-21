@@ -700,7 +700,7 @@ export class AgentTagCoordinator {
       ...(task.threadStarted ? {} : { bootstrap: this.#threadBootstrap(task, operation, profile, modelSelection) }),
       createdAt: this.#now().toISOString(),
     }, signal), signal);
-    this.#store.markT3ThreadStarted({ taskId: task.taskId, now: this.#now().toISOString() });
+    this.#store.markT3ThreadStarted({ taskId: task.taskId, threadId: task.threadId, now: this.#now().toISOString() });
     // Watching from the receipt's sequence skips the initial snapshot frame; the loop's first fetch
     // reads the thread anyway.
     polling.watch = this.#watcher?.acquire(task.threadId, { afterSequence: turn.sequence }) ?? null;

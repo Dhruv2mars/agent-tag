@@ -95,7 +95,7 @@ export interface SettleCommandInput {
 }
 
 /** Settles a started ledger row and writes its audit row. Runs inside the caller's transaction. */
-function settleCommandRow(database: Database, input: SettleCommandInput): void {
+export function settleCommandRow(database: Database, input: SettleCommandInput): void {
   const now = isoDateTime.parse(input.now);
   const reason = input.reason === null ? null : commandReasonSchema.parse(input.reason);
   const row = z

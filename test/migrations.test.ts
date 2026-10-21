@@ -90,7 +90,7 @@ function seedVersionOne(database: Database): void {
 
 test("upgrades every historical SQLite schema while preserving existing work", async () => {
   const versions = STORE_MIGRATIONS.map((migration) => migration.version);
-  expect(versions).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24]);
+  expect(versions).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25]);
   // Each historical prefix, plus a store that applied 14 (from main) before 13 existed: applied
   // versions are tracked as a set, so 13 must still apply on top of it.
   const startingSets: ReadonlyArray<{ readonly label: string; readonly applied: ReadonlyArray<number> }> = [
@@ -817,6 +817,43 @@ test("N1: migration 24 backfills task activity and creates the retired-thread ta
     database.close();
   } finally {
     if (!directory.startsWith(`${tmpdir()}/agent-tag-migration-lifecycle-`)) {
+      throw new Error(`refusing to remove unexpected migration fixture path ${directory}`);
+    }
+    await rm(directory, { recursive: true });
+  }
+});
+
+test("H2: migration 25 adds the restart request columns to a database holding tasks", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-tag-migration-restart-"));
+  const path = join(directory, "agent-tag.sqlite");
+  try {
+    const historical = new Database(path, { create: true, strict: true });
+    historical.exec("PRAGMA foreign_keys = ON");
+    historical.exec("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)");
+    applyMigration(historical, 1);
+    seedVersionOne(historical);
+    for (const migration of STORE_MIGRATIONS) {
+      if (migration.version > 1 && migration.version < 25) applyMigration(historical, migration.version);
+    }
+    historical.close();
+    (await AgentTagStore.open(path)).close();
+    // Reopening re-runs nothing.
+    (await AgentTagStore.open(path)).close();
+
+    const database = new Database(path, { strict: true });
+    expect(
+      database.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM schema_migrations WHERE version = 25").get(),
+    ).toEqual({ count: 1 });
+    expect(
+      database
+        .query<Record<string, unknown>, []>(
+          `SELECT restart_requested_at, restart_requested_by, restart_command_key, session_generation FROM tasks WHERE task_id = 'task-1'`,
+        )
+        .get(),
+    ).toEqual({ restart_requested_at: null, restart_requested_by: null, restart_command_key: null, session_generation: 1 });
+    database.close();
+  } finally {
+    if (!directory.startsWith(`${tmpdir()}/agent-tag-migration-restart-`)) {
       throw new Error(`refusing to remove unexpected migration fixture path ${directory}`);
     }
     await rm(directory, { recursive: true });

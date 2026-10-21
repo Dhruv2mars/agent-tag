@@ -631,6 +631,8 @@ export function clearInvalidModelSelection(
 
 export interface MarkT3ThreadStartedInput {
   readonly taskId: string;
+  /** The T3 thread the turn went to: a turn on a thread a restart retired never marks its successor. */
+  readonly threadId: string;
   readonly now: string;
 }
 
@@ -639,10 +641,13 @@ export function markT3ThreadStarted(database: Database, input: MarkT3ThreadStart
   const result = database
     .query(
       `UPDATE tasks SET t3_thread_started_at = COALESCE(t3_thread_started_at, ?), updated_at = ?
-       WHERE task_id = ? AND state = 'active'`,
+       WHERE task_id = ? AND state = 'active' AND t3_thread_id = ?`,
     )
-    .run(now, now, requiredId(input.taskId, "taskId"));
-  if (result.changes !== 1) throw new Error("active task not found");
+    .run(now, now, requiredId(input.taskId, "taskId"), requiredId(input.threadId, "threadId"));
+  if (result.changes === 1) return;
+  // A forced restart retired the thread under this turn: the new thread is not started, so leave it.
+  const active = database.query("SELECT 1 FROM tasks WHERE task_id = ? AND state = 'active'").get(input.taskId);
+  if (active === null) throw new Error("active task not found");
 }
 
 export interface EnsureTaskForThreadInput {
