@@ -959,7 +959,7 @@ describe("plain-language model switch from Slack (P2c)", () => {
     const h = await harness(configWith({ allowedModels: ALLOWED, modelSwitch: { enabled: false } }));
     await h.slack(slackEvent({ text: "use opus: do y" }).body);
     expect(h.count("operations")).toBe(0);
-    expect(h.outboxTexts()).toEqual(["Model switching is turned off for this channel. Your request was not started."]);
+    expect(h.outboxTexts()).toEqual(["Model switching is turned off here. Your request was not started."]);
   });
 });
 

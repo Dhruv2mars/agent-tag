@@ -77,7 +77,7 @@ export function refusedReply(input: RefusalCopy): SlackOutboxPayload {
   const target = input.target === null ? query : named(input.target);
   switch (input.code) {
     case "switch-disabled":
-      return text(`Model switching is turned off for this channel.${tail}`);
+      return text(`Model switching is turned off here.${tail}`);
     case "not-allowed":
       return text(`${query} isn't allowed here. Allowed: ${choiceList(input.allowed)}.${stays}${tail}`);
     case "ambiguous":

@@ -13,6 +13,7 @@ import {
   effectiveSelection,
   type ModelChoice,
   planSwitch,
+  sameSelection,
   type SwitchPlan,
   type SwitchRefusalCode,
 } from "../policy/models.ts";
@@ -75,10 +76,6 @@ interface Executed extends ThreadCommandResult {
   readonly receipt: IngestReceipt | null;
   /** Set when the actor lost authority: nothing changed and the reply goes only to them. */
   readonly ephemeral?: SlackOutboxPayload;
-}
-
-function sameSelection(left: T3ModelSelection, right: T3ModelSelection): boolean {
-  return left.instanceId === right.instanceId && left.model === right.model;
 }
 
 function selectionOf(choice: ModelChoice): T3ModelSelection {

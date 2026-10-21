@@ -23,6 +23,8 @@ const VERB =
 const TAIL =
   /^(?:[ \t]+model)?(?:[ \t]+for[ \t]+(?:the[ \t]+rest[ \t]+of[ \t]+)?this[ \t]+thread)?[ \t]*(?:$|\n|[:,;.—])/i;
 const TRAILING_TERMINATORS = /[:,;.—]+$/;
+/** Extra terminators after the one that ended the directive, e.g. "use opus...". */
+const LEADING_TERMINATORS = /^[\s:,;.—]+/;
 const QUOTES: Readonly<Record<string, string>> = { "`": "`", '"': '"', "'": "'", "“": "”", "‘": "’" };
 const MAX_TOKENS = 3;
 
@@ -56,7 +58,8 @@ function candidates(rest: string): Candidate[] {
 function remainderAfter(rest: string, end: number): string | null {
   const tail = TAIL.exec(rest.slice(end));
   if (tail === null) return null;
-  return rest.slice(end + tail[0].length).trim();
+  const remainder = rest.slice(end + tail[0].length).replace(LEADING_TERMINATORS, "").trim();
+  return /[\p{L}\p{N}]/u.test(remainder) ? remainder : "";
 }
 
 /** A catalog model named by slug (case-insensitive) or exact `instance/model`. */

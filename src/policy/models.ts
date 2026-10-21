@@ -15,7 +15,7 @@ export interface ModelChoice {
   readonly source: ModelSource;
 }
 
-function sameSelection(left: T3ModelSelection, right: T3ModelSelection): boolean {
+export function sameSelection(left: T3ModelSelection, right: T3ModelSelection): boolean {
   return left.instanceId === right.instanceId && left.model === right.model;
 }
 

@@ -520,11 +520,13 @@ A model is named by its alias, label, slug, or `instance/model`. The directive e
 
 The choice belongs to the thread and lasts for the rest of it, across closing, reopening and `!restart`. `!status` shows the model the next turn will use. Each Slack message switches at most once: the choice, its `task.model.selected` audit row, the reply, its `slack_command_events` row (kind `model-switch`) and any request after it commit together, so a redelivery or the duplicate `message` event for one mention is answered once.
 
-Refusals reply in the thread, say which model the thread stays on, and are audited as `task.model.denied` with a code. A request that came with a refused switch is not run, so it never runs on a model nobody asked for:
+Refusals reply in the thread, say which model the thread stays on, and are audited as `task.model.denied` with a code. A request that came with a refused switch is not run:
 
 - a name outside the allowlist (`not-allowed`, the reply lists what is allowed) or one that matches several entries (`ambiguous`);
 - a provider T3 doesn't report as ready (`unavailable`);
 - switching turned off (`switch-disabled`) or `crossProvider: "deny"` (`cross-provider-denied`).
+
+A name that is neither an allowed model nor a model T3 reports (say `use sonnet` when no allowed entry is called that) is not a switch, so the whole message runs as a request on the thread's current model.
 
 ### The cross-provider rule
 
