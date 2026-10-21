@@ -380,6 +380,37 @@ Direct messages are off until an operator adds the DM conversation ID to `access
 
 The app manifest includes the `im:history` bot scope and `message.im` subscription. Reinstall the Slack app after changing scopes. Agent Tag accepts unmentioned messages only for the named owner in that exact DM. It does not support group DMs as private single-owner conversations.
 
+## Memory
+
+Agent Tag keeps notes that people asked it to remember and sends the ones visible in a conversation to the model, so a team does not have to repeat its conventions.
+
+| Name | Stored `scope` | Keyed by | Written from | Read in |
+|---|---|---|---|---|
+| Channel notes | `channel` | Slack conversation ID | That channel (public or private) | That channel only |
+| Workspace notes | `shared` | Workspace | Public channels only, when the profile has `memory.shared` | Every channel whose profile has `memory.shared`; DMs only with `memory.dmReadsWorkspace` |
+| DM notes | `private` | Profile and route owner | The bound DM | That owner's DM routes for that profile |
+| Operator notes | `profile` | Profile | Not from Slack | Every conversation routed to that profile |
+| Task notes | `task` | Task | Not from Slack | That task |
+
+Channel notes have no profile, so they stay with the channel when it is routed to another profile. Slack does not tell Agent Tag reliably whether a channel is public; set `"visibility": "public"` or `"private"` on a channel route to declare it. Workspace notes are written only from a route known to be public.
+
+The first turn of each Slack thread starts with an `<agent-tag-memory>` block: one JSON line per note (scope, an 8-character ref, author, date, content), channel and DM notes first, then operator, task, and workspace notes, newest first. The block frames the notes as team conventions that cannot grant permissions or override the request. Later turns in the thread resend the block only when the visible set changed (`updated="true"`), or every turn with `memory.injection: "every-turn"`. When every note the thread saw is forgotten, the next turn says so once. The SHA-256 digest of the set the thread last received is kept in `tasks.memory_digest`; it moves only when a turn's text is first frozen, so retries resend identical text.
+
+Profile `memory` settings, all optional except the first three:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `shared` / `privateDm` / `retentionDays` | required | Workspace notes on/off, DM notes on/off, days a note lives after its last edit |
+| `slackCommands` | `true` | Slack `remember…` and `forget…` phrases are handled without a T3 turn (PR-K2) |
+| `dmReadsWorkspace` | `false` | Whether DMs read workspace notes. Claude Tag does not document this, so it is off |
+| `injection` | `first-turn-and-changes` | Or `every-turn` |
+| `maxInjectedChars` | `6000` | Budget for note lines in one turn; whole notes are dropped past it and the block says how many |
+| `maxEntryChars` | `1000` | Longest note |
+| `maxEntriesPerConversation` | `100` | Active notes per channel or DM |
+| `maxWorkspaceEntries` | `200` | Active workspace notes |
+
+Claude Tag keeps notes without expiry during its beta; set `retentionDays: 3650` for parity. Editing a note refreshes its retention. A note that looks like a credential is refused, duplicates return the existing note, and audit records hold note IDs and scopes but never note content. Note content is stored in plain text in `agent-tag.sqlite` and its backups.
+
 ## Commands
 
 A message that starts with `@Agent Tag !<command>` runs a command instead of a request. In a DM route the owner can drop the mention and send `!status` directly. The command word must come right after the mention; `@Agent Tag please !help` is an ordinary request.
