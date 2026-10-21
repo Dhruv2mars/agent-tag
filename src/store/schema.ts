@@ -190,6 +190,8 @@ export const auditMetadataSchema = z.record(
   z.union([z.string(), z.number(), z.boolean(), z.null()]),
 );
 export const AUDIT_ACTIONS = [
+  "access.denied",
+  "access.membership.degraded",
   "ambient.decided",
   "interaction.approval.requested",
   "interaction.cancel.requested",

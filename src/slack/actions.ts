@@ -2,6 +2,7 @@ import type { types as SlackTypes } from "@slack/bolt";
 import { z } from "zod";
 
 import type { AgentTagConfig } from "../config.ts";
+import { type AccessDenialReason, type AccessPurpose, isSteeringAllowed } from "../policy/access.ts";
 import type { AgentTagStore, UserInputQuestionPrompt, UserInputSelection } from "../store/store.ts";
 import { alreadyHandledText } from "./cards.ts";
 
@@ -75,9 +76,7 @@ const viewSubmissionSchema = z.object({
 
 type IgnoredReason =
   | "invalid-action"
-  | "workspace-denied"
-  | "channel-denied"
-  | "user-denied"
+  | AccessDenialReason
   | "interaction-denied"
   | "interaction-expired"
   | "link-button";
@@ -184,6 +183,12 @@ export function userInputModal(input: {
   };
 }
 
+/** Stop cancels the turn; approval buttons approve; question buttons answer (guests may do none of these). */
+export function actionPurpose(actionId: string): AccessPurpose {
+  if (actionId === "agent-tag.turn.cancel") return "cancel";
+  return actionId.startsWith("agent-tag.approval.") ? "approve" : "answer";
+}
+
 export class SlackActionRouter {
   readonly #config: AgentTagConfig;
   readonly #store: AgentTagStore;
@@ -195,11 +200,9 @@ export class SlackActionRouter {
     this.#now = input.now ?? (() => new Date().toISOString());
   }
 
-  #accessDenied(workspaceId: string, channelId: string, userId: string): IgnoredReason | null {
-    if (workspaceId !== this.#config.slack.workspaceId) return "workspace-denied";
-    if (!this.#config.access.allowedChannelIds.includes(channelId)) return "channel-denied";
-    if (!this.#config.access.allowedUserIds.includes(userId)) return "user-denied";
-    return null;
+  #accessDenied(workspaceId: string, channelId: string, userId: string, purpose: AccessPurpose): IgnoredReason | null {
+    const decision = isSteeringAllowed({ config: this.#config, workspaceId, conversationId: channelId, userId, purpose });
+    return decision.allowed ? null : decision.reason;
   }
 
   ingest(input: unknown): SlackActionResult {
@@ -209,7 +212,7 @@ export class SlackActionRouter {
     const action = body.actions[0];
     if (action === undefined) return { kind: "ignored", reason: "invalid-action" };
     if (action.action_id === "agent-tag.pr.view") return { kind: "ignored", reason: "link-button" };
-    const denied = this.#accessDenied(body.team.id, body.channel.id, body.user.id);
+    const denied = this.#accessDenied(body.team.id, body.channel.id, body.user.id, actionPurpose(action.action_id));
     if (denied !== null) return { kind: "ignored", reason: denied };
     const threadTs = body.message.thread_ts ?? body.message.ts;
     const sourceActionId = `${body.team.id}:${body.user.id}:${action.action_ts}:${action.action_id}`;
@@ -339,7 +342,7 @@ export class SlackActionRouter {
     const body = parsed.data;
     const metadata = decodeJson(body.view.private_metadata, modalMetadataSchema);
     if (metadata === null) return { kind: "ignored", reason: "invalid-action" };
-    const denied = this.#accessDenied(body.team.id, metadata.conversationId, body.user.id);
+    const denied = this.#accessDenied(body.team.id, metadata.conversationId, body.user.id, "answer");
     if (denied !== null) return { kind: "ignored", reason: denied };
 
     const values = body.view.state.values;

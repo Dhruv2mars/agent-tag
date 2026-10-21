@@ -1,4 +1,5 @@
 import type { AgentTagConfig } from "./config.ts";
+import { type AccessDecision, isAllowlisted, isSteeringAllowed } from "./policy/access.ts";
 import { containsKnownSecret } from "./security/redact.ts";
 import { normalizeMemoryRef, type MemoryStoreKey } from "./store/memory.ts";
 import type { AgentTagStore, MemoryRecord } from "./store/store.ts";
@@ -349,9 +350,8 @@ export class AgentTagMemory {
     if (context.workspaceId !== this.#config.slack.workspaceId) {
       return { kind: "denied", reason: "workspace-denied" };
     }
-    if (!this.#config.access.allowedUserIds.includes(context.actorUserId)) {
-      return { kind: "denied", reason: "user-denied" };
-    }
+    const access = this.#accessDecision(context);
+    if (!access.allowed) return { kind: "denied", reason: access.reason };
     const profile = this.#config.profiles.find((candidate) => candidate.id === context.profileId);
     if (profile === undefined) return { kind: "denied", reason: "profile-denied" };
     if (
@@ -366,6 +366,32 @@ export class AgentTagMemory {
       return { kind: "denied", reason: "task-denied" };
     }
     return { kind: "accepted", profile };
+  }
+
+  /**
+   * Allowlisted users keep today's rule (any conversation the routers let through). Anyone else needs the
+   * access predicate to allow them in the context's conversation (or its task's), so in `channel-members`
+   * mode a channel member may use memory where they may steer.
+   */
+  #accessDecision(context: MemoryContext): AccessDecision {
+    if (isAllowlisted(this.#config, context.actorUserId)) return { allowed: true, basis: "allowlist" };
+    if (this.#config.access.mode === "allowlist") return { allowed: false, reason: "user-denied" };
+    let conversationId = context.conversationId;
+    let dmOwnerUserId: string | null = null;
+    const task = context.taskId === undefined ? null : this.#store.findTaskConversation(context.taskId);
+    if (task !== null) {
+      conversationId ??= task.conversationId;
+      dmOwnerUserId = task.ownerUserId;
+    }
+    if (conversationId === undefined) return { allowed: false, reason: "user-denied" };
+    return isSteeringAllowed({
+      config: this.#config,
+      workspaceId: context.workspaceId,
+      conversationId,
+      userId: context.actorUserId,
+      purpose: "memory",
+      dmOwnerUserId,
+    });
   }
 
   #canAccess(context: MemoryContext, memory: MemoryRecord): boolean {

@@ -152,10 +152,12 @@ export class InteractionWorker {
     });
     if (response === null) return { kind: "idle" };
     try {
+      // The clicker must still be allowed to approve or answer here (a guest never is).
       requireExecutionAuthority({
         config: this.#config,
         task: this.#store.getTaskExecution(response.taskId),
         actorUserId: response.actorUserId,
+        purpose: response.kind === "user-input" ? "answer" : "approve",
       });
       let command: T3Command;
       if (response.kind === "approval") {
@@ -174,7 +176,7 @@ export class InteractionWorker {
         if (parsed.kind === "answer") {
           const task = this.#store.getTaskExecution(response.taskId);
           for (const contributor of parsed.contributors ?? []) {
-            requireExecutionAuthority({ config: this.#config, task, actorUserId: contributor });
+            requireExecutionAuthority({ config: this.#config, task, actorUserId: contributor, purpose: "answer" });
           }
         }
         command =

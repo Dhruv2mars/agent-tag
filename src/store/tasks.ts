@@ -201,6 +201,19 @@ export function taskBelongsToContext(database: Database, input: TaskBelongsToCon
   return row.count === 1;
 }
 
+/** A task's conversation and DM owner, for access checks; null when the task does not exist. */
+export function findTaskConversation(
+  database: Database,
+  taskIdInput: string,
+): { readonly conversationId: string; readonly ownerUserId: string | null } | null {
+  const row = database
+    .query<{ conversation_id: string; owner_user_id: string | null }, [string]>(
+      "SELECT conversation_id, owner_user_id FROM tasks WHERE task_id = ?",
+    )
+    .get(requiredId(taskIdInput, "taskId"));
+  return row === null ? null : { conversationId: row.conversation_id, ownerUserId: row.owner_user_id };
+}
+
 export interface BindT3TaskInput {
   readonly taskId: string;
   readonly projectId: string;

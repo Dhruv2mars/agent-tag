@@ -39,6 +39,10 @@ const slackUserSchema = z.object({
   real_name: z.string().optional(),
   deleted: z.boolean().optional(),
   is_bot: z.boolean().optional(),
+  /** Multi-channel guest. */
+  is_restricted: z.boolean().optional(),
+  /** Single-channel guest. */
+  is_ultra_restricted: z.boolean().optional(),
   profile: z
     .object({
       display_name: z.string().optional(),
@@ -101,10 +105,14 @@ export function slackErrorCode(error: unknown): string {
   return error instanceof Error && error.name ? error.name : "unknown_error";
 }
 
-/** What one lookup yields: the speaker label and the profile time zone (null when unknown). */
+/** The account kind access policy needs; `unknown` when the lookup failed or is disabled. */
+export type SlackUserKind = "member" | "guest" | "bot" | "unknown";
+
+/** What one lookup yields: the speaker label, the profile time zone (null when unknown) and the account kind. */
 interface ResolvedUser {
   readonly identity: SpeakerIdentity;
   readonly timeZone: string | null;
+  readonly kind: SlackUserKind;
 }
 
 interface CacheEntry extends ResolvedUser {
@@ -112,7 +120,13 @@ interface CacheEntry extends ResolvedUser {
 }
 
 function unresolvedUser(userId: string): ResolvedUser {
-  return { identity: unresolvedSpeaker(userId), timeZone: null };
+  return { identity: unresolvedSpeaker(userId), timeZone: null, kind: "unknown" };
+}
+
+function userKind(user: SlackUser): SlackUserKind {
+  if (user.is_bot === true) return "bot";
+  if (user.is_restricted === true || user.is_ultra_restricted === true) return "guest";
+  return "member";
 }
 
 /** Slack's `tz`, kept only when it is a non-empty, plausibly IANA value; callers validate it. */
@@ -195,6 +209,17 @@ export class SlackUserDirectory {
     return this.#resolve(userId, signal).then((user) => user.timeZone);
   }
 
+  /** The account kind (member, guest or bot) from `users.info`; `unknown` when it cannot be read. */
+  kind(userId: string, signal?: AbortSignal): Promise<SlackUserKind> {
+    return this.#resolve(userId, signal).then((user) => user.kind);
+  }
+
+  /** The cached account kind, without a lookup: `unknown` when the user was not looked up recently. */
+  cachedKind(userId: string): SlackUserKind {
+    const cached = this.#cache.get(userId);
+    return cached !== undefined && cached.expiresAt > this.#now() ? cached.kind : "unknown";
+  }
+
   #resolve(userId: string, signal?: AbortSignal): Promise<ResolvedUser> {
     if (signal?.aborted) return Promise.reject(abortError(signal));
     if (this.#disabledCode !== null) return Promise.resolve(unresolvedUser(userId));
@@ -272,7 +297,11 @@ export class SlackUserDirectory {
       if (failure.success) throw new SlackUserLookupError(failure.data.error);
       const parsed = usersInfoResponseSchema.safeParse(response);
       if (!parsed.success) throw new SlackUserLookupError("invalid_response");
-      const user = { identity: identityFromUser(userId, parsed.data.user), timeZone: profileTimeZone(parsed.data.user) };
+      const user = {
+        identity: identityFromUser(userId, parsed.data.user),
+        timeZone: profileTimeZone(parsed.data.user),
+        kind: userKind(parsed.data.user),
+      };
       this.#remember(userId, user, this.#ttlMs);
       return user;
     } catch (error) {

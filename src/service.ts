@@ -8,6 +8,7 @@ import { InteractionWorker } from "./interaction-worker.ts";
 import { reportAllowedModels, validateConfiguredProviders } from "./policy/provider.ts";
 import { createScheduleWorkers } from "./scheduler.ts";
 import { SlackSocketBridge } from "./slack/bridge.ts";
+import { createMembershipWorker } from "./slack/membership.ts";
 import { createRetentionWorker } from "./store/retention.ts";
 import { AgentTagStore } from "./store/store.ts";
 import { isT3CredentialRejection } from "./t3/auth.ts";
@@ -74,6 +75,8 @@ export interface ServiceLogRecord {
   readonly instanceId?: string;
   readonly model?: string;
   readonly reactionKey?: string;
+  /** Slack channel a membership refresh was for. */
+  readonly conversationId?: string;
 }
 
 export type ServiceLogger = (record: ServiceLogRecord) => void;
@@ -466,6 +469,7 @@ export async function createAgentTagService(input: {
             return { kind: "idle" };
           },
         },
+        ...(bridge.membership === null ? [] : [createMembershipWorker({ refresh: () => bridge.refreshMembership(), now })]),
         createT3GateWorker({ gate, now }),
         createT3CredentialWorker({ credentials }),
         createProviderCatalogWorker({ catalog, now }),

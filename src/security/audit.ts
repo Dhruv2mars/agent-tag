@@ -339,12 +339,16 @@ export function checkAccess(input: {
   readonly allowedUserIds: ReadonlyArray<string>;
   readonly allowedChannelIds: ReadonlyArray<string>;
   readonly adminUserIds?: ReadonlyArray<string> | undefined;
+  readonly mode?: "allowlist" | "channel-members";
 }): SecurityFinding[] {
   const findings: SecurityFinding[] = [];
+  const channelMembers = input.mode === "channel-members";
   for (const [label, ids] of [
     ["users", input.allowedUserIds],
     ["channels", input.allowedChannelIds],
   ] as const) {
+    // In channel-members mode the user allowlist is optional: channel membership grants access.
+    if (channelMembers && label === "users" && ids.length === 0) continue;
     if (ids.some((id) => WILDCARDS.has(id.trim().toLowerCase()) || id.includes("*"))) {
       findings.push({
         id: `access-${label}-wildcard`,
@@ -360,11 +364,20 @@ export function checkAccess(input: {
       });
     }
   }
-  findings.push({
-    id: "access-summary",
-    severity: "info",
-    message: `${input.allowedUserIds.length} Slack user(s) in ${input.allowedChannelIds.length} conversation(s) can make the agent run code in the configured repositories`,
-  });
+  findings.push(
+    channelMembers
+      ? {
+        id: "access-channel-members",
+        severity: "medium",
+        message: `access.mode is channel-members: every non-guest member of ${input.allowedChannelIds.length} conversation(s), plus ${input.allowedUserIds.length} allowlisted user(s), can make the agent run code in the configured repositories as the host user`,
+        remediation: "use allowlist mode unless every member of the allowed channels is trusted with the host account",
+      }
+      : {
+        id: "access-summary",
+        severity: "info",
+        message: `${input.allowedUserIds.length} Slack user(s) in ${input.allowedChannelIds.length} conversation(s) can make the agent run code in the configured repositories`,
+      },
+  );
   if (input.adminUserIds === undefined || input.adminUserIds.length === 0) {
     findings.push({
       id: "access-no-admins",

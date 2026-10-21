@@ -102,7 +102,8 @@ if (operatorCommand !== undefined) {
   if (command === "status") {
     const store = await AgentTagStore.open(resolve(config.dataDir, "agent-tag.sqlite"));
     try {
-      console.log(JSON.stringify(store.operationalStatus(new Date().toISOString()), null, 2));
+      // No network: the access mode only; `doctor` reads channel membership.
+      console.log(JSON.stringify({ ...store.operationalStatus(new Date().toISOString()), accessMode: config.access.mode }, null, 2));
     } finally {
       store.close();
     }

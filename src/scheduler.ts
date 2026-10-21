@@ -1,5 +1,6 @@
 import { z } from "zod";
 
+import { isSteeringAllowed } from "./policy/access.ts";
 import { ExecutionAuthorityDenied, requireExecutionAuthority } from "./policy/execution.ts";
 import type { AgentTagConfig } from "./config.ts";
 import { nextRecurrenceRun, scheduleRecurrenceSchema } from "./routines/cron.ts";
@@ -133,7 +134,18 @@ export class AgentTagSchedules {
 
   #denial(context: ScheduleContext): string | null {
     if (context.workspaceId !== this.#config.slack.workspaceId) return "workspace-denied";
-    if (!this.#config.access.allowedUserIds.includes(context.actorUserId)) return "user-denied";
+    // Any member who may use the channel may list or cancel its routines (Claude Tag parity, PR-Q §3.3).
+    const task = this.#store.findTaskConversation(context.taskId);
+    if (task === null) return "task-denied";
+    const access = isSteeringAllowed({
+      config: this.#config,
+      workspaceId: context.workspaceId,
+      conversationId: task.conversationId,
+      userId: context.actorUserId,
+      purpose: "schedule",
+      dmOwnerUserId: task.ownerUserId,
+    });
+    if (!access.allowed) return access.reason;
     if (!this.#config.profiles.some((profile) => profile.id === context.profileId)) return "profile-denied";
     if (
       !this.#store.taskBelongsToContext({
