@@ -1,12 +1,15 @@
 // Slack outbox queue: enqueue, claim (respecting retry backoff and rate-limit cooldowns), delivery
 // outcome, retry, fallback, and quarantine of unknown outcomes.
 import type { Database } from "bun:sqlite";
+import { z } from "zod";
 
 import { writeAudit } from "./audit.ts";
 import { type StoreContext, requiredId, parseStoredJson } from "./context.ts";
 import { leaseExpiry, requireLeaseHeld } from "./lease.ts";
 import {
+  REFRESH_KINDS,
   isoDateTime,
+  nonEmpty,
   outboxIdentitySchema,
   outboxPayloadSchema,
   outboxRowSchema,
@@ -102,7 +105,26 @@ export interface ClaimNextOutboxInput {
   readonly workerId: string;
   readonly now: string;
   readonly leaseMs: number;
+  /**
+   * When a claimable refresh row may go out instead (a throttle), or null for now. The claim passes
+   * over a deferred row, without marking it, so a later claim asks again (and a retry backoff in
+   * `blocked_until` stays the row's own).
+   */
+  readonly deferRefresh?: (refresh: OutboxRefreshCandidate, now: string) => string | null;
 }
+
+export interface OutboxRefreshCandidate {
+  readonly refreshKind: RefreshKind;
+  readonly refreshKey: string;
+  readonly targetOutboxId: string;
+}
+
+const claimCandidateSchema = z.object({
+  outbox_id: nonEmpty,
+  refresh_kind: z.enum(REFRESH_KINDS).nullable(),
+  correlation_id: nonEmpty,
+  target_outbox_id: nonEmpty.nullable(),
+});
 
 /**
  * Every outbox row is a chat.postMessage (or chat.update) call with the one bot token, so a rate limit
@@ -124,7 +146,8 @@ export function activeOutboxRateLimit(database: Database, now: string): string |
 /** Claim order for a row; also used to keep later rows of a thread behind an earlier blocked row. */
 const CLAIM_ORDER_COLUMNS = (alias: string): string =>
   `${alias}.created_at, ${alias}.correlation_id,
-    CASE WHEN ${alias}.client_message_id LIKE '%:started' THEN 0 ELSE 1 END, ${alias}.outbox_id`;
+    CASE WHEN ${alias}.client_message_id LIKE '%:status' OR ${alias}.client_message_id LIKE '%:started' THEN 0 ELSE 1 END,
+    ${alias}.outbox_id`;
 
 /**
  * Claims the next deliverable pending row. Rows waiting out a retry backoff (`blocked_until` in the
@@ -156,12 +179,15 @@ export function claimNextOutbox(
   const expiresAt = leaseExpiry(now, input.leaseMs);
   const claim = database.transaction((): ClaimedOutboxMessage | null => {
     if (activeOutboxRateLimit(database, now) !== null) return null;
-    const candidate = outboxIdentitySchema.nullable().parse(
+    const deferred: string[] = [];
+    const next = () => claimCandidateSchema.nullable().parse(
       database
         .query(
-          `SELECT candidate.outbox_id FROM slack_outbox AS candidate
+          `SELECT candidate.outbox_id, candidate.refresh_kind, candidate.correlation_id, candidate.target_outbox_id
+           FROM slack_outbox AS candidate
            WHERE candidate.status = 'pending'
              AND (candidate.blocked_until IS NULL OR candidate.blocked_until <= ?)
+             AND candidate.outbox_id NOT IN (SELECT value FROM json_each(?))
              AND CASE candidate.method
                -- Invariant 1: a post waits only on earlier blocked posts of its thread.
                WHEN 'post' THEN NOT EXISTS (
@@ -192,8 +218,18 @@ export function claimNextOutbox(
            ORDER BY ${CLAIM_ORDER_COLUMNS("candidate")}
            LIMIT 1`,
         )
-        .get(now, now, now),
+        .get(now, JSON.stringify(deferred), now, now),
     );
+    let candidate = next();
+    while (candidate !== null && candidate.refresh_kind !== null && candidate.target_outbox_id !== null) {
+      const deferredUntil = input.deferRefresh?.(
+        { refreshKind: candidate.refresh_kind, refreshKey: candidate.correlation_id, targetOutboxId: candidate.target_outbox_id },
+        now,
+      ) ?? null;
+      if (deferredUntil === null) break;
+      deferred.push(candidate.outbox_id);
+      candidate = next();
+    }
     if (candidate === null) return null;
     const updated = database
       .query(

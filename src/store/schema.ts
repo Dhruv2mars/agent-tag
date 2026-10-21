@@ -66,9 +66,9 @@ export const operationRowSchema = z.object({
 
 /**
  * Kinds of outbox refresh rows, whose message is rendered from current state at delivery time.
- * Additive: append a kind here and register its renderer in slack/outbox.ts (PR-F adds "status-message").
+ * Additive: append a kind here and register its renderer in slack/outbox.ts .
  */
-export const REFRESH_KINDS = ["interaction-card"] as const;
+export const REFRESH_KINDS = ["interaction-card", "status-message"] as const;
 export const refreshKindSchema = z.enum(REFRESH_KINDS);
 export const outboxStatusSchema = z.enum(["pending", "inflight", "delivered", "failed"]);
 
@@ -112,6 +112,9 @@ export const taskLookupSchema = z.object({
   t3_thread_id: nonEmpty.nullable(),
   conversation_type: z.enum(["channel", "dm"]),
   owner_user_id: nonEmpty.nullable(),
+  state: z.enum(["active", "closed"]),
+  session_generation: z.number().int().positive(),
+  last_activity_at: isoDateTime.nullable(),
 });
 export const outboxIdentitySchema = z.object({ outbox_id: nonEmpty });
 export const taskExecutionSchema = z.object({
@@ -129,6 +132,8 @@ export const taskExecutionSchema = z.object({
   model_selection_json: z.string().nullable(),
   t3_model_selection_json: z.string().nullable(),
   t3_rejected_model_selection_json: z.string().nullable(),
+  state: z.enum(["active", "closed"]),
+  session_generation: z.number().int().positive(),
 });
 export const interactionIdentitySchema = z.object({ interaction_id: nonEmpty });
 export const interactionRowSchema = z.object({
@@ -249,7 +254,12 @@ export const AUDIT_ACTIONS = [
   "slack.outbox.retry-scheduled",
   "slack.reaction.added",
   "slack.reaction.failed",
+  "status.opened",
+  "status.terminal",
   "task.cancellation.requested",
+  "task.close.requested",
+  "task.closed",
+  "task.reopened",
   "task.model.denied",
   "task.model.reverted",
   "task.model.selected",

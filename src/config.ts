@@ -38,9 +38,18 @@ const slackUiSchema = z
       .regex(/^[a-z0-9_+'-]{1,100}(::skin-tone-[2-6])?$/, "an emoji name without colons, e.g. eyes")
       .nullable()
       .default("eyes"),
+    /**
+     * The live status message shows the turn's plan, recent tool lines and tool count. Tool titles can
+     * include shell commands and paths; false keeps only the headline and the Stop button.
+     */
+    statusProgress: z.boolean().default(true),
+    /** Least time between two edits of one status message. */
+    statusUpdateIntervalMs: z.number().int().min(1_000).max(60_000).default(2_000),
+    /** Budget for progress edits across all status messages (chat.update is rate limited per workspace). */
+    statusUpdatesPerMinute: z.number().int().min(1).max(600).default(40),
   })
   .strict()
-  .default({ ackReaction: "eyes" });
+  .default({ ackReaction: "eyes", statusProgress: true, statusUpdateIntervalMs: 2_000, statusUpdatesPerMinute: 40 });
 
 const isolationSchema = z.discriminatedUnion("mode", [
   z.object({
@@ -470,6 +479,19 @@ const commandsSchema = z
   .strict()
   .prefault({});
 
+/**
+ * Task lifecycle (PR-N). A task idle this long closes; the next reply in its thread reopens it as a
+ * new T3 session. Every key defaults, so existing configs stay valid.
+ */
+const lifecycleSchema = z
+  .object({
+    closeIdleAfterHours: z.number().int().min(1).max(24 * 90).default(168),
+    sweepIntervalSeconds: z.number().int().min(10).max(3_600).default(60),
+    maxClosesPerSweep: z.number().int().min(1).max(500).default(20),
+  })
+  .strict()
+  .prefault({});
+
 export const agentTagConfigSchema = z
   .object({
     version: z.literal(1),
@@ -498,6 +520,7 @@ export const agentTagConfigSchema = z
     }),
     retention: retentionSchema,
     routines: routinesSchema,
+    lifecycle: lifecycleSchema,
     github: githubSchema.optional(),
   })
   .superRefine((config, context) => {

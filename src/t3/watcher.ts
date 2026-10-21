@@ -1,16 +1,20 @@
 import { z } from "zod";
 
+import { planFromPayload } from "../progress.ts";
 import type { ServiceLogger } from "../service.ts";
+import type { StatusPlanStep } from "../store/store.ts";
 import type { T3Connection } from "./connection.ts";
 import type { T3ThreadStreamItem } from "./gateway.ts";
 
-/** An activity as the stream reports it; enough for a progress view, never its payload. */
+/** An activity as the stream reports it; enough for a progress view, never its raw payload. */
 export interface ThreadActivityView {
   readonly id: string;
   readonly tone: string;
   readonly kind: string;
   readonly summary: string;
   readonly turnId: string | null;
+  /** The steps of a `turn.plan.updated` activity (see src/progress.ts). */
+  readonly plan?: ReadonlyArray<StatusPlanStep>;
 }
 
 export interface ThreadSessionView {
@@ -69,6 +73,7 @@ const activityPayloadSchema = z.object({
     kind: z.string().min(1),
     summary: z.string(),
     turnId: nullableId,
+    payload: z.unknown().optional(),
   }),
 });
 const sessionPayloadSchema = z.object({
@@ -94,7 +99,13 @@ export function normalizeV1Item(item: T3ThreadStreamItem): NormalizedThreadItem 
   if (type === "thread.activity-appended") {
     const parsed = activityPayloadSchema.safeParse(payload);
     if (parsed.success) {
-      const activity = { ...parsed.data.activity, turnId: parsed.data.activity.turnId ?? null };
+      const { payload: activityPayload, ...fields } = parsed.data.activity;
+      const plan = planFromPayload(fields.kind, activityPayload);
+      const activity: ThreadActivityView = {
+        ...fields,
+        turnId: fields.turnId ?? null,
+        ...(plan === undefined ? {} : { plan }),
+      };
       return {
         kind: "event",
         sequence,

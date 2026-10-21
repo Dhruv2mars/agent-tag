@@ -13,6 +13,7 @@ import { THREAD_CONTEXT_TIMEOUT_MS, type SlackRepliesPage } from "./context.ts";
 import { SlackEventRouter } from "./events.ts";
 import { SlackMemoryCommands } from "./memory-commands.ts";
 import { deliverNextSlackOutbox, type RefreshRenderers, type SlackOutboxOutcome } from "./outbox.ts";
+import { renderStatusMessage } from "./status.ts";
 import { classifySlackDeliveryError } from "./outbox-policy.ts";
 import { ROUTINE_CANCEL_ACTION_ID } from "./routine-replies.ts";
 import { SlackRoutines } from "./routines.ts";
@@ -206,6 +207,10 @@ export function refreshRenderers(store: AgentTagStore, config: AgentTagConfig): 
     "interaction-card": (interactionId) => {
       const view = store.getInteractionCardView(interactionId);
       return view === null ? null : renderInteractionCard(view, { expirySeconds: config.limits.interactionExpirySeconds });
+    },
+    "status-message": (operationId) => {
+      const view = store.getStatusMessageView(operationId);
+      return view === null ? null : renderStatusMessage(view, { showProgress: config.slack.ui.statusProgress });
     },
   };
 }

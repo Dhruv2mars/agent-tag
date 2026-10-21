@@ -16,10 +16,10 @@ export interface PullRequestSyncOptions {
 }
 
 /** Turn-text line for profiles with mode "auto" on a mapped root; null otherwise. */
-export function pullRequestTurnNote(profile: AgentTagProfile, repositoryRoot: string, taskId: string): string | null {
+export function pullRequestTurnNote(profile: AgentTagProfile, repositoryRoot: string, branch: string): string | null {
   if (profile.pullRequests.mode !== "auto" || pullRequestRepositoryFor(profile, repositoryRoot) === undefined) return null;
   return (
-    `When you finish, Agent Tag commits anything left on branch \`agent-tag/${taskId}\` and pushes it to a draft PR. ` +
+    `When you finish, Agent Tag commits anything left on branch \`${branch}\` and pushes it to a draft PR. ` +
     "Do not run `git push` or `gh pr create`; you have no GitHub write credentials."
   );
 }

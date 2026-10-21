@@ -58,7 +58,7 @@ test("the checked-in Slack manifest is the least-privilege runtime contract", as
   ]);
   expect(manifest.settings.socket_mode_enabled).toBe(true);
   expect(manifest.settings.interactivity.is_enabled).toBe(true);
-  expect(SLACK_ACTION_IDS).toHaveLength(8);
+  expect(SLACK_ACTION_IDS).toHaveLength(9);
 });
 
 test("doctor's required bot scopes match the checked-in manifest", async () => {
@@ -83,7 +83,7 @@ test("the checked-in Agent Tag config parses without hidden defaults", async () 
     },
   ]);
   expect(config.profiles[0]?.ambient.enabled).toBe(false);
-  expect(config.slack.ui).toEqual({ ackReaction: "eyes" });
+  expect(config.slack.ui).toEqual({ ackReaction: "eyes", statusProgress: true, statusUpdateIntervalMs: 2_000, statusUpdatesPerMinute: 40 });
   expect(config.limits.stalledTurn).toEqual({
     timeoutSeconds: 300,
     retryDelaySeconds: 30,

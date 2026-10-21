@@ -9,8 +9,11 @@ import { fetchThreadWindow, SlackContextUnavailable, THREAD_CONTEXT_TIMEOUT_MS }
 import { approvalMessage, describeDuration, questionMessage } from "./slack/cards.ts";
 import { collectMentionedUserIds, type SpeakerIdentity } from "./slack/markup.ts";
 import { escapeSlackText, markdownToMrkdwn, splitForSlack } from "./slack/render.ts";
+import { renderStatusMessage } from "./slack/status.ts";
+import { EMPTY_PROGRESS, progressActivity, TurnProgress } from "./progress.ts";
 import { slackErrorCode, unresolvedSpeaker } from "./slack/users.ts";
 import type { AgentTagStore, ClaimedOperation, PrSyncInput, TaskExecutionBinding } from "./store/store.ts";
+import { taskBranchName } from "./store/tasks.ts";
 import { composeTurnText, type TurnWindow } from "./turn-text.ts";
 import {
   awaitingT3AnswerContinuation,
@@ -506,7 +509,7 @@ export class AgentTagCoordinator {
         },
       memory: memory.block,
     });
-    const prNote = this.#pullRequests === undefined ? null : pullRequestTurnNote(profile, task.repositoryRoot, operation.taskId);
+    const prNote = this.#pullRequests === undefined ? null : pullRequestTurnNote(profile, task.repositoryRoot, taskBranchName(task.taskId, task.sessionGeneration));
     const proposedText = prNote === null ? turnText : `${turnText}\n\n${prNote}`;
     return this.#store.resolveOperationTurnText({
       ...lease,
@@ -611,6 +614,38 @@ export class AgentTagCoordinator {
     return window;
   }
 
+  // --- Task lifecycle (PR-N): the T3 thread bootstrap for a task's session generation. ---
+  /**
+   * Creates the generation's T3 thread with a fresh worktree from the profile base branch, on
+   * `taskBranchName(id, generation)`: a reopened task never reuses the retired thread's branch.
+   */
+  #threadBootstrap(
+    task: TaskExecutionBinding,
+    operation: ClaimedOperation,
+    profile: AgentTagProfile,
+    modelSelection: T3ModelSelection,
+  ): NonNullable<Extract<T3Command, { readonly type: "thread.turn.start" }>["bootstrap"]> {
+    return {
+      createThread: {
+        projectId: task.projectId,
+        title: `Slack ${operation.payload.conversationId}/${operation.payload.threadTs}`,
+        modelSelection,
+        runtimeMode: profile.runtimeMode,
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+        createdAt: task.createdAt,
+      },
+      prepareWorktree: {
+        projectCwd: task.repositoryRoot,
+        baseBranch: profile.baseBranch,
+        branch: taskBranchName(task.taskId, task.sessionGeneration),
+      },
+      runSetupScript: false,
+    };
+  }
+  // --- End task lifecycle. ---
+
   async #run(
     operation: ClaimedOperation,
     signal: AbortSignal | undefined,
@@ -662,28 +697,7 @@ export class AgentTagCoordinator {
       titleSeed: `Slack ${operation.payload.conversationId}/${operation.payload.threadTs}`,
       runtimeMode: profile.runtimeMode,
       interactionMode: "default",
-      ...(task.threadStarted
-        ? {}
-        : {
-            bootstrap: {
-              createThread: {
-                projectId: task.projectId,
-                title: `Slack ${operation.payload.conversationId}/${operation.payload.threadTs}`,
-                modelSelection,
-                runtimeMode: profile.runtimeMode,
-                interactionMode: "default",
-                branch: null,
-                worktreePath: null,
-                createdAt: task.createdAt,
-              },
-              prepareWorktree: {
-                projectCwd: task.repositoryRoot,
-                baseBranch: profile.baseBranch,
-                branch: `agent-tag/${task.taskId}`,
-              },
-              runSetupScript: false,
-            },
-          }),
+      ...(task.threadStarted ? {} : { bootstrap: this.#threadBootstrap(task, operation, profile, modelSelection) }),
       createdAt: this.#now().toISOString(),
     }, signal), signal);
     this.#store.markT3ThreadStarted({ taskId: task.taskId, now: this.#now().toISOString() });
@@ -698,41 +712,42 @@ export class AgentTagCoordinator {
       now: this.#now().toISOString(),
     });
     let turnIdRecorded = false;
-    this.#store.enqueueOutbox({
+    // One status message per turn replaces the old "working" line: it carries the Stop button while
+    // the turn runs and every settle path edits it to its outcome (see store/status.ts). A resumed
+    // claim re-attaches to it.
+    const showProgress = this.#config.slack.ui.statusProgress;
+    this.#store.openStatusMessage({
+      operationId: operation.operationId,
       taskId: operation.taskId,
-      correlationId: operation.operationId,
       conversationId: operation.payload.conversationId,
       threadTs: operation.payload.threadTs,
-      clientMessageId: `${operation.operationId}:started`,
-      payload: {
-        text: "Agent Tag is working on this request.",
-        blocks: [
-          {
-            type: "section",
-            text: { type: "mrkdwn", text: "Agent Tag is working on this request." },
-          },
-          {
-            type: "actions",
-            elements: [
-              {
-                type: "button",
-                text: { type: "plain_text", text: "Cancel" },
-                style: "danger",
-                action_id: "agent-tag.turn.cancel",
-                value: operation.taskId,
-                confirm: {
-                  title: { type: "plain_text", text: "Cancel this task?" },
-                  text: { type: "mrkdwn", text: "The active T3 turn will be interrupted." },
-                  confirm: { type: "plain_text", text: "Cancel task" },
-                  deny: { type: "plain_text", text: "Keep running" },
-                  style: "danger",
-                },
-              },
-            ],
-          },
-        ],
-      },
-      createdAt: this.#now().toISOString(),
+      message: (view) => renderStatusMessage(view, { showProgress }),
+      now: this.#now().toISOString(),
+    });
+    const progress = new TurnProgress();
+    let publishedProgress = JSON.stringify(EMPTY_PROGRESS);
+    const publishProgress = () => {
+      if (!showProgress) return;
+      const view = progress.view();
+      const json = JSON.stringify(view);
+      if (json === publishedProgress) return;
+      publishedProgress = json;
+      try {
+        this.#store.updateStatusProgress({
+          operationId: operation.operationId,
+          progress: view,
+          now: this.#now().toISOString(),
+        });
+      } catch {
+        // Progress is cosmetic: a failed write must not fail the turn. The next change retries.
+        publishedProgress = "";
+      }
+    };
+    // Tool progress does not wake the loop (see watcher.ts), so the stream feeds it directly.
+    polling.watch?.onItem((item) => {
+      if (item.kind !== "event" || item.activity === undefined) return;
+      progress.add(item.activity);
+      publishProgress();
     });
 
     // Stall means "no T3 progress for the stall window", not "not finished yet": a long turn that
@@ -806,6 +821,12 @@ export class AgentTagCoordinator {
           selection: modelSelection,
           now: this.#now().toISOString(),
         });
+      }
+      if (snapshot.thread.latestTurn !== null) {
+        // A message-mode answer can continue in a new turn; progress follows T3's latest one.
+        progress.setTurn(snapshot.thread.latestTurn.turnId);
+        for (const activity of snapshot.thread.activities) progress.add(progressActivity(activity));
+        publishProgress();
       }
       const approvals = pendingT3Approvals(snapshot);
       const userInputs = pendingT3UserInputs(snapshot);

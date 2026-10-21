@@ -18,7 +18,7 @@ const config = await loadConfig(configPath);
 const liveStore = await AgentTagStore.open(join(config.dataDir, "agent-tag.sqlite"));
 const target = (() => {
 try {
-  const binding = liveStore.findActiveTask({ workspaceId: config.slack.workspaceId, conversationId, threadTs });
+  const binding = liveStore.findTaskForThread({ workspaceId: config.slack.workspaceId, conversationId, threadTs });
   if (binding === null || binding.conversationType !== "channel") throw new Error("An existing authorized channel task is required");
   return liveStore.getTaskExecution(binding.taskId);
 } finally { liveStore.close(); }

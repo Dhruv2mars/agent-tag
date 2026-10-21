@@ -800,7 +800,7 @@ describe("coordinator thread notes", () => {
       expect(await firstCoordinator.processNext()).toMatchObject({ kind: "retry-scheduled" });
       expect(turnTexts()).toHaveLength(1);
       // Both notes were consumed when the text froze; one recorded afterwards stays pending.
-      const taskId = store.findActiveTask({ workspaceId: "T1", conversationId: "C1", threadTs: "1000.000001" })?.taskId;
+      const taskId = store.findTaskForThread({ workspaceId: "T1", conversationId: "C1", threadTs: "1000.000001" })?.taskId;
       if (taskId === undefined) throw new Error("task is not bound");
       expect(store.listPendingThreadNotes(taskId)).toEqual([]);
       const late = recordNote(store, { messageTs: "1000.000007", speakerId: "U0D4", steeringAllowed: false, text: "late" });
@@ -867,7 +867,7 @@ describe("coordinator thread notes", () => {
       recordNote(store, { messageTs: "1000.000002", text: "noted" });
       expect((await coordinator.processNext()).kind).toBe("completed");
       expect(turnTexts()[0]).not.toContain("thread updates");
-      const taskId = store.findActiveTask({ workspaceId: "T1", conversationId: "C1", threadTs: "1000.000001" })?.taskId;
+      const taskId = store.findTaskForThread({ workspaceId: "T1", conversationId: "C1", threadTs: "1000.000001" })?.taskId;
       if (taskId === undefined) throw new Error("task is not bound");
       expect(store.listPendingThreadNotes(taskId)).toHaveLength(1);
     });

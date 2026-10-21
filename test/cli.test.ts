@@ -1,9 +1,11 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtemp, readdir, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 import { externalT3AdminFlags } from "../src/cli-commands.ts";
+import { AgentTagStore } from "../src/store/store.ts";
+import { runTasksCommand } from "../src/tasks-cli.ts";
 import { PINNED_T3, t3ArtifactFor } from "../src/t3/lock.ts";
 import { buildFakeT3Tarball, serveFakeT3Mirror } from "./fixtures/fake-t3-tarball.ts";
 
@@ -272,4 +274,86 @@ test("t3 status rejects --admin-token-file, which only applies to t3 rotate", as
   expect(result.stderr).toContain(
     "agent-tag t3: --admin-token-file, --t3-base-dir and --t3-bin only apply to t3 rotate",
   );
+});
+
+test("tasks list and tasks close work against the store without the service", async () => {
+  const home = await mkdtemp(join(tmpdir(), "agent-tag-cli-tasks-"));
+  try {
+    const dataDir = await mkdtemp(join(home, "data-"));
+    const configPath = join(home, "agent-tag.json");
+    await writeFile(configPath, JSON.stringify({
+      version: 1,
+      dataDir,
+      t3: { baseUrl: "http://127.0.0.1:37841", tokenFile: join(home, "t3-token") },
+      slack: { workspaceId: "T1", appTokenFile: join(home, "app"), botTokenFile: join(home, "bot") },
+      access: { allowedUserIds: ["U1"], allowedChannelIds: ["C1"] },
+      profiles: [{
+        id: "engineering",
+        repositoryRoots: ["/repos/example"],
+        defaultProviderInstanceId: "codex",
+        defaultModel: "gpt-5.6-sol",
+        runtimeMode: "approval-required",
+        isolation: { mode: "trusted-same-user", acknowledgedSharedMachineAccess: true },
+        externalWrites: { mode: "deny" },
+        memory: { shared: true, privateDm: false, retentionDays: 30 },
+      }],
+      routes: [{ conversationId: "C1", profileId: "engineering" }],
+      limits: { maxConcurrentTasks: 2 },
+    }));
+    const store = await AgentTagStore.open(join(dataDir, "agent-tag.sqlite"));
+    const event = (threadTs: string) => ({
+      deliveryId: `delivery-${threadTs}`,
+      eventKey: `C1:${threadTs}`,
+      workspaceId: "T1",
+      conversationId: "C1",
+      threadTs,
+      actorUserId: "U1",
+      conversationType: "channel" as const,
+      profileId: "engineering",
+      repositoryRoot: "/repos/example",
+      text: "fixture",
+      receivedAt: "2026-10-01T00:00:00.000Z",
+      sourceOrderKey: threadTs,
+    });
+    const quiet = store.ingestSlackEvent(event("1000.0001"));
+    const claimed = store.claimNextOperation({ workerId: "w", now: "2026-10-01T00:00:00.000Z", leaseMs: 10_000, maxConcurrentTasks: 1 });
+    if (claimed === null) throw new Error("fixture operation was not claimable");
+    store.completeOperation({ operationId: claimed.operationId, workerId: "w", resultSequence: 1, now: "2026-10-01T00:00:00.000Z" });
+    const busy = store.ingestSlackEvent({ ...event("2000.0001"), receivedAt: "2026-10-01T00:01:00.000Z" });
+    store.close();
+
+    const tasks = async (argv: readonly string[]) => {
+      const lines: string[] = [];
+      const exitCode = await runTasksCommand(argv, { write: (line) => lines.push(line) });
+      return { exitCode, stdout: lines.join("\n") };
+    };
+    expect(await tasks(["close", quiet.taskId, configPath])).toEqual({
+      exitCode: 0,
+      stdout: `closed ${quiet.taskId} (generation 1); the next reply in its thread starts a new session`,
+    });
+    expect(await tasks(["close", busy.taskId, configPath])).toEqual({
+      exitCode: 0,
+      stdout: `close requested for ${busy.taskId}; it closes once its in-flight work settles`,
+    });
+    expect(await tasks(["close", quiet.taskId, configPath])).toEqual({ exitCode: 1, stdout: `no active task ${quiet.taskId}` });
+
+    const listed = await tasks(["list", configPath, "--json"]);
+    expect(JSON.parse(listed.stdout)).toEqual([
+      expect.objectContaining({ taskId: busy.taskId, state: "active", closeReason: "admin", closeRequestedAt: expect.any(String) }),
+      expect.objectContaining({ taskId: quiet.taskId, state: "closed", generation: 1, closeReason: "admin" }),
+    ]);
+    const table = await tasks(["list", configPath, "--state", "closed"]);
+    expect(table.stdout).toContain(quiet.taskId);
+    expect(table.stdout).not.toContain(busy.taskId);
+    await expect(tasks(["list", configPath, "--limit", "0"])).rejects.toThrow("--limit must be a positive integer");
+
+    // Through the binary: wired into the operator commands, with a clean usage error.
+    const misuse = await runCli(["tasks", "list", configPath, "--state", "open"]);
+    expect(misuse.exitCode).toBe(1);
+    expect(misuse.stderr).toContain("--state must be active or closed");
+    expect(misuse.stderr).not.toContain("cli.ts:");
+  } finally {
+    if (!home.startsWith(`${tmpdir()}/agent-tag-cli-tasks-`)) throw new Error(`refusing to remove unexpected fixture path ${home}`);
+    await rm(home, { recursive: true });
+  }
 });

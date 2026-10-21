@@ -90,7 +90,7 @@ function seedVersionOne(database: Database): void {
 
 test("upgrades every historical SQLite schema while preserving existing work", async () => {
   const versions = STORE_MIGRATIONS.map((migration) => migration.version);
-  expect(versions).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22]);
+  expect(versions).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24]);
   // Each historical prefix, plus a store that applied 14 (from main) before 13 existed: applied
   // versions are tracked as a set, so 13 must still apply on top of it.
   const startingSets: ReadonlyArray<{ readonly label: string; readonly applied: ReadonlyArray<number> }> = [
@@ -757,6 +757,66 @@ test("K1: migration 22 rebuilds memory with the channel scope, keeps every note 
     fresh.close();
   } finally {
     if (!directory.startsWith(`${tmpdir()}/agent-tag-migration-memory-`)) {
+      throw new Error(`refusing to remove unexpected migration fixture path ${directory}`);
+    }
+    await rm(directory, { recursive: true });
+  }
+});
+
+test("N1: migration 24 backfills task activity and creates the retired-thread table with every reason", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-tag-migration-lifecycle-"));
+  const path = join(directory, "agent-tag.sqlite");
+  try {
+    const historical = new Database(path, { create: true, strict: true });
+    historical.exec("PRAGMA foreign_keys = ON");
+    historical.exec("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)");
+    applyMigration(historical, 1);
+    seedVersionOne(historical);
+    for (const migration of STORE_MIGRATIONS) {
+      if (migration.version > 1 && migration.version < 24) applyMigration(historical, migration.version);
+    }
+    historical.close();
+    (await AgentTagStore.open(path)).close();
+    // Reopening re-runs nothing.
+    (await AgentTagStore.open(path)).close();
+
+    const database = new Database(path, { strict: true });
+    expect(
+      database.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM schema_migrations WHERE version = 24").get(),
+    ).toEqual({ count: 1 });
+    expect(
+      database
+        .query<Record<string, unknown>, []>(
+          `SELECT session_generation, last_activity_at, updated_at, closed_at, close_reason FROM tasks WHERE task_id = 'task-1'`,
+        )
+        .get(),
+    ).toEqual({ session_generation: 1, last_activity_at: createdAt, updated_at: createdAt, closed_at: null, close_reason: null });
+    expect(() => database.query("UPDATE tasks SET close_reason = 'bogus'").run()).toThrow();
+    expect(() => database.query("UPDATE tasks SET session_generation = 0").run()).toThrow();
+
+    const insertRetired = database.query(
+      `INSERT INTO task_retired_t3_threads (task_id, generation, t3_project_id, t3_thread_id, repository_root, branch,
+         reason, retired_at, thread_created, session_stop_command_id, delete_command_id)
+       VALUES ('task-1', ?, 'p', 't', '/srv/repos/example', 'agent-tag/task-1', ?, ?, 1, ?, ?)`,
+    );
+    const reasons = ["restart", "model-switch", "idle", "command", "root-deleted", "admin"];
+    reasons.forEach((reason, index) => {
+      insertRetired.run(index + 1, reason, createdAt, `task-1:g${index + 1}:session.stop`, `task-1:g${index + 1}:thread.delete`);
+    });
+    expect(() => insertRetired.run(99, "bogus", createdAt, "task-1:g99:session.stop", "task-1:g99:thread.delete")).toThrow();
+    // One row per generation, and command ids are never reused.
+    expect(() => insertRetired.run(1, "idle", createdAt, "x:session.stop", "x:thread.delete")).toThrow();
+    expect(() => insertRetired.run(98, "idle", createdAt, "task-1:g1:session.stop", "y:thread.delete")).toThrow();
+    expect(
+      database
+        .query<{ worktree_state: string; branch_state: string; completed_at: string | null }, []>(
+          "SELECT DISTINCT worktree_state, branch_state, completed_at FROM task_retired_t3_threads",
+        )
+        .all(),
+    ).toEqual([{ worktree_state: "unknown", branch_state: "unknown", completed_at: null }]);
+    database.close();
+  } finally {
+    if (!directory.startsWith(`${tmpdir()}/agent-tag-migration-lifecycle-`)) {
       throw new Error(`refusing to remove unexpected migration fixture path ${directory}`);
     }
     await rm(directory, { recursive: true });
