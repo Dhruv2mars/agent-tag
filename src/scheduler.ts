@@ -59,8 +59,7 @@ export class AgentTagSchedules {
     /** Slack request source. A repeated `eventKey` returns the schedule it already created. */
     readonly source?: ScheduleSourceInput;
   }): ScheduleMutationResult {
-    // A new schedule needs an active task; a closed task's existing schedules stay listable and cancellable.
-    const denial = this.#denial(input.context, false);
+    const denial = this.#denial(input.context);
     if (denial !== null) return this.#deny(input.context, input.context.taskId, denial, input.now);
     const parsed = scheduleSpecSchema.safeParse(input.spec);
     if (!parsed.success) {
@@ -132,7 +131,8 @@ export class AgentTagSchedules {
       : { kind: "denied" };
   }
 
-  #denial(context: ScheduleContext, includeClosed = true): string | null {
+  // A closed task keeps its schedules, and a new one may target it: its first run reopens the task.
+  #denial(context: ScheduleContext): string | null {
     if (context.workspaceId !== this.#config.slack.workspaceId) return "workspace-denied";
     if (!this.#config.access.allowedUserIds.includes(context.actorUserId)) return "user-denied";
     if (!this.#config.profiles.some((profile) => profile.id === context.profileId)) return "profile-denied";
@@ -142,7 +142,7 @@ export class AgentTagSchedules {
         workspaceId: context.workspaceId,
         profileId: context.profileId,
         actorUserId: context.actorUserId,
-        includeClosed,
+        includeClosed: true,
       })
     ) {
       return "task-denied";

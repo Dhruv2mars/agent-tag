@@ -396,12 +396,20 @@ describe("task lifecycle: reopen", () => {
       if (created.kind !== "accepted") throw new Error(`schedule fixture denied: ${created.reason}`);
       store.closeTask({ taskId: receipt.taskId, reason: "idle", actorId: "w", now: weekLater });
       expect(store.listSchedules(receipt.taskId)).toHaveLength(1);
-      // Existing schedules survive the close, but a closed task takes no new ones.
+      // Schedules survive the close, and a closed thread can take a new one (a routine asked for there).
       expect(schedules.create({
         context: { workspaceId: "T1", actorUserId: "U1", profileId: "engineering", taskId: receipt.taskId },
-        spec: { kind: "reminder", prompt: "later", runAt: "2026-10-10T00:00:00.000Z" },
+        spec: {
+          kind: "reminder",
+          prompt: "later",
+          runAt: "2026-10-10T00:00:00.000Z",
+          missedRunPolicy: "run-once",
+          misfireGraceSeconds: 60,
+          overlapPolicy: "skip",
+        },
         now: weekLater,
-      })).toMatchObject({ kind: "denied", reason: "task-denied" });
+      })).toMatchObject({ kind: "accepted", schedule: { taskId: receipt.taskId } });
+      expect(store.getTaskExecution(receipt.taskId)).toMatchObject({ state: "closed", sessionGeneration: 1 });
 
       const due = "2026-10-09T00:00:00.000Z";
       const worker = new ScheduleWorker({ config, store, workerId: "schedule-a", now: () => new Date(due) });
