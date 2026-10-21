@@ -225,6 +225,12 @@ export class AgentTagMemory {
     return { kind: "found", memory: only };
   }
 
+  /** Whether a note listed here may be changed from this conversation (see #canWrite). */
+  canWrite(context: MemoryContext, memory: MemoryRecord): boolean {
+    const authorized = this.#authorizeContext(context);
+    return authorized.kind === "accepted" && this.#canWrite(context, authorized.profile, memory);
+  }
+
   forgetRef(input: { readonly context: MemoryContext; readonly ref: string; readonly now: string }): MemoryRefMutationResult {
     const target = this.#resolveWritable(input.context, input.ref, input.now);
     if (target.kind !== "found") return target;

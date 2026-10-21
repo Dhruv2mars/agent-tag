@@ -12,6 +12,7 @@ import type { SlackContextSource } from "./context-source.ts";
 import { THREAD_CONTEXT_TIMEOUT_MS, type SlackRepliesPage } from "./context.ts";
 import { SlackEventRouter } from "./events.ts";
 import { downloadSlackFile, parseSlackFileInfo, type SlackFileClient } from "./files.ts";
+import { SlackMemoryCommands } from "./memory-commands.ts";
 import { deliverNextSlackOutbox, type RefreshRenderers, type SlackOutboxOutcome } from "./outbox.ts";
 import { renderStatusMessage } from "./status.ts";
 import { classifySlackDeliveryError } from "./outbox-policy.ts";
@@ -20,6 +21,7 @@ import { SlackRoutines } from "./routines.ts";
 import { deliverNextSlackReaction, type SlackReactionOutcome } from "./reactions.ts";
 import { installUndiciWebSocketCompat } from "./undici-compat.ts";
 import { SlackUserDirectory, slackErrorCode } from "./users.ts";
+import { ConversationVisibilityResolver } from "./visibility.ts";
 
 const authTestSchema = z.object({
   ok: z.literal(true),
@@ -215,20 +217,22 @@ export function createCommandReplySender(
 }
 
 /**
- * Routes one Slack event; a `!command` or routine request is executed after the router returns
- * (never inside ingest).
+ * Routes one Slack event; a `!command`, routine request or memory phrase is executed after the
+ * router returns (never inside ingest).
  */
 export async function handleSlackEvent(
   input: {
     readonly router: Pick<SlackEventRouter, "ingest">;
     readonly commands: Pick<AgentTagCommands, "execute">;
     readonly routines?: Pick<SlackRoutines, "handle">;
+    readonly memory?: Pick<SlackMemoryCommands, "handle">;
   },
   body: unknown,
 ): Promise<void> {
   const result = input.router.ingest(body);
   if (result.kind === "command") await input.commands.execute(result);
   if (result.kind === "routine") await input.routines?.handle(result);
+  if (result.kind === "memory") await input.memory?.handle(result);
 }
 
 /** Delivery-time renderers for outbox refresh rows, by refresh kind. PR-F adds "status-message". */
@@ -370,12 +374,27 @@ export class SlackSocketBridge {
       ...(auth.user === undefined ? {} : { botName: auth.user }),
       ...(input.logger === undefined ? {} : { logger: input.logger }),
     });
+    // channels:read / groups:read: whether a channel is public, for workspace notes. Without them the
+    // lookup fails, visibility is unknown and only workspace writes are refused.
+    const visibility = new ConversationVisibilityResolver({
+      config: () => input.config,
+      conversationsInfo: (channel) => app.client.conversations.info({ channel }),
+      ...(input.logger === undefined ? {} : { logger: input.logger }),
+    });
+    const memory = new SlackMemoryCommands({
+      config: () => input.config,
+      store: input.store,
+      replies: commandReplies,
+      visibility,
+      users,
+      ...(input.logger === undefined ? {} : { logger: input.logger }),
+    });
     const actions = new SlackActionRouter({ config: input.config, store: input.store });
     app.event("app_mention", async ({ body }) => {
-      await handleSlackEvent({ router, commands, routines }, body);
+      await handleSlackEvent({ router, commands, routines, memory }, body);
     });
     app.event("message", async ({ body }) => {
-      await handleSlackEvent({ router, commands, routines }, body);
+      await handleSlackEvent({ router, commands, routines, memory }, body);
     });
     app.action(ROUTINE_CANCEL_ACTION_ID, async ({ ack, body, respond }) => {
       await ack();
