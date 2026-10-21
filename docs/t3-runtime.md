@@ -103,6 +103,8 @@ Each profile runs on `defaultProviderInstanceId` / `defaultModel` unless people 
 
 `instanceId` is the T3 provider instance (as `doctor` lists it), `label` is the name Slack replies use, and `aliases` are short lowercase names people can type. A route can set its own `defaultModel` (`{ "instanceId", "model" }`) for one channel; it must be the profile default or one of its `allowedModels`. `modelSwitch.enabled: false` on a profile turns switching off; `modelSwitch.crossProvider: "deny"` keeps every thread on its default's provider. `agent-tag doctor` reports each allowed entry as `available` or the reason T3 can't serve it, and never fails startup over one; the service logs a `provider.allowed-model` line for each unavailable entry.
 
+T3 0.0.45 takes its model list from a model manifest. It fetches the manifest from GitHub while running, but only applies it on its next start. A model released after T3 started, such as `claude-haiku-5-5` on 2026-10-21, shows as `model-missing` until T3 restarts. A missing profile or route default blocks startup, and Agent Tag keeps retrying. Restart T3 (managed: `agent-tag service restart`, which also restarts the managed T3), then rerun `agent-tag doctor`. Doctor's hint points there whenever it reports `model-missing`.
+
 How people switch models from Slack, and which switches T3 0.0.45 can follow on a started thread, is in [Using Agent Tag in Slack](slack-usage.md#switching-models-from-slack).
 
 ### Licensing

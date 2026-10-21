@@ -34,3 +34,4 @@ docs/evidence/2026-10-21-service-resilience.md	2026-10-21	fix/service-resilience
 docs/evidence/2026-10-21-slack-files.md	2026-10-21	ee65b7e	darwin-arm64	0.0.45	none	automated-real,automated-fixture	SLK-05,SEC-01
 docs/evidence/2026-10-21-t3-live-main.md	2026-10-21	ee1eaf8	darwin-arm64	0.0.45	codex,claudeAgent	automated-real	T3-01,T3-02,T3-04,SLK-04,SLK-05,SLK-07,LIFE-01,MOD-01
 docs/evidence/2026-10-21-t3-managed.md	2026-10-21	feat/o4-t3-managed-docs	darwin-arm64	0.0.45	codex	automated-real	T3-05
+docs/evidence/2026-10-21-t3-live-luna-haiku.md	2026-10-21	2ae84a3	darwin-arm64	0.0.45	codex,claudeAgent	automated-real	T3-01,T3-02,T3-04,T3-05,SLK-04,SLK-05,SLK-07,LIFE-01,MOD-01

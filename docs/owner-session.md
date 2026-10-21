@@ -132,7 +132,7 @@ Run them in this order. Step 1 starts first because its routines need time to fi
 - **Expect:** 1: the card updates to the decision within 2 s and the turn completes. 2: the card shows Expired. 3: the click after the restart is honoured exactly once and the turn completes. 4: the card shows the decline and the turn ends without the file. 5: the question card lists both choices, updates to the answer, and the turn creates `notes/blue.txt` on `claude-haiku-5-5`. 6: the question card closes and the turn stops without a file.
 - **Agent captures:** `interaction.approval.requested`, `interaction.user-input.requested`, `interaction.response.*`, `interaction.expired`, `interaction.adopted`, `interaction.closed`, `task.stop.requested` → `docs/evidence/<date>-owner-i.md`. Restore `runtimeMode` and `interactionExpirySeconds`.
 - **Rehearsal:** Codex asks questions only in plan mode, which Agent Tag never uses, so the question comes from Haiku 5.5. Rehearse 5 on a private T3 first. If no question card appears there, the question half of SLK-04 stays `UNCONFIRMED`; record that.
-- **Fallback:** `FAIL` the row, continue. SLK-04 also has an automated-real half that fails on `ee1eaf8` (`docs/evidence/2026-10-21-t3-live-main.md`); it must pass again before SLK-04 can pass.
+- **Fallback:** `FAIL` the row, continue. SLK-04's automated-real half passes on Luna (`docs/evidence/2026-10-21-t3-live-luna-haiku.md`); this step is the human half.
 
 ### 6. Memory (K)
 

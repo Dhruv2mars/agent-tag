@@ -360,6 +360,28 @@ describe("agent-tag doctor", () => {
     expect(JSON.parse(JSON.stringify(report)).models).toHaveLength(3);
   });
 
+  test("points a missing model at a stale T3 model manifest and a restart", async () => {
+    await rewriteConfig((config) => {
+      config.profiles[0].allowedModels = [{ instanceId: "codex", model: "gpt-6-luna" }];
+    });
+    const allowed = await run();
+    expect(check(allowed, "t3-models").summary).toContain("default: codex/gpt-6-luna (model-missing)");
+    expect(check(allowed, "t3-models").hint).toContain("`agent-tag service restart`");
+
+    await rewriteConfig((config) => {
+      config.profiles[0].allowedModels = [];
+      config.profiles[0].defaultModel = "gpt-6-luna";
+    });
+    const missing = await run();
+    expect(check(missing, "t3-providers")).toMatchObject({ status: "fail", summary: expect.stringContaining("model gpt-6-luna is not offered") });
+    expect(check(missing, "t3-providers").hint).toContain("model manifest may be stale");
+
+    await rewriteConfig((config) => {
+      config.profiles[0].defaultProviderInstanceId = "claudeAgent";
+    });
+    expect(check(await run(), "t3-providers").hint).toBe("authenticate the provider in T3 or change the profile's provider/model");
+  });
+
   test("reports models as unchecked and skips the model check when T3 is unreachable", async () => {
     world.environment = new Error("connect ECONNREFUSED");
     const report = await run();
