@@ -828,6 +828,21 @@ describe("agent-tag onboard with managed T3", () => {
     expect(fake.started).toEqual([]);
   });
 
+  test("never starts managed T3 in a home that is the desktop T3's $T3CODE_HOME", async () => {
+    const fake = fakeManaged();
+    const previous = process.env.T3CODE_HOME;
+    process.env.T3CODE_HOME = join(harness.home, "data", "t3", "home");
+    try {
+      await expect(runOnboard(managedFlags({ t3Managed: true }), { ...harness.deps, managedT3: fake.managedT3 })).rejects.toThrow(
+        "managed T3 must not share the desktop T3 base dir",
+      );
+    } finally {
+      if (previous === undefined) delete process.env.T3CODE_HOME;
+      else process.env.T3CODE_HOME = previous;
+    }
+    expect(fake.started).toEqual([]);
+  });
+
   test("a failed start fails --t3-managed, but only warns when managed T3 was the default", async () => {
     const fake = fakeManaged({ fail: new Error("port 37841 is already in use") });
     const deps = { ...harness.deps, managedT3: fake.managedT3 };

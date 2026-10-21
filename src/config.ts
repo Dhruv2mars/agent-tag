@@ -372,6 +372,18 @@ function resolveManagedT3(t3: z.infer<typeof managedT3Schema>, dataDir: string):
   };
 }
 
+/** Managed T3 directories that would mix with the desktop T3's data or with each other. */
+function managedT3DirProblems(managed: { readonly homeDir: string; readonly runtimeDir: string }): Array<{ readonly path: string; readonly message: string }> {
+  const problems: Array<{ readonly path: string; readonly message: string }> = [];
+  if (desktopT3Homes(process.env, homedir()).includes(resolve(managed.homeDir))) {
+    problems.push({ path: "homeDir", message: "managed T3 must not share the desktop T3 base dir (~/.t3 or $T3CODE_HOME); use its own homeDir" });
+  }
+  if (resolve(managed.homeDir) === resolve(managed.runtimeDir)) {
+    problems.push({ path: "runtimeDir", message: "t3.runtimeDir must differ from t3.homeDir" });
+  }
+  return problems;
+}
+
 function resolveT3Config(t3: z.infer<typeof t3Schema>, dataDir: string): ResolvedT3Config {
   if (t3.mode === "external") return { mode: "external", baseUrl: t3.baseUrl, tokenFile: t3.tokenFile, watch: t3.watch };
   const managed = resolveManagedT3(t3, dataDir);
@@ -385,6 +397,8 @@ function resolveT3Config(t3: z.infer<typeof t3Schema>, dataDir: string): Resolve
 export function resolveManagedT3Config(input: unknown, dataDir: string): Extract<ResolvedT3Config, { readonly mode: "managed" }> {
   const resolved = resolveT3Config(managedT3Schema.parse(input), dataDir);
   if (resolved.mode !== "managed") throw new Error("expected a managed t3 block");
+  const [problem] = managedT3DirProblems(resolved.managed);
+  if (problem !== undefined) throw new Error(problem.message);
   return resolved;
 }
 
@@ -791,16 +805,8 @@ export const agentTagConfigSchema = z
       }
     }
     if (config.t3.mode === "managed") {
-      const { homeDir, runtimeDir } = resolveManagedT3(config.t3, config.dataDir);
-      if (desktopT3Homes(process.env, homedir()).includes(resolve(homeDir))) {
-        context.addIssue({
-          code: "custom",
-          path: ["t3", "homeDir"],
-          message: "managed T3 must not share the desktop T3 base dir (~/.t3 or $T3CODE_HOME); use its own homeDir",
-        });
-      }
-      if (resolve(homeDir) === resolve(runtimeDir)) {
-        context.addIssue({ code: "custom", path: ["t3", "runtimeDir"], message: "t3.runtimeDir must differ from t3.homeDir" });
+      for (const problem of managedT3DirProblems(resolveManagedT3(config.t3, config.dataDir))) {
+        context.addIssue({ code: "custom", path: ["t3", problem.path], message: problem.message });
       }
     }
   })
