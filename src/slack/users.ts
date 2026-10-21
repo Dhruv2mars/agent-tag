@@ -39,6 +39,10 @@ const slackUserSchema = z.object({
   real_name: z.string().optional(),
   deleted: z.boolean().optional(),
   is_bot: z.boolean().optional(),
+  /** Multi-channel guest. */
+  is_restricted: z.boolean().optional(),
+  /** Single-channel guest. */
+  is_ultra_restricted: z.boolean().optional(),
   profile: z
     .object({
       display_name: z.string().optional(),
@@ -101,10 +105,14 @@ export function slackErrorCode(error: unknown): string {
   return error instanceof Error && error.name ? error.name : "unknown_error";
 }
 
-/** What one lookup yields: the speaker label and the profile time zone (null when unknown). */
+/** The account kind access policy needs; `unknown` when the lookup failed or is disabled. */
+export type SlackUserKind = "member" | "guest" | "bot" | "unknown";
+
+/** What one lookup yields: the speaker label, the profile time zone (null when unknown) and the account kind. */
 interface ResolvedUser {
   readonly identity: SpeakerIdentity;
   readonly timeZone: string | null;
+  readonly kind: SlackUserKind;
 }
 
 interface CacheEntry extends ResolvedUser {
@@ -112,7 +120,13 @@ interface CacheEntry extends ResolvedUser {
 }
 
 function unresolvedUser(userId: string): ResolvedUser {
-  return { identity: unresolvedSpeaker(userId), timeZone: null };
+  return { identity: unresolvedSpeaker(userId), timeZone: null, kind: "unknown" };
+}
+
+function userKind(user: SlackUser): SlackUserKind {
+  if (user.is_bot === true) return "bot";
+  if (user.is_restricted === true || user.is_ultra_restricted === true) return "guest";
+  return "member";
 }
 
 /** Slack's `tz`, kept only when it is a non-empty, plausibly IANA value; callers validate it. */
@@ -163,6 +177,8 @@ export class SlackUserDirectory {
   readonly #now: () => number;
   readonly #logger: ServiceLogger;
   readonly #cache = new Map<string, CacheEntry>();
+  /** Last kind `users.info` returned per user, kept past the cache TTL (see cachedKind). */
+  readonly #knownKinds = new Map<string, SlackUserKind>();
   readonly #inflight = new Map<string, Promise<ResolvedUser>>();
   #disabledCode: string | null = null;
 
@@ -193,6 +209,20 @@ export class SlackUserDirectory {
    */
   timeZone(userId: string, signal?: AbortSignal): Promise<string | null> {
     return this.#resolve(userId, signal).then((user) => user.timeZone);
+  }
+
+  /** The account kind (member, guest or bot) from `users.info`; `unknown` when it cannot be read. */
+  kind(userId: string, signal?: AbortSignal): Promise<SlackUserKind> {
+    return this.#resolve(userId, signal).then((user) => user.kind);
+  }
+
+  /** The cached account kind, without a lookup: `unknown` when the user was not looked up recently. */
+  cachedKind(userId: string): SlackUserKind {
+    const cached = this.#cache.get(userId);
+    const fresh = cached !== undefined && cached.expiresAt > this.#now() ? cached.kind : "unknown";
+    // Execution-time re-checks run long after the event; a kind seen once outlives the label TTL and
+    // a failed refresh, so a member's approval or answer is not denied just because the entry aged out.
+    return fresh === "unknown" ? (this.#knownKinds.get(userId) ?? "unknown") : fresh;
   }
 
   #resolve(userId: string, signal?: AbortSignal): Promise<ResolvedUser> {
@@ -272,8 +302,21 @@ export class SlackUserDirectory {
       if (failure.success) throw new SlackUserLookupError(failure.data.error);
       const parsed = usersInfoResponseSchema.safeParse(response);
       if (!parsed.success) throw new SlackUserLookupError("invalid_response");
-      const user = { identity: identityFromUser(userId, parsed.data.user), timeZone: profileTimeZone(parsed.data.user) };
+      const user = {
+        identity: identityFromUser(userId, parsed.data.user),
+        timeZone: profileTimeZone(parsed.data.user),
+        kind: userKind(parsed.data.user),
+      };
       this.#remember(userId, user, this.#ttlMs);
+      if (user.kind !== "unknown") {
+        this.#knownKinds.delete(userId);
+        this.#knownKinds.set(userId, user.kind);
+        while (this.#knownKinds.size > this.#maxEntries) {
+          const oldest = this.#knownKinds.keys().next().value;
+          if (oldest === undefined) break;
+          this.#knownKinds.delete(oldest);
+        }
+      }
       return user;
     } catch (error) {
       const code = slackErrorCode(error);

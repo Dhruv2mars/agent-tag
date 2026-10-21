@@ -30,7 +30,7 @@ This is the only deployment Agent Tag supports and tests today. The config must 
 Assumptions:
 
 - Agent Tag, T3 Code, and every agent process run as **the same OS user** on one host.
-- Every user in `access.allowedUserIds` is trusted with shell access to that account. This covers everything the account can read or write: other repositories, `~/.ssh`, cloud credentials, browser profiles, and Agent Tag's own secret files and database.
+- Every user in `access.allowedUserIds` is trusted with shell access to that account. With `access.mode: "channel-members"`, so is every non-guest member of every channel in `access.allowedChannelIds`: anyone who can join such a channel can run code as the host user. This covers everything the account can read or write: other repositories, `~/.ssh`, cloud credentials, browser profiles, and Agent Tag's own secret files and database.
 - Repository content and Slack thread text are untrusted input to the model. Prompt injection from a file, issue, or message can steer the agent within the authority above.
 - The host, the OS account, and the T3 server are trusted and patched.
 
@@ -55,7 +55,7 @@ Even in tier 2, the agent can still push to anything its own credentials reach, 
 
 ### What Agent Tag protects
 
-- **Who can start work.** Only users in `access.allowedUserIds`, in conversations listed in `access.allowedChannelIds` and bound by a route. DM routes are bound to a single owner. Authority is checked again before every queued turn, interaction response, schedule run, and Slack reply. Removing a user or route stops queued work after a restart.
+- **Who can start work.** Only users in `access.allowedUserIds` (plus current channel members in `channel-members` mode; guests never approve, other bots never qualify, and unreadable or stale membership fails closed), in conversations listed in `access.allowedChannelIds` and bound by a route. DM routes, configured or auto-routed, are bound to a single allowlisted owner; membership never grants a DM. Authority is checked again before every queued turn, interaction response, schedule run, and Slack reply. Removing a user or route stops queued work after a restart.
 - **Who can run commands.** `!commands` use the same user, channel, route, and DM-owner checks as requests, then the task's execution authority in a bound thread. `commands.disabled` and `commands.adminOnly` narrow them further. Command replies other than mute notices are visible only to the sender, and commands never store or echo message text.
 - **Who can manage routines.** Routine requests from Slack need an explicit mention or the DM owner, and pass the same user, channel, route, and task checks as prompts. A channel's routines can be cancelled by any allowed user there; DM routines only by the owner. Button clicks are re-checked against the loaded config. A routine runs later without anyone watching, under the profile of the thread it was created in, so routines on a `full-access` profile run autonomously.
 - **Which repositories a task uses.** Each route is pinned to one root in its profile's `repositoryRoots`. This is a routing guarantee, not a filesystem sandbox.
