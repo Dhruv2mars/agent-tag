@@ -3,7 +3,9 @@ import { z } from "zod";
 import type { CommandIngress } from "../commands/context.ts";
 import { IMPLEMENTED_COMMANDS, isCommandUsage, parseAgentCommand } from "../commands/parse.ts";
 import type { AgentTagConfig } from "../config.ts";
+import { detectRoutineIntent } from "../routines/intent.ts";
 import { AgentTagStore, type ActiveTaskBinding, type IngestReceipt } from "../store/store.ts";
+import { matchCancelTargets, type RoutineIngress } from "./routines.ts";
 
 const slackId = z.string().regex(/^[A-Z][A-Z0-9]+$/);
 const slackTimestamp = z.string().regex(/^\d{1,20}\.\d{1,9}$/);
@@ -59,6 +61,8 @@ export type SlackIngressResult =
   | { readonly kind: "noted"; readonly noteId: string; readonly duplicate: boolean }
   /** An `@bot !command`: no ingest, no task, no operation. The bridge runs it (commands/handler.ts). */
   | CommandIngress
+  /** A routine create/list/cancel request: no ingest, no operation. The bridge runs it (slack/routines.ts). */
+  | RoutineIngress
   | {
       readonly kind: "ignored";
       readonly reason:
@@ -164,6 +168,20 @@ export class SlackEventRouter {
     const command = parseAgentCommand(text, { botUserId: this.#botUserId, allowBare: route.conversationType === "dm" });
     if (command === null || isCommandUsage(command)) return null;
     return (IMPLEMENTED_COMMANDS as ReadonlyArray<string>).includes(command.name) ? command : null;
+  }
+
+  /**
+   * The routine intent of a direct request, or null for a prompt. A free-text cancel reference that
+   * matches no active routine ("remove the schedule field from the API") is a prompt too.
+   */
+  #routineIntent(workspaceId: string, conversationId: string, threadTs: string, text: string): RoutineIngress["intent"] | null {
+    const intent = detectRoutineIntent(text);
+    if (intent.kind === "none") return null;
+    if (intent.kind === "cancel" && intent.ref.kind === "text") {
+      const active = this.#store.listActiveSchedulesForConversation({ workspaceId, conversationId, limit: 1_000 });
+      if (matchCancelTargets(active, intent.ref, threadTs).length === 0) return null;
+    }
+    return intent;
   }
 
   #findBinding(workspaceId: string, conversationId: string, threadTs: string): ActiveTaskBinding | null {
@@ -383,6 +401,31 @@ export class SlackEventRouter {
       ? { rootTs: threadTs, beforeTs: event.ts }
       : undefined;
     const text = event.text.replaceAll(`<@${this.#botUserId}>`, "").trim();
+    // Routines only on a direct request: a mention, or any message in a DM. Ambient triggers and
+    // unmentioned thread replies always stay prompts.
+    if (this.#config.routines.enabled && (explicitMention || route.conversationType === "dm")) {
+      const intent = this.#routineIntent(workspaceId, event.channel, threadTs, text);
+      if (intent !== null) {
+        return {
+          kind: "routine",
+          intent,
+          request: {
+            deliveryId,
+            eventKey,
+            workspaceId,
+            conversationId: event.channel,
+            conversationType: route.conversationType,
+            threadTs,
+            messageTs: event.ts,
+            actorUserId,
+            profileId,
+            repositoryRoot,
+            text,
+            receivedAt,
+          },
+        };
+      }
+    }
     const receipt = this.#store.ingestSlackEvent({
       deliveryId,
       eventKey,
