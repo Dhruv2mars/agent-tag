@@ -251,19 +251,24 @@ export interface AuditCursor {
   readonly auditId: string;
 }
 
+export type MemoryScope = "shared" | "profile" | "task" | "private" | "channel";
+
 export interface MemoryRecord {
   readonly memoryId: string;
   readonly workspaceId: string;
-  readonly scope: "shared" | "profile" | "task" | "private";
+  readonly scope: MemoryScope;
   readonly profileId: string | null;
   readonly taskId: string | null;
   readonly ownerUserId: string | null;
+  /** The Slack conversation a `channel` note belongs to; null for every other scope. */
+  readonly conversationId: string | null;
   readonly content: string;
   readonly sourceType: string;
   readonly sourceId: string;
   readonly version: number;
   readonly expiresAt: string;
   readonly createdBy: string;
+  readonly updatedBy: string | null;
   readonly createdAt: string;
   readonly updatedAt: string;
 }

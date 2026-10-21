@@ -80,6 +80,7 @@ export type {
   ClaimedSchedule,
   IngestReceipt,
   MemoryRecord,
+  MemoryScope,
   OperationalStatus,
   OutboxStatus,
   RefreshKind,
@@ -102,7 +103,9 @@ export type { RestoreBackupInput } from "./files.ts";
 export type { ListAuditRecordsInput } from "./audit.ts";
 export type {
   CreateMemoryInput,
-  ListMemoryInput,
+  ListVisibleMemoryInput,
+  FindMemoryByRefInput,
+  MemoryStoreKey,
   UpdateMemoryInput,
   ForgetMemoryInput,
   RecordMemoryDenialInput,
@@ -225,8 +228,28 @@ export class AgentTagStore {
     return memory.getMemory(this.#database, memoryId);
   }
 
-  listMemory(input: memory.ListMemoryInput): ReadonlyArray<MemoryRecord> {
-    return memory.listMemory(this.#database, input);
+  listVisibleMemory(input: memory.ListVisibleMemoryInput): ReadonlyArray<MemoryRecord> {
+    return memory.listVisibleMemory(this.#database, input);
+  }
+
+  findMemoryByRef(input: memory.FindMemoryByRefInput): ReadonlyArray<MemoryRecord> {
+    return memory.findMemoryByRef(this.#database, input);
+  }
+
+  findDuplicateMemory(input: memory.MemoryStoreKey & { readonly content: string; readonly now: string }): MemoryRecord | null {
+    return memory.findDuplicateMemory(this.#database, input);
+  }
+
+  countActiveMemory(input: memory.MemoryStoreKey & { readonly now: string }): number {
+    return memory.countActiveMemory(this.#database, input);
+  }
+
+  hasConversationMemory(input: { readonly workspaceId: string; readonly conversationId: string; readonly now: string }): boolean {
+    return memory.hasConversationMemory(this.#database, input);
+  }
+
+  getTaskMemoryDigest(taskId: string): string | null {
+    return memory.getTaskMemoryDigest(this.#database, taskId);
   }
 
   updateMemory(input: memory.UpdateMemoryInput): MemoryRecord {
