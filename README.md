@@ -90,7 +90,7 @@ The service validates every configured provider/model against T3 before connecti
 
 Provider authentication is not a license grant. Review [provider access and licensing](docs/provider-licensing.md) before making an authenticated provider available to other Slack users.
 
-For the exact Slack manifest, scopes, token files, route fields, and first live mention without the wizard, follow [Slack setup](docs/slack-setup.md). The checked-in manifest deliberately omits file scopes because Slack file transfer remains outside the implemented path.
+For the exact Slack manifest, scopes, token files, route fields, and first live mention without the wizard, follow [Slack setup](docs/slack-setup.md). The checked-in manifest requests file scopes ahead of Slack file transfer, which is not implemented yet.
 
 With the pinned T3 server running and an exact-scope service token configured:
 

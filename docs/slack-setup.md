@@ -1,6 +1,6 @@
 # Slack setup
 
-This is the shortest supported path to a live Agent Tag mention. File transfer is not implemented yet, so the manifest does not request Slack file scopes.
+This is the shortest supported path to a live Agent Tag mention.
 
 `bun run onboard` automates steps 1–3. It prints a create-from-manifest link, stores both tokens at mode `0600` under `~/.agent-tag/secrets/`, checks `auth.test`, and writes a config with one route per channel. See [Onboarding](operations.md#onboarding). For unattended runs, pass the tokens through `AGENT_TAG_SLACK_APP_TOKEN` and `AGENT_TAG_SLACK_BOT_TOKEN` in a process environment that is not logged, and never as command-line arguments. The manual steps below remain the reference.
 
@@ -10,17 +10,23 @@ In Slack's app dashboard, create an app from [`config/slack-manifest.example.jso
 
 - `app_mentions:read`
 - `channels:history`
+- `channels:read`
 - `chat:write`
+- `files:read`
+- `files:write`
 - `groups:history`
+- `groups:read`
 - `im:history`
 - `reactions:write`
 - `users:read`
 
+`channels:read`, `groups:read`, `files:read` and `files:write` are requested ahead of the GA channel and file work, so an installed app does not need another reinstall when that work lands. No current code path uses them yet: Agent Tag does not read channel lists and does not accept or return Slack files. `agent-tag doctor` warns until an app installed from an older manifest is reinstalled.
+
 `reactions:write` lets Agent Tag react with :eyes: to a mention as soon as it is accepted, before any work starts, even when all coordinators are busy. Set `slack.ui.ackReaction` to another emoji name, or to `null` to turn the reaction off. An app installed before this scope existed must be reinstalled from the updated manifest. Until then Agent Tag logs one `slack.reaction.failed` warning with `errorCode: "missing_scope"` per process and otherwise keeps working. `agent-tag doctor` warns about the missing scope in the same way.
 
-`users:read` lets Agent Tag call `users.info` to show the model who is speaking, as `Alice Chen (U0A1)`, and to render `<@U0A1>` mentions as names. `users:read.email` is not requested, and no email address is read. Names are cached in memory for one hour and are never written to the database, except inside the frozen text of a turn already sent to T3.
+`users:read` lets Agent Tag call `users.info` to show the model who is speaking, as `Alice Chen (U0A1)`, and to render `<@U0A1>` mentions as names. `users:read.email` is not requested, and no email address is read. Names are cached in memory for one hour and are never written to the database, except inside the frozen text of a turn already sent to T3. The same lookup supplies the requester's profile time zone (`tz`) for routines created from Slack; a routine stores the zone it was created in.
 
-If the bot token lacks `users:read` (an app installed before this scope was added), Agent Tag logs one `slack.users.disabled` warning with `errorCode: "missing_scope"` per process and keeps working with raw user IDs such as `U0A1`. Reinstall the app from the updated manifest to restore names. A failed or slow lookup for one user also falls back to the ID and is retried after five minutes. Name lookups for one turn stop after at most five seconds (a quarter of the operation lease if that is shorter) and resolve at most 50 users; anyone not resolved by then appears as a raw ID.
+If the bot token lacks `users:read` (an app installed before this scope was added), Agent Tag logs one `slack.users.disabled` warning with `errorCode: "missing_scope"` per process and keeps working with raw user IDs such as `U0A1`. Routines then use `routines.defaultTimeZone` and say so in the confirmation. Reinstall the app from the updated manifest to restore names and profile time zones. A failed or slow lookup for one user also falls back to the ID and is retried after five minutes. Name lookups for one turn stop after at most five seconds (a quarter of the operation lease if that is shorter) and resolve at most 50 users; anyone not resolved by then appears as a raw ID.
 
 Each turn sent to T3 starts with `Slack message from <name> (<user ID>):`, or `Scheduled routine run (created by <name> (<user ID>)):` for a routine. The user ID is always present, so two people with the same display name stay distinct. Display names are treated as untrusted: control, bidirectional and zero-width characters, Slack markup characters, and line breaks are removed, parentheses become brackets so a name cannot imitate the `(U…)` suffix, and names are capped at 64 characters. A line of message text that looks like Agent Tag framing (`Slack message from …`, `Scheduled routine run …`, `[Agent Tag …`, `Agent Tag reference memory …`, or an `<agent-tag-memory>` tag) is prefixed with `\` so it cannot pass for a header. Scheduled routine prompts are plain text and are sent verbatim, apart from that escaping; Slack markup and entities in them are not interpreted. The text is frozen on first dispatch, so retries resend identical text without calling Slack.
 
@@ -34,7 +40,7 @@ Its bot events are exactly `app_mention`, `message.channels`, `message.groups`, 
 
 Install the app to the target workspace. Under **Basic Information > App-Level Tokens**, create one token with only `connections:write`. This is the app token and begins with `xapp-`. Under **OAuth & Permissions**, copy the bot token created by the workspace install. It begins with `xoxb-`.
 
-Invite Agent Tag to each configured public or private channel. No channel-list scope is requested, so the operator supplies exact IDs in the config.
+Invite Agent Tag to each configured public or private channel. Agent Tag does not look channels up yet, so the operator supplies exact IDs in the config.
 
 ## 2. Store tokens
 
@@ -83,5 +89,5 @@ Mention the app in an allowed channel. Agent Tag should acknowledge work in the 
 
 - A Codex-backed mention and a same-thread follow-up completed with final Slack replies. Independent human acceptance remains open; see [live Slack evidence](evidence/2026-09-28-slack-live.md).
 - The App Home Messages tab was made writable, and one owner-bound Codex DM completed with a final reply. Independent human and cross-identity privacy exercises, plus Assistant Threads, remain open; see [DM evidence](evidence/2026-09-29-dm-live.md).
-- Slack files are not accepted or returned. `files:read` and `files:write` are intentionally absent.
+- Slack files are not accepted or returned. The manifest already requests `files:read` and `files:write`, but no code uses them yet.
 - The first live Slack turn on 2026-09-26 hit a Codex account usage limit. Later Codex turns completed. T3 reports Claude as ready and authenticated, but real Claude turns failed with `provider-api-errors`; Agent Tag does not silently change providers.

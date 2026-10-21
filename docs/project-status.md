@@ -23,13 +23,13 @@ Work lands on `main` through one squash-merged pull request per change. Use Bun 
 - One shared T3 connection with a thread watcher, a progress-based stall policy, approval expiry, and interaction retries with backoff.
 - Per-profile `allowedModels` and a per-task model that stays sticky across turns.
 - A draft pull request worker (`pullRequests.mode: "auto"`) with a Slack PR card. The live GitHub run is still owner-blocked (PR-01).
-- Routine parsing, run outcomes, and auto-disable after repeated failures. Creating, listing, and cancelling routines from Slack is not on `main` yet.
+- Routines from Slack: create, list, and cancel in plain language (by text or button) in the requester's Slack time zone, with run outcomes and auto-disable after repeated failures. The live Slack run is owner-blocked (JOB-01).
 - A pinned T3 runtime installer, a supervised managed `t3 serve` with a runtime protocol gate, and restricted-token rotation (`agent-tag t3 install|status|serve|pair|rotate`).
 - `agent-tag onboard`, `agent-tag doctor [--fix]`, and a platform-neutral `agent-tag service` (launchd on macOS, `systemd --user` on Linux). The Linux unit is fixture-tested only and has not run on a live host.
 - Credential redaction, retention pruning, `security audit`, and secret scanning.
 - `install.sh`, a tag-triggered release workflow, self-updating binaries, and a Docker image.
 - Queued turns, interaction responses, schedules, and Slack replies recheck current task authority before dispatch ([revocation evidence](evidence/2026-09-30-authority-revocation.md)). OS isolation and tool-write enforcement remain unimplemented.
-- The pinned T3 adapter can transfer image and file attachments ([transport evidence](evidence/2026-09-30-t3-attachments.md)). Slack file ingestion and artifact return remain unimplemented, so the manifest requests no file scopes.
+- The pinned T3 adapter can transfer image and file attachments ([transport evidence](evidence/2026-09-30-t3-attachments.md)). Slack file ingestion and artifact return remain unimplemented; the manifest requests `files:read` and `files:write` ahead of that work.
 - Codex `gpt-5.6-sol` and Claude `claude-sonnet-4-6`/`claude-haiku-4-5` complete live through the adapter on T3 `0.0.45` ([evidence](evidence/2026-10-06-t3-0.0.45.md)).
 
 ## Required work

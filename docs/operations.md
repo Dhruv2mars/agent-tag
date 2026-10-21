@@ -453,6 +453,27 @@ bun run verify:slack-authority -- CONFIG CHANNEL THREAD_TS
 
 This command authenticates the real Slack bot, uses a temporary fixture store, rejects a queued message after removing its route, checks its denial audit, and verifies the rejected marker is absent from Slack. It then sends one test marker through the authorized route and verifies exactly one same-thread message. It does not start Socket Mode or change live tasks, schedules, or human approvals. Use a test thread with fewer than 100 replies; the verifier refuses an incomplete reply scan.
 
+## Routines from Slack
+
+Mention the bot (or write in your DM with it) to manage routines in that conversation:
+
+- **Create:** `@Agent Tag every weekday at 9am summarize open PRs`, `@Agent Tag remind me tomorrow at 3pm to deploy`, `@Agent Tag schedule tomorrow at 3pm: run the release checklist`. A one-off agent run needs the `schedule` lead; a recurring lead (`every`, `daily`, `weekdays`, …) or `remind` is enough otherwise. The routine binds to the thread it was requested in, and its results post there.
+- **List:** `@Agent Tag list routines` shows the conversation's active routines (up to 20, each with a Cancel button) and any turned off for repeated failures in the last 7 days.
+- **Cancel:** `@Agent Tag cancel routine a1b2c3` (the ID from the confirmation or list), `cancel routine 2` (list number), `cancel this routine` (in the routine's thread), `cancel the reminder about deploys` (prompt text), or the Cancel button on any confirmation or list.
+
+Times use the requester's Slack profile time zone (`users.info` `tz`, needs `users:read`). Name a zone to override it (`… at 9am in Europe/London`, `9am PT`). Without `users:read`, or when the profile has no zone, `routines.defaultTimeZone` (default `UTC`) applies and the confirmation says so. Unmentioned channel messages and ambient triggers are never treated as routine requests. A free-text cancel that matches no routine ("remove the schedule field from the API") stays a normal prompt.
+
+Anyone allowed in a shared channel can list and cancel that channel's routines. DM routines belong to the DM owner. Every request is recorded in `slack_command_events` (kinds `routine-create|list|cancel`) with a `slack.command.executed` or `slack.command.denied` audit row, and a Socket Mode redelivery or the duplicate `message` event for one mention is answered once.
+
+```jsonc
+"routines": {
+  "enabled": true,                  // false: routine phrases are ordinary prompts
+  "defaultTimeZone": "UTC",         // IANA zone when the requester's Slack zone is unknown
+  "maxActivePerConversation": 25,   // per channel or DM; the workspace cap is limits.maxActiveSchedules
+  "autoDisable": { "consecutiveFailures": 3, "minFailureSpanSeconds": 3600 }
+}
+```
+
 ## Schedules
 
 Schedules belong to an existing active Agent Tag task. Create a JSON spec such as:
