@@ -12,7 +12,7 @@ import { SLACK_SECTION_TEXT_LIMIT, splitForSlack } from "../src/slack/render.ts"
 import { renderStatusMessage } from "../src/slack/status.ts";
 import { slackBlockSchema } from "../src/store/schema.ts";
 import { AgentTagStore, type SlackOutboxPayload, type StatusMessageView } from "../src/store/store.ts";
-import type { T3ThreadSnapshot } from "../src/t3/gateway.ts";
+import { threadSnapshotSchema, type T3ThreadSnapshot } from "../src/t3/gateway.ts";
 import type { ThreadWakeReason, ThreadWatch } from "../src/t3/watcher.ts";
 
 const now = "2026-09-21T00:00:00.000Z";
@@ -221,7 +221,7 @@ describe("final reply footer (F4)", () => {
         text: "Fixed the *bug*.",
         blocks: [
           { type: "section", text: { type: "mrkdwn", text: "Fixed the *bug*." } },
-          { type: "context", elements: [{ type: "mrkdwn", text: "claude-opus-5-5 · claudeAgent · 3m 12s" }] },
+          { type: "context", elements: [{ type: "plain_text", text: "claude-opus-5-5 · claudeAgent · 3m 12s" }] },
         ],
       },
     ]);
@@ -239,7 +239,7 @@ describe("final reply footer (F4)", () => {
     const section = last?.blocks[0];
     expect(section?.type === "section" ? section.text.text : null).toBe(last?.text ?? "");
     expect((last?.text.length ?? 0) <= SLACK_SECTION_TEXT_LIMIT).toBe(true);
-    expect(last?.blocks[1]).toEqual({ type: "context", elements: [{ type: "mrkdwn", text: "claude-opus-5-5 · claudeAgent · 3m 12s" }] });
+    expect(last?.blocks[1]).toEqual({ type: "context", elements: [{ type: "plain_text", text: "claude-opus-5-5 · claudeAgent · 3m 12s" }] });
     for (let index = 0; index < 40; index += 1) {
       expect(posts.some((post) => post.text.includes(`Paragraph ${index}:`))).toBe(true);
     }
@@ -309,8 +309,9 @@ describe("files changed on completion (F4)", () => {
 describe("footer helpers", () => {
   const completed = snapshot({ threadId: "thread-1", turnId: "turn-2", userMessageId: undefined, text: "ok" });
 
-  test("footer text escapes provider ids and drops an unknown elapsed time", () => {
-    expect(footerText({ model: "m<@U1>&", instanceId: "codex", elapsedMs: 45_000 })).toBe("m@​U1&amp; · codex · 45s");
+  test("footer text keeps provider ids literal and drops an unknown elapsed time", () => {
+    // plain_text: Slack neither formats nor resolves mentions in it, so ids need no escaping.
+    expect(footerText({ model: "my_model*<@U1>", instanceId: "codex_work", elapsedMs: 45_000 })).toBe("my_model*<@U1> · codex_work · 45s");
     expect(footerText({ model: "gpt-5.6-sol", instanceId: "codex", elapsedMs: null })).toBe("gpt-5.6-sol · codex");
   });
 
@@ -330,6 +331,15 @@ describe("footer helpers", () => {
     expect(turnFilesChanged(withCheckpoints([{ turnId: "turn-2", status: "ready", files: [] }]))).toEqual({ filesChanged: 0 });
     expect(turnFilesChanged(withCheckpoints([{ turnId: "turn-1", status: "ready", files: files(4) }]))).toEqual({});
     expect(turnFilesChanged(withCheckpoints([{ turnId: "turn-2", status: "missing", files: [] }]))).toEqual({});
+  });
+
+  test("a checkpoint shape the schema does not know drops the count, not the snapshot", () => {
+    const parsed = threadSnapshotSchema.parse({
+      ...completed,
+      thread: { ...completed.thread, checkpoints: [{ turnId: "turn-2", status: "archived", files: [{}] }] },
+    });
+    expect(parsed.thread.checkpoints).toBeUndefined();
+    expect(parsed.thread.latestTurn?.state).toBe("completed");
   });
 
   test("chunks without a footer match splitForSlack; with one, every block passes the outbox schema", () => {

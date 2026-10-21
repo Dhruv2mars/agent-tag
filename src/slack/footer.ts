@@ -4,7 +4,7 @@
 import type { SlackOutboxPayload } from "../store/store.ts";
 import type { T3ThreadSnapshot } from "../t3/gateway.ts";
 import { describeElapsed } from "./status.ts";
-import { SLACK_SECTION_TEXT_LIMIT, escapeSlackText, splitForSlack } from "./render.ts";
+import { SLACK_SECTION_TEXT_LIMIT, splitForSlack } from "./render.ts";
 
 export interface ReplyFooter {
   readonly model: string;
@@ -35,11 +35,11 @@ export function turnFilesChanged(snapshot: T3ThreadSnapshot): { filesChanged?: n
   return checkpoint?.status === "ready" ? { filesChanged: checkpoint.files.length } : {};
 }
 
-/** "gpt-5.6-sol · codex · 3m 12s" (mrkdwn, escaped). */
+/** "gpt-5.6-sol · codex · 3m 12s", rendered as plain text so ids like `my_model` stay literal. */
 export function footerText(footer: ReplyFooter): string {
   const parts = [footer.model, footer.instanceId];
   if (footer.elapsedMs !== null) parts.push(describeElapsed(footer.elapsedMs));
-  return parts.map((part) => escapeSlackText(part)).join(" · ");
+  return parts.join(" · ");
 }
 
 /**
@@ -57,7 +57,7 @@ export function finalReplyChunks(mrkdwn: string, footer: ReplyFooter | null): Ar
     text: last,
     blocks: [
       { type: "section", text: { type: "mrkdwn", text: last } },
-      { type: "context", elements: [{ type: "mrkdwn", text: footerText(footer) }] },
+      { type: "context", elements: [{ type: "plain_text", text: footerText(footer) }] },
     ],
   };
   return chunks;
