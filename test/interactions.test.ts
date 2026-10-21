@@ -13,7 +13,6 @@ import {
   InteractionWorker,
   type InteractionWorkerOutcome,
   NO_LONGER_PENDING_NOTICE,
-  RETRIES_EXHAUSTED_NOTICE,
   interactionRetryDelayMs,
   type T3InteractionGateway,
 } from "../src/interaction-worker.ts";

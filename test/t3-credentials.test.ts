@@ -6,7 +6,6 @@ import { join } from "node:path";
 import type { CommandRunner } from "../src/command.ts";
 import type { AgentTagConfig, ResolvedT3Config } from "../src/config.ts";
 import { checkT3TokenRotation } from "../src/doctor.ts";
-import { SecretString } from "../src/security/secret-file.ts";
 import type { ServiceLogRecord } from "../src/service.ts";
 import { REQUIRED_T3_SCOPES } from "../src/t3/auth.ts";
 import {

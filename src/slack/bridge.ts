@@ -1,6 +1,7 @@
 import type { App as SlackApp, types as SlackTypes } from "@slack/bolt";
 import { z } from "zod";
 
+import { AgentTagCommands, type CommandReplySender } from "../commands/handler.ts";
 import type { AgentTagConfig } from "../config.ts";
 import { readSecretFile } from "../security/secret-file.ts";
 import type { ServiceLogger } from "../service.ts";
@@ -12,6 +13,7 @@ import { THREAD_CONTEXT_TIMEOUT_MS, type SlackRepliesPage } from "./context.ts";
 import { SlackEventRouter } from "./events.ts";
 import { deliverNextSlackOutbox, type RefreshRenderers, type SlackOutboxOutcome } from "./outbox.ts";
 import { renderStatusMessage } from "./status.ts";
+import { classifySlackDeliveryError } from "./outbox-policy.ts";
 import { deliverNextSlackReaction, type SlackReactionOutcome } from "./reactions.ts";
 import { installUndiciWebSocketCompat } from "./undici-compat.ts";
 import { SlackUserDirectory, slackErrorCode } from "./users.ts";
@@ -20,6 +22,8 @@ const authTestSchema = z.object({
   ok: z.literal(true),
   team_id: z.string().min(1),
   user_id: z.string().min(1),
+  /** The bot user's name, used as its display name in command replies. */
+  user: z.string().min(1).max(80).optional(),
   /** Documented for bot tokens; absent on older or unusual installs. */
   bot_id: z.string().min(1).optional(),
 });
@@ -123,7 +127,67 @@ export async function createSlackUserDirectory(input: {
   });
 }
 
-/** Delivery-time renderers for outbox refresh rows, by refresh kind. */
+/** Longest Retry-After an only-you command reply waits for its single retry. */
+export const COMMAND_REPLY_RETRY_CAP_MS = 5_000;
+
+interface CommandReplyClient {
+  readonly chat: {
+    postEphemeral(args: { channel: string; user: string; text: string; thread_ts?: string; blocks?: unknown[] }): Promise<unknown>;
+    postMessage(args: { channel: string; thread_ts: string; text: string; blocks?: unknown[] }): Promise<{ ts?: string }>;
+  };
+}
+
+/**
+ * Command replies over the outbox's Web API client (no SDK retries, 429s surfaced). An only-you
+ * reply is retried once after a classified retryable failure, waiting Retry-After capped at 5 s;
+ * anything else propagates and the handler logs it.
+ */
+export function createCommandReplySender(
+  client: CommandReplyClient,
+  sleep: (ms: number) => Promise<void> = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+): CommandReplySender {
+  return {
+    async ephemeral({ channel, user, threadTs, payload }) {
+      const send = () =>
+        client.chat.postEphemeral({
+          channel,
+          user,
+          text: payload.text,
+          ...(threadTs === undefined ? {} : { thread_ts: threadTs }),
+          ...(payload.blocks === undefined ? {} : { blocks: [...payload.blocks] }),
+        });
+      try {
+        await send();
+      } catch (error) {
+        const failure = classifySlackDeliveryError(error);
+        if (failure.kind !== "retryable") throw error;
+        await sleep(Math.min(failure.retryAfterMs ?? 1_000, COMMAND_REPLY_RETRY_CAP_MS));
+        await send();
+      }
+    },
+    async post({ channel, threadTs, payload }) {
+      const result = await client.chat.postMessage({
+        channel,
+        thread_ts: threadTs,
+        text: payload.text,
+        ...(payload.blocks === undefined ? {} : { blocks: [...payload.blocks] }),
+      });
+      if (typeof result.ts !== "string") throw new Error("chat.postMessage returned no ts");
+      return { ts: result.ts };
+    },
+  };
+}
+
+/** Routes one Slack event; a `!command` is executed after the router returns (never inside ingest). */
+export async function handleSlackEvent(
+  input: { readonly router: Pick<SlackEventRouter, "ingest">; readonly commands: Pick<AgentTagCommands, "execute"> },
+  body: unknown,
+): Promise<void> {
+  const result = input.router.ingest(body);
+  if (result.kind === "command") await input.commands.execute(result);
+}
+
+/** Delivery-time renderers for outbox refresh rows, by refresh kind. PR-F adds "status-message". */
 export function refreshRenderers(store: AgentTagStore, config: AgentTagConfig): RefreshRenderers {
   return {
     "interaction-card": (interactionId) => {
@@ -237,12 +301,19 @@ export class SlackSocketBridge {
       botUserId: auth.user_id,
       ...(selfBotId === undefined ? {} : { selfBotId }),
     });
+    const commands = new AgentTagCommands({
+      config: () => input.config,
+      store: input.store,
+      replies: createCommandReplySender(app.client as unknown as CommandReplyClient),
+      ...(auth.user === undefined ? {} : { botName: auth.user }),
+      ...(input.logger === undefined ? {} : { logger: input.logger }),
+    });
     const actions = new SlackActionRouter({ config: input.config, store: input.store });
     app.event("app_mention", async ({ body }) => {
-      router.ingest(body);
+      await handleSlackEvent({ router, commands }, body);
     });
     app.event("message", async ({ body }) => {
-      router.ingest(body);
+      await handleSlackEvent({ router, commands }, body);
     });
     for (const actionId of SLACK_ACTION_IDS) {
       app.action(actionId, async ({ ack, body, client, respond }) => {

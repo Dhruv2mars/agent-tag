@@ -176,14 +176,6 @@ function defaultLaunchdHost(): LaunchdHost {
   return { run: runCommand, sleep: (milliseconds) => Bun.sleep(milliseconds), uid: requireMacOS(), plistPath: plistPath() };
 }
 
-export function launchAgentPlistPath(): string {
-  return plistPath();
-}
-
-export async function launchAgentDefinition(configPathInput: string): Promise<LaunchAgentDefinition> {
-  return definition(configPathInput);
-}
-
 async function definition(configPathInput: string): Promise<LaunchAgentDefinition> {
   const configPath = resolve(configPathInput);
   await loadConfig(configPath);

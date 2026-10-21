@@ -16,7 +16,6 @@ import { insertOutboxMessage } from "./outbox.ts";
 import { isoDateTime, nonEmpty, outboxIdentitySchema, outboxPayloadSchema, refreshKindSchema } from "./schema.ts";
 import type { RefreshKind, SlackOutboxPayload } from "./types.ts";
 
-export { REFRESH_KINDS } from "./schema.ts";
 export type { RefreshKind } from "./types.ts";
 
 /** Stored as the payload of refresh rows; never sent, because they render at delivery time. */

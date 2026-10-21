@@ -5,7 +5,7 @@ import { AgentTagCoordinator } from "./coordinator.ts";
 import { PrWorker, pullRequestsEnabled } from "./git/pr-worker.ts";
 import { createGitRunner } from "./git/runner.ts";
 import { InteractionWorker } from "./interaction-worker.ts";
-import { type AllowedModelReport, reportAllowedModels, validateConfiguredProviders } from "./policy/provider.ts";
+import { reportAllowedModels, validateConfiguredProviders } from "./policy/provider.ts";
 import { createScheduleWorkers } from "./scheduler.ts";
 import { SlackSocketBridge } from "./slack/bridge.ts";
 import { createRetentionWorker } from "./store/retention.ts";
@@ -501,45 +501,5 @@ export async function createAgentTagService(input: {
     await runtime?.stop().catch(() => undefined);
     store.close();
     throw error;
-  }
-}
-
-export async function diagnoseAgentTag(config: AgentTagConfig): Promise<{
-  readonly store: ReturnType<AgentTagStore["diagnostics"]>;
-  readonly t3: {
-    readonly reachable: true;
-    readonly orchestrationProtocol: number;
-    readonly providers: ReadonlyArray<{
-      readonly instanceId: string;
-      readonly status: string;
-      readonly authenticated: boolean;
-    }>;
-    readonly models: ReadonlyArray<AllowedModelReport>;
-  };
-  readonly slack: { readonly authenticated: true };
-}> {
-  const store = await AgentTagStore.open(join(config.dataDir, "agent-tag.sqlite"));
-  try {
-    const [t3] = await Promise.all([
-      inspectT3(config.t3),
-      SlackSocketBridge.create({ config, store }),
-    ]);
-    validateConfiguredProviders(config, t3);
-    return {
-      store: store.diagnostics(),
-      t3: {
-        reachable: true,
-        orchestrationProtocol: t3.orchestrationProtocol,
-        providers: t3.providers.map((provider) => ({
-          instanceId: provider.instanceId,
-          status: provider.status,
-          authenticated: provider.auth.status === "authenticated",
-        })),
-        models: reportAllowedModels(config, t3),
-      },
-      slack: { authenticated: true },
-    };
-  } finally {
-    store.close();
   }
 }

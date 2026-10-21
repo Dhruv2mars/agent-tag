@@ -89,8 +89,6 @@ const rawReplySchema = z.object({
   edited: z.object({}).passthrough().optional(),
   files: z.array(z.object({ name: z.string().optional(), title: z.string().optional() })).optional(),
 });
-export type RawReply = z.infer<typeof rawReplySchema>;
-
 const repliesResponseSchema = z.object({
   ok: z.literal(true),
   messages: z.array(z.unknown()).default([]),

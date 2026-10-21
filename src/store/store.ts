@@ -13,6 +13,7 @@
  *   waits.ts        human waits, expiry, abandoned turns   schedule-outcomes.ts run outcomes, auto-disable
  *   thread-notes.ts thread context notes (bot, edit, non-allowlisted updates)
  *   pull-requests.ts  task pull requests and draft PR jobs
+ *   commands.ts     `!command` ledger, thread mute, `!status` summaries
  *   reactions.ts    Slack reaction queue (instant ack)
  *   status.ts       live status message per turn (state, progress, throttled edits)
  *   schema.ts       zod schemas                            types.ts        public types (re-exported)
@@ -20,7 +21,6 @@
 import type { Database } from "bun:sqlite";
 
 import type { StoreContext } from "./context.ts";
-import type { T3ModelSelection } from "../t3/gateway.ts";
 import type {
   ActiveTaskBinding,
   AmbientDecision,
@@ -58,10 +58,11 @@ import * as messageEdits from "./message-edits.ts";
 import * as waits from "./waits.ts";
 import * as threadNotes from "./thread-notes.ts";
 import * as pullRequests from "./pull-requests.ts";
+import * as commands from "./commands.ts";
 import * as reactions from "./reactions.ts";
 import * as status from "./status.ts";
 
-export { AUDIT_ACTIONS, type AuditAction } from "./schema.ts";
+export type { AuditAction } from "./schema.ts";
 export type {
   ClaimedPrSyncJob,
   PrSyncInput,
@@ -164,7 +165,6 @@ export type {
   PendingInteractionRequest,
 } from "./waits.ts";
 export type { GetPendingUserInputQuestionInput, SubmitUserInputAnswerInput } from "./user-input.ts";
-export { RESOLVED_ELSEWHERE } from "./interaction-cards.ts";
 export type {
   InteractionCardState,
   InteractionCardView,
@@ -462,6 +462,34 @@ export class AgentTagStore {
 
   bindT3Task(input: tasks.BindT3TaskInput): void {
     tasks.bindT3Task(this.#database, input);
+  }
+
+  beginCommand(input: commands.BeginCommandInput): "accepted" | "duplicate" {
+    return commands.beginCommand(this.#database, input);
+  }
+
+  settleCommand(input: commands.SettleCommandInput): void {
+    commands.settleCommand(this.#database, input);
+  }
+
+  isCommandEvent(input: { readonly workspaceId: string; readonly eventKey: string }): boolean {
+    return commands.isCommandEvent(this.#database, input);
+  }
+
+  isThreadMuted(input: commands.ThreadKey): boolean {
+    return commands.isThreadMuted(this.#database, input);
+  }
+
+  setThreadMute(input: commands.SetThreadMuteInput): "changed" | "unchanged" {
+    return commands.setThreadMute(this.#database, input);
+  }
+
+  getThreadStatus(input: commands.ThreadKey & { readonly taskId: string }): commands.ThreadWorkStatus {
+    return commands.getThreadStatus(this.#database, input);
+  }
+
+  getConversationStatus(input: { readonly workspaceId: string; readonly conversationId: string }): commands.ConversationWorkStatus {
+    return commands.getConversationStatus(this.#database, input);
   }
 
   findActiveTask(input: tasks.FindActiveTaskInput): ActiveTaskBinding | null {

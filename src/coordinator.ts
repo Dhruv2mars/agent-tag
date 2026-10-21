@@ -11,7 +11,7 @@ import { escapeSlackText, markdownToMrkdwn, splitForSlack } from "./slack/render
 import { renderStatusMessage } from "./slack/status.ts";
 import { EMPTY_PROGRESS, progressActivity, TurnProgress } from "./progress.ts";
 import { slackErrorCode, unresolvedSpeaker } from "./slack/users.ts";
-import type { AgentTagStore, ClaimedOperation, PrSyncInput, SlackOutboxPayload, TaskExecutionBinding } from "./store/store.ts";
+import type { AgentTagStore, ClaimedOperation, PrSyncInput, TaskExecutionBinding } from "./store/store.ts";
 import { composeTurnText, type TurnWindow } from "./turn-text.ts";
 import {
   awaitingT3AnswerContinuation,
