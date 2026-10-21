@@ -310,3 +310,22 @@ describe("startTransientManagedT3 next to a running managed T3", () => {
     }
   });
 });
+
+describe("startTransientManagedT3 with a stale server-runtime.json", () => {
+  test("a recycled pid with nothing on the port does not block the start", async () => {
+    const config = await liveManagedConfig();
+    await mkdir(join(config.managed.homeDir, "userdata"), { recursive: true });
+    // Our own pid is alive but is not a T3; nothing listens on the managed port.
+    await writeFile(join(config.managed.homeDir, "userdata", "server-runtime.json"), JSON.stringify({ pid: process.pid }));
+    await expect(
+      startTransientManagedT3({
+        t3: { ...config, tokenFile: join(config.managed.homeDir, "missing-token") },
+        pin: PINNED_T3,
+        logger: () => {},
+        installed: { binary: FAKE_T3_BINARY, version: PINNED_T3.version },
+        runtimeOptions: { timing: FAST },
+      }),
+    ).rejects.not.toThrow("already running");
+    expect(alive(process.pid)).toBe(true);
+  });
+});
