@@ -9,6 +9,7 @@ import type { ServiceLogRecord } from "../src/service.ts";
 import type { SlackContextSource } from "../src/slack/context-source.ts";
 import type { SlackRepliesPage } from "../src/slack/context.ts";
 import { SlackUserDirectory } from "../src/slack/users.ts";
+import { T3_BOOTSTRAP_WINDOW_MS } from "../src/store/restart.ts";
 import { AgentTagStore, type SlackEventInput } from "../src/store/store.ts";
 import type { T3Command, T3ThreadSnapshot } from "../src/t3/gateway.ts";
 
@@ -690,7 +691,11 @@ describe("coordinator thread window", () => {
       expect(await coordinator.processNext()).toMatchObject({ kind: "failed", errorCode: "session-restarted" });
       expect(commands).toEqual([]);
       expect(store.getTaskExecution(first.taskId)).toMatchObject({ threadId: newThread, threadStarted: false });
-      expect(store.listPendingSessionStops({ now: start, limit: 10 })).toMatchObject([{ threadId: oldThread, generation: 1 }]);
+      // Failing it here does not end T3's detached bootstrap of the sent turn: the stop waits it out.
+      const windowEnd = Date.parse(start) + T3_BOOTSTRAP_WINDOW_MS;
+      expect(store.listPendingSessionStops({ now: new Date(windowEnd - 1).toISOString(), limit: 10 })).toEqual([]);
+      expect(store.listPendingSessionStops({ now: new Date(windowEnd + 1).toISOString(), limit: 10 }))
+        .toMatchObject([{ threadId: oldThread, generation: 1 }]);
       // The next request bootstraps the fresh thread.
       store.ingestSlackEvent(slackEvent({ ts: "1000.000006", threadTs: ROOT_TS, text: "try again" }));
       expect((await coordinator.processNext()).kind).toBe("completed");

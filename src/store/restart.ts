@@ -19,6 +19,12 @@ import type { SlackOutboxPayload } from "./types.ts";
 
 /** Error code of an operation the restart ended: its T3 thread was retired under it. */
 export const SESSION_RESTARTED = "session-restarted";
+
+/**
+ * How long after the latest `thread.turn.start` a missing T3 thread or message may still appear,
+ * because a detached worktree bootstrap (git fetch, thread create) is still running.
+ */
+export const T3_BOOTSTRAP_WINDOW_MS = 15 * 60_000;
 const USER_CANCELLED = "user-cancelled";
 
 /** Holds the old session: running, or sent to T3 and released (only a claim could confirm it). */
@@ -466,12 +472,14 @@ export function listPendingSessionStops(database: Database, input: { readonly no
           `SELECT task_id, generation, t3_thread_id, session_stop_command_id, retired_at FROM task_retired_t3_threads
            WHERE session_stopped_at IS NULL AND thread_created = 1 AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
              -- A turn still on the thread (left running by a forced restart) may yet create it or
-             -- start its session: stop once it has settled, so the stop cannot land first.
+             -- start its session, and so may T3's detached bootstrap of a turn sent without a receipt
+             -- (settled here or not): stop after both, so the stop cannot land first.
              AND NOT EXISTS (SELECT 1 FROM operations o WHERE o.task_id = task_retired_t3_threads.task_id
-               AND o.t3_thread_id = task_retired_t3_threads.t3_thread_id AND o.status IN ('pending', 'inflight'))
+               AND o.t3_thread_id = task_retired_t3_threads.t3_thread_id
+               AND (o.status IN ('pending', 'inflight') OR (o.t3_turn_started_at IS NULL AND o.t3_turn_dispatched_at > ?)))
            ORDER BY retired_at, task_id, generation LIMIT ?`,
         )
-        .all(now, z.number().int().positive().parse(input.limit)),
+        .all(now, new Date(Date.parse(now) - T3_BOOTSTRAP_WINDOW_MS).toISOString(), z.number().int().positive().parse(input.limit)),
     )
     .map((row) => ({
       taskId: row.task_id,

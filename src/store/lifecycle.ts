@@ -83,13 +83,9 @@ export function retireCurrentThread(
   if (task.t3_project_id === null || task.t3_thread_id === null) return;
   const generation = task.session_generation;
   // A turn sent to the thread may have created it even with no receipt (or one a forced `!restart`
-  // outran); one dispatched before migration 28 pinned nothing, so any unsettled sent turn counts.
-  const created = task.t3_thread_started_at !== null || database
-    .query(
-      `SELECT 1 FROM operations WHERE task_id = ? AND (t3_thread_id = ? OR (t3_thread_id IS NULL
-         AND t3_turn_dispatched_at IS NOT NULL AND status IN ('pending', 'inflight'))) LIMIT 1`,
-    )
-    .get(taskId, task.t3_thread_id) !== null;
+  // outran). Every sent turn is pinned to its thread (migration 28 backfilled earlier ones).
+  const created = task.t3_thread_started_at !== null ||
+    database.query("SELECT 1 FROM operations WHERE task_id = ? AND t3_thread_id = ? LIMIT 1").get(taskId, task.t3_thread_id) !== null;
   // A session that adopted the previous generation's worktree ran on that generation's branch.
   const adopted = z.object({ branch: nonEmpty }).nullable().parse(
     database

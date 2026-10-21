@@ -5,6 +5,7 @@ import { T3_TURN_ENDED_FAILURE_CODES } from "./coordinator.ts";
 import type { AccessPurpose } from "./policy/access.ts";
 import { ExecutionAuthorityDenied, requireExecutionAuthority } from "./policy/execution.ts";
 import type { AgentTagStore, ClaimedInteractionResponse } from "./store/store.ts";
+import { T3_BOOTSTRAP_WINDOW_MS } from "./store/restart.ts";
 import { classifyT3DispatchError } from "./t3/dispatch-errors.ts";
 import {
   dispatchT3Command,
@@ -60,12 +61,9 @@ export const DEFAULT_INTERACTION_RETRY_POLICY: InteractionRetryPolicy = {
   maxAttempts: 8,
 };
 
-/**
- * How long after the latest `thread.turn.start` a missing T3 thread or message may still appear,
- * because a detached worktree bootstrap (git fetch, thread create) is still running. Until then a
- * cancel for a failed operation stays pending instead of being settled as never received.
- */
-export const T3_BOOTSTRAP_WINDOW_MS = 15 * 60_000;
+// Until the bootstrap window has passed, a cancel for a failed operation stays pending instead of
+// being settled as never received.
+export { T3_BOOTSTRAP_WINDOW_MS };
 
 export const NO_LONGER_PENDING_NOTICE = "This request is no longer pending.";
 export const RETRIES_EXHAUSTED_NOTICE =
