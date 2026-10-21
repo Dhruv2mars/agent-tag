@@ -11,6 +11,7 @@ import { insertAckReaction } from "./reactions.ts";
 import {
   canonicalEventSchema,
   deliveryLookupSchema,
+  inboundFileRefs,
   isoDateTime,
   nonEmpty,
   operationIdentitySchema,
@@ -98,6 +99,7 @@ export function ingestSlackEvent(context: StoreContext, input: SlackEventInput):
       ...(event.messageTs === undefined ? {} : { messageTs: event.messageTs }),
       ...(event.origin === undefined ? {} : { origin: event.origin }),
       ...(event.threadContext === undefined ? {} : { threadContext: event.threadContext }),
+      files: inboundFileRefs(input.files ?? []),
     });
     database
       .query(

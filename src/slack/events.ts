@@ -9,7 +9,8 @@ import { matchCancelTargets, type RoutineIngress } from "./routines.ts";
 
 const slackId = z.string().regex(/^[A-Z][A-Z0-9]+$/);
 const slackTimestamp = z.string().regex(/^\d{1,20}\.\d{1,9}$/);
-const slackFile = z.object({ name: z.string().optional(), title: z.string().optional() }).passthrough();
+// Slack sends `name: null` (and `title: null`) for some files; the file is still carried.
+const slackFile = z.object({ name: z.string().nullish(), title: z.string().nullish() }).passthrough();
 const messageFields = {
   channel: slackId,
   ts: slackTimestamp,
@@ -51,8 +52,8 @@ type PlainEvent = z.infer<typeof plainEvent>;
 type Route = AgentTagConfig["routes"][number];
 type Profile = AgentTagConfig["profiles"][number];
 
-/** Human subtypes that may trigger a turn. `file_share` stays ignored until file support lands. */
-const TRIGGER_SUBTYPES = new Set([undefined, "thread_broadcast"]);
+/** Human subtypes that may trigger a turn. A `file_share` carries its files to the turn (PR-L). */
+const TRIGGER_SUBTYPES = new Set([undefined, "thread_broadcast", "file_share"]);
 /** Bot subtypes recorded as context notes. */
 const BOT_NOTE_SUBTYPES = new Set([undefined, "bot_message", "thread_broadcast"]);
 
@@ -443,6 +444,7 @@ export class SlackEventRouter {
       sourceOrderKey: event.ts,
       messageTs: event.ts,
       origin: "slack",
+      files: event.files ?? [],
       ...(this.#config.slack.ui.ackReaction === null ? {} : { ackReaction: this.#config.slack.ui.ackReaction }),
       ...(threadContext === undefined ? {} : { threadContext }),
       ...(binding !== null && explicitMention ? { unmuteThread: true } : {}),

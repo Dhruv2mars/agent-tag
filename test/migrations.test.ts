@@ -90,7 +90,7 @@ function seedVersionOne(database: Database): void {
 
 test("upgrades every historical SQLite schema while preserving existing work", async () => {
   const versions = STORE_MIGRATIONS.map((migration) => migration.version);
-  expect(versions).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24]);
+  expect(versions).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25]);
   // Each historical prefix, plus a store that applied 14 (from main) before 13 existed: applied
   // versions are tracked as a set, so 13 must still apply on top of it.
   const startingSets: ReadonlyArray<{ readonly label: string; readonly applied: ReadonlyArray<number> }> = [
@@ -611,6 +611,8 @@ test("D12: an operation payload written before messageTs, origin and threadConte
       threadTs: "1000.000001",
       profileId: "engineering",
       repositoryRoot: "/srv/repos/example",
+      // Payloads from before PR-L1 parse with no shared files.
+      files: [],
     };
     expect(operationPayloadSchema.parse(JSON.parse(legacyJson))).toEqual(legacyPayload);
 
