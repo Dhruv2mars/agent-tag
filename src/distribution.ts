@@ -31,6 +31,10 @@ Usage:
   agent-tag schedule-add CONFIG TASK ACTOR PROFILE SPEC_FILE
   agent-tag schedule-list CONFIG TASK ACTOR PROFILE
   agent-tag schedule-cancel CONFIG TASK ACTOR PROFILE SCHEDULE_ID
+  agent-tag tasks list [CONFIG] [--state active|closed] [--json]
+                                       List tasks with their session generation and last activity
+  agent-tag tasks close TASK_ID [CONFIG]
+                                       Close a task now (or once its work settles); a reply reopens it
   agent-tag security audit CONFIG [--json] [--offline] [--log-dir DIR]
                                        Check permissions, config, T3 token, and leaked credentials
   agent-tag prune CONFIG [--dry-run]   Delete data older than the retention windows
@@ -39,7 +43,7 @@ Usage:
                                        Download, verify, and replace this release binary
   agent-tag help                       Show this help
 
-For doctor, service, and t3, CONFIG defaults to $AGENT_TAG_CONFIG, then agent-tag.json in $AGENT_TAG_HOME
+For doctor, service, t3, and tasks, CONFIG defaults to $AGENT_TAG_CONFIG, then agent-tag.json in $AGENT_TAG_HOME
 (default ~/.agent-tag), where onboard writes it.
 
 Docs: https://github.com/Dhruv2mars/agent-tag#readme

@@ -48,12 +48,14 @@ export interface SlackEventInput {
   readonly unmuteThread?: boolean;
 }
 
+/** The task bound to a Slack thread (`findTaskForThread`). A closed task reopens on its next accepted event. */
 export interface ActiveTaskBinding {
   readonly taskId: string;
   readonly profileId: string;
   readonly repositoryRoot: string;
   readonly conversationType: "channel" | "dm";
   readonly ownerUserId: string | null;
+  readonly state: "active" | "closed";
 }
 
 export interface TaskExecutionBinding {
@@ -67,6 +69,9 @@ export interface TaskExecutionBinding {
   readonly projectCreatedAt: string;
   readonly threadId: string;
   readonly threadStarted: boolean;
+  readonly state: "active" | "closed";
+  /** 1 for the task's first T3 thread; each reopen after a close starts the next one. */
+  readonly sessionGeneration: number;
   readonly conversationType: "channel" | "dm";
   readonly ownerUserId: string | null;
   readonly createdAt: string;

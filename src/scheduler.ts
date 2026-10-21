@@ -132,6 +132,7 @@ export class AgentTagSchedules {
       : { kind: "denied" };
   }
 
+  // A closed task keeps its schedules, and a new one may target it: its first run reopens the task.
   #denial(context: ScheduleContext): string | null {
     if (context.workspaceId !== this.#config.slack.workspaceId) return "workspace-denied";
     // Any member who may use the channel may list or cancel its routines (Claude Tag parity, PR-Q §3.3).
@@ -153,6 +154,7 @@ export class AgentTagSchedules {
         workspaceId: context.workspaceId,
         profileId: context.profileId,
         actorUserId: context.actorUserId,
+        includeClosed: true,
       })
     ) {
       return "task-denied";
@@ -268,6 +270,9 @@ export class ScheduleWorker {
       });
     } else {
       const task = this.#store.getTaskExecution(schedule.taskId);
+      // This run reopens a closed task into a fresh T3 thread, so it rereads the Slack thread like a reply would.
+      const rereadThread = task.state === "closed" &&
+        this.#config.profiles.find((profile) => profile.id === schedule.profileId)?.threadContext.enabled === true;
       const receipt = this.#store.ingestSlackEvent({
         deliveryId: `schedule:${schedule.scheduleId}:${schedule.dueAt}`,
         eventKey: `schedule:${schedule.scheduleId}:${schedule.dueAt}`,
@@ -282,6 +287,7 @@ export class ScheduleWorker {
         receivedAt: current.toISOString(),
         sourceOrderKey: slackOrderKey(new Date(schedule.dueAt)),
         origin: "schedule",
+        ...(rereadThread ? { threadContext: { rootTs: schedule.threadTs, beforeTs: slackOrderKey(current) } } : {}),
       });
       operationId = receipt.operationId;
     }

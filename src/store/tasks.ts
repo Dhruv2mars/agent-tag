@@ -84,7 +84,7 @@ export function ingestSlackEvent(context: StoreContext, input: SlackEventInput):
       return receipt(database, "duplicate", event.deliveryId, canonical.operation_id);
     }
 
-    const taskId = findOrCreateTask(database, event);
+    const taskId = findOrCreateTask(database, event, { reopen: true });
     const operationId = crypto.randomUUID();
     const commandId = crypto.randomUUID();
     const messageId = crypto.randomUUID();
@@ -182,13 +182,16 @@ export interface TaskBelongsToContextInput {
   readonly workspaceId: string;
   readonly profileId: string;
   readonly actorUserId: string;
+  /** Also match a closed task (routines stay attached across close; the next run reopens it). */
+  readonly includeClosed?: boolean;
 }
 
 export function taskBelongsToContext(database: Database, input: TaskBelongsToContextInput): boolean {
   const row = database
     .query<{ count: number }, [string, string, string, string]>(
       `SELECT COUNT(*) AS count FROM tasks
-       WHERE task_id = ? AND workspace_id = ? AND profile_id = ? AND state = 'active'
+       WHERE task_id = ? AND workspace_id = ? AND profile_id = ?
+         ${input.includeClosed === true ? "" : "AND state = 'active'"}
          AND (conversation_type = 'channel' OR owner_user_id = ?)`,
     )
     .get(
@@ -251,25 +254,30 @@ export function bindT3Task(database: Database, input: BindT3TaskInput): void {
   bind.immediate();
 }
 
-export interface FindActiveTaskInput {
+export interface FindTaskForThreadInput {
   readonly workspaceId: string;
   readonly conversationId: string;
   readonly threadTs: string;
 }
 
-export function findActiveTask(database: Database, input: FindActiveTaskInput): ActiveTaskBinding | null {
+/**
+ * The task bound to a Slack thread, active or closed. A closed task routes like an active one: the
+ * next accepted event reopens it as a new session generation (`findOrCreateTask`).
+ */
+export function findTaskForThread(database: Database, input: FindTaskForThreadInput): ActiveTaskBinding | null {
   const schema = z.object({
     task_id: nonEmpty,
     profile_id: nonEmpty,
     repository_root: nonEmpty,
     conversation_type: z.enum(["channel", "dm"]),
     owner_user_id: nonEmpty.nullable(),
+    state: z.enum(["active", "closed"]),
   });
   const row = schema.nullable().parse(
     database
       .query(
-        `SELECT task_id, profile_id, repository_root, conversation_type, owner_user_id FROM tasks
-         WHERE workspace_id = ? AND conversation_id = ? AND thread_ts = ? AND state = 'active'`,
+        `SELECT task_id, profile_id, repository_root, conversation_type, owner_user_id, state FROM tasks
+         WHERE workspace_id = ? AND conversation_id = ? AND thread_ts = ?`,
       )
       .get(
         requiredId(input.workspaceId, "workspaceId"),
@@ -284,17 +292,23 @@ export function findActiveTask(database: Database, input: FindActiveTaskInput): 
     repositoryRoot: row.repository_root,
     conversationType: row.conversation_type,
     ownerUserId: row.owner_user_id,
+    state: row.state,
   };
 }
 
+/**
+ * A task's execution binding, active or closed: delivery workers (outbox, reactions, PR jobs) and a
+ * routine's next run still read a closed task. A closed task has no pending operation (the close
+ * guards, and a reopen happens in the same ingest transaction that queues one).
+ */
 export function getTaskExecution(database: Database, taskIdInput: string): TaskExecutionBinding {
   const row = taskExecutionSchema.parse(
     database
       .query(
         `SELECT task_id, workspace_id, conversation_id, profile_id, repository_root, t3_project_id, t3_thread_id,
                 t3_thread_started_at, conversation_type, owner_user_id, created_at, model_selection_json,
-                t3_model_selection_json, t3_rejected_model_selection_json
-         FROM tasks WHERE task_id = ? AND state = 'active'`,
+                t3_model_selection_json, t3_rejected_model_selection_json, state, session_generation
+         FROM tasks WHERE task_id = ?`,
       )
       .get(requiredId(taskIdInput, "taskId")),
   );
@@ -317,6 +331,8 @@ export function getTaskExecution(database: Database, taskIdInput: string): TaskE
     projectCreatedAt: projectOwner.created_at,
     threadId: row.t3_thread_id,
     threadStarted: row.t3_thread_started_at !== null,
+    state: row.state,
+    sessionGeneration: row.session_generation,
     conversationType: row.conversation_type,
     ownerUserId: row.owner_user_id,
     createdAt: row.created_at,
@@ -668,7 +684,14 @@ export function ensureTaskForThread(database: Database, input: EnsureTaskForThre
     repositoryRoot: requiredId(input.repositoryRoot, "repositoryRoot"),
     receivedAt: isoDateTime.parse(input.now),
   };
-  return database.transaction(() => findOrCreateTask(database, event)).immediate();
+  // Binding a routine to a closed thread does not reopen it; the routine's first run does.
+  return database.transaction(() => findOrCreateTask(database, event, { reopen: false })).immediate();
+}
+
+/** The T3 worktree branch of a task's session generation: `agent-tag/<id>`, then `agent-tag/<id>-g<n>`. */
+export function taskBranchName(taskId: string, generation: number): string {
+  if (!Number.isInteger(generation) || generation < 1) throw new Error("session generation must be a positive integer");
+  return generation === 1 ? `agent-tag/${taskId}` : `agent-tag/${taskId}-g${generation}`;
 }
 
 function findOrCreateTask(database: Database, event: {
@@ -680,12 +703,12 @@ function findOrCreateTask(database: Database, event: {
   readonly profileId: string;
   readonly repositoryRoot: string;
   readonly receivedAt: string;
-}): string {
+}, options: { readonly reopen: boolean }): string {
   const existing = taskLookupSchema.nullable().parse(
     database
       .query(
         `SELECT task_id, profile_id, repository_root, t3_project_id, t3_thread_id,
-                conversation_type, owner_user_id FROM tasks
+                conversation_type, owner_user_id, state, session_generation, last_activity_at FROM tasks
          WHERE workspace_id = ? AND conversation_id = ? AND thread_ts = ?`,
       )
       .get(event.workspaceId, event.conversationId, event.threadTs),
@@ -699,6 +722,12 @@ function findOrCreateTask(database: Database, event: {
       existing.owner_user_id !== expectedOwner
     ) {
       throw new Error("task conversation identity does not match the incoming event");
+    }
+    if (existing.state === "closed") {
+      if (!options.reopen) return existing.task_id;
+      reopenTask(database, { taskId: existing.task_id, generation: existing.session_generation, now: event.receivedAt });
+    } else if (options.reopen && (existing.last_activity_at === null || existing.last_activity_at < event.receivedAt)) {
+      database.query("UPDATE tasks SET last_activity_at = ? WHERE task_id = ?").run(event.receivedAt, existing.task_id);
     }
     if (existing.t3_project_id === null || existing.t3_thread_id === null) {
       database
@@ -722,8 +751,9 @@ function findOrCreateTask(database: Database, event: {
     .query(
       `INSERT INTO tasks (
         task_id, workspace_id, conversation_id, thread_ts, profile_id, repository_root,
-        t3_project_id, t3_thread_id, conversation_type, owner_user_id, state, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)`,
+        t3_project_id, t3_thread_id, conversation_type, owner_user_id, state, created_at, updated_at,
+        last_activity_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)`,
     )
     .run(
       taskId,
@@ -738,8 +768,44 @@ function findOrCreateTask(database: Database, event: {
       event.conversationType === "dm" ? event.actorUserId : null,
       event.receivedAt,
       event.receivedAt,
+      event.receivedAt,
     );
   return taskId;
+}
+
+/**
+ * Reopens a closed task as the next session generation: a fresh T3 thread id (created on the next
+ * turn's bootstrap, on branch `taskBranchName(id, generation)`), so the retired thread is never
+ * written to again. The applied and rejected model selections and the injected memory digest were
+ * per T3 thread and reset; the user's chosen model, schedules, memory and thread mute stay with the task.
+ */
+function reopenTask(database: Database, input: { readonly taskId: string; readonly generation: number; readonly now: string }): void {
+  const generation = input.generation + 1;
+  const threadId = `agent-tag-thread-${crypto.randomUUID()}`;
+  const result = database
+    .query(
+      `UPDATE tasks SET state = 'active', session_generation = ?, t3_thread_id = ?, t3_thread_started_at = NULL,
+         t3_model_selection_json = NULL, t3_rejected_model_selection_json = NULL, memory_digest = NULL, closed_at = NULL,
+         close_reason = NULL, close_requested_at = NULL, session_released_at = NULL, last_activity_at = ?,
+         updated_at = ?
+       WHERE task_id = ? AND state = 'closed' AND session_generation = ?`,
+    )
+    .run(generation, threadId, input.now, input.now, input.taskId, input.generation);
+  if (result.changes !== 1) throw new Error("closed task not found");
+  // The PR belonged to the retired branch (its url is on the retired row); the new branch gets its own.
+  database.query("DELETE FROM task_pull_requests WHERE task_id = ?").run(input.taskId);
+  writeAudit(database, {
+    actorType: "service",
+    actorId: "agent-tag",
+    authority: "task-lifecycle",
+    source: input.taskId,
+    target: threadId,
+    action: "task.reopened",
+    result: "active",
+    correlationId: input.taskId,
+    metadata: { generation },
+    createdAt: input.now,
+  });
 }
 
 function projectIdForRoot(database: Database, repositoryRoot: string): string {

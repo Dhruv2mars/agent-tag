@@ -453,6 +453,27 @@ bun run verify:slack-authority -- CONFIG CHANNEL THREAD_TS
 
 This command authenticates the real Slack bot, uses a temporary fixture store, rejects a queued message after removing its route, checks its denial audit, and verifies the rejected marker is absent from Slack. It then sends one test marker through the authorized route and verifies exactly one same-thread message. It does not start Socket Mode or change live tasks, schedules, or human approvals. Use a test thread with fewer than 100 replies; the verifier refuses an incomplete reply scan.
 
+## Task lifecycle
+
+Every Slack thread the agent works in is one task. A task closes after `lifecycle.closeIdleAfterHours` (default 168, seven days) without activity. Activity is an accepted message, or any turn or approval changing state. A task closes only when nothing is queued or running: no pending or in-flight turn, no open approval or question, and no undelivered Slack reply, reaction or PR job. Idle close is silent; nothing is posted to the thread.
+
+A closed task keeps its Slack thread, schedules and task memory. The next message in its thread (a plain reply is enough, no mention needed) reopens the same task as a new session generation. The new generation starts a new T3 thread with a fresh worktree on the branch `agent-tag/<task-id>-g<generation>`, and the agent rereads the Slack thread for context. A scheduled run on a closed task reopens it the same way, and a routine can still be created there. A closed task still refuses a message routed to a different profile or repository.
+
+Closing records the old T3 thread in `task_retired_t3_threads`, with its generation and branch. Agent Tag does not yet stop or delete that T3 thread, or remove its worktree or branch; that cleanup comes in a later release, and the rows are kept for it. Closes are audited as `task.closed`, reopens as `task.reopened`.
+
+```sh
+agent-tag tasks list [CONFIG] [--state active|closed] [--limit N] [--json]
+agent-tag tasks close TASK_ID [CONFIG]
+```
+
+Both read the local store only, so they work while the service or T3 is down. `tasks close` closes a quiet task at once. A task with work in flight is marked close-requested (`task.close.requested`) and closes when that work settles; in-flight work is never cancelled.
+
+```json
+{ "lifecycle": { "closeIdleAfterHours": 168, "sweepIntervalSeconds": 60, "maxClosesPerSweep": 20 } }
+```
+
+After upgrading, every task idle for longer than `closeIdleAfterHours` becomes due at once. The sweep closes at most `maxClosesPerSweep` per `sweepIntervalSeconds`, so a large backlog drains over a few minutes. Each close is a single local transaction.
+
 ## Routines from Slack
 
 Mention the bot (or write in your DM with it) to manage routines in that conversation:
@@ -476,7 +497,7 @@ Anyone allowed in a shared channel can list and cancel that channel's routines. 
 
 ## Schedules
 
-Schedules belong to an existing active Agent Tag task. Create a JSON spec such as:
+Schedules belong to an existing Agent Tag task; one created on a closed task reopens it on its first run. Create a JSON spec such as:
 
 ```json
 {

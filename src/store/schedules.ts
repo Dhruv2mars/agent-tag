@@ -164,7 +164,7 @@ export function createSchedule(database: Database, input: CreateScheduleInput): 
       database
         .query(
           `SELECT workspace_id, conversation_id, thread_ts, profile_id, repository_root
-           FROM tasks WHERE task_id = ? AND state = 'active'`,
+           FROM tasks WHERE task_id = ?`,
         )
         .get(taskId),
     );

@@ -5,6 +5,7 @@ import { AgentTagCoordinator } from "./coordinator.ts";
 import { PrWorker, pullRequestsEnabled } from "./git/pr-worker.ts";
 import { createGitRunner } from "./git/runner.ts";
 import { InteractionWorker } from "./interaction-worker.ts";
+import { LifecycleWorker } from "./lifecycle-worker.ts";
 import { reportAllowedModels, validateConfiguredProviders } from "./policy/provider.ts";
 import { createScheduleWorkers } from "./scheduler.ts";
 import { createServiceLogWorker } from "./service-logs.ts";
@@ -481,6 +482,7 @@ export async function createAgentTagService(input: {
           },
         },
         createRetentionWorker({ databasePath, policy: input.config.retention, now }),
+        new LifecycleWorker({ store, policy: input.config.lifecycle, now }),
         {
           processNext: async () => {
             const current = now();

@@ -425,7 +425,8 @@ export function renewPrSyncJobLease(database: Database, input: JobLease & { read
 /**
  * Records a successful push before any PR call, so the next snapshot guards only the new delta and a
  * crash between push and PR creation replays into "push is up to date, find or create the PR". The
- * remote head branch is fixed by the first push and never changes for the task.
+ * remote head branch is fixed by the first push and never changes for the task's generation (a reopen
+ * drops the binding; the retired row keeps its pr_url).
  */
 export function recordPrSyncPushed(
   database: Database,
