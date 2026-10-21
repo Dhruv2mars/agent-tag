@@ -1929,11 +1929,11 @@ describe("interaction retries and cancellation", () => {
   });
 });
 
-test("interaction responses re-check the purpose of the action; a turn-policy interrupt only needs the requester to still run", () => {
+test("interaction responses re-check the purpose of the action; a turn-policy interrupt is never gated on the requester", () => {
   expect(interactionPurpose({ kind: "approval", requestId: "approval-1" })).toBe("approve");
   expect(interactionPurpose({ kind: "user-input", requestId: "input-1" })).toBe("answer");
   expect(interactionPurpose({ kind: "cancel", requestId: "cancel:op-1" })).toBe("cancel");
-  // A ceiling or expired-wait interrupt must fire even when the requester's account kind is unknown or a guest's.
-  expect(interactionPurpose({ kind: "cancel", requestId: "interrupt:op-1" })).toBe("execute");
+  // A ceiling or expired-wait interrupt must fire even after the requester left the channel or lost access.
+  expect(interactionPurpose({ kind: "cancel", requestId: "interrupt:op-1" })).toBeNull();
 });
 
