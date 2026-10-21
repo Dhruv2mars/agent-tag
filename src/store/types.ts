@@ -19,6 +19,7 @@ export type StoreFaultPoint =
   | "outbox-enqueue.after-insert"
   | "outbox-claim.after-update"
   | "schedule-outcome.after-record"
+  | "command.after-execute"
   | "attachment.after-record";
 
 export interface StoreOpenOptions {

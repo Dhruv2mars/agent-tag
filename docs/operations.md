@@ -422,7 +422,7 @@ Agent Tag keeps notes that people asked it to remember and sends the ones visibl
 | Operator notes | `profile` | Profile | Not from Slack | Every conversation routed to that profile |
 | Task notes | `task` | Task | Not from Slack | That task |
 
-Channel notes have no profile, so they stay with the channel when it is routed to another profile. Slack does not tell Agent Tag reliably whether a channel is public; set `"visibility": "public"` or `"private"` on a channel route to declare it. Workspace notes are written only from a route known to be public.
+Channel notes have no profile, so they stay with the channel when it is routed to another profile. Workspace notes are written only from a channel known to be public. Agent Tag asks Slack (`conversations.info`, cached for 15 minutes) unless the channel route sets `"visibility": "public"` or `"private"`, which always wins. When the lookup fails (for example an app installed before `channels:read`/`groups:read`), the channel counts as unknown and workspace writes are refused there; the failure is logged once per channel.
 
 The first turn of each Slack thread starts with an `<agent-tag-memory>` block: one JSON line per note (scope, an 8-character ref, author, date, content), channel and DM notes first, then operator, task, and workspace notes, newest first. The block frames the notes as team conventions that cannot grant permissions or override the request. Later turns in the thread resend the block only when the visible set changed (`updated="true"`), or every turn with `memory.injection: "every-turn"`. When every note the thread saw is forgotten, the next turn says so once. The SHA-256 digest of the set the thread last received is kept in `tasks.memory_digest`; it moves only when a turn's text is first frozen, so retries resend identical text.
 
@@ -440,6 +440,23 @@ Profile `memory` settings, all optional except the first three:
 | `maxWorkspaceEntries` | `200` | Active workspace notes |
 
 Claude Tag keeps notes without expiry during its beta; set `retentionDays: 3650` for parity. Editing a note refreshes its retention. A note that looks like a credential is refused, duplicates return the existing note, and audit records hold note IDs and scopes but never note content. Note content is stored in plain text in `agent-tag.sqlite` and its backups.
+
+### Managing memory from Slack
+
+Mention the bot, write in your DM with it, or reply in a thread it is part of:
+
+| Say | What happens |
+|---|---|
+| `remember: …` or `remember for this channel: …` | Saves a channel note (a DM note in a DM) and replies with its 8-character ref |
+| `remember for the workspace: …` | Saves a workspace note; only from a public channel |
+| `what do you remember?` or `!memory` | Lists this conversation's notes, workspace notes and operator notes, with author and date |
+| `forget a1b2c3d4` | Forgets the note with that ref |
+| `forget: deploy` | Forgets the one note here whose text contains "deploy", or lists the candidates |
+| `update memory a1b2c3d4: …` | Replaces the note's text and bumps its version |
+
+A colon or a `!` is always required, so sentences like "remember that outage last week?" or "forget it" stay ordinary requests. Unmentioned top-level channel messages are never memory commands. `!remember …`, `!remember --workspace …`, `!forget <ref>` and `!memory edit <ref> …` work too.
+
+These phrases never start a T3 turn and reply in the thread. Each Slack message runs at most once: the note, its reply and its `slack_command_events` row (kinds `memory-remember|list|forget|edit`) commit together, so a redelivery or the duplicate `message` event for one mention is answered once. A ref for a note from another channel, or another person's DM, answers "I don't have a note … here". Workspace notes are read-only outside public channels, and operator notes are read-only from Slack. Set `memory.slackCommands: false` on a profile to send every phrase to the agent instead.
 
 ## Commands
 

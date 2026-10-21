@@ -6,6 +6,8 @@ import type { AgentTagConfig } from "../config.ts";
 import { isSteeringAllowed } from "../policy/access.ts";
 import { detectRoutineIntent } from "../routines/intent.ts";
 import { AgentTagStore, type ActiveTaskBinding, type IngestReceipt } from "../store/store.ts";
+import type { MemoryIngress } from "./memory-commands.ts";
+import { parseMemoryCommand } from "./memory-grammar.ts";
 import { matchCancelTargets, type RoutineIngress } from "./routines.ts";
 
 const slackId = z.string().regex(/^[A-Z][A-Z0-9]+$/);
@@ -65,6 +67,8 @@ export type SlackIngressResult =
   | CommandIngress
   /** A routine create/list/cancel request: no ingest, no operation. The bridge runs it (slack/routines.ts). */
   | RoutineIngress
+  /** A memory phrase (remember, list, forget, update): no ingest, no operation. The bridge runs it (slack/memory-commands.ts). */
+  | MemoryIngress
   | {
       readonly kind: "ignored";
       readonly reason:
@@ -411,6 +415,29 @@ export class SlackEventRouter {
       ? { rootTs: threadTs, beforeTs: event.ts }
       : undefined;
     const text = event.text.replaceAll(`<@${this.#botUserId}>`, "").trim();
+    // Memory phrases only when addressed: a mention, a DM, or a reply in a bound thread. Ambient
+    // top-level chatter never writes memory.
+    if (profile.memory.slackCommands && (explicitMention || route.conversationType === "dm" || binding !== null)) {
+      const memoryCommand = parseMemoryCommand(text);
+      if (memoryCommand !== null) {
+        return {
+          kind: "memory",
+          command: memoryCommand,
+          request: {
+            deliveryId,
+            eventKey,
+            workspaceId,
+            conversationId: event.channel,
+            conversationType: route.conversationType,
+            threadTs,
+            actorUserId,
+            profileId,
+            repositoryRoot,
+            receivedAt,
+          },
+        };
+      }
+    }
     // Routines only on a direct request: a mention, or any message in a DM. Ambient triggers and
     // unmentioned thread replies always stay prompts.
     if (this.#config.routines.enabled && (explicitMention || route.conversationType === "dm")) {
