@@ -5,6 +5,7 @@ import { z } from "zod";
 import { type T3ModelSelection, t3ModelSelectionSchema } from "../t3/gateway.ts";
 
 import { writeAudit } from "./audit.ts";
+import { type FileUploadsInput, recordFileUploads } from "./file-uploads.ts";
 import { type StoreContext, requiredId, parseStoredJson } from "./context.ts";
 import { OPERATION_SETTLED, closeOperationInteractions } from "./interactions.ts";
 import { leaseExpiry, requireLeaseHeld } from "./lease.ts";
@@ -21,7 +22,7 @@ import {
   outboxPayloadSchema,
   resolvedOperationTextSchema,
 } from "./schema.ts";
-import type { ClaimedOperation } from "./types.ts";
+import type { ClaimedOperation, SlackOutboxPayload } from "./types.ts";
 
 type OperationPayload = ClaimedOperation["payload"];
 
@@ -468,12 +469,19 @@ export interface CompleteOperationWithOutboxInput {
   readonly resultSequence: number;
   readonly conversationId: string;
   readonly threadTs: string;
-  /** One reply, or ordered Slack-sized chunks of one reply (see splitForSlack). */
-  readonly text: string | readonly string[];
+  /**
+   * One reply, or ordered Slack-sized chunks of one reply (see splitForSlack). A chunk may be a full
+   * payload, e.g. the last one carrying the model footer (src/slack/footer.ts).
+   */
+  readonly text: string | ReadonlyArray<string | SlackOutboxPayload>;
+  /** Files the turn changed (T3 checkpoint), shown on the status message's "Done" line. */
+  readonly filesChanged?: number;
   /** Draft PR workflow: the snapshot outcome, recorded with the reply (pull-requests.ts). */
   readonly prSync?: PrSyncInput;
   /** The requesting user, recorded on a PR job. Required with `prSync`. */
   readonly actorUserId?: string;
+  /** Files the reply shares (PR-L2), queued behind its last chunk (file-uploads.ts). */
+  readonly uploads?: FileUploadsInput;
   readonly now: string;
 }
 
@@ -514,14 +522,18 @@ export function completeOperationWithOutbox(
       keepAwaitingHuman: true,
       now,
     });
-    settleStatusMessage(database, { operationId, now });
+    settleStatusMessage(database, {
+      operationId,
+      now,
+      ...(input.filesChanged === undefined ? {} : { filesChanged: input.filesChanged }),
+    });
 
     // A single reply keeps the historical `:final` id; chunked replies get stable
     // `:final-1..n` ids. Chunks are spaced 1ms apart so the outbox claim order
     // (created_at first) delivers them in sequence.
     const texts = typeof input.text === "string" ? [input.text] : [...input.text];
     if (texts.length === 0) throw new Error("final reply must have at least one chunk");
-    const outboxIds = texts.map((text, index) => {
+    const outboxIds = texts.map((chunk, index) => {
       const clientMessageId = texts.length === 1 ? `${operationId}:final` : `${operationId}:final-${index + 1}`;
       const createdAt = new Date(new Date(now).getTime() + index).toISOString();
       const prior = outboxIdentitySchema.nullable().parse(
@@ -538,7 +550,7 @@ export function completeOperationWithOutbox(
           conversationId: requiredId(input.conversationId, "conversationId"),
           threadTs: requiredId(input.threadTs, "threadTs"),
           clientMessageId,
-          payload: outboxPayloadSchema.parse({ text }),
+          payload: outboxPayloadSchema.parse(typeof chunk === "string" ? { text: chunk } : chunk),
           createdAt,
         });
       }
@@ -558,6 +570,20 @@ export function completeOperationWithOutbox(
         prSync: input.prSync,
         now,
         noticeAt: new Date(new Date(now).getTime() + texts.length).toISOString(),
+      });
+    }
+    const last = outboxIds.at(-1);
+    if (input.uploads !== undefined && last !== undefined) {
+      recordFileUploads(database, {
+        operationId,
+        taskId,
+        workerId: input.workerId,
+        conversationId: input.conversationId,
+        threadTs: input.threadTs,
+        uploads: input.uploads,
+        afterOutboxId: last.outboxId,
+        now,
+        noticeAt: new Date(new Date(now).getTime() + texts.length + 1).toISOString(),
       });
     }
     writeAudit(database, {

@@ -32,6 +32,8 @@ const progressSchema = z.object({
   plan: z.array(planStepSchema).default([]),
   recent: z.array(z.string()).default([]),
   toolCount: z.number().int().nonnegative().default(0),
+  /** Files the turn changed, from T3's checkpoint diff; set only when the turn completes. */
+  filesChanged: z.number().int().nonnegative().optional(),
 });
 /** What the status message shows besides its headline (see src/progress.ts). */
 export type StatusProgress = z.infer<typeof progressSchema>;
@@ -321,7 +323,7 @@ export function cancellingActor(database: Database, operationId: string): string
  */
 export function settleStatusMessage(
   database: Database,
-  input: { readonly operationId: string; readonly now: string },
+  input: { readonly operationId: string; readonly now: string; readonly filesChanged?: number },
 ): string | null {
   const now = isoDateTime.parse(input.now);
   const operationId = requiredId(input.operationId, "operationId");
@@ -350,12 +352,15 @@ export function settleStatusMessage(
   else if (row.last_error_code === EXPIRED_ERROR_CODE) state = "expired";
   else state = "failed";
   const actor = state === "stopped" ? row.actor_user_id ?? cancellingActor(database, operationId) : row.actor_user_id;
+  const filesChanged =
+    input.filesChanged === undefined ? null : z.number().int().nonnegative().parse(input.filesChanged);
   database
     .query(
-      `UPDATE status_messages SET state = ?, actor_user_id = ?, settled_at = ?, updated_at = ?
+      `UPDATE status_messages SET state = ?, actor_user_id = ?, settled_at = ?, updated_at = ?,
+         view_json = CASE WHEN ? IS NULL OR NOT json_valid(view_json) THEN view_json ELSE json_set(view_json, '$.filesChanged', ?) END
        WHERE operation_id = ? AND state IN ('running', 'waiting', 'stopping')`,
     )
-    .run(state, actor, now, now, operationId);
+    .run(state, actor, now, now, filesChanged, filesChanged, operationId);
   const edit = refresh(database, operationId, now);
   audit(database, operationId, "status.terminal", state, now);
   return edit?.outboxId ?? null;

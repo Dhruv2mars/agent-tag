@@ -189,7 +189,7 @@ export function userInputModal(input: {
 
 /** Stop cancels the turn; approval buttons approve; question buttons answer (guests may do none of these). */
 export function actionPurpose(actionId: string): AccessPurpose {
-  if (actionId === "agent-tag.turn.cancel") return "cancel";
+  if (actionId === "agent-tag.turn.stop" || actionId === "agent-tag.turn.cancel") return "cancel";
   return actionId.startsWith("agent-tag.approval.") ? "approve" : "answer";
 }
 

@@ -30,7 +30,7 @@ This is the only deployment Agent Tag supports and tests today. The config must 
 Assumptions:
 
 - Agent Tag, T3 Code, and every agent process run as **the same OS user** on one host.
-- Every user in `access.allowedUserIds` is trusted with shell access to that account. With `access.mode: "channel-members"`, so is every non-guest member of every channel in `access.allowedChannelIds`: anyone who can join such a channel can run code as the host user. This covers everything the account can read or write: other repositories, `~/.ssh`, cloud credentials, browser profiles, and Agent Tag's own secret files and database.
+- Every user in `access.allowedUserIds` is trusted with shell access to that account. With `access.mode: "channel-members"`, so is every non-guest member of every channel in `access.allowedChannelIds`: anyone who can join such a channel can run code as the host user. Guests are recognized only when Agent Tag can read the account kind (`users:read`); if that lookup fails or is disabled, a guest member may still start turns, though never approve. This covers everything the account can read or write: other repositories, `~/.ssh`, cloud credentials, browser profiles, and Agent Tag's own secret files and database.
 - Repository content and Slack thread text are untrusted input to the model. Prompt injection from a file, issue, or message can steer the agent within the authority above.
 - The host, the OS account, and the T3 server are trusted and patched.
 
@@ -63,6 +63,7 @@ Even in tier 2, the agent can still push to anything its own credentials reach, 
 - **Secrets in the audit trail.** Audit metadata passes through a redactor for known credential shapes (Slack, GitHub, AWS, Anthropic, OpenAI) before it is written. The audit log never stores Slack message bodies.
 - **Least privilege toward T3.** Agent Tag uses an exact-scope restricted token. Enrollment checks that T3's administrative endpoints deny it.
 - **Data minimisation.** The optional `retention` config replaces stored message bodies with a marker, and deletes old audit rows, after a set number of days (see [operations](docs/operations.md#data-retention)).
+- **Files the agent shares to Slack.** A reply line `[[agent-tag:upload <path>]]` shares a file only from the task's own worktree, only into the task's own thread, after the task's authority is re-checked. Absolute, `~`, `..` and hidden paths (`.env`, `.ssh/`, `.git/`) are refused, and so is a symlink that resolves outside the worktree or onto a hidden file. Every file is scanned for the known credential shapes (text and the readable runs of binary files) and held back with a thread notice on a match; the audit row records the credential class and the file's extension, never its content or name. Compressed content (zip, xlsx, image data) is not inspected, and the agent can still copy any file it can read into its worktree first, so this is defence in depth, not a boundary. Set `files.outbound.enabled` to `false` to turn sharing off.
 - **Detection.** `agent-tag security audit` checks the controls above and fails on high-severity findings.
 
 ### What Agent Tag does not protect

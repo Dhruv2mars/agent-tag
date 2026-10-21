@@ -8,7 +8,8 @@ import type { SlackContextSource } from "./slack/context-source.ts";
 import { fetchThreadWindow, SlackContextUnavailable, THREAD_CONTEXT_TIMEOUT_MS } from "./slack/context.ts";
 import { approvalMessage, describeDuration, questionMessage } from "./slack/cards.ts";
 import { collectMentionedUserIds, type SpeakerIdentity } from "./slack/markup.ts";
-import { escapeSlackText, markdownToMrkdwn, splitForSlack } from "./slack/render.ts";
+import { finalReplyChunks, replyFooter, turnFilesChanged } from "./slack/footer.ts";
+import { escapeSlackText, markdownToMrkdwn } from "./slack/render.ts";
 import { renderStatusMessage } from "./slack/status.ts";
 import { EMPTY_PROGRESS, progressActivity, TurnProgress } from "./progress.ts";
 import { slackErrorCode, unresolvedSpeaker } from "./slack/users.ts";
@@ -39,6 +40,7 @@ import {
   t3AttachmentUploader,
   turnFiles,
 } from "./slack/files.ts";
+import { parseUploadDirectives, rejectedUploadsNotice, uploadInstruction } from "./slack/uploads.ts";
 
 export interface T3CoordinatorGateway {
   /** Implementations should stop the RPC (closing its socket) when `signal` aborts. */
@@ -78,6 +80,9 @@ export interface CoordinatorProviderCatalog {
 
 /** Budget for refreshing a stale catalog before planning a model switch. */
 const CATALOG_REFRESH_BUDGET_MS = 3_000;
+/** Waits for a completed turn's checkpoint diff before settling without a file count (PR-F4). */
+const CHECKPOINT_WAITS = 3;
+const CHECKPOINT_WAIT_MS = 1_000;
 
 export interface CoordinatorOptions {
   readonly config: AgentTagConfig;
@@ -523,6 +528,7 @@ export class AgentTagCoordinator {
           limits: { maxChars: profile.threadContext.maxChars, maxMessageChars: profile.threadContext.maxMessageChars },
         },
       memory: memory.block,
+      ...(this.#config.files.outbound.enabled ? { uploadInstruction: uploadInstruction(this.#config.files.outbound) } : {}),
     });
     const prNote = this.#pullRequests === undefined ? null : pullRequestTurnNote(profile, task.repositoryRoot, taskBranchName(task.taskId, task.sessionGeneration));
     const proposedText = prNote === null ? turnText : `${turnText}\n\n${prNote}`;
@@ -857,6 +863,7 @@ export class AgentTagCoordinator {
     let progressMarker: string | null = null;
     let progressAt = loopStartedAt;
     let renewAt = loopStartedAt + Math.floor(this.#leaseMs / 2);
+    let checkpointWaits = 0;
     while (true) {
       if (signal?.aborted) throw new CoordinatorAborted();
       if (this.#now().getTime() >= renewAt) {
@@ -1041,7 +1048,37 @@ export class AgentTagCoordinator {
             !message.streaming,
         );
         if (assistant === undefined) throw new Error("completed T3 turn has no final assistant message");
-        const prSync = await this.#preparePullRequest(operation, task, profile, snapshot, assistant.text, turnActiveMs, signal);
+        // T3 records the turn's diff (thread.turn-diff-completed) about 200 ms after the turn completes.
+        // With a thread watch, wait a little for it so the status can say how many files changed.
+        if (
+          polling.watch !== null &&
+          checkpointWaits < CHECKPOINT_WAITS &&
+          snapshot.thread.checkpoints?.some((checkpoint) => checkpoint.turnId === latestTurn.turnId) !== true
+        ) {
+          checkpointWaits += 1;
+          if (snapshot.snapshotSequence >= polling.watch.lastSequence) {
+            await abortable(polling.watch.next(CHECKPOINT_WAIT_MS, signal), signal);
+          }
+          continue;
+        }
+        // Agent file shares (PR-L2): directive lines leave the reply and become upload rows.
+        const outbound = this.#config.files.outbound;
+        const shares = outbound.enabled ? parseUploadDirectives(assistant.text, outbound.maxFilesPerTurn) : null;
+        const replyText = shares?.text ?? assistant.text;
+        const uploads = shares === null || shares.requests.length + shares.rejected.length === 0
+          ? undefined
+          : {
+            t3ThreadId: snapshot.thread.id,
+            workspaceRoot: snapshot.thread.worktreePath ?? task.repositoryRoot,
+            requests: shares.requests,
+            rejectedNotice: rejectedUploadsNotice(shares.rejected, outbound),
+          };
+        const prSync = await this.#preparePullRequest(operation, task, profile, snapshot, replyText, turnActiveMs, signal);
+        const completedAt = this.#now();
+        const footer =
+          this.#config.slack.ui.footer === "none"
+            ? null
+            : replyFooter(snapshot, this.#store.getStatusMessageView(operation.operationId)?.startedAt, completedAt);
         const outboxId = this.#store.completeOperationWithOutbox({
           operationId: operation.operationId,
           taskId: operation.taskId,
@@ -1049,9 +1086,11 @@ export class AgentTagCoordinator {
           resultSequence: Math.max(turn.sequence, snapshot.snapshotSequence),
           conversationId: operation.payload.conversationId,
           threadTs: operation.payload.threadTs,
-          text: splitForSlack(markdownToMrkdwn(assistant.text)),
+          text: finalReplyChunks(markdownToMrkdwn(replyText), footer),
+          ...turnFilesChanged(snapshot),
           ...(prSync === undefined ? {} : { prSync, actorUserId: operation.payload.actorUserId }),
-          now: this.#now().toISOString(),
+          ...(uploads === undefined ? {} : { uploads }),
+          now: completedAt.toISOString(),
         });
         return { kind: "completed", operationId: operation.operationId, outboxId };
       }

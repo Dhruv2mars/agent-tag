@@ -47,9 +47,17 @@ const slackUiSchema = z
     statusUpdateIntervalMs: z.number().int().min(1_000).max(60_000).default(2_000),
     /** Budget for progress edits across all status messages (chat.update is rate limited per workspace). */
     statusUpdatesPerMinute: z.number().int().min(1).max(600).default(40),
+    /** The final reply's last chunk ends with "model · instance · elapsed"; "none" leaves replies plain. */
+    footer: z.enum(["model", "none"]).default("model"),
   })
   .strict()
-  .default({ ackReaction: "eyes", statusProgress: true, statusUpdateIntervalMs: 2_000, statusUpdatesPerMinute: 40 });
+  .default({
+    ackReaction: "eyes",
+    statusProgress: true,
+    statusUpdateIntervalMs: 2_000,
+    statusUpdatesPerMinute: 40,
+    footer: "model",
+  });
 
 const isolationSchema = z.discriminatedUnion("mode", [
   z.object({
@@ -531,6 +539,19 @@ const filesSchema = z
         maxFileBytes: z.number().int().min(1).max(T3_MAX_FILE_BYTES).default(25 * 1024 * 1024),
         /** Extensions never downloaded, lowercase without the dot (`"exe"`). */
         deniedExtensions: z.array(z.string().regex(/^[a-z0-9]{1,16}$/)).max(100).default([]),
+      })
+      .strict()
+      .prefault({}),
+    /**
+     * Files the agent shares back (PR-L2): a reply line `[[agent-tag:upload <path>]]` uploads that
+     * workspace file to the thread. Every file is scanned for known credential shapes unless disabled.
+     */
+    outbound: z
+      .object({
+        enabled: z.boolean().default(true),
+        maxFilesPerTurn: z.number().int().min(1).max(10).default(5),
+        maxFileBytes: z.number().int().min(1).max(T3_MAX_FILE_BYTES).default(25 * 1024 * 1024),
+        scanForSecrets: z.boolean().default(true),
       })
       .strict()
       .prefault({}),
