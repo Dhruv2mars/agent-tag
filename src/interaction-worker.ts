@@ -2,6 +2,7 @@ import { z } from "zod";
 
 import type { AgentTagConfig } from "./config.ts";
 import { T3_TURN_ENDED_FAILURE_CODES } from "./coordinator.ts";
+import type { AccessPurpose } from "./policy/access.ts";
 import { ExecutionAuthorityDenied, requireExecutionAuthority } from "./policy/execution.ts";
 import type { AgentTagStore, ClaimedInteractionResponse } from "./store/store.ts";
 import { classifyT3DispatchError } from "./t3/dispatch-errors.ts";
@@ -107,6 +108,17 @@ class InteractionSettled extends Error {
   }
 }
 
+/**
+ * What the response's actor must still be allowed to do: the clicker approves, answers or stops (a guest
+ * never may). A turn-policy interrupt (`interrupt:<op>`) acts for the requester, who only needs to still
+ * be allowed to run the turn, so a ceiling always fires.
+ */
+export function interactionPurpose(response: { readonly kind: string; readonly requestId: string }): AccessPurpose {
+  if (response.kind === "approval") return "approve";
+  if (response.kind === "user-input") return "answer";
+  return response.requestId.startsWith("interrupt:") ? "execute" : "cancel";
+}
+
 export class InteractionWorker {
   readonly #store: AgentTagStore;
   readonly #config: AgentTagConfig;
@@ -152,12 +164,11 @@ export class InteractionWorker {
     });
     if (response === null) return { kind: "idle" };
     try {
-      // The clicker must still be allowed to approve or answer here (a guest never is).
       requireExecutionAuthority({
         config: this.#config,
         task: this.#store.getTaskExecution(response.taskId),
         actorUserId: response.actorUserId,
-        purpose: response.kind === "user-input" ? "answer" : "approve",
+        purpose: interactionPurpose(response),
       });
       let command: T3Command;
       if (response.kind === "approval") {

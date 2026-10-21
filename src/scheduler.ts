@@ -182,7 +182,7 @@ export class AgentTagSchedules {
 export type ScheduleWorkerOutcome =
   | { readonly kind: "idle" }
   | {
-      readonly kind: "dispatched" | "missed-skipped" | "overlap-skipped" | "authority-revoked";
+      readonly kind: "dispatched" | "missed-skipped" | "overlap-skipped" | "authority-revoked" | "authority-deferred";
       readonly scheduleId: string;
       readonly dueAt: string;
     };
@@ -241,6 +241,10 @@ export class ScheduleWorker {
       });
     } catch (error) {
       if (!(error instanceof ExecutionAuthorityDenied)) throw error;
+      // No fresh membership snapshot yet (startup, Slack outage): leave the claim to lapse and retry.
+      if (error.reason === "membership-unknown") {
+        return { kind: "authority-deferred", scheduleId: schedule.scheduleId, dueAt: schedule.dueAt };
+      }
       this.#store.revokeClaimedSchedule({ scheduleId: schedule.scheduleId, workerId: this.#workerId, now: current.toISOString() });
       return { kind: "authority-revoked", scheduleId: schedule.scheduleId, dueAt: schedule.dueAt };
     }

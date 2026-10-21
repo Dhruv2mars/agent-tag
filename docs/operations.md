@@ -55,11 +55,11 @@ In `channel-members` mode Agent Tag reads each routed channel's members with `co
 | Key | Default | Meaning |
 |---|---|---|
 | `access.membership.ttlSeconds` | 300 | A snapshot older than this is refreshed in the background and before a non-allowlisted user's event. |
-| `access.membership.maxStaleSeconds` | 3600 | Past this age (for example while Slack rate-limits the refresh) the snapshot answers "unknown", and non-allowlisted users are denied with `membership-unknown`. |
+| `access.membership.maxStaleSeconds` | 3600 | Past this age (for example while Slack rate-limits the refresh) the snapshot answers "unknown": non-allowlisted users are denied with `membership-unknown`, and their due routines wait instead of being cancelled. |
 | `access.membership.maxMembers` | 5000 | A larger channel is not snapshotted; only the allowlist works there. |
 | `access.membership.guests` | `deny` | Guests (restricted accounts) never approve, answer or cancel. `steer-only` lets them start and steer turns. |
 
-Other bots never get access through membership. A user whose account kind cannot be read may steer but not approve. When a scope is missing, Agent Tag writes one `access.membership.degraded` audit row and one warning per channel, then works allowlist-only in that channel. Someone who leaves a channel loses access within one TTL, and their queued turns, interaction responses and schedules are revoked at execution like an allowlist removal. Denied mentions and clicks write `access.denied` audit rows with the reason (`user-denied`, `approver-denied`, `guest-denied`, `membership-unknown`, `dm-owner-denied`, `dm-disabled`).
+Other bots never get access through membership. A user whose account kind cannot be read may steer but not approve. The service reads membership once at startup (up to 15 s) before it resumes queued work. When a scope is missing, Agent Tag writes one `access.membership.degraded` audit row and one warning per channel, then works allowlist-only in that channel. Someone who leaves a channel loses access within one TTL, and their queued turns, interaction responses and schedules are revoked at execution like an allowlist removal. Denied mentions and clicks write `access.denied` audit rows with the reason (`user-denied`, `approver-denied`, `guest-denied`, `membership-unknown`, `dm-owner-denied`, `dm-disabled`).
 
 Approval, answer and cancel buttons follow the same predicate with their own purpose: in `channel-members` mode any non-guest channel member may approve. `commands.adminOnly` still uses `access.adminUserIds` and never membership.
 

@@ -5,15 +5,17 @@ import type { AgentTagConfig, AgentTagRoute } from "../config.ts";
 /** What the actor is trying to do. Guests never get `approve`, `answer` or `cancel`. */
 export type AccessPurpose = "steer" | "approve" | "answer" | "cancel" | "schedule" | "memory" | "execute";
 
-export type AccessDenialReason =
-  | "workspace-denied"
-  | "channel-denied"
-  | "user-denied"
-  | "dm-owner-denied"
-  | "guest-denied"
-  | "approver-denied"
-  | "membership-unknown"
-  | "dm-disabled";
+export const ACCESS_DENIAL_REASONS = [
+  "workspace-denied",
+  "channel-denied",
+  "user-denied",
+  "dm-owner-denied",
+  "guest-denied",
+  "approver-denied",
+  "membership-unknown",
+  "dm-disabled",
+] as const;
+export type AccessDenialReason = (typeof ACCESS_DENIAL_REASONS)[number];
 
 export type AccessDecision =
   | { readonly allowed: true; readonly basis: "allowlist" | "member" | "dm-owner" }

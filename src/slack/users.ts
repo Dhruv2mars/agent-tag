@@ -177,6 +177,8 @@ export class SlackUserDirectory {
   readonly #now: () => number;
   readonly #logger: ServiceLogger;
   readonly #cache = new Map<string, CacheEntry>();
+  /** Last kind `users.info` returned per user, kept past the cache TTL (see cachedKind). */
+  readonly #knownKinds = new Map<string, SlackUserKind>();
   readonly #inflight = new Map<string, Promise<ResolvedUser>>();
   #disabledCode: string | null = null;
 
@@ -217,7 +219,10 @@ export class SlackUserDirectory {
   /** The cached account kind, without a lookup: `unknown` when the user was not looked up recently. */
   cachedKind(userId: string): SlackUserKind {
     const cached = this.#cache.get(userId);
-    return cached !== undefined && cached.expiresAt > this.#now() ? cached.kind : "unknown";
+    const fresh = cached !== undefined && cached.expiresAt > this.#now() ? cached.kind : "unknown";
+    // Execution-time re-checks run long after the event; a kind seen once outlives the label TTL and
+    // a failed refresh, so a member's approval or answer is not denied just because the entry aged out.
+    return fresh === "unknown" ? (this.#knownKinds.get(userId) ?? "unknown") : fresh;
   }
 
   #resolve(userId: string, signal?: AbortSignal): Promise<ResolvedUser> {
@@ -303,6 +308,15 @@ export class SlackUserDirectory {
         kind: userKind(parsed.data.user),
       };
       this.#remember(userId, user, this.#ttlMs);
+      if (user.kind !== "unknown") {
+        this.#knownKinds.delete(userId);
+        this.#knownKinds.set(userId, user.kind);
+        while (this.#knownKinds.size > this.#maxEntries) {
+          const oldest = this.#knownKinds.keys().next().value;
+          if (oldest === undefined) break;
+          this.#knownKinds.delete(oldest);
+        }
+      }
       return user;
     } catch (error) {
       const code = slackErrorCode(error);

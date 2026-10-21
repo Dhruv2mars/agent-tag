@@ -162,7 +162,8 @@ export class ChannelMembershipCache implements MembershipView {
   /** All member ids, or null when the channel has more than `maxMembers`. */
   async #walk(conversationId: string): Promise<ReadonlySet<string> | null> {
     const members = new Set<string>();
-    const maxPages = Math.ceil(this.#settings.maxMembers / MEMBERS_PAGE_SIZE) + 1;
+    // Slack may return short pages; the size check below is the real limit, this only bounds the walk.
+    const maxPages = Math.ceil(this.#settings.maxMembers / MEMBERS_PAGE_SIZE) * 4 + 1;
     let cursor: string | undefined;
     for (let page = 0; page < maxPages; page++) {
       const response = await this.#list({

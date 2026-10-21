@@ -10,6 +10,7 @@ import { agentTagConfigSchema } from "../src/config.ts";
 import { questionMessage } from "../src/coordinator.ts";
 import {
   DEFAULT_INTERACTION_RETRY_POLICY,
+  interactionPurpose,
   InteractionWorker,
   type InteractionWorkerOutcome,
   NO_LONGER_PENDING_NOTICE,
@@ -1927,3 +1928,12 @@ describe("interaction retries and cancellation", () => {
     });
   });
 });
+
+test("interaction responses re-check the purpose of the action; a turn-policy interrupt only needs the requester to still run", () => {
+  expect(interactionPurpose({ kind: "approval", requestId: "approval-1" })).toBe("approve");
+  expect(interactionPurpose({ kind: "user-input", requestId: "input-1" })).toBe("answer");
+  expect(interactionPurpose({ kind: "cancel", requestId: "cancel:op-1" })).toBe("cancel");
+  // A ceiling or expired-wait interrupt must fire even when the requester's account kind is unknown or a guest's.
+  expect(interactionPurpose({ kind: "cancel", requestId: "interrupt:op-1" })).toBe("execute");
+});
+

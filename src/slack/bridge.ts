@@ -3,7 +3,7 @@ import { z } from "zod";
 
 import { AgentTagCommands, type CommandReplySender } from "../commands/handler.ts";
 import type { AgentTagConfig } from "../config.ts";
-import { bindMembership } from "../policy/access.ts";
+import { ACCESS_DENIAL_REASONS, bindMembership } from "../policy/access.ts";
 import { readSecretFile } from "../security/secret-file.ts";
 import type { ServiceLogger } from "../service.ts";
 import type { AgentTagStore } from "../store/store.ts";
@@ -113,6 +113,8 @@ export const SLACK_MEMBERSHIP_CLIENT_OPTIONS = {
   timeout: 10_000,
 } as const;
 
+/** How long startup waits for the first membership snapshots in `channel-members` mode. */
+export const MEMBERSHIP_STARTUP_WAIT_MS = 15_000;
 /** How long an event or a click waits for a membership refresh and a kind lookup before deciding. */
 export const ACCESS_WARMUP_EVENT_MS = 10_000;
 /** Clicks wait less: a modal's trigger id expires 3 s after the click. */
@@ -337,16 +339,7 @@ export function slackIngressAccess(input: {
   };
 }
 
-const ACCESS_IGNORED_REASONS: ReadonlySet<string> = new Set([
-  "workspace-denied",
-  "channel-denied",
-  "user-denied",
-  "dm-owner-denied",
-  "guest-denied",
-  "approver-denied",
-  "membership-unknown",
-  "dm-disabled",
-]);
+const ACCESS_IGNORED_REASONS: ReadonlySet<string> = new Set(ACCESS_DENIAL_REASONS);
 
 const actionAuditSchema = z.object({
   team: z.object({ id: z.string().min(1) }),
@@ -567,6 +560,9 @@ export class SlackSocketBridge {
   }
 
   async start(): Promise<void> {
+    // Read channel membership before the service's workers re-check queued work, so a restart does not
+    // deny members for `membership-unknown`. Bounded: a slow Slack never holds startup.
+    await Promise.race([this.refreshMembership(), Bun.sleep(MEMBERSHIP_STARTUP_WAIT_MS)]);
     await this.#app.start();
   }
 

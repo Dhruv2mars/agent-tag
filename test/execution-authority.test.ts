@@ -189,3 +189,40 @@ test("channel-members: queued work by a member who left the channel is revoked l
     await rm(directory, { recursive: true });
   }
 });
+
+test("channel-members: a due schedule without a membership snapshot is deferred, not revoked, and runs once membership is known", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-tag-authority-"));
+  const store = await AgentTagStore.open(join(directory, "agent-tag.sqlite"));
+  try {
+    const membersConfig = agentTagConfigSchema.parse({ ...config, access: { ...config.access, mode: "channel-members" } });
+    // Right after a restart the snapshot is empty: every lookup is "unknown" until the first refresh.
+    let state: "unknown" | "member" = "member";
+    bindMembership(membersConfig, { lookup: (_conversationId, userId) => (userId === "U5" ? state : "not-member"), userKind: () => "member" });
+    const receipt = store.ingestSlackEvent({
+      deliveryId: "delivery-d1", eventKey: "C1:1000.000001", workspaceId: "T1",
+      conversationId: "C1", threadTs: "1000.000001", actorUserId: "U5",
+      conversationType: "channel", profileId: "engineering", repositoryRoot: root,
+      text: "member request", receivedAt: now,
+    });
+    const schedules = new AgentTagSchedules({ config: membersConfig, store });
+    expect(schedules.create({
+      context: { workspaceId: "T1", actorUserId: "U5", profileId: profile.id, taskId: receipt.taskId },
+      spec: { kind: "reminder", prompt: "member reminder", runAt: now, cadenceSeconds: 60,
+        missedRunPolicy: "run-once", misfireGraceSeconds: 60, overlapPolicy: "skip" },
+      now,
+    }).kind).toBe("accepted");
+    state = "unknown";
+    let clock = new Date(now).getTime();
+    const worker = new ScheduleWorker({ config: membersConfig, store, now: () => new Date(clock), leaseMs: 1_000 });
+    expect((await worker.processNext()).kind).toBe("authority-deferred");
+    expect(store.listSchedules(receipt.taskId).every((schedule) => schedule.state !== "cancelled")).toBe(true);
+    expect(store.listAuditRecords({ limit: 100 }).some((row) => row.action === "schedule.authority-revoked")).toBe(false);
+    state = "member";
+    clock += 2_000;
+    expect((await worker.processNext()).kind).toBe("dispatched");
+  } finally {
+    store.close();
+    await rm(directory, { recursive: true });
+  }
+});
+
