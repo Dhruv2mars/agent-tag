@@ -44,6 +44,11 @@ function xmlString(value: string): string {
   return `<string>${xmlText(value)}</string>`;
 }
 
+/**
+ * ProcessType is Standard, not Background: Background applies launchd's CPU and I/O throttling to the
+ * service and to the managed T3 it spawns, and on a loaded Mac that stretched startup past managed
+ * T3's 60 s readiness deadline, so every launch exited and launchd respawned it.
+ */
 export function renderLaunchAgent(input: LaunchAgentDefinition): string {
   const paths = [
     ...serviceProgramPaths(input.program),
@@ -76,7 +81,7 @@ ${argumentsXml}
   <key>KeepAlive</key>
   <true/>
   <key>ProcessType</key>
-  <string>Background</string>
+  <string>Standard</string>
   <key>ThrottleInterval</key>
   <integer>10</integer>
   <key>StandardOutPath</key>

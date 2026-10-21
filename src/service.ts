@@ -19,7 +19,7 @@ import { createT3GateWorker, T3RuntimeGate } from "./t3/gate.ts";
 import { inspectT3, type T3ServerInfo } from "./t3/gateway.ts";
 import { PINNED_T3 } from "./t3/lock.ts";
 import { createProviderCatalogWorker, ProviderCatalog } from "./t3/provider-catalog.ts";
-import { waitForReachableT3 } from "./t3/startup.ts";
+import { type T3StartupWait, waitForReachableT3, waitForRunnableProviders } from "./t3/startup.ts";
 import { prepareManagedT3Binary, T3ManagedRuntime } from "./t3/supervisor.ts";
 import { protocolV1Source, ThreadWatcher } from "./t3/watcher.ts";
 
@@ -410,15 +410,19 @@ export async function createAgentTagService(input: {
     }
     // A T3 that is down (or still starting) is waited for here rather than failing startup: the
     // service manager would only respawn us into the same failure.
-    await waitForReachableT3({
+    const startupWait = {
       baseUrl: t3Config.baseUrl,
       logger,
       now,
       ...(input.signal === undefined ? {} : { signal: input.signal }),
-      ...(input.state === undefined ? {} : { onWaiting: (wait) => input.state?.waitingForT3(wait) }),
+      ...(input.state === undefined ? {} : { onWaiting: (wait: T3StartupWait) => input.state?.waitingForT3(wait) }),
+    };
+    await waitForReachableT3(startupWait);
+    const server = await waitForRunnableProviders({
+      ...startupWait,
+      inspect: () => inspectT3(t3Config),
+      validate: (candidate) => validateConfiguredProviders(input.config, candidate),
     });
-    const server = await inspectT3(t3Config);
-    validateConfiguredProviders(input.config, server);
     for (const record of allowedModelLogRecords(input.config, server, now().toISOString())) logger(record);
     // Model switches are planned against this catalog; a failed refresh keeps the last good snapshot.
     const catalog = new ProviderCatalog({

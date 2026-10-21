@@ -10,7 +10,8 @@ import { createAgentTagService, type ServiceLogRecord } from "../src/service.ts"
 import { capServiceLog } from "../src/service-logs.ts";
 import { readServiceState, ServiceStateRecorder } from "../src/service-state.ts";
 import { T3EnvironmentRequestError } from "../src/t3/protocol.ts";
-import { type T3StartupWait, waitForReachableT3 } from "../src/t3/startup.ts";
+import { ProviderSelectionError } from "../src/policy/provider.ts";
+import { type T3StartupWait, waitForReachableT3, waitForRunnableProviders } from "../src/t3/startup.ts";
 
 const NOW = new Date("2026-10-21T00:00:00.000Z");
 const descriptor = (): Response =>
@@ -186,6 +187,85 @@ describe("service state", () => {
     expect(await readServiceState(dataDir, () => false)).toMatchObject({ state: "running", alive: false });
     await writeFile(join(dataDir, "service-state.json"), "{not json");
     expect(await readServiceState(dataDir)).toBeUndefined();
+  });
+});
+
+describe("waitForRunnableProviders", () => {
+  const notReady = () =>
+    new ProviderSelectionError({ code: "provider-disabled", profileId: "engineering", detail: "provider codex is not enabled and installed" });
+
+  test("re-inspects while a fresh T3 still reports the provider unusable, then returns the good catalog", async () => {
+    const records: ServiceLogRecord[] = [];
+    const waits: T3StartupWait[] = [];
+    const delays: number[] = [];
+    let inspections = 0;
+    const server = await waitForRunnableProviders({
+      baseUrl: "http://127.0.0.1:37841",
+      logger: (record) => records.push(record),
+      now: () => NOW,
+      inspect: async () => ({ inspection: (inspections += 1) }),
+      validate: (candidate) => {
+        if (candidate.inspection < 3) throw notReady();
+      },
+      sleep: async (milliseconds) => {
+        delays.push(milliseconds);
+      },
+      onWaiting: (wait) => {
+        waits.push(wait);
+      },
+    });
+    expect(server).toEqual({ inspection: 3 });
+    expect(delays).toEqual([1_000, 2_000]);
+    expect(waits.map((wait) => wait.lastError)).toEqual([
+      "profile engineering: provider codex is not enabled and installed",
+      "profile engineering: provider codex is not enabled and installed",
+    ]);
+    expect(records.map((record) => record.event)).toEqual([
+      "t3.startup.waiting",
+      "t3.startup.waiting",
+      "t3.startup.providers-ready",
+    ]);
+    expect(records[0]).toMatchObject({
+      level: "warn",
+      errorCode: "ProviderSelectionError",
+      detail:
+        "T3 at http://127.0.0.1:37841 cannot run the configured models yet " +
+        "(profile engineering: provider codex is not enabled and installed); retrying in 1 s",
+    });
+  });
+
+  test("rethrows any other inspection failure without waiting", async () => {
+    const failure = new Error("unsupported orchestration protocol");
+    await expect(
+      waitForRunnableProviders({
+        baseUrl: "http://127.0.0.1:37841",
+        logger: () => undefined,
+        now: () => NOW,
+        inspect: async () => {
+          throw failure;
+        },
+        validate: () => undefined,
+        sleep: async () => {
+          throw new Error("must not wait");
+        },
+      }),
+    ).rejects.toBe(failure);
+  });
+
+  test("stops waiting when the signal aborts", async () => {
+    const controller = new AbortController();
+    const waiting = waitForRunnableProviders({
+      baseUrl: "http://127.0.0.1:37841",
+      logger: () => undefined,
+      now: () => NOW,
+      signal: controller.signal,
+      inspect: async () => ({}),
+      validate: () => {
+        throw notReady();
+      },
+      onWaiting: () => controller.abort(),
+    });
+    await expect(waiting).rejects.toThrow();
   });
 });
 

@@ -27,6 +27,8 @@ test("renders a private macOS LaunchAgent with absolute executable arguments", (
   expect(plist).toContain("<string>/opt/homebrew/bin/bun</string>");
   expect(plist).toContain("<string>/var/lib/agent-tag/config &amp; live.json</string>");
   expect(plist).toContain("<key>KeepAlive</key>\n  <true/>");
+  // Background throttling stretched managed T3 startup past its readiness deadline under load.
+  expect(plist).toContain("<key>ProcessType</key>\n  <string>Standard</string>");
   expect(plist).not.toContain("& live.json");
 });
 
