@@ -151,15 +151,18 @@ describe("Agent Tag config", () => {
       statusProgress: false,
       statusUpdateIntervalMs: 2_000,
       statusUpdatesPerMinute: 40,
+      footer: "model",
     });
     expect(withUi({ statusUpdateIntervalMs: 999 }).success).toBe(false);
+    expect(withUi({ footer: "none" }).data?.slack.ui.footer).toBe("none");
+    expect(withUi({ footer: "provider" }).success).toBe(false);
     expect(withUi({ statusUpdateIntervalMs: 5_000 }).data?.slack.ui.statusUpdateIntervalMs).toBe(5_000);
     expect(withUi({ statusUpdatesPerMinute: 0 }).success).toBe(false);
     expect(withUi({ statusMessage: true }).success).toBe(false);
   });
 
   test("defaults and validates the ack reaction", () => {
-    expect(agentTagConfigSchema.parse(baseConfig).slack.ui).toEqual({ ackReaction: "eyes", statusProgress: true, statusUpdateIntervalMs: 2_000, statusUpdatesPerMinute: 40 });
+    expect(agentTagConfigSchema.parse(baseConfig).slack.ui).toEqual({ ackReaction: "eyes", statusProgress: true, statusUpdateIntervalMs: 2_000, statusUpdatesPerMinute: 40, footer: "model" });
     const withAck = (ackReaction: unknown) =>
       agentTagConfigSchema.safeParse({ ...baseConfig, slack: { ...baseConfig.slack, ui: { ackReaction } } });
     expect(withAck(null).data?.slack.ui.ackReaction).toBeNull();

@@ -163,6 +163,17 @@ describe("!restart", () => {
     });
   });
 
+  test("a busy restart names the queued requests it dropped in the restarting notice", async () => {
+    await withCommandHarness(config, async (h) => {
+      await runningTurn(h);
+      await h.send(message("1000.000002", "<@U0BOT> queued before"));
+      await h.send(message("1000.000003", "<@U0BOT> !restart", { user: "U2" }));
+      expect(h.operations()[1]).toMatchObject({ status: "failed", last_error_code: "user-cancelled" });
+      expect(h.outboxTexts()).toEqual([replies.restartingReply("U2", 1).text]);
+      expect(replies.restartingReply("U2", 1).text).toEndWith("Dropped 1 queued request sent before the restart.");
+    });
+  });
+
   test("a turn whose worker died (lease lapsed) is ended by the rotation", async () => {
     await withCommandHarness(config, async (h) => {
       const turn = await runningTurn(h);
@@ -212,6 +223,10 @@ describe("!restart", () => {
       await h.send(message("1000.000003", "<@U0BOT> !restart"));
       expect(task(h).session_generation).toBe(2);
       expect(h.operations()[1]).toMatchObject({ status: "failed", last_error_code: "user-cancelled" });
+      // The dropped request never started a turn (no status message), so the confirmation names it.
+      expect(h.outboxTexts().at(-1)).toBe(
+        replies.restartReadyReply({ actorUserId: "U1", rereads: true, forced: false, dropped: 1 }).text,
+      );
       expect(h.db.query("SELECT state, last_error_code FROM interactions WHERE kind = 'approval'").get()).toEqual({
         state: "failed",
         last_error_code: "session-restarted",
@@ -324,7 +339,9 @@ describe("retired session stop", () => {
         message: "Orchestration command invariant failed (thread.session.stop): thread does not exist",
       })).processNext();
       expect(dispatched).toHaveLength(2);
-      expect(retired(h)[0]).toMatchObject({ session_stopped_at: h.iso(), last_error_code: "T3CommandRejected" });
+      // Final either way; the rejection stays in the audit log, not in PR-N2's cleanup error column.
+      expect(retired(h)[0]).toMatchObject({ session_stopped_at: h.iso(), next_attempt_at: null, last_error_code: null });
+      expect(h.db.query("SELECT result FROM audit_log WHERE action = 'task.session.stopped'").get()).toEqual({ result: "rejected" });
     });
   });
 });

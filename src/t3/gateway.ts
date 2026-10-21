@@ -257,6 +257,13 @@ const sessionSchema = z
   })
   .nullable();
 
+/** A turn's checkpoint diff (T3 `thread.turn-diff-completed`); only the changed-file list is read. */
+const checkpointSchema = z.object({
+  turnId: id,
+  status: z.enum(["ready", "missing", "error"]),
+  files: z.array(z.object({ path: z.string() })),
+});
+
 export const threadSnapshotSchema = z.object({
   snapshotSequence: z.number().int().nonnegative(),
   thread: z.object({
@@ -271,6 +278,15 @@ export const threadSnapshotSchema = z.object({
     latestTurn: latestTurnSchema,
     messages: z.array(messageSchema),
     activities: z.array(activitySchema),
+    /** Absent from test fixtures and older servers; T3 0.0.45 always sends it. */
+    // Only feeds the "N files changed" count, so a checkpoint shape this schema does not know is
+    // skipped instead of failing the snapshot (and the turn).
+    checkpoints: z
+      .array(checkpointSchema.nullable().catch(null))
+      .optional()
+      .catch(undefined)
+      .transform((list) => list?.filter((checkpoint) => checkpoint !== null))
+      .optional(),
     session: sessionSchema,
   }),
 });
@@ -667,7 +683,7 @@ export async function watchT3Thread(input: {
   await Effect.runPromise(program);
 }
 
-class T3AssetTransferError extends Error {
+export class T3AssetTransferError extends Error {
   constructor() {
     super("T3 asset transfer failed");
     this.name = "T3AssetTransferError";
@@ -735,24 +751,64 @@ export async function downloadT3Attachment(input: {
     const response = await fetch(assetTransferUrl(asset.relativeUrl, input.config, "/api/assets"), {
       redirect: "error", signal: AbortSignal.timeout(30_000),
     });
-    if (!response.ok || response.body === null) throw new T3AssetTransferError();
-    const reader = response.body.getReader();
-    const chunks: Uint8Array[] = [];
-    let length = 0;
-    try {
-      while (true) {
-        const chunk = await reader.read();
-        if (chunk.done) break;
-        length += chunk.value.byteLength;
-        if (length > attachment.sizeBytes) throw new T3AssetTransferError();
-        chunks.push(chunk.value);
-      }
-    } finally { await reader.cancel(); }
-    if (length !== attachment.sizeBytes) throw new T3AssetTransferError();
-    const bytes = new Uint8Array(length);
-    let offset = 0;
-    for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
-    return bytes;
+    return await readCapped(response, attachment.sizeBytes, true);
+  } catch { throw new T3AssetTransferError(); }
+}
+
+/**
+ * Reads a 2xx body into memory, aborting once it passes `maxBytes`; with `exact`, it must be exactly
+ * `maxBytes` long. Throws T3AssetTransferError, which never carries the (signed) URL.
+ */
+async function readCapped(response: Response, maxBytes: number, exact = false): Promise<Uint8Array> {
+  if (!response.ok || response.body === null) throw new T3AssetTransferError();
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let length = 0;
+  try {
+    while (true) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      length += chunk.value.byteLength;
+      if (length > maxBytes) throw new T3AssetTransferError();
+      chunks.push(chunk.value);
+    }
+  } finally { await reader.cancel(); }
+  if (exact && length !== maxBytes) throw new T3AssetTransferError();
+  const bytes = new Uint8Array(length);
+  let offset = 0;
+  for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+  return bytes;
+}
+
+/**
+ * A file in a thread's workspace through T3's `workspace-file` asset (realpath containment on the T3
+ * side). Pinned T3 0.0.45 issues these URLs only for browser-preview types (.htm, .html, .pdf and
+ * images) and refuses every other extension, so Slack uploads read the worktree directly
+ * (slack/uploads.ts); this pins that contract in the live test. Never `media-file`: it takes host
+ * paths outside the workspace.
+ */
+export async function downloadT3WorkspaceFile(input: {
+  readonly config: T3ConnectionConfig;
+  readonly threadId: string;
+  readonly path: string;
+  readonly maxBytes: number;
+  readonly signal?: AbortSignal;
+}): Promise<Uint8Array> {
+  const resource = { _tag: "workspace-file", threadId: id.parse(input.threadId), path: id.parse(input.path) };
+  const url = await socketUrl(input.config, input.signal);
+  const program = Effect.gen(function* () {
+    const client = yield* RpcClient.make(rpcGroup);
+    return z.object({ relativeUrl: id }).parse(yield* client["assets.createUrl"]({ resource }));
+  }).pipe(Effect.provide(protocolLayer(url)), Effect.scoped);
+  let asset: { readonly relativeUrl: string };
+  try {
+    asset = await runRpc(program, input.signal);
+  } catch { throw new T3AssetTransferError(); }
+  try {
+    const response = await fetch(assetTransferUrl(asset.relativeUrl, input.config, "/api/assets"), {
+      redirect: "error", signal: AbortSignal.timeout(30_000),
+    });
+    return await readCapped(response, input.maxBytes);
   } catch { throw new T3AssetTransferError(); }
 }
 

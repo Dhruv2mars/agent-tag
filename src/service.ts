@@ -13,6 +13,7 @@ import { createServiceLogWorker } from "./service-logs.ts";
 import type { ServiceStateRecorder } from "./service-state.ts";
 import { SlackSocketBridge } from "./slack/bridge.ts";
 import { createMembershipWorker } from "./slack/membership.ts";
+import { FileUploadWorker } from "./slack/uploads.ts";
 import { createRetentionWorker } from "./store/retention.ts";
 import { AgentTagStore } from "./store/store.ts";
 import { isT3CredentialRejection } from "./t3/auth.ts";
@@ -487,6 +488,8 @@ export async function createAgentTagService(input: {
         new LifecycleWorker({ store, policy: input.config.lifecycle, now }),
         new TaskRestartWorker({ store, config: () => input.config, now }),
         new SessionStopWorker({ store, dispatch: (command) => t3.dispatch(command), now }),
+        // Agent file shares (PR-L2); with files.outbound off it fails any queued row.
+        new FileUploadWorker({ config: input.config, store, slack: bridge.uploads, now }),
         {
           processNext: async () => {
             const current = now();
