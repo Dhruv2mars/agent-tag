@@ -311,21 +311,51 @@ describe("startTransientManagedT3 next to a running managed T3", () => {
   });
 });
 
-describe("startTransientManagedT3 with a stale server-runtime.json", () => {
-  test("a recycled pid with nothing on the port does not block the start", async () => {
-    const config = await liveManagedConfig();
+describe("startTransientManagedT3 with a server-runtime.json pid that is not answering", () => {
+  async function recordPid(config: ManagedT3Config): Promise<ReturnType<typeof Bun.spawn>> {
+    const child = Bun.spawn(["sleep", "30"]);
     await mkdir(join(config.managed.homeDir, "userdata"), { recursive: true });
-    // Our own pid is alive but is not a T3; nothing listens on the managed port.
-    await writeFile(join(config.managed.homeDir, "userdata", "server-runtime.json"), JSON.stringify({ pid: process.pid }));
-    await expect(
-      startTransientManagedT3({
-        t3: { ...config, tokenFile: join(config.managed.homeDir, "missing-token") },
-        pin: PINNED_T3,
-        logger: () => {},
-        installed: { binary: FAKE_T3_BINARY, version: PINNED_T3.version },
-        runtimeOptions: { timing: FAST },
-      }),
-    ).rejects.not.toThrow("already running");
-    expect(alive(process.pid)).toBe(true);
+    await writeFile(join(config.managed.homeDir, "userdata", "server-runtime.json"), JSON.stringify({ pid: child.pid }));
+    return child;
+  }
+
+  test("a recycled pid (not our t3 serve) neither blocks the start nor gets killed", async () => {
+    const config = await liveManagedConfig();
+    const child = await recordPid(config);
+    try {
+      // The start gets past the guard and the runtime starts; it then fails only at minting, since the fake T3 has no auth.
+      await expect(
+        startTransientManagedT3({
+          t3: { ...config, tokenFile: join(config.managed.homeDir, "missing-token") },
+          pin: PINNED_T3,
+          logger: () => {},
+          installed: { binary: FAKE_T3_BINARY, version: PINNED_T3.version },
+          runtimeOptions: { timing: FAST },
+        }),
+      ).rejects.toThrow("t3 auth session issue");
+      expect(alive(child.pid)).toBe(true);
+    } finally {
+      child.kill();
+    }
+  });
+
+  test("our own t3 serve that does not answer yet still blocks the start", async () => {
+    const config = await liveManagedConfig();
+    const child = await recordPid(config);
+    try {
+      const args = `${FAKE_T3_BINARY} serve --host 127.0.0.1 --port ${config.managed.port} --base-dir ${config.managed.homeDir}`;
+      await expect(
+        startTransientManagedT3({
+          t3: config,
+          pin: PINNED_T3,
+          logger: () => {},
+          installed: { binary: FAKE_T3_BINARY, version: PINNED_T3.version },
+          run: async () => ({ exitCode: 0, stdout: `${args}\n`, stderr: "" }),
+        }),
+      ).rejects.toThrow(`managed T3 is already running in ${config.managed.homeDir} (pid ${child.pid})`);
+      expect(alive(child.pid)).toBe(true);
+    } finally {
+      child.kill();
+    }
   });
 });

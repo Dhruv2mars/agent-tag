@@ -3,7 +3,7 @@ import { join } from "node:path";
 
 import { z } from "zod";
 
-import type { CommandRunner } from "../command.ts";
+import { type CommandRunner, runCommand } from "../command.ts";
 import type { ResolvedT3Config } from "../config.ts";
 import { readSecretFile } from "../security/secret-file.ts";
 import type { ServiceLogger } from "../service.ts";
@@ -12,6 +12,7 @@ import { inspectInstalledT3 } from "./install.ts";
 import type { T3Pin } from "./pin.ts";
 import { type EnvironmentFetch, fetchT3EnvironmentDescriptor, t3DescriptorProblem } from "./protocol.ts";
 import {
+  isManagedServeCommand,
   type ManagedT3Binary,
   prepareManagedT3Binary,
   redactT3Output,
@@ -108,9 +109,16 @@ export async function startTransientManagedT3(input: {
   readonly run?: CommandRunner;
 }): Promise<TransientManagedT3> {
   // Starting would reap a live runtime in this home as an orphan, taking T3 away from a running service.
-  // A stale server-runtime.json whose pid was recycled has nothing answering on the port, so it passes.
+  // It counts as live when it answers on the port or still runs our `t3 serve` for this home (the
+  // supervisor's orphan test); a stale server-runtime.json whose pid was recycled passes.
+  const { managed } = input.t3;
   const live = await inspectManagedT3Runtime({ t3: input.t3, pinnedVersion: input.pin.version });
-  if (live.pid !== null && live.protocol !== null) {
+  const servesThisHome = async (pid: number): Promise<boolean> => {
+    const args = (await (input.run ?? runCommand)(["ps", "-ww", "-o", "args=", "-p", String(pid)])).stdout.trim();
+    const binary = input.installed?.binary ?? join(managed.runtimeDir, "versions", input.pin.version, "t3");
+    return isManagedServeCommand(args, { homeDir: managed.homeDir, runtimeDir: managed.runtimeDir, binary });
+  };
+  if (live.pid !== null && (live.protocol !== null || (await servesThisHome(live.pid)))) {
     throw new Error(
       `managed T3 is already running in ${input.t3.managed.homeDir} (pid ${live.pid}); stop the Agent Tag service (or \`agent-tag t3 serve\`) first`,
     );
