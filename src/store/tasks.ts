@@ -763,8 +763,8 @@ function findOrCreateTask(database: Database, event: {
 /**
  * Reopens a closed task as the next session generation: a fresh T3 thread id (created on the next
  * turn's bootstrap, on branch `taskBranchName(id, generation)`), so the retired thread is never
- * written to again. The applied and rejected model selections were per T3 thread and reset; the
- * user's chosen model, schedules, memory and thread mute stay with the task.
+ * written to again. The applied and rejected model selections and the injected memory digest were
+ * per T3 thread and reset; the user's chosen model, schedules, memory and thread mute stay with the task.
  */
 function reopenTask(database: Database, input: { readonly taskId: string; readonly generation: number; readonly now: string }): void {
   const generation = input.generation + 1;
@@ -772,7 +772,7 @@ function reopenTask(database: Database, input: { readonly taskId: string; readon
   const result = database
     .query(
       `UPDATE tasks SET state = 'active', session_generation = ?, t3_thread_id = ?, t3_thread_started_at = NULL,
-         t3_model_selection_json = NULL, t3_rejected_model_selection_json = NULL, closed_at = NULL,
+         t3_model_selection_json = NULL, t3_rejected_model_selection_json = NULL, memory_digest = NULL, closed_at = NULL,
          close_reason = NULL, close_requested_at = NULL, session_released_at = NULL, last_activity_at = ?,
          updated_at = ?
        WHERE task_id = ? AND state = 'closed' AND session_generation = ?`,

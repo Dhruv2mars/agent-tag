@@ -562,6 +562,55 @@ export const STORE_MIGRATIONS: readonly StoreMigration[] = [
         CHECK ((muted_at IS NULL) = (mute_source IS NULL))
       );
     `,
+  },  {
+    // Channel memory (PR-K1): rebuilds memory_entries to add the `channel` scope (keyed by Slack
+    // conversation, no profile) plus conversation_id and updated_by, and adds tasks.memory_digest
+    // (which memory set the last frozen turn showed). Independent of 12-21; SQLite cannot alter a
+    // CHECK, and nothing references memory_entries by foreign key, so the rebuild is safe.
+    version: 22,
+    sql: `
+      CREATE TABLE memory_entries_next (
+        memory_id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL,
+        scope TEXT NOT NULL CHECK (scope IN ('shared', 'profile', 'task', 'private', 'channel')),
+        profile_id TEXT,
+        task_id TEXT REFERENCES tasks(task_id),
+        owner_user_id TEXT,
+        conversation_id TEXT,
+        content TEXT NOT NULL,
+        source_type TEXT NOT NULL,
+        source_id TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('active', 'forgotten')),
+        version INTEGER NOT NULL DEFAULT 1 CHECK (version > 0),
+        expires_at TEXT NOT NULL,
+        forgotten_at TEXT,
+        created_by TEXT NOT NULL,
+        updated_by TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        CHECK (
+          (scope = 'shared' AND profile_id IS NULL AND task_id IS NULL AND owner_user_id IS NULL AND conversation_id IS NULL) OR
+          (scope = 'profile' AND profile_id IS NOT NULL AND task_id IS NULL AND owner_user_id IS NULL AND conversation_id IS NULL) OR
+          (scope = 'task' AND profile_id IS NULL AND task_id IS NOT NULL AND owner_user_id IS NULL AND conversation_id IS NULL) OR
+          (scope = 'private' AND profile_id IS NOT NULL AND task_id IS NULL AND owner_user_id IS NOT NULL AND conversation_id IS NULL) OR
+          (scope = 'channel' AND profile_id IS NULL AND task_id IS NULL AND owner_user_id IS NULL AND conversation_id IS NOT NULL)
+        )
+      );
+      INSERT INTO memory_entries_next (
+        memory_id, workspace_id, scope, profile_id, task_id, owner_user_id, conversation_id, content,
+        source_type, source_id, state, version, expires_at, forgotten_at, created_by, updated_by, created_at, updated_at)
+      SELECT memory_id, workspace_id, scope, profile_id, task_id, owner_user_id, NULL, content,
+        source_type, source_id, state, version, expires_at, forgotten_at, created_by, NULL, created_at, updated_at
+      FROM memory_entries;
+      DROP TABLE memory_entries;
+      ALTER TABLE memory_entries_next RENAME TO memory_entries;
+      CREATE INDEX memory_entries_visibility_idx
+        ON memory_entries(workspace_id, state, scope, profile_id, task_id, owner_user_id, expires_at);
+      CREATE INDEX memory_entries_conversation_idx
+        ON memory_entries(workspace_id, state, scope, conversation_id, expires_at);
+
+      ALTER TABLE tasks ADD COLUMN memory_digest TEXT;
+    `,
   },
   {
     // Task lifecycle (PR-N1): idle close and reopen as a new session generation on the same task row.
@@ -569,7 +618,7 @@ export const STORE_MIGRATIONS: readonly StoreMigration[] = [
     // and the PR-N2 cleanup worker, so it is created once with every reason and cleanup column: a
     // widened CHECK would need a table rebuild. Backfill: an existing task's last activity is its
     // `updated_at`. New tables and columns only, so it applies in any order relative to other versions.
-    version: 22,
+    version: 23,
     sql: `
       ALTER TABLE tasks ADD COLUMN session_generation INTEGER NOT NULL DEFAULT 1 CHECK (session_generation >= 1);
       ALTER TABLE tasks ADD COLUMN last_activity_at TEXT;

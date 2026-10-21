@@ -196,6 +196,54 @@ describe("Agent Tag config", () => {
     ).toThrow("DM route owner is not in access.allowedUserIds");
   });
 
+  test("defaults and validates the memory settings and route visibility", () => {
+    const profile = baseConfig.profiles[0];
+    if (profile === undefined) throw new Error("base profile is missing");
+    const parsed = agentTagConfigSchema.parse(baseConfig);
+    expect(parsed.profiles[0]?.memory).toEqual({
+      shared: true,
+      privateDm: false,
+      retentionDays: 180,
+      slackCommands: true,
+      dmReadsWorkspace: false,
+      injection: "first-turn-and-changes",
+      maxInjectedChars: 6_000,
+      maxEntryChars: 1_000,
+      maxEntriesPerConversation: 100,
+      maxWorkspaceEntries: 200,
+    });
+    const withMemory = (memory: Record<string, unknown>) =>
+      agentTagConfigSchema.parse({ ...baseConfig, profiles: [{ ...profile, memory: { ...profile.memory, ...memory } }] });
+    expect(withMemory({ injection: "every-turn" }).profiles[0]?.memory.injection).toBe("every-turn");
+    expect(() => withMemory({ injection: "never" })).toThrow();
+    expect(() => withMemory({ maxInjectedChars: 499 })).toThrow();
+    expect(() => withMemory({ maxEntryChars: 2_001 })).toThrow();
+    expect(() => withMemory({ maxWorkspaceEntries: 0 })).toThrow();
+
+    const route = baseConfig.routes[0];
+    expect(
+      agentTagConfigSchema.parse({ ...baseConfig, routes: [{ ...route, visibility: "private" }] }).routes[0],
+    ).toMatchObject({ visibility: "private" });
+    expect(() => agentTagConfigSchema.parse({ ...baseConfig, routes: [{ ...route, visibility: "secret" }] })).toThrow();
+    expect(() =>
+      agentTagConfigSchema.parse({
+        ...baseConfig,
+        access: { ...baseConfig.access, allowedChannelIds: ["D123"] },
+        profiles: [{ ...profile, memory: { ...profile.memory, privateDm: true } }],
+        routes: [
+          {
+            conversationId: "D123",
+            conversationType: "dm",
+            ownerUserId: "U123",
+            profileId: "engineering",
+            repositoryRoot: "/repos/example",
+            visibility: "public",
+          },
+        ],
+      }),
+    ).toThrow("DM routes cannot set visibility");
+  });
+
   test("rejects ambiguous duplicate conversation routes", () => {
     expect(() =>
       agentTagConfigSchema.parse({
