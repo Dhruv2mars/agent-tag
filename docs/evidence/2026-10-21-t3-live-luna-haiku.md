@@ -48,7 +48,7 @@ The token was minted by `scripts/enroll-t3.ts` with scopes `orchestration:read o
 | agent files: a real thread worktree reads back exactly… (PR-L2 Done 8) | Luna | pass | SLK-05 |
 | lifecycle cleanup: tasks close + tasks cleanup --once… (PR-N Done 5) | Luna | pass | LIFE-01 |
 | moves a started thread to another model of the same driver in place… | Haiku 4.5 → Haiku 5.5 | pass | MOD-01, T3-04 |
-| refuses a turn that moves a started thread to another driver… | Haiku 5.5 → Luna | pass | MOD-01, T3-04 |
+| refuses a turn that moves a started thread to another driver… | Haiku 4.5 → Luna | pass | MOD-01, T3-04 |
 
 `docs/evidence/2026-10-21-t3-live-main.md` records two failures on `main`: the durable restart case (T3-02) and the reject/interrupt case (SLK-04). Both were Codex `gpt-5.6-sol` turns that ran past the fixtures' 60 s budgets. On Luna both pass unchanged, so the suite is green with no change to the fixtures.
 
