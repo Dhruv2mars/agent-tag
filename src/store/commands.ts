@@ -26,6 +26,7 @@ export const SLACK_COMMAND_KINDS = [
   "memory-list",
   "memory-forget",
   "memory-edit",
+  "model-switch",
 ] as const;
 export const slackCommandKindSchema = z.enum(SLACK_COMMAND_KINDS);
 export type SlackCommandKind = z.infer<typeof slackCommandKindSchema>;

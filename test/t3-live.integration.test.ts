@@ -8,7 +8,7 @@ import { z } from "zod";
 
 import { agentTagConfigSchema } from "../src/config.ts";
 import { classifyT3DispatchError } from "../src/t3/dispatch-errors.ts";
-import { AgentTagCoordinator } from "../src/coordinator.ts";
+import { AgentTagCoordinator, classifyT3TurnFailure } from "../src/coordinator.ts";
 import { ProviderSelectionError, validateConfiguredProviders } from "../src/policy/provider.ts";
 import { ArtifactError, readWorkspaceArtifact } from "../src/slack/uploads.ts";
 import { AgentTagStore } from "../src/store/store.ts";
@@ -1198,6 +1198,150 @@ if (!enabled) {
           }
           await removeFixtureDirectory(fixtureRoot);
         }
+      },
+      240_000,
+    );
+
+    /**
+     * PR-P2 Done 7: what T3 0.0.45 does with a model change on a started thread. Starts a Claude
+     * thread on `from`, then runs `act` on it; the fixture project is deleted afterwards.
+     */
+    async function withStartedClaudeThread(
+      from: string,
+      act: (input: { readonly threadId: string; readonly turn: (model: { instanceId: string; model: string }, text: string) => Promise<void> }) => Promise<void>,
+    ): Promise<void> {
+      const workspaceRoot = await mkdtemp(join(tmpdir(), "agent-tag-t3-switch-"));
+      const projectId = crypto.randomUUID();
+      const threadId = crypto.randomUUID();
+      let created = false;
+      try {
+        await writeFile(join(workspaceRoot, "README.md"), "# Agent Tag model switch fixture\n");
+        await runGit(workspaceRoot, "init", "-b", "main");
+        await runGit(workspaceRoot, "config", "user.name", "Agent Tag Integration");
+        await runGit(workspaceRoot, "config", "user.email", "agent-tag@example.invalid");
+        await runGit(workspaceRoot, "add", "README.md");
+        await runGit(workspaceRoot, "commit", "-m", "test: add model switch fixture");
+        await dispatchT3Command({
+          config,
+          command: {
+            type: "project.create",
+            commandId: crypto.randomUUID(),
+            projectId,
+            title: "Agent Tag model switch fixture",
+            workspaceRoot,
+            createdAt: new Date().toISOString(),
+          },
+        });
+        created = true;
+        const createdAt = new Date().toISOString();
+        const start = { instanceId: "claudeAgent", model: from };
+        await dispatchT3Command({
+          config,
+          command: {
+            type: "thread.turn.start",
+            commandId: crypto.randomUUID(),
+            threadId,
+            message: {
+              messageId: crypto.randomUUID(),
+              role: "user",
+              text: "Reply with exactly switch-one-ok. Do not call tools, change files, or use the network.",
+              attachments: [],
+            },
+            modelSelection: start,
+            titleSeed: "Agent Tag model switch fixture",
+            runtimeMode: "approval-required",
+            interactionMode: "default",
+            bootstrap: {
+              createThread: {
+                projectId,
+                title: "Agent Tag model switch fixture",
+                modelSelection: start,
+                runtimeMode: "approval-required",
+                interactionMode: "default",
+                branch: "main",
+                worktreePath: workspaceRoot,
+                createdAt,
+              },
+              runSetupScript: false,
+            },
+            createdAt,
+          },
+        });
+        await waitForSnapshot(threadId, (candidate) => candidate.thread.latestTurn?.state === "completed", 120_000);
+        await act({
+          threadId,
+          turn: async (modelSelection, text) => {
+            await dispatchT3Command({
+              config,
+              command: {
+                type: "thread.turn.start",
+                commandId: crypto.randomUUID(),
+                threadId,
+                message: { messageId: crypto.randomUUID(), role: "user", text, attachments: [] },
+                modelSelection,
+                runtimeMode: "approval-required",
+                interactionMode: "default",
+                createdAt: new Date().toISOString(),
+              },
+            });
+          },
+        });
+      } finally {
+        if (created) {
+          await dispatchT3Command({
+            config,
+            command: { type: "project.delete", commandId: crypto.randomUUID(), projectId, force: true },
+          });
+        }
+        if (!workspaceRoot.startsWith(`${tmpdir()}/agent-tag-t3-switch-`)) {
+          throw new Error(`refusing to remove unexpected fixture path ${workspaceRoot}`);
+        }
+        await removeFixtureDirectory(workspaceRoot);
+      }
+    }
+
+    test(
+      "moves a started thread to another model of the same driver in place, and the next turn runs on it",
+      async () => {
+        await withStartedClaudeThread("claude-haiku-4-5", async ({ threadId, turn }) => {
+          const target = { instanceId: "claudeAgent", model: "claude-sonnet-4-6" };
+          await dispatchT3Command({
+            config,
+            command: { type: "thread.meta.update", commandId: crypto.randomUUID(), threadId, modelSelection: target },
+          });
+          await turn(target, "Reply with exactly switch-two-ok. Do not call tools, change files, or use the network.");
+          const snapshot = await waitForSnapshot(
+            threadId,
+            (candidate) =>
+              candidate.thread.latestTurn?.state === "completed" &&
+              candidate.thread.messages.some((message) => message.role === "assistant" && !message.streaming && message.text.includes("switch-two-ok")),
+            120_000,
+          );
+          expect(snapshot.thread.modelSelection).toEqual(target);
+          expect(snapshot.thread.session).toMatchObject({ providerInstanceId: "claudeAgent", lastError: null });
+          expect(snapshot.thread.activities.some((activity) => activity.kind === "provider.turn.start.failed")).toBe(false);
+        });
+      },
+      300_000,
+    );
+
+    test(
+      "refuses a turn that moves a started thread to another driver with provider.turn.start.failed",
+      async () => {
+        await withStartedClaudeThread("claude-haiku-4-5", async ({ threadId, turn }) => {
+          await turn({ instanceId: "codex", model: "gpt-5.6-sol" }, "Reply with exactly switch-cross-ok.");
+          const snapshot = await waitForSnapshot(
+            threadId,
+            (candidate) => candidate.thread.activities.some((activity) => activity.kind === "provider.turn.start.failed"),
+            60_000,
+          );
+          const failure = snapshot.thread.activities.find((activity) => activity.kind === "provider.turn.start.failed")!;
+          const detail = z.object({ detail: z.string() }).parse(failure.payload).detail;
+          // Agent Tag reads this as a refused switch, so the thread keeps its model (Done 6).
+          expect(classifyT3TurnFailure(detail).code).toBe("T3ModelSwitchRejected");
+          expect(snapshot.thread.modelSelection).toEqual({ instanceId: "claudeAgent", model: "claude-haiku-4-5" });
+          console.log(`provider.turn.start.failed detail: ${detail}`);
+        });
       },
       240_000,
     );

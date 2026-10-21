@@ -4,10 +4,14 @@ import type { CommandIngress } from "../commands/context.ts";
 import { IMPLEMENTED_COMMANDS, isCommandUsage, parseAgentCommand } from "../commands/parse.ts";
 import type { AgentTagConfig } from "../config.ts";
 import { isSteeringAllowed } from "../policy/access.ts";
+import { allowedChoices } from "../policy/models.ts";
 import { detectRoutineIntent } from "../routines/intent.ts";
-import { AgentTagStore, type ActiveTaskBinding, type IngestReceipt } from "../store/store.ts";
+import { AgentTagStore, type ActiveTaskBinding, type IngestReceipt, type SlackEventInput } from "../store/store.ts";
+import type { T3ServerInfo } from "../t3/gateway.ts";
 import type { MemoryIngress } from "./memory-commands.ts";
 import { parseMemoryCommand } from "./memory-grammar.ts";
+import { parseModelDirective } from "./model-directive.ts";
+import type { ModelIngress } from "./model-switch.ts";
 import { matchCancelTargets, type RoutineIngress } from "./routines.ts";
 
 const slackId = z.string().regex(/^[A-Z][A-Z0-9]+$/);
@@ -69,6 +73,8 @@ export type SlackIngressResult =
   | RoutineIngress
   /** A memory phrase (remember, list, forget, update): no ingest, no operation. The bridge runs it (slack/memory-commands.ts). */
   | MemoryIngress
+  /** A model switch ("use opus", "switch to …"): the bridge runs it, queueing any request after it (slack/model-switch.ts). */
+  | ModelIngress
   | {
       readonly kind: "ignored";
       readonly reason:
@@ -99,6 +105,8 @@ export interface SlackEventRouterOptions {
   readonly botUserId: string;
   /** `auth.test.bot_id`: the agent's own bot ID, so its `chat.update` echoes are dropped unwritten. */
   readonly selfBotId?: string;
+  /** The T3 provider catalog: a catalog model that is not allowed is answered as such, not run as a prompt. */
+  readonly catalog?: { current(): T3ServerInfo | null };
   readonly now?: () => string;
 }
 
@@ -123,6 +131,7 @@ export class SlackEventRouter {
   readonly #store: AgentTagStore;
   readonly #botUserId: string;
   readonly #selfBotId: string | undefined;
+  readonly #catalog: SlackEventRouterOptions["catalog"];
   readonly #now: () => string;
 
   constructor(options: SlackEventRouterOptions) {
@@ -130,6 +139,7 @@ export class SlackEventRouter {
     this.#store = options.store;
     this.#botUserId = slackId.parse(options.botUserId);
     this.#selfBotId = options.selfBotId === undefined ? undefined : slackId.parse(options.selfBotId);
+    this.#catalog = options.catalog;
     this.#now = options.now ?? (() => new Date().toISOString());
   }
 
@@ -415,9 +425,53 @@ export class SlackEventRouter {
       ? { rootTs: threadTs, beforeTs: event.ts }
       : undefined;
     const text = event.text.replaceAll(`<@${this.#botUserId}>`, "").trim();
+    const prompt = (promptText: string): SlackEventInput => ({
+      deliveryId,
+      eventKey,
+      workspaceId,
+      conversationId: event.channel,
+      threadTs,
+      actorUserId,
+      conversationType: route.conversationType,
+      profileId,
+      repositoryRoot,
+      text: promptText,
+      receivedAt,
+      sourceOrderKey: event.ts,
+      messageTs: event.ts,
+      origin: "slack",
+      files: event.files ?? [],
+      ...(this.#config.slack.ui.ackReaction === null ? {} : { ackReaction: this.#config.slack.ui.ackReaction }),
+      ...(threadContext === undefined ? {} : { threadContext }),
+      ...(binding !== null && explicitMention ? { unmuteThread: true } : {}),
+    });
+    const addressed = explicitMention || route.conversationType === "dm" || binding !== null;
+    // A model switch (PR-P2 §3.5) only when addressed, like memory phrases: ambient chatter is never parsed.
+    if (addressed) {
+      const directive = parseModelDirective(text, allowedChoices(profile, route), this.#catalog?.current() ?? null);
+      if (directive !== null) {
+        return {
+          kind: "model",
+          directive,
+          request: {
+            deliveryId,
+            eventKey,
+            workspaceId,
+            conversationId: event.channel,
+            conversationType: route.conversationType,
+            threadTs,
+            actorUserId,
+            profileId,
+            repositoryRoot,
+            receivedAt,
+          },
+          prompt: directive.remainder.length === 0 ? null : prompt(directive.remainder),
+        };
+      }
+    }
     // Memory phrases only when addressed: a mention, a DM, or a reply in a bound thread. Ambient
     // top-level chatter never writes memory.
-    if (profile.memory.slackCommands && (explicitMention || route.conversationType === "dm" || binding !== null)) {
+    if (profile.memory.slackCommands && addressed) {
       const memoryCommand = parseMemoryCommand(text);
       if (memoryCommand !== null) {
         return {
@@ -463,26 +517,7 @@ export class SlackEventRouter {
         };
       }
     }
-    const receipt = this.#store.ingestSlackEvent({
-      deliveryId,
-      eventKey,
-      workspaceId,
-      conversationId: event.channel,
-      threadTs,
-      actorUserId,
-      conversationType: route.conversationType,
-      profileId,
-      repositoryRoot,
-      text,
-      receivedAt,
-      sourceOrderKey: event.ts,
-      messageTs: event.ts,
-      origin: "slack",
-      files: event.files ?? [],
-      ...(this.#config.slack.ui.ackReaction === null ? {} : { ackReaction: this.#config.slack.ui.ackReaction }),
-      ...(threadContext === undefined ? {} : { threadContext }),
-      ...(binding !== null && explicitMention ? { unmuteThread: true } : {}),
-    });
+    const receipt = this.#store.ingestSlackEvent(prompt(text));
     return { kind: receipt.kind, receipt };
   }
 }
