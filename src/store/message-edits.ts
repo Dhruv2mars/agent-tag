@@ -40,12 +40,6 @@ export interface EnqueueMessageRefreshInput {
   /** The rendered entity, for example an interaction id; stored in correlation_id. */
   readonly refreshKey: string;
   readonly now: string;
-  /**
-   * Throttle: the edit is not sent before this instant. Coalescing into a pending, never-attempted
-   * edit only ever moves its send time earlier (a retry backoff is kept), so a later request cannot
-   * delay an earlier one. Absent means due now.
-   */
-  readonly notBefore?: string;
 }
 
 export interface EnqueueMessageEditInput {
@@ -68,7 +62,6 @@ export function enqueueMessageRefresh(database: Database, input: EnqueueMessageR
     correlationId: () => refreshKey,
     clientMessageId: () => `${refreshKey}:refresh:${crypto.randomUUID()}`,
     now: input.now,
-    notBefore: input.notBefore === undefined ? null : isoDateTime.parse(input.notBefore),
   });
 }
 
@@ -81,7 +74,6 @@ export function enqueueMessageEdit(database: Database, input: EnqueueMessageEdit
     correlationId: (target) => target.correlation_id,
     clientMessageId: (target) => `${target.correlation_id}:edit:${crypto.randomUUID()}`,
     now: input.now,
-    notBefore: null,
   });
 }
 
@@ -92,7 +84,6 @@ function enqueueEdit(database: Database, input: {
   readonly correlationId: (target: z.infer<typeof editTargetSchema>) => string;
   readonly clientMessageId: (target: z.infer<typeof editTargetSchema>) => string;
   readonly now: string;
-  readonly notBefore: string | null;
 }): MessageEditResult {
   const now = isoDateTime.parse(input.now);
   const target = editTargetSchema.nullable().parse(
@@ -129,16 +120,15 @@ function enqueueEdit(database: Database, input: {
       .get(target.outbox_id),
   );
   if (pending !== null) {
+    // The coalesced edit is due again: the claim re-applies any throttle (see statusEditDeferral),
+    // so newer state, such as a terminal status, is never held back. A retry keeps its backoff.
     database
       .query(
-        `UPDATE slack_outbox SET payload_json = ?1, refresh_kind = ?2, correlation_id = ?3, updated_at = ?4,
-           blocked_until = CASE
-             WHEN attempts = 0 AND blocked_until IS NOT NULL
-               AND (?5 IS NULL OR julianday(?5) < julianday(blocked_until)) THEN ?5
-             ELSE blocked_until END
-         WHERE outbox_id = ?6 AND status = 'pending'`,
+        `UPDATE slack_outbox SET payload_json = ?, refresh_kind = ?, correlation_id = ?, updated_at = ?,
+           blocked_until = CASE WHEN attempts = 0 THEN NULL ELSE blocked_until END
+         WHERE outbox_id = ? AND status = 'pending'`,
       )
-      .run(JSON.stringify(input.payload), input.refreshKind, correlationId, now, input.notBefore, pending.outbox_id);
+      .run(JSON.stringify(input.payload), input.refreshKind, correlationId, now, pending.outbox_id);
     audit(pending.outbox_id, "coalesced");
     return { outboxId: pending.outbox_id, reused: true };
   }
@@ -154,7 +144,6 @@ function enqueueEdit(database: Database, input: {
     payload: input.payload,
     createdAt: now,
     edit: { targetOutboxId: target.outbox_id, refreshKind: input.refreshKind },
-    blockedUntil: input.notBefore,
   });
   audit(outboxId, "pending");
   return { outboxId, reused: false };

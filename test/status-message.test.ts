@@ -64,7 +64,7 @@ interface Harness {
   readonly drain: (at: string) => Promise<void>;
 }
 
-async function withHarness(run: (harness: Harness) => Promise<void>): Promise<void> {
+async function withHarness(run: (harness: Harness) => Promise<void>, harnessConfig = config): Promise<void> {
   const directory = await mkdtemp(join(tmpdir(), "agent-tag-status-"));
   const path = join(directory, "agent-tag.sqlite");
   const store = await AgentTagStore.open(path);
@@ -78,11 +78,11 @@ async function withHarness(run: (harness: Harness) => Promise<void>): Promise<vo
       drain: async (clock) => {
         for (;;) {
           const outcome = await deliverNextSlackOutbox({
-            config,
+            config: harnessConfig,
             store,
             workerId: "slack-a",
             now: () => clock,
-            refreshRenderers: refreshRenderers(store, config),
+            refreshRenderers: refreshRenderers(store, harnessConfig),
             postMessage: async (message) => {
               posted += 1;
               const ts = `2000.${String(posted).padStart(6, "0")}`;
@@ -426,8 +426,6 @@ describe("live status message (F3)", () => {
           store.updateStatusProgress({
             operationId: receipt.operationId,
             progress: progress.view(),
-            intervalMs: interval,
-            perMinute: config.slack.ui.statusUpdatesPerMinute,
             now: clock,
           });
         }
@@ -447,8 +445,9 @@ describe("live status message (F3)", () => {
     });
   });
 
-  test("the global edit budget spreads status edits across messages", async () => {
-    await withHarness(async ({ store, path, drain }) => {
+  test("the global edit budget holds every minute to statusUpdatesPerMinute, counted at delivery", async () => {
+    const budget = { ...config, slack: { ...config.slack, ui: { ...config.slack.ui, statusUpdatesPerMinute: 2 } } };
+    await withHarness(async ({ store, calls, drain }) => {
       const operations = [1, 2, 3].map((index) => {
         const receipt = store.ingestSlackEvent({
           deliveryId: `delivery-${index}`,
@@ -476,31 +475,18 @@ describe("live status message (F3)", () => {
       });
       await drain(now);
       for (const operationId of operations) {
-        store.updateStatusProgress({
-          operationId,
-          progress: { plan: [], recent: ["Ran tests"], toolCount: 1 },
-          intervalMs: 1_000,
-          perMinute: 2,
-          now: at(5_000),
-        });
+        store.updateStatusProgress({ operationId, progress: { plan: [], recent: ["Ran tests"], toolCount: 1 }, now: at(5_000) });
       }
-      const database = new Database(path, { readonly: true, strict: true });
-      try {
-        const rows = database
-          .query<{ blocked_until: string }, []>(
-            "SELECT blocked_until FROM slack_outbox WHERE refresh_kind = 'status-message' ORDER BY blocked_until",
-          )
-          .all();
-        // Budget 2/min: the first two go after the per-message interval, the third a minute after them.
-        expect(rows.map((row) => row.blocked_until)).toEqual([at(5_000), at(5_000), at(5_000 + 60_000)]);
-      } finally {
-        database.close();
-      }
-    });
+      // The outbox was held up until 90 s: two edits go out then, the third a minute after them.
+      await drain(at(90_000));
+      await drain(at(149_999));
+      await drain(at(150_000));
+      expect(calls.filter((call) => call.method === "update").map((call) => call.at)).toEqual([at(90_000), at(90_000), at(150_000)]);
+    }, budget);
   });
 
-  test("an edit delivered late pushes the next one an interval past its delivery", async () => {
-    await withHarness(async ({ store, path, calls, drain }) => {
+  test("a status message is edited at most once per interval, measured from actual delivery", async () => {
+    await withHarness(async ({ store, calls, drain }) => {
       const receipt = ingest(store, 1);
       store.claimNextOperation({ workerId: "worker-a", now, leaseMs: 600_000, maxConcurrentTasks: 2 });
       store.openStatusMessage({
@@ -513,29 +499,27 @@ describe("live status message (F3)", () => {
       });
       await drain(now);
       const update = (recent: string, clock: string) =>
-        store.updateStatusProgress({
-          operationId: receipt.operationId,
-          progress: { plan: [], recent: [recent], toolCount: 1 },
-          intervalMs: 2_000,
-          perMinute: 40,
-          now: clock,
-        });
+        store.updateStatusProgress({ operationId: receipt.operationId, progress: { plan: [], recent: [recent], toolCount: 1 }, now: clock });
+      const updates = () => calls.filter((call) => call.method === "update").map((call) => call.at);
+      // Edit due at 2 s goes out late, at 90 s: the next waits until 92 s.
       update("first", at(1_000));
-      // The outbox was busy: the edit due at 2 s goes out at 90 s.
       await drain(at(90_000));
-      expect(calls.filter((call) => call.method === "update").map((call) => call.at)).toEqual([at(90_000)]);
       update("second", at(90_100));
-      const database = new Database(path, { readonly: true, strict: true });
-      try {
-        const pending = database
-          .query<{ blocked_until: string }, []>(
-            "SELECT blocked_until FROM slack_outbox WHERE refresh_kind = 'status-message' AND status = 'pending'",
-          )
-          .all();
-        expect(pending.map((row) => row.blocked_until)).toEqual([at(92_000)]);
-      } finally {
-        database.close();
-      }
+      await drain(at(91_999));
+      expect(updates()).toEqual([at(90_000)]);
+      await drain(at(92_000));
+      expect(updates()).toEqual([at(90_000), at(92_000)]);
+      // Claimed at 94 s but only delivered at 96 s: the next waits until 98 s.
+      update("third", at(93_000));
+      const statusEdits = { intervalMs: config.slack.ui.statusUpdateIntervalMs, perMinute: config.slack.ui.statusUpdatesPerMinute };
+      const inflight = store.claimNextOutbox({ workerId: "slack-b", now: at(94_000), leaseMs: 30_000, statusEdits });
+      if (inflight === null) throw new Error("third edit was not claimable");
+      update("fourth", at(94_100));
+      store.markOutboxDelivered({ outboxId: inflight.outboxId, workerId: "slack-b", slackMessageTs: "2000.000001", now: at(96_000) });
+      await drain(at(97_999));
+      expect(updates()).toEqual([at(90_000), at(92_000)]);
+      await drain(at(98_000));
+      expect(updates()).toEqual([at(90_000), at(92_000), at(98_000)]);
     });
   });
 
@@ -556,8 +540,6 @@ describe("live status message (F3)", () => {
       const update = {
         operationId: receipt.operationId,
         progress: { plan: [], recent: ["late"], toolCount: 1 },
-        intervalMs: 2_000,
-        perMinute: 40,
         now: at(4_000),
       };
       expect(store.updateStatusProgress(update)).toBe(false);
@@ -604,8 +586,6 @@ describe("live status message (F3)", () => {
         store.updateStatusProgress({
           operationId: receipt.operationId,
           progress: { plan: [{ step: "Fix bug", status: "inProgress" }], recent: ["Ran `rm secrets`"], toolCount: 1 },
-          intervalMs: 1_000,
-          perMinute: 40,
           now,
         });
         return receipt;

@@ -651,8 +651,19 @@ export class AgentTagStore {
     return this.#database.transaction(() => messageEdits.enqueueMessageEdit(this.#database, input)).immediate();
   }
 
-  claimNextOutbox(input: outbox.ClaimNextOutboxInput): ClaimedOutboxMessage | null {
-    return outbox.claimNextOutbox(this.#context, input);
+  /** `statusEdits` throttles status progress edits by what actually reached Slack (see store/status.ts). */
+  claimNextOutbox(
+    input: Omit<outbox.ClaimNextOutboxInput, "deferRefresh"> & { readonly statusEdits?: status.StatusEditThrottle },
+  ): ClaimedOutboxMessage | null {
+    const { statusEdits, ...claim } = input;
+    if (statusEdits === undefined) return outbox.claimNextOutbox(this.#context, claim);
+    return outbox.claimNextOutbox(this.#context, {
+      ...claim,
+      deferRefresh: (refresh, now) =>
+        refresh.refreshKind === "status-message"
+          ? status.statusEditDeferral(this.#database, { operationId: refresh.refreshKey, targetOutboxId: refresh.targetOutboxId }, now, statusEdits)
+          : null,
+    });
   }
 
   claimNextReaction(input: reactions.ClaimNextReactionInput): reactions.ClaimedReaction | null {

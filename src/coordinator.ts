@@ -724,8 +724,6 @@ export class AgentTagCoordinator {
         this.#store.updateStatusProgress({
           operationId: operation.operationId,
           progress: view,
-          intervalMs: this.#config.slack.ui.statusUpdateIntervalMs,
-          perMinute: this.#config.slack.ui.statusUpdatesPerMinute,
           now: this.#now().toISOString(),
         });
       } catch {

@@ -1,12 +1,15 @@
 // Slack outbox queue: enqueue, claim (respecting retry backoff and rate-limit cooldowns), delivery
 // outcome, retry, fallback, and quarantine of unknown outcomes.
 import type { Database } from "bun:sqlite";
+import { z } from "zod";
 
 import { writeAudit } from "./audit.ts";
 import { type StoreContext, requiredId, parseStoredJson } from "./context.ts";
 import { leaseExpiry, requireLeaseHeld } from "./lease.ts";
 import {
+  REFRESH_KINDS,
   isoDateTime,
+  nonEmpty,
   outboxIdentitySchema,
   outboxPayloadSchema,
   outboxRowSchema,
@@ -25,8 +28,6 @@ export interface OutboxMessageRow {
   readonly createdAt: string;
   /** Makes the row a chat.update of the message its target post row posted (see message-edits.ts). */
   readonly edit?: { readonly targetOutboxId: string; readonly refreshKind: RefreshKind | null };
-  /** Not claimable before this instant (an edit throttle); null or absent means due now. */
-  readonly blockedUntil?: string | null;
 }
 
 /**
@@ -39,8 +40,8 @@ export function insertOutboxMessage(database: Database, row: OutboxMessageRow): 
       `INSERT INTO slack_outbox (
         outbox_id, task_id, correlation_id, conversation_id, thread_ts,
         client_message_id, payload_json, status, created_at, updated_at,
-        method, target_outbox_id, refresh_kind, blocked_until
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)`,
+        method, target_outbox_id, refresh_kind
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)`,
     )
     .run(
       row.outboxId,
@@ -55,7 +56,6 @@ export function insertOutboxMessage(database: Database, row: OutboxMessageRow): 
       row.edit === undefined ? "post" : "update",
       row.edit?.targetOutboxId ?? null,
       row.edit?.refreshKind ?? null,
-      row.blockedUntil ?? null,
     );
 }
 
@@ -105,7 +105,25 @@ export interface ClaimNextOutboxInput {
   readonly workerId: string;
   readonly now: string;
   readonly leaseMs: number;
+  /**
+   * When a claimable refresh row may go out instead (a throttle), or null for now. A deferred row
+   * gets that `blocked_until` and the claim moves on to the next row.
+   */
+  readonly deferRefresh?: (refresh: OutboxRefreshCandidate, now: string) => string | null;
 }
+
+export interface OutboxRefreshCandidate {
+  readonly refreshKind: RefreshKind;
+  readonly refreshKey: string;
+  readonly targetOutboxId: string;
+}
+
+const claimCandidateSchema = z.object({
+  outbox_id: nonEmpty,
+  refresh_kind: z.enum(REFRESH_KINDS).nullable(),
+  correlation_id: nonEmpty,
+  target_outbox_id: nonEmpty.nullable(),
+});
 
 /**
  * Every outbox row is a chat.postMessage (or chat.update) call with the one bot token, so a rate limit
@@ -160,10 +178,11 @@ export function claimNextOutbox(
   const expiresAt = leaseExpiry(now, input.leaseMs);
   const claim = database.transaction((): ClaimedOutboxMessage | null => {
     if (activeOutboxRateLimit(database, now) !== null) return null;
-    const candidate = outboxIdentitySchema.nullable().parse(
+    const next = () => claimCandidateSchema.nullable().parse(
       database
         .query(
-          `SELECT candidate.outbox_id FROM slack_outbox AS candidate
+          `SELECT candidate.outbox_id, candidate.refresh_kind, candidate.correlation_id, candidate.target_outbox_id
+           FROM slack_outbox AS candidate
            WHERE candidate.status = 'pending'
              AND (candidate.blocked_until IS NULL OR candidate.blocked_until <= ?)
              AND CASE candidate.method
@@ -198,6 +217,16 @@ export function claimNextOutbox(
         )
         .get(now, now, now),
     );
+    let candidate = next();
+    while (candidate !== null && candidate.refresh_kind !== null && candidate.target_outbox_id !== null) {
+      const deferredUntil = input.deferRefresh?.(
+        { refreshKind: candidate.refresh_kind, refreshKey: candidate.correlation_id, targetOutboxId: candidate.target_outbox_id },
+        now,
+      ) ?? null;
+      if (deferredUntil === null) break;
+      database.query("UPDATE slack_outbox SET blocked_until = ? WHERE outbox_id = ?").run(deferredUntil, candidate.outbox_id);
+      candidate = next();
+    }
     if (candidate === null) return null;
     const updated = database
       .query(
