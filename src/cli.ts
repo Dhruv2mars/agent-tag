@@ -5,7 +5,9 @@ import { runDoctorCommand, runOnboardCommand, runServiceCommand, runT3Command } 
 import { loadConfig } from "./config.ts";
 import { isDistributionCommand, processDistributionContext, runDistributionCommand } from "./distribution.ts";
 import { runSecurityCli, SECURITY_CLI_USAGE } from "./security/cli.ts";
+import { launchAgentLogPathsForProcess } from "./launchd.ts";
 import { createAgentTagService } from "./service.ts";
+import { readServiceState, ServiceStateRecorder } from "./service-state.ts";
 import { AgentTagSchedules } from "./scheduler.ts";
 import { AgentTagStore } from "./store/store.ts";
 import { T3_FATAL_EXIT_CODE, waitForShutdownOrFatal } from "./t3/operator.ts";
@@ -102,7 +104,8 @@ if (operatorCommand !== undefined) {
   if (command === "status") {
     const store = await AgentTagStore.open(resolve(config.dataDir, "agent-tag.sqlite"));
     try {
-      console.log(JSON.stringify(store.operationalStatus(new Date().toISOString()), null, 2));
+      const service = (await readServiceState(config.dataDir)) ?? null;
+      console.log(JSON.stringify({ ...store.operationalStatus(new Date().toISOString()), service }, null, 2));
     } finally {
       store.close();
     }
@@ -171,11 +174,40 @@ if (operatorCommand !== undefined) {
       store.close();
     }
   } else {
-    const service = await createAgentTagService({ config });
+    const state = new ServiceStateRecorder({ dataDir: config.dataDir, now: () => new Date() });
+    // Startup can wait a long time for T3; a stop request during that wait exits cleanly.
+    const startup = new AbortController();
+    const abortStartup = (): void => startup.abort();
+    process.once("SIGINT", abortStartup);
+    process.once("SIGTERM", abortStartup);
+    let service: Awaited<ReturnType<typeof createAgentTagService>>;
+    try {
+      service = await createAgentTagService({
+        config,
+        signal: startup.signal,
+        state,
+        serviceLogPaths: launchAgentLogPathsForProcess(),
+      });
+    } catch (error) {
+      if (!startup.signal.aborted) throw error;
+      await state.stopped();
+      process.exit(0);
+    } finally {
+      process.off("SIGINT", abortStartup);
+      process.off("SIGTERM", abortStartup);
+    }
+    if (startup.signal.aborted) {
+      // The stop request arrived just as T3 came back: stop without starting.
+      await service.stop();
+      await state.stopped();
+      process.exit(0);
+    }
     await service.start();
+    await state.running();
     // A managed T3 crash loop stops the service with EX_TEMPFAIL so launchd/systemd restart it.
     const reason = await waitForShutdownOrFatal((listener) => service.onFatal(listener));
     await service.stop();
+    await state.stopped();
     if (reason === "fatal") process.exit(T3_FATAL_EXIT_CODE);
   }
 }

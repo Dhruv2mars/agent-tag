@@ -13,6 +13,7 @@ import { checkGitHubAccess, checkGitVersion, defaultGitVersion } from "./github/
 import { type AllowedModelReport, reportAllowedModels, validateConfiguredProviders } from "./policy/provider.ts";
 import { SecretString } from "./security/secret-file.ts";
 import type { ServiceManager } from "./service-manager.ts";
+import { readServiceState, type ServiceStateReport } from "./service-state.ts";
 import { describeInstalledProgram } from "./service-unit.ts";
 import { AgentTagStore } from "./store/store.ts";
 import { readT3CredentialState, T3_CREDENTIAL_STATE_FILE, type T3CredentialState } from "./t3/credentials.ts";
@@ -62,6 +63,8 @@ export interface DoctorDependencies {
   readonly service: ServiceManager | undefined;
   /** `git --version` output, or undefined when git cannot run. Defaults to spawning git. */
   readonly gitVersion?: () => Promise<string | undefined>;
+  /** The running service's `<dataDir>/service-state.json`. Defaults to reading it. */
+  readonly serviceState?: (dataDir: string) => Promise<ServiceStateReport | undefined>;
 }
 
 export const T3_ORCHESTRATION_PROTOCOL_VERSION = SUPPORTED_T3_ORCHESTRATION_PROTOCOL;
@@ -716,6 +719,32 @@ function skipped(id: string, reason: string): DoctorCheck {
   return { id, status: "skip", summary: reason };
 }
 
+/**
+ * What the service process recorded in `<dataDir>/service-state.json`. A live service waiting for an
+ * unreachable T3 is a failure with the wait's details; a stale record (process gone) is only a skip.
+ */
+export function checkServiceState(config: AgentTagConfig, state: ServiceStateReport | undefined): DoctorCheck {
+  const id = "service-state";
+  if (state === undefined) return skipped(id, "no service state recorded yet");
+  if (!state.alive) return skipped(id, `service is not running (last state ${state.state}, updated ${state.updatedAt})`);
+  if (state.state === "waiting-for-t3" && state.t3 !== undefined) {
+    return {
+      id,
+      status: "fail",
+      summary: `service pid ${state.pid} has been waiting for T3 at ${state.t3.baseUrl} since ${state.since} ` +
+        `(${state.t3.attempts} attempt(s); last error: ${state.t3.lastError}; next attempt ${state.t3.nextAttemptAt})`,
+      hint: t3UnreachableHint(config),
+    };
+  }
+  return { id, status: "pass", summary: `service pid ${state.pid} ${state.state} since ${state.since}` };
+}
+
+function t3UnreachableHint(config: AgentTagConfig): string {
+  return config.t3.mode === "managed"
+    ? "the service supervises managed T3; check `agent-tag service logs` and `agent-tag t3 status CONFIG`"
+    : `start the external T3 server on ${config.t3.baseUrl} (or switch to t3.mode "managed"); the service waits and resumes on its own`;
+}
+
 export async function runDoctor(input: {
   readonly configPath: string;
   readonly fix: boolean;
@@ -754,8 +783,23 @@ export async function runDoctor(input: {
       : skipped("store", "data directory is not usable"),
   );
 
+  const serviceState = await (dependencies.serviceState ?? readServiceState)(config.dataDir);
   const environment = await checkT3Environment(config, dependencies);
-  checks.push(environment.check);
+  const serviceRunning = serviceState?.alive === true;
+  if (!environment.reachable && config.t3.mode === "managed" && !serviceRunning) {
+    // Managed T3 runs inside the service, so it is down whenever the service is: not a failure, or
+    // `service install`/`upgrade` (which run doctor first) could never bring it up.
+    checks.push({
+      id: "t3-environment",
+      status: "warn",
+      summary: `managed T3 is not running at ${config.t3.baseUrl}; the Agent Tag service starts it`,
+      hint: "start the service (`agent-tag service install` or `agent-tag service restart`)",
+    });
+  } else if (!environment.reachable && environment.check.status === "fail") {
+    checks.push({ ...environment.check, hint: t3UnreachableHint(config) });
+  } else {
+    checks.push(environment.check);
+  }
   checks.push(checkT3Version(environment.serverVersion, dependencies.pin));
   const t3Token = secrets.get("secret:t3-token");
   // Authenticated checks send the T3 token, so they run only against a server whose environment check
@@ -810,6 +854,8 @@ export async function runDoctor(input: {
     if (githubToken === undefined) checks.push(skipped("github-access", "GitHub token is not usable"));
     else checks.push(...(await checkGitHubAccess({ config, token: githubToken, fetch: dependencies.fetch })));
   }
+
+  checks.push(checkServiceState(config, serviceState));
 
   // Service repair reruns the doctor inside the installer, so only attempt it once everything else passes.
   const blocked = checks.some((check) => check.status === "fail");

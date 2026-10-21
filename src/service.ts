@@ -7,6 +7,8 @@ import { createGitRunner } from "./git/runner.ts";
 import { InteractionWorker } from "./interaction-worker.ts";
 import { reportAllowedModels, validateConfiguredProviders } from "./policy/provider.ts";
 import { createScheduleWorkers } from "./scheduler.ts";
+import { createServiceLogWorker } from "./service-logs.ts";
+import type { ServiceStateRecorder } from "./service-state.ts";
 import { SlackSocketBridge } from "./slack/bridge.ts";
 import { createRetentionWorker } from "./store/retention.ts";
 import { AgentTagStore } from "./store/store.ts";
@@ -17,6 +19,7 @@ import { createT3GateWorker, T3RuntimeGate } from "./t3/gate.ts";
 import { inspectT3, type T3ServerInfo } from "./t3/gateway.ts";
 import { PINNED_T3 } from "./t3/lock.ts";
 import { createProviderCatalogWorker, ProviderCatalog } from "./t3/provider-catalog.ts";
+import { type T3StartupWait, waitForReachableT3, waitForRunnableProviders } from "./t3/startup.ts";
 import { prepareManagedT3Binary, T3ManagedRuntime } from "./t3/supervisor.ts";
 import { protocolV1Source, ThreadWatcher } from "./t3/watcher.ts";
 
@@ -353,9 +356,18 @@ export async function createAgentTagService(input: {
   readonly config: AgentTagConfig;
   readonly logger?: ServiceLogger;
   readonly now?: () => Date;
+  /** Aborts the wait for an unreachable T3 (SIGTERM during startup). */
+  readonly signal?: AbortSignal;
+  /** Records "waiting-for-t3" for `agent-tag status` and doctor. */
+  readonly state?: ServiceStateRecorder;
+  /** Log files the service manager appends to and never rotates (launchd); capped now and every 5 min. */
+  readonly serviceLogPaths?: readonly string[];
 }): Promise<AgentTagService> {
   const now = input.now ?? (() => new Date());
   const logger = input.logger ?? defaultLogger;
+  const logWorker = input.serviceLogPaths === undefined || input.serviceLogPaths.length === 0
+    ? undefined
+    : await createServiceLogWorker({ paths: input.serviceLogPaths, logger, now });
   const databasePath = join(input.config.dataDir, "agent-tag.sqlite");
   const store = await AgentTagStore.open(databasePath);
   const quarantined = store.quarantineExpiredOutbox(now().toISOString());
@@ -396,8 +408,22 @@ export async function createAgentTagService(input: {
         now,
       });
     }
-    const server = await inspectT3(t3Config);
-    validateConfiguredProviders(input.config, server);
+    // A T3 that is down (or still starting) is waited for here rather than failing startup: the
+    // service manager would only respawn us into the same failure.
+    const startupWait = {
+      baseUrl: t3Config.baseUrl,
+      logger,
+      now,
+      ...(input.signal === undefined ? {} : { signal: input.signal }),
+      ...(input.state === undefined ? {} : { onWaiting: (wait: T3StartupWait) => input.state?.waitingForT3(wait) }),
+    };
+    await waitForReachableT3(startupWait);
+    const server = await waitForRunnableProviders({
+      ...startupWait,
+      // The signal lets a stop request end a stalled probe; SIGTERM no longer kills us during startup.
+      inspect: () => inspectT3(t3Config, input.signal),
+      validate: (candidate) => validateConfiguredProviders(input.config, candidate),
+    });
     for (const record of allowedModelLogRecords(input.config, server, now().toISOString())) logger(record);
     // Model switches are planned against this catalog; a failed refresh keeps the last good snapshot.
     const catalog = new ProviderCatalog({
@@ -470,6 +496,7 @@ export async function createAgentTagService(input: {
         createT3GateWorker({ gate, now }),
         createT3CredentialWorker({ credentials }),
         createProviderCatalogWorker({ catalog, now }),
+        ...(logWorker === undefined ? [] : [logWorker]),
         ...(pullRequests === undefined
           ? []
           : [
