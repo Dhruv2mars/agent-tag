@@ -39,6 +39,8 @@ export interface ComposeTurnInput {
   readonly notes: TurnNotes | null;
   /** The rendered `<agent-tag-memory>` block (memory-prompt.ts), or null when this turn carries none. */
   readonly memory: string | null;
+  /** How to share files back to Slack (PR-L2 `uploadInstruction`), or absent when outbound files are off. */
+  readonly uploadInstruction?: string;
 }
 
 type TurnSection = (input: ComposeTurnInput) => string | null;
@@ -231,6 +233,10 @@ function memorySection(input: ComposeTurnInput): string | null {
   return input.memory;
 }
 
+function uploadInstructionSection(input: ComposeTurnInput): string | null {
+  return input.uploadInstruction ?? null;
+}
+
 // Memory leads: it frames the whole turn, and the request and its thread context read last.
 const TURN_SECTIONS: readonly TurnSection[] = [
   memorySection,
@@ -238,6 +244,7 @@ const TURN_SECTIONS: readonly TurnSection[] = [
   attachmentsSection,
   windowSection,
   notesSection,
+  uploadInstructionSection,
 ];
 
 // PR-W: T3 protocol 2 `message.dispatch.context` may carry the untrusted sections instead.

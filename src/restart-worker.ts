@@ -84,6 +84,12 @@ export class SessionStopWorker {
     const current = this.#now();
     if (current.getTime() < this.#nextSweepAt) return { kind: "idle" };
     this.#nextSweepAt = current.getTime() + SWEEP_INTERVAL_MS;
+    const count = await this.stopDue(current);
+    return count === 0 ? { kind: "idle" } : { kind: "sessions-stopped", count };
+  }
+
+  /** Stops up to one batch of due sessions now, unthrottled (`tasks cleanup --once` drains with it). */
+  async stopDue(current: Date): Promise<number> {
     const now = current.toISOString();
     let count = 0;
     // On a transport failure the rest wait for the next sweep.
@@ -110,6 +116,6 @@ export class SessionStopWorker {
         break;
       }
     }
-    return count === 0 ? { kind: "idle" } : { kind: "sessions-stopped", count };
+    return count;
   }
 }

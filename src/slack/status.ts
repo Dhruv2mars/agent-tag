@@ -45,10 +45,12 @@ function headline(view: StatusMessageView): string {
       return "Waiting for your answer above";
     case "stopping":
       return `Stopping…${by === "" ? "" : ` (requested${by})`}`;
-    case "done":
-      return view.settledAt === null
-        ? "Done"
-        : `Done in ${describeElapsed(Date.parse(view.settledAt) - Date.parse(view.startedAt))}`;
+    case "done": {
+      const done =
+        view.settledAt === null ? "Done" : `Done in ${describeElapsed(Date.parse(view.settledAt) - Date.parse(view.startedAt))}`;
+      const files = view.progress.filesChanged ?? 0;
+      return files === 0 ? done : `${done} · ${files} file${files === 1 ? "" : "s"} changed`;
+    }
     case "stopped":
       return `Stopped${by}`;
     case "failed":

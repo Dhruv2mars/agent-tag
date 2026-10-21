@@ -47,9 +47,17 @@ const slackUiSchema = z
     statusUpdateIntervalMs: z.number().int().min(1_000).max(60_000).default(2_000),
     /** Budget for progress edits across all status messages (chat.update is rate limited per workspace). */
     statusUpdatesPerMinute: z.number().int().min(1).max(600).default(40),
+    /** The final reply's last chunk ends with "model · instance · elapsed"; "none" leaves replies plain. */
+    footer: z.enum(["model", "none"]).default("model"),
   })
   .strict()
-  .default({ ackReaction: "eyes", statusProgress: true, statusUpdateIntervalMs: 2_000, statusUpdatesPerMinute: 40 });
+  .default({
+    ackReaction: "eyes",
+    statusProgress: true,
+    statusUpdateIntervalMs: 2_000,
+    statusUpdatesPerMinute: 40,
+    footer: "model",
+  });
 
 const isolationSchema = z.discriminatedUnion("mode", [
   z.object({
@@ -544,6 +552,19 @@ const filesSchema = z
       })
       .strict()
       .prefault({}),
+    /**
+     * Files the agent shares back (PR-L2): a reply line `[[agent-tag:upload <path>]]` uploads that
+     * workspace file to the thread. Every file is scanned for known credential shapes unless disabled.
+     */
+    outbound: z
+      .object({
+        enabled: z.boolean().default(true),
+        maxFilesPerTurn: z.number().int().min(1).max(10).default(5),
+        maxFileBytes: z.number().int().min(1).max(T3_MAX_FILE_BYTES).default(25 * 1024 * 1024),
+        scanForSecrets: z.boolean().default(true),
+      })
+      .strict()
+      .prefault({}),
   })
   .strict()
   .prefault({});
@@ -557,6 +578,11 @@ const lifecycleSchema = z
     closeIdleAfterHours: z.number().int().min(1).max(24 * 90).default(168),
     sweepIntervalSeconds: z.number().int().min(10).max(3_600).default(60),
     maxClosesPerSweep: z.number().int().min(1).max(500).default(20),
+    /** A closed session's dirty worktree is kept this long for a reopen to pick up; null keeps it forever. */
+    dirtyWorktreeRetentionDays: z.number().int().min(1).max(365).nullable().default(14),
+    /** Delete a retired session's local branch with `git branch -d` when it has no commits or PR. */
+    deleteEmptyBranches: z.boolean().default(true),
+    maxCleanupsPerSweep: z.number().int().min(1).max(100).default(5),
   })
   .strict()
   .prefault({});

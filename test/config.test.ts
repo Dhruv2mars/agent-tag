@@ -34,6 +34,22 @@ const baseConfig = {
 };
 
 describe("Agent Tag config", () => {
+  test("defaults and validates the lifecycle cleanup settings", () => {
+    expect(agentTagConfigSchema.parse(baseConfig).lifecycle).toEqual({
+      closeIdleAfterHours: 168,
+      sweepIntervalSeconds: 60,
+      maxClosesPerSweep: 20,
+      dirtyWorktreeRetentionDays: 14,
+      deleteEmptyBranches: true,
+      maxCleanupsPerSweep: 5,
+    });
+    expect(agentTagConfigSchema.parse({ ...baseConfig, lifecycle: { dirtyWorktreeRetentionDays: null, deleteEmptyBranches: false } }).lifecycle)
+      .toMatchObject({ dirtyWorktreeRetentionDays: null, deleteEmptyBranches: false });
+    for (const lifecycle of [{ dirtyWorktreeRetentionDays: 0 }, { dirtyWorktreeRetentionDays: 1.5 }, { maxCleanupsPerSweep: 101 }]) {
+      expect(() => agentTagConfigSchema.parse({ ...baseConfig, lifecycle })).toThrow();
+    }
+  });
+
   test("defaults and validates the !command settings", () => {
     const parsed = agentTagConfigSchema.parse(baseConfig);
     expect(parsed.commands).toEqual({ enabled: true, disabled: [], adminOnly: [], restartTimeoutSeconds: 120 });
@@ -151,15 +167,18 @@ describe("Agent Tag config", () => {
       statusProgress: false,
       statusUpdateIntervalMs: 2_000,
       statusUpdatesPerMinute: 40,
+      footer: "model",
     });
     expect(withUi({ statusUpdateIntervalMs: 999 }).success).toBe(false);
+    expect(withUi({ footer: "none" }).data?.slack.ui.footer).toBe("none");
+    expect(withUi({ footer: "provider" }).success).toBe(false);
     expect(withUi({ statusUpdateIntervalMs: 5_000 }).data?.slack.ui.statusUpdateIntervalMs).toBe(5_000);
     expect(withUi({ statusUpdatesPerMinute: 0 }).success).toBe(false);
     expect(withUi({ statusMessage: true }).success).toBe(false);
   });
 
   test("defaults and validates the ack reaction", () => {
-    expect(agentTagConfigSchema.parse(baseConfig).slack.ui).toEqual({ ackReaction: "eyes", statusProgress: true, statusUpdateIntervalMs: 2_000, statusUpdatesPerMinute: 40 });
+    expect(agentTagConfigSchema.parse(baseConfig).slack.ui).toEqual({ ackReaction: "eyes", statusProgress: true, statusUpdateIntervalMs: 2_000, statusUpdatesPerMinute: 40, footer: "model" });
     const withAck = (ackReaction: unknown) =>
       agentTagConfigSchema.safeParse({ ...baseConfig, slack: { ...baseConfig.slack, ui: { ackReaction } } });
     expect(withAck(null).data?.slack.ui.ackReaction).toBeNull();

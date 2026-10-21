@@ -278,6 +278,15 @@ describe("Agent Tag durable store", () => {
         schedulesAutoDisabled: 0,
         ambientDecisions: 0,
         auditRecords: 2,
+        lifecycle: {
+          activeTasks: 1,
+          releasedTasks: 0,
+          closedTasks: 0,
+          pendingCleanup: 0,
+          retainedDirty: 0,
+          oldestRetainUntil: null,
+          cleanupFailures: 0,
+        },
       });
       expect((await stat(path)).mode & 0o777).toBe(0o600);
     });

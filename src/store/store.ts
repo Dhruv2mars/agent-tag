@@ -17,6 +17,7 @@
  *   reactions.ts    Slack reaction queue (instant ack)
  *   status.ts       live status message per turn (state, progress, throttled edits)
  *   lifecycle.ts    task idle/operator close, retired T3 threads, task listing
+ *   cleanup.ts      retired-thread cleanup queue, worktree adoption, lifecycle counts
  *   schema.ts       zod schemas                            types.ts        public types (re-exported)
  */
 import type { Database } from "bun:sqlite";
@@ -62,9 +63,11 @@ import * as pullRequests from "./pull-requests.ts";
 import * as commands from "./commands.ts";
 import * as reactions from "./reactions.ts";
 import * as attachments from "./attachments.ts";
+import * as fileUploads from "./file-uploads.ts";
 import * as status from "./status.ts";
 import * as lifecycle from "./lifecycle.ts";
 import * as restart from "./restart.ts";
+import * as cleanup from "./cleanup.ts";
 
 export type { AuditAction } from "./schema.ts";
 export type {
@@ -148,6 +151,17 @@ export type {
   TaskSummary,
 } from "./lifecycle.ts";
 export type {
+  BranchState,
+  ClaimRetiredThreadInput,
+  LifecycleCounts,
+  RecordRetiredStepInput,
+  ResumeCandidate,
+  RetiredThread,
+  RetiredThreadPatch,
+  WorktreeState,
+} from "./cleanup.ts";
+export { RetiredLeaseLostError } from "./cleanup.ts";
+export type {
   ClaimNextOperationInput,
   RenewOperationLeaseInput,
   ResolveOperationTurnTextInput,
@@ -213,6 +227,7 @@ export type {
   SettleReactionInput,
 } from "./reactions.ts";
 export type { InboundSkipReason, OperationAttachment, RecordOperationAttachmentInput } from "./attachments.ts";
+export type { ClaimedFileUpload, FileUploadRequest, FileUploadsInput } from "./file-uploads.ts";
 export type { EnqueueMessageEditInput, EnqueueMessageRefreshInput, MessageEditResult } from "./message-edits.ts";
 
 export class AgentTagStore {
@@ -330,6 +345,34 @@ export class AgentTagStore {
 
   recordOperationAttachment(input: attachments.RecordOperationAttachmentInput): attachments.OperationAttachment {
     return attachments.recordOperationAttachment(this.#context, input);
+  }
+
+  claimNextFileUpload(input: Parameters<typeof fileUploads.claimNextFileUpload>[1]): fileUploads.ClaimedFileUpload | null {
+    return fileUploads.claimNextFileUpload(this.#context, input);
+  }
+
+  markFileUploadStarted(input: Parameters<typeof fileUploads.markFileUploadStarted>[1]): void {
+    fileUploads.markFileUploadStarted(this.#database, input);
+  }
+
+  clearFileUploadStart(input: Parameters<typeof fileUploads.clearFileUploadStart>[1]): void {
+    fileUploads.clearFileUploadStart(this.#database, input);
+  }
+
+  markFileUploadDelivered(input: Parameters<typeof fileUploads.markFileUploadDelivered>[1]): void {
+    fileUploads.markFileUploadDelivered(this.#database, input);
+  }
+
+  retryFileUpload(input: Parameters<typeof fileUploads.retryFileUpload>[1]): void {
+    fileUploads.retryFileUpload(this.#database, input);
+  }
+
+  releaseFileUpload(input: Parameters<typeof fileUploads.releaseFileUpload>[1]): void {
+    fileUploads.releaseFileUpload(this.#database, input);
+  }
+
+  failFileUpload(input: Parameters<typeof fileUploads.failFileUpload>[1]): void {
+    fileUploads.failFileUpload(this.#database, input);
   }
 
   recordThreadNote(input: threadNotes.RecordThreadNoteInput): threadNotes.RecordThreadNoteResult {
@@ -597,6 +640,30 @@ export class AgentTagStore {
     return lifecycle.listTasks(this.#database, input);
   }
 
+  claimNextRetiredThread(input: cleanup.ClaimRetiredThreadInput): cleanup.RetiredThread | null {
+    return cleanup.claimNextRetiredThread(this.#database, input);
+  }
+
+  recordRetiredStep(input: cleanup.RecordRetiredStepInput): cleanup.RetiredThread {
+    return cleanup.recordRetiredStep(this.#database, input);
+  }
+
+  listPendingRetiredThreads(): readonly cleanup.RetiredThread[] {
+    return cleanup.listPendingRetiredThreads(this.#database);
+  }
+
+  getResumeCandidate(taskId: string, generation: number): cleanup.ResumeCandidate | null {
+    return cleanup.getResumeCandidate(this.#database, taskId, generation);
+  }
+
+  adoptRetiredWorktree(input: { readonly taskId: string; readonly generation: number; readonly now: string }): boolean {
+    return cleanup.adoptRetiredWorktree(this.#database, input);
+  }
+
+  lifecycleCounts(): cleanup.LifecycleCounts {
+    return cleanup.lifecycleCounts(this.#database);
+  }
+
   getTaskExecution(taskIdInput: string): TaskExecutionBinding {
     return tasks.getTaskExecution(this.#database, taskIdInput);
   }
@@ -607,6 +674,14 @@ export class AgentTagStore {
 
   setTaskModelSelection(input: tasks.SetTaskModelSelectionInput): void {
     tasks.setTaskModelSelection(this.#database, input);
+  }
+
+  recordModelDenied(input: tasks.RecordModelDeniedInput): void {
+    tasks.recordModelDenied(this.#database, input);
+  }
+
+  hasInflightOperation(taskId: string): boolean {
+    return tasks.hasInflightOperation(this.#database, taskId);
   }
 
   recordAppliedModelSelection(input: tasks.RecordAppliedModelSelectionInput): boolean {

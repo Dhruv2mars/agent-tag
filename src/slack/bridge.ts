@@ -7,6 +7,7 @@ import { ACCESS_DENIAL_REASONS, bindMembership } from "../policy/access.ts";
 import { readSecretFile } from "../security/secret-file.ts";
 import type { ServiceLogger } from "../service.ts";
 import type { AgentTagStore } from "../store/store.ts";
+import type { T3ServerInfo } from "../t3/gateway.ts";
 import {
   actionSubject,
   auditAccessDenial,
@@ -25,6 +26,7 @@ import { SlackEventRouter, type SlackIngressResult } from "./events.ts";
 import { downloadSlackFile, parseSlackFileInfo, type SlackFileClient } from "./files.ts";
 import { ChannelMembershipCache, membershipChannels, type ChannelMembershipStatus } from "./membership.ts";
 import { SlackMemoryCommands } from "./memory-commands.ts";
+import { SlackModelSwitch } from "./model-switch.ts";
 import { deliverNextSlackOutbox, type RefreshRenderers, type SlackOutboxOutcome } from "./outbox.ts";
 import { renderStatusMessage } from "./status.ts";
 import { classifySlackDeliveryError } from "./outbox-policy.ts";
@@ -32,6 +34,7 @@ import { ROUTINE_CANCEL_ACTION_ID } from "./routine-replies.ts";
 import { SlackRoutines } from "./routines.ts";
 import { deliverNextSlackReaction, type SlackReactionOutcome } from "./reactions.ts";
 import { installUndiciWebSocketCompat } from "./undici-compat.ts";
+import { slackUploadClient, type SlackUploadClient } from "./uploads.ts";
 import { SlackUserDirectory, slackErrorCode, type SlackUserKind } from "./users.ts";
 import { ConversationVisibilityResolver } from "./visibility.ts";
 
@@ -291,8 +294,8 @@ export interface SlackIngressAccess {
 }
 
 /**
- * Routes one Slack event; a `!command`, routine request or memory phrase is executed after the
- * router returns (never inside ingest).
+ * Routes one Slack event; a `!command`, model switch, routine request or memory phrase is executed
+ * after the router returns (never inside ingest).
  */
 export async function handleSlackEvent(
   input: {
@@ -301,6 +304,7 @@ export async function handleSlackEvent(
     readonly routines?: Pick<SlackRoutines, "handle">;
     readonly access?: SlackIngressAccess;
     readonly memory?: Pick<SlackMemoryCommands, "handle">;
+    readonly models?: Pick<SlackModelSwitch, "handle">;
   },
   body: unknown,
 ): Promise<void> {
@@ -310,6 +314,7 @@ export async function handleSlackEvent(
   if (result.kind === "command") await input.commands.execute(result);
   if (result.kind === "routine") await input.routines?.handle(result);
   if (result.kind === "memory") await input.memory?.handle(result);
+  if (result.kind === "model") await input.models?.handle(result);
 }
 
 /** Builds the ingress access hooks for a config, a store and (in `channel-members` mode) a cache. */
@@ -457,6 +462,12 @@ export class SlackSocketBridge {
   readonly membership: ChannelMembershipCache | null;
   /** Shared-file reads for the coordinator (PR-L1). */
   readonly files: SlackFileClient;
+  /**
+   * Agent file shares (PR-L2) over the outbox's client: no SDK retries, so the upload worker owns
+   * every retry and a completed share is never repeated. Needs `files:write` (and `files:read` for
+   * the crash-recovery share check).
+   */
+  readonly uploads: SlackUploadClient;
 
   private constructor(
     app: SlackApp,
@@ -473,11 +484,14 @@ export class SlackSocketBridge {
     this.contextSource = contextSource;
     this.membership = membership;
     this.files = files;
+    this.uploads = slackUploadClient(app.client);
   }
 
   static async create(input: {
     readonly config: AgentTagConfig;
     readonly store: AgentTagStore;
+    /** The T3 provider catalog, for model switches from Slack. */
+    readonly catalog?: { current(): T3ServerInfo | null };
     readonly logger?: ServiceLogger;
   }): Promise<SlackSocketBridge> {
     installUndiciWebSocketCompat();
@@ -506,6 +520,7 @@ export class SlackSocketBridge {
         store: input.store,
         botUserId: auth.user_id,
         ...(selfBotId === undefined ? {} : { selfBotId }),
+        ...(input.catalog === undefined ? {} : { catalog: input.catalog }),
       });
     const router = new DirectMessageAutoRouter({ config: input.config, base: eventRouter(input.config), create: eventRouter });
     const commandReplies = createCommandReplySender(app.client as unknown as CommandReplyClient);
@@ -562,12 +577,20 @@ export class SlackSocketBridge {
       users,
       ...(input.logger === undefined ? {} : { logger: input.logger }),
     });
+    const models = new SlackModelSwitch({
+      config: () => input.config,
+      store: input.store,
+      replies: commandReplies,
+      ...(input.catalog === undefined ? {} : { catalog: input.catalog }),
+      ...(auth.user === undefined ? {} : { botName: auth.user }),
+      ...(input.logger === undefined ? {} : { logger: input.logger }),
+    });
     const actions = new SlackActionRouter({ config: input.config, store: input.store });
     app.event("app_mention", async ({ body }) => {
-      await handleSlackEvent({ router, commands, routines, access, memory }, body);
+      await handleSlackEvent({ router, commands, routines, access, memory, models }, body);
     });
     app.event("message", async ({ body }) => {
-      await handleSlackEvent({ router, commands, routines, access, memory }, body);
+      await handleSlackEvent({ router, commands, routines, access, memory, models }, body);
     });
     app.action(ROUTINE_CANCEL_ACTION_ID, async ({ ack, body, respond }) => {
       await ack();

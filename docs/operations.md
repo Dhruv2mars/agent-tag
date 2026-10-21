@@ -63,7 +63,7 @@ In `channel-members` mode Agent Tag reads each routed channel's members with `co
 | Key | Default | Meaning |
 |---|---|---|
 | `access.membership.ttlSeconds` | 300 | A snapshot older than this is refreshed in the background and before a non-allowlisted user's event. |
-| `access.membership.maxStaleSeconds` | 3600 | Past this age (for example while Slack rate-limits the refresh) the snapshot answers "unknown": non-allowlisted users are denied with `membership-unknown`, and their due routines wait instead of being cancelled. |
+| `access.membership.maxStaleSeconds` | 3600 | Past this age (for example while Slack rate-limits the refresh) the snapshot answers "unknown": non-allowlisted users are denied with `membership-unknown`, and their due routines wait (up to the routine's misfire grace, then that run is skipped) instead of being cancelled. |
 | `access.membership.maxMembers` | 5000 | A larger channel is not snapshotted; only the allowlist works there. |
 | `access.membership.guests` | `deny` | Guests (restricted accounts) never approve, answer or cancel. `steer-only` lets them start and steer turns. |
 
@@ -514,7 +514,7 @@ A message that starts with `@Agent Tag !<command>` runs a command instead of a r
 | `!mute` | a thread the agent is part of | Stops the agent answering unmentioned replies in that thread. Posts a public notice. |
 | `!unmute` | a thread the agent is part of | Reverses `!mute`. Any message that mentions the agent in a muted thread also unmutes it. |
 | `!stop` | a thread the agent is working in | Stops the running turn, the same way as the status message's Stop button: the status message turns into "Stopped by @you". Requests in that thread sent before `!stop` and not started yet are dropped, with one public note saying how many. Requests sent after it still run. |
-| `!restart` | a thread the agent is part of | Starts a fresh T3 session for the thread: a new T3 thread on a new worktree branch (`agent-tag/<task>-g2`, `-g3`, ...) from the profile's base branch. With nothing running it happens at once. Otherwise the running turn is stopped first, new messages wait, and the agent confirms in the thread once the fresh session is ready (after at most `commands.restartTimeoutSeconds`, default 120; past that the old turn may still post a late reply). The first request on the fresh session rereads the earlier thread messages (without `!commands` and the agent's own replies) when `threadContext` is enabled. |
+| `!restart` | a thread the agent is part of | Starts a fresh T3 session for the thread: a new T3 thread on a new worktree branch (`agent-tag/<task>-g2`, `-g3`, ...) from the profile's base branch. With nothing running it happens at once. Requests queued before `!restart` are dropped, and its notice says how many. Otherwise the running turn is stopped first, new messages wait, and the agent confirms in the thread once the fresh session is ready (after at most `commands.restartTimeoutSeconds`, default 120; past that the old turn may still post a late reply). The first request on the fresh session rereads the earlier thread messages (without `!commands` and the agent's own replies) when `threadContext` is enabled. |
 
 Commands never create a T3 turn and never store the message text. Each run is recorded once per Slack message in `slack_command_events` and audited as `slack.command.executed` or `slack.command.denied`; mute changes are audited as `thread.muted` and `thread.unmuted`, `!stop` as `task.stop.requested`, and `!restart` as `task.restart.requested` and `task.session.rotated`. Other `!words` (for example `!model`) are still treated as ordinary requests until their commands ship.
 
@@ -536,6 +536,59 @@ Configure commands under `commands`:
 
 Only-you replies use `chat.postEphemeral` (covered by the existing `chat:write` scope). They are sent at most once, with one retry after a rate limit.
 
+## Models and providers
+
+Each profile runs on `defaultProviderInstanceId` / `defaultModel` unless people pick something else. `allowedModels` lists what else a thread may use (up to 20 entries); with no entries, threads stay on the default:
+
+```json
+"allowedModels": [
+  { "instanceId": "codex", "model": "gpt-5.6-mini", "label": "GPT Mini", "aliases": ["mini"] },
+  { "instanceId": "claudeAgent", "model": "claude-opus-5-5", "label": "Opus 5.5", "aliases": ["opus"] }
+]
+```
+
+`instanceId` is the T3 provider instance (as `doctor` lists it), `label` is the name Slack replies use, and `aliases` are short lowercase names people can type. A route can set its own `defaultModel` (`{ "instanceId", "model" }`) for one channel; it must be the profile default or one of its `allowedModels`. `modelSwitch.enabled: false` on a profile turns switching off; `modelSwitch.crossProvider: "deny"` keeps every thread on its default's provider. `agent-tag doctor` reports each allowed entry as `available` or the reason T3 can't serve it, and never fails startup over one; the service logs a `provider.allowed-model` line for each unavailable entry.
+
+### Switching models from Slack
+
+Mention the bot, write in your DM with it, or reply in a thread it is part of:
+
+| Say | What happens |
+|---|---|
+| `use opus` | Switches this thread to Opus and replies in the thread; no turn runs |
+| `use opus: fix the flaky test` | Switches, then runs the request on the new model |
+| `switch to gpt-5.6-mini`, `change the model to sonnet` | Same as `use …` |
+| `use Opus 5.5 for the rest of this thread` | Same; the tail is optional |
+| `model: sonnet` | Same |
+
+A model is named by its alias, label, slug, or `instance/model`. The directive ends at a `:`, `,`, `;`, `.`, `—` or a new line; anything after it is the request. A message only counts as a switch when the words right after the verb name a model, so "use the README to fix the install docs" or "switch to dark mode" stay ordinary requests. Unmentioned top-level channel messages, including ambient ones, are never parsed. `!commands` come first, then a switch, then memory phrases, then the request.
+
+The choice belongs to the thread and lasts for the rest of it, across closing, reopening and `!restart`. `!status` shows the model the next turn will use. Each Slack message switches at most once: the choice, its `task.model.selected` audit row, the reply, its `slack_command_events` row (kind `model-switch`) and any request after it commit together, so a redelivery or the duplicate `message` event for one mention is answered once.
+
+Refusals reply in the thread, say which model the thread stays on, and are audited as `task.model.denied` with a code. A request that came with a refused switch is not run:
+
+- a name outside the allowlist (`not-allowed`, the reply lists what is allowed) or one that matches several entries (`ambiguous`);
+- a provider T3 doesn't report as ready (`unavailable`);
+- switching turned off (`switch-disabled`) or `crossProvider: "deny"` (`cross-provider-denied`).
+
+A name that is neither an allowed model nor a model T3 reports (say `use sonnet` when no allowed entry is called that) is not a switch, so the whole message runs as a request on the thread's current model.
+
+### The cross-provider rule
+
+T3 0.0.45 keeps a started conversation on its provider's session, so Agent Tag only moves a started thread where T3 can follow it:
+
+- **Before the first turn** (a new thread, or a closed one whose next request starts a fresh session) any allowed model works, and the first turn starts on it.
+- **On a started thread** the switch must stay on the same driver and the same resume state (for example `codex` to `codex`, not `codex` to `codex-work` with another home). It is applied in place with `thread.meta.update` before the next turn.
+- **Anything else** is refused (`cross-provider-started`, or `requires-new-thread` for a driver that needs a new thread for any model change, or `incompatible-continuation`). The reply offers a new thread (`@Agent Tag use opus: <request>`) or, when `!restart` is enabled for the person, `!restart` in the thread followed by the switch. A fresh session does not remember the conversation.
+
+A turn already sent to T3 counts as started, even before its reply arrives. If T3 still rejects a switch at turn time, the thread keeps the model it had and says so (`task.model.reverted`). When a config change removes a thread's model from the allowlist, the next turn falls back to the default only when T3 can make that move, and otherwise stays on what the thread already runs; both are audited as `task.model.reverted`.
+
+Tested live on T3 0.0.45: the `codex` and `claudeAgent` drivers ([evidence](evidence/2026-10-21-model-switch.md)). Other drivers (for example `grok` or `opencode`) follow the capabilities T3 reports for them but have not been run live.
+
+### Licensing
+
+Every provider in `allowedModels` is used on behalf of everyone who can reach the bot. Only list providers the organisation has approved for that shared use; see [Provider access and licensing](provider-licensing.md).
+
 ## Access changes and live verification
 
 Restart or upgrade the service after changing access configuration. Before each queued T3 turn, interaction response, or schedule, Agent Tag rechecks the stored task against the loaded workspace, user, channel, route, profile, repository, and DM-owner policy. Denied turns and interaction responses fail durably; revoked recurring schedules stop with an audit record. Queued Slack replies also recheck the task route and DM owner before sending. A sanitized failure notice may still reach an authorized shared channel after its requesting user is removed.
@@ -556,20 +609,41 @@ Every Slack thread the agent works in is one task. A task closes after `lifecycl
 
 A closed task keeps its Slack thread, schedules and task memory. The next message in its thread (a plain reply is enough, no mention needed) reopens the same task as a new session generation. The new generation starts a new T3 thread with a fresh worktree on the branch `agent-tag/<task-id>-g<generation>`, and the agent rereads the Slack thread for context. A scheduled run on a closed task reopens it the same way, and a routine can still be created there. A closed task still refuses a message routed to a different profile or repository.
 
-Closing records the old T3 thread in `task_retired_t3_threads`, with its generation and branch. Agent Tag does not yet stop or delete that T3 thread, or remove its worktree or branch; that cleanup comes in a later release, and the rows are kept for it. Closes are audited as `task.closed`, reopens as `task.reopened`.
+Closing records the old T3 thread in `task_retired_t3_threads`, with its generation and branch, and audits `task.closed` (reopens are `task.reopened`). Once the session is stopped, a background cleanup worker retires the rest, one row at a time under a lease:
+
+1. It reads the thread's worktree and branch from T3. A branch that is not this task's (`agent-tag/<task-id>` or `-g<generation>`) fails the row and nothing is removed.
+2. It deletes the T3 thread (`thread.delete`).
+3. A clean worktree is removed (`vcs.removeWorktree`). A dirty one is kept for `lifecycle.dirtyWorktreeRetentionDays` (default 14; `null` keeps it forever) and the Slack thread gets one notice, unless the task has moved on, the thread is muted or its repository root was deleted. The notice always comes at least a day before the worktree is force-removed.
+4. The local branch is deleted with `git branch -d` only when T3 reported zero commits ahead of the default branch and there is no open PR, even after a merged PR; otherwise it is kept (`kept-commits`, `kept-pr`). An unknown count (T3 already removed the worktree) keeps the branch. `lifecycle.deleteEmptyBranches: false` keeps every branch.
+
+Cleanup never removes the repository root, the data directory, the home directory or an ancestor of any of them; a path git does not list as the branch's worktree; or a worktree another T3 thread (live or archived) is bound to. Those rows fail at once and keep their worktree and branch. Transient errors retry with backoff (30 seconds doubling to an hour) and fail after 10 attempts. Each step is audited: `task.thread.deleted`, `task.worktree.removed`, `task.worktree.retained`, `task.branch.deleted`, `task.cleanup.completed`, `task.cleanup.failed`.
+
+A reply in a closed thread resumes from what cleanup left. A kept dirty worktree is adopted: the new T3 thread reuses it, uncommitted changes included, and cleanup no longer touches it. A kept branch is continued: the new worktree branches from it. Otherwise the new generation starts fresh from the base branch. The first turn of the resumed session tells the agent which of the three it got. A session retired by `!restart` resumes as before, with no note.
 
 ```sh
 agent-tag tasks list [CONFIG] [--state active|closed] [--limit N] [--json]
 agent-tag tasks close TASK_ID [CONFIG]
+agent-tag tasks cleanup [CONFIG] --dry-run|--once
 ```
 
-Both read the local store only, so they work while the service or T3 is down. `tasks close` closes a quiet task at once. A task with work in flight is marked close-requested (`task.close.requested`) and closes when that work settles; in-flight work is never cancelled.
+`tasks list`, `tasks close` and `tasks cleanup --dry-run` read the local store only, so they work while the service or T3 is down. `tasks close` closes a quiet task at once. A task with work in flight is marked close-requested (`task.close.requested`) and closes when that work settles; in-flight work is never cancelled. `tasks cleanup --dry-run` prints what cleanup would do to each pending retired thread. `tasks cleanup --once` stops any due sessions and runs one cleanup pass over every due row, ignoring `maxCleanupsPerSweep`; it needs T3 and exits 1 when a row fails. It is safe to run beside the service: rows are leased.
 
 ```json
-{ "lifecycle": { "closeIdleAfterHours": 168, "sweepIntervalSeconds": 60, "maxClosesPerSweep": 20 } }
+{
+  "lifecycle": {
+    "closeIdleAfterHours": 168,
+    "sweepIntervalSeconds": 60,
+    "maxClosesPerSweep": 20,
+    "dirtyWorktreeRetentionDays": 14,
+    "deleteEmptyBranches": true,
+    "maxCleanupsPerSweep": 5
+  }
+}
 ```
 
-After upgrading, every task idle for longer than `closeIdleAfterHours` becomes due at once. The sweep closes at most `maxClosesPerSweep` per `sweepIntervalSeconds`, so a large backlog drains over a few minutes. Each close is a single local transaction.
+After upgrading, every task idle for longer than `closeIdleAfterHours` becomes due at once. The sweep closes at most `maxClosesPerSweep` per `sweepIntervalSeconds`, so a large backlog drains over a few minutes. Each close is a single local transaction. Cleanup runs on the same interval, at most `maxCleanupsPerSweep` rows a sweep.
+
+`agent-tag doctor` reports a `lifecycle` check: active (and released) and closed tasks, retired threads pending cleanup, kept dirty worktrees with the earliest expiry, and cleanup failures. Failures make it a warning; the cause is in the `task.cleanup.failed` audit rows. `agent-tag status --json` carries the same counts under `lifecycle`.
 
 ## Routines from Slack
 
@@ -683,6 +757,29 @@ Use a fine-grained personal access token limited to the repositories you configu
 - Before anything is pushed, the net diff, the patch of every new commit, and the message and author of every new commit are scanned with the same credential patterns as `scan:secrets`. These patterns also cover `github_pat_` tokens and private key headers. A hit blocks the push. A credential that one commit adds and a later commit deletes is still blocked, because the push would carry it, so history must be rewritten to remove it. Changes over `maxChangedFiles` or `maxDiffBytes` are blocked too, including when the patches of the new commits together exceed `maxDiffBytes`. If any output a guard depends on is cut off at the capture limit, the step fails rather than checking only part of it. Rejected (non-fast-forward) pushes are reported and never forced.
 
 In `trusted-same-user` isolation the agent runs as the same OS user and could read `tokenFile` directly. These measures make sure the token is never handed to the agent; they do not make the file unreadable to it. Use `os-account` or `container` isolation for that.
+
+## Slack files
+
+Files people share with a request become T3 attachments for that turn, and files the agent names with `[[agent-tag:upload <path>]]` are posted back to the thread. Both need the `files:read` and `files:write` scopes ([reinstall to add them](slack-setup.md#1-create-the-app)). Both paths are on by default; set `files.inbound.enabled` or `files.outbound.enabled` to `false` to turn one off. Turning outbound off also fails files already queued, each with a notice.
+
+There is no spool directory. File bytes never touch disk or SQLite on the Agent Tag side:
+
+- Inbound bytes go from Slack into memory and straight to T3 (`attachments.createUploadUrl`). T3 stores the attachment. The `operation_attachments` table records only each file's Slack ID, outcome and T3 attachment metadata (ID, type, name, mime type, size), so a replayed turn sends the same attachments without downloading again.
+- Outbound bytes are read from the task's T3 worktree when the upload runs, held in memory for that one upload, and read again on a retry. The `slack_file_uploads` table records the relative path, title, state and Slack file ID.
+
+| Limit | Config key | Default | Allowed |
+| --- | --- | --- | --- |
+| Files per message (extras are skipped) | `files.inbound.maxFilesPerMessage` | 5 | 1–8 (T3's per-turn cap) |
+| Image size (a larger image is sent as a file) | `files.inbound.maxImageBytes` | 10 MiB | up to 10 MiB |
+| File size | `files.inbound.maxFileBytes` | 25 MiB | up to 50 MiB |
+| Refused extensions | `files.inbound.deniedExtensions` | none | up to 100, lowercase, no dot |
+| Files per reply (extras are noticed) | `files.outbound.maxFilesPerTurn` | 5 | 1–10 |
+| File size | `files.outbound.maxFileBytes` | 25 MiB | up to 50 MiB |
+| Credential scan on every outbound file | `files.outbound.scanForSecrets` | `true` | |
+
+Each inbound download has a 30 s timeout; each outbound byte upload 60 s. An upload is claimed with a 2-minute lease, so one left `inflight` by a crash is picked up again after that. Retryable Slack and network failures back off exponentially (about 5 s at first, at most 10 minutes, longer if Slack sends `Retry-After`), and a file fails with a thread notice after 10 attempts. A retry first asks Slack (`files.info`) whether the file already reached the thread, so a share is never posted twice. Audit rows (`slack.file.attached`, `slack.file.skipped`, `slack.file.upload-*`) record the file's extension, size or error code, never its name, path or content.
+
+Cleanup: nothing on the Agent Tag side holds file bytes, so there is nothing to sweep. `prune` does not touch `operation_attachments` or `slack_file_uploads`, and `messageDays` rewrites only the message text, so file names in `operations.payload_json`, the attachment rows and agent-chosen upload paths are kept until retention covers them (PR-T). T3's copies of inbound attachments follow T3's own lifecycle.
 
 ## Host constraints
 

@@ -14,7 +14,8 @@
       "ackReaction": "eyes",
       "statusProgress": true,
       "statusUpdateIntervalMs": 2000,
-      "statusUpdatesPerMinute": 40
+      "statusUpdatesPerMinute": 40,
+      "footer": "model"
     }
   },
   "access": {
@@ -113,6 +114,9 @@
   "lifecycle": {
     "closeIdleAfterHours": 168,
     "sweepIntervalSeconds": 60,
-    "maxClosesPerSweep": 20
+    "maxClosesPerSweep": 20,
+    "dirtyWorktreeRetentionDays": 14,
+    "deleteEmptyBranches": true,
+    "maxCleanupsPerSweep": 5
   }
 }

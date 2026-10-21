@@ -1,3 +1,5 @@
+import { existsSync } from "node:fs";
+
 import type { AgentTagConfig, AgentTagProfile, AgentTagRoute } from "./config.ts";
 import { preparePullRequestSync, pullRequestTurnNote, type PullRequestSyncOptions } from "./git/pr-sync.ts";
 import { ExecutionAuthorityDenied, requireExecutionAuthority } from "./policy/execution.ts";
@@ -8,7 +10,8 @@ import type { SlackContextSource } from "./slack/context-source.ts";
 import { fetchThreadWindow, SlackContextUnavailable, THREAD_CONTEXT_TIMEOUT_MS } from "./slack/context.ts";
 import { approvalMessage, describeDuration, questionMessage } from "./slack/cards.ts";
 import { collectMentionedUserIds, type SpeakerIdentity } from "./slack/markup.ts";
-import { escapeSlackText, markdownToMrkdwn, splitForSlack } from "./slack/render.ts";
+import { finalReplyChunks, replyFooter, turnFilesChanged } from "./slack/footer.ts";
+import { escapeSlackText, markdownToMrkdwn } from "./slack/render.ts";
 import { renderStatusMessage } from "./slack/status.ts";
 import { EMPTY_PROGRESS, progressActivity, TurnProgress } from "./progress.ts";
 import { slackErrorCode, unresolvedSpeaker } from "./slack/users.ts";
@@ -39,6 +42,7 @@ import {
   t3AttachmentUploader,
   turnFiles,
 } from "./slack/files.ts";
+import { parseUploadDirectives, rejectedUploadsNotice, uploadInstruction } from "./slack/uploads.ts";
 
 export interface T3CoordinatorGateway {
   /** Implementations should stop the RPC (closing its socket) when `signal` aborts. */
@@ -78,6 +82,9 @@ export interface CoordinatorProviderCatalog {
 
 /** Budget for refreshing a stale catalog before planning a model switch. */
 const CATALOG_REFRESH_BUDGET_MS = 3_000;
+/** Waits for a completed turn's checkpoint diff before settling without a file count (PR-F4). */
+const CHECKPOINT_WAITS = 3;
+const CHECKPOINT_WAIT_MS = 1_000;
 
 export interface CoordinatorOptions {
   readonly config: AgentTagConfig;
@@ -472,6 +479,7 @@ export class AgentTagCoordinator {
     operation: ClaimedOperation,
     task: TaskExecutionBinding,
     profile: AgentTagProfile,
+    workspace: TaskWorkspace,
     signal: AbortSignal | undefined,
   ): Promise<string> {
     const lease = { operationId: operation.operationId, workerId: this.#workerId };
@@ -523,9 +531,11 @@ export class AgentTagCoordinator {
           limits: { maxChars: profile.threadContext.maxChars, maxMessageChars: profile.threadContext.maxMessageChars },
         },
       memory: memory.block,
+      ...(this.#config.files.outbound.enabled ? { uploadInstruction: uploadInstruction(this.#config.files.outbound) } : {}),
     });
-    const prNote = this.#pullRequests === undefined ? null : pullRequestTurnNote(profile, task.repositoryRoot, taskBranchName(task.taskId, task.sessionGeneration));
-    const proposedText = prNote === null ? turnText : `${turnText}\n\n${prNote}`;
+    const prNote = this.#pullRequests === undefined ? null : pullRequestTurnNote(profile, task.repositoryRoot, workspace.branch);
+    const resumeNote = workspaceTurnNote(workspace, profile);
+    const proposedText = [resumeNote, turnText, prNote].filter((part) => part !== null).join("\n\n");
     return this.#store.resolveOperationTurnText({
       ...lease,
       proposedText,
@@ -713,15 +723,49 @@ export class AgentTagCoordinator {
 
   // --- Task lifecycle (PR-N): the T3 thread bootstrap for a task's session generation. ---
   /**
-   * Creates the generation's T3 thread with a fresh worktree from the profile base branch, on
-   * `taskBranchName(id, generation)`: a reopened task never reuses the retired thread's branch.
+   * Where a reopened task's session works (PR-N2). A dirty worktree the previous session left is
+   * adopted as is (claimed first, so cleanup cannot remove it; refused while cleanup holds its lease);
+   * a kept branch (commits, a PR, or a dirty tree that could not be adopted) is continued on the new
+   * generation's branch; otherwise the session starts fresh. A `!restart` is always fresh.
+   */
+  #taskWorkspace(task: TaskExecutionBinding): TaskWorkspace {
+    const branch = taskBranchName(task.taskId, task.sessionGeneration);
+    const fresh: TaskWorkspace = { kind: "fresh", branch, resumed: false };
+    if (task.sessionGeneration === 1) return fresh;
+    const previous = this.#store.getResumeCandidate(task.taskId, task.sessionGeneration);
+    if (previous === null) return fresh;
+    // Once the thread exists only the branch matters (for the PR note); the resume note went out with
+    // the generation's first turn.
+    if (previous.worktreeState === "adopted" && previous.worktreePath !== null) {
+      return { kind: "adopt", branch: previous.branch, worktreePath: previous.worktreePath, resumed: !task.threadStarted };
+    }
+    if (task.threadStarted) return fresh;
+    if (
+      previous.worktreeState === "retained-dirty" &&
+      previous.worktreePath !== null &&
+      existsSync(previous.worktreePath) &&
+      this.#store.adoptRetiredWorktree({ taskId: task.taskId, generation: previous.generation, now: this.#now().toISOString() })
+    ) {
+      return { kind: "adopt", branch: previous.branch, worktreePath: previous.worktreePath, resumed: true };
+    }
+    if (previous.branchState === "kept-commits" || previous.branchState === "kept-pr" || previous.worktreeState === "retained-dirty") {
+      return { kind: "continue", branch, fromBranch: previous.branch, resumed: true };
+    }
+    return { ...fresh, resumed: true };
+  }
+
+  /**
+   * Creates the generation's T3 thread: on the adopted worktree, or in a new worktree on
+   * `taskBranchName(id, generation)` from the continued branch or the profile base branch.
    */
   #threadBootstrap(
     task: TaskExecutionBinding,
     operation: ClaimedOperation,
     profile: AgentTagProfile,
     modelSelection: T3ModelSelection,
+    workspace: TaskWorkspace,
   ): NonNullable<Extract<T3Command, { readonly type: "thread.turn.start" }>["bootstrap"]> {
+    const adopt = workspace.kind === "adopt";
     return {
       createThread: {
         projectId: task.projectId,
@@ -729,15 +773,19 @@ export class AgentTagCoordinator {
         modelSelection,
         runtimeMode: profile.runtimeMode,
         interactionMode: "default",
-        branch: null,
-        worktreePath: null,
+        branch: adopt ? workspace.branch : null,
+        worktreePath: adopt ? workspace.worktreePath : null,
         createdAt: task.createdAt,
       },
-      prepareWorktree: {
-        projectCwd: task.repositoryRoot,
-        baseBranch: profile.baseBranch,
-        branch: taskBranchName(task.taskId, task.sessionGeneration),
-      },
+      ...(adopt
+        ? {}
+        : {
+          prepareWorktree: {
+            projectCwd: task.repositoryRoot,
+            baseBranch: workspace.kind === "continue" ? workspace.fromBranch : profile.baseBranch,
+            branch: workspace.branch,
+          },
+        }),
       runSetupScript: false,
     };
   }
@@ -755,7 +803,8 @@ export class AgentTagCoordinator {
       actorUserId: operation.payload.actorUserId,
     });
     const route = this.#config.routes.find((candidate) => candidate.conversationId === task.conversationId);
-    const turnText = await this.#composeTurn(operation, task, profile, signal);
+    const workspace = this.#taskWorkspace(task);
+    const turnText = await this.#composeTurn(operation, task, profile, workspace, signal);
     // Shutdown aborts these dispatches (the gateway interrupts the RPC and closes its socket). Both
     // commands use stable ids, so T3 deduplicates the replay when the released operation resumes.
     await abortable(this.#t3.dispatch({
@@ -794,7 +843,7 @@ export class AgentTagCoordinator {
       titleSeed: `Slack ${operation.payload.conversationId}/${operation.payload.threadTs}`,
       runtimeMode: profile.runtimeMode,
       interactionMode: "default",
-      ...(task.threadStarted ? {} : { bootstrap: this.#threadBootstrap(task, operation, profile, modelSelection) }),
+      ...(task.threadStarted ? {} : { bootstrap: this.#threadBootstrap(task, operation, profile, modelSelection, workspace) }),
       createdAt: this.#now().toISOString(),
     }, signal), signal);
     this.#store.markT3ThreadStarted({ taskId: task.taskId, threadId: task.threadId, now: this.#now().toISOString() });
@@ -857,6 +906,7 @@ export class AgentTagCoordinator {
     let progressMarker: string | null = null;
     let progressAt = loopStartedAt;
     let renewAt = loopStartedAt + Math.floor(this.#leaseMs / 2);
+    let checkpointWaits = 0;
     while (true) {
       if (signal?.aborted) throw new CoordinatorAborted();
       if (this.#now().getTime() >= renewAt) {
@@ -1041,7 +1091,37 @@ export class AgentTagCoordinator {
             !message.streaming,
         );
         if (assistant === undefined) throw new Error("completed T3 turn has no final assistant message");
-        const prSync = await this.#preparePullRequest(operation, task, profile, snapshot, assistant.text, turnActiveMs, signal);
+        // T3 records the turn's diff (thread.turn-diff-completed) about 200 ms after the turn completes.
+        // With a thread watch, wait a little for it so the status can say how many files changed.
+        if (
+          polling.watch !== null &&
+          checkpointWaits < CHECKPOINT_WAITS &&
+          snapshot.thread.checkpoints?.some((checkpoint) => checkpoint.turnId === latestTurn.turnId) !== true
+        ) {
+          checkpointWaits += 1;
+          if (snapshot.snapshotSequence >= polling.watch.lastSequence) {
+            await abortable(polling.watch.next(CHECKPOINT_WAIT_MS, signal), signal);
+          }
+          continue;
+        }
+        // Agent file shares (PR-L2): directive lines leave the reply and become upload rows.
+        const outbound = this.#config.files.outbound;
+        const shares = outbound.enabled ? parseUploadDirectives(assistant.text, outbound.maxFilesPerTurn) : null;
+        const replyText = shares?.text ?? assistant.text;
+        const uploads = shares === null || shares.requests.length + shares.rejected.length === 0
+          ? undefined
+          : {
+            t3ThreadId: snapshot.thread.id,
+            workspaceRoot: snapshot.thread.worktreePath ?? task.repositoryRoot,
+            requests: shares.requests,
+            rejectedNotice: rejectedUploadsNotice(shares.rejected, outbound),
+          };
+        const prSync = await this.#preparePullRequest(operation, task, profile, snapshot, replyText, turnActiveMs, signal);
+        const completedAt = this.#now();
+        const footer =
+          this.#config.slack.ui.footer === "none"
+            ? null
+            : replyFooter(snapshot, this.#store.getStatusMessageView(operation.operationId)?.startedAt, completedAt);
         const outboxId = this.#store.completeOperationWithOutbox({
           operationId: operation.operationId,
           taskId: operation.taskId,
@@ -1049,9 +1129,11 @@ export class AgentTagCoordinator {
           resultSequence: Math.max(turn.sequence, snapshot.snapshotSequence),
           conversationId: operation.payload.conversationId,
           threadTs: operation.payload.threadTs,
-          text: splitForSlack(markdownToMrkdwn(assistant.text)),
+          text: finalReplyChunks(markdownToMrkdwn(replyText), footer),
+          ...turnFilesChanged(snapshot),
           ...(prSync === undefined ? {} : { prSync, actorUserId: operation.payload.actorUserId }),
-          now: this.#now().toISOString(),
+          ...(uploads === undefined ? {} : { uploads }),
+          now: completedAt.toISOString(),
         });
         return { kind: "completed", operationId: operation.operationId, outboxId };
       }
@@ -1340,4 +1422,20 @@ export class AgentTagCoordinator {
     );
     await abortable(watch.next(timeoutMs, signal), signal);
   }
+}
+
+/** A task session's workspace (PR-N2); `resumed` marks the first turn of a reopen (not a `!restart`). */
+type TaskWorkspace =
+  | { readonly kind: "fresh"; readonly branch: string; readonly resumed: boolean }
+  | { readonly kind: "adopt"; readonly branch: string; readonly worktreePath: string; readonly resumed: boolean }
+  | { readonly kind: "continue"; readonly branch: string; readonly fromBranch: string; readonly resumed: true };
+
+function workspaceTurnNote(workspace: TaskWorkspace, profile: AgentTagProfile): string | null {
+  if (!workspace.resumed) return null;
+  const where = workspace.kind === "adopt"
+    ? `reused the previous session's worktree on ${workspace.branch}, uncommitted changes included`
+    : workspace.kind === "continue"
+      ? `a new worktree on ${workspace.branch}, continued from branch ${workspace.fromBranch}`
+      : `a fresh worktree on ${workspace.branch} from ${profile.baseBranch}`;
+  return `[agent-tag] This Slack thread was resumed after its previous session closed. Workspace: ${where}.`;
 }

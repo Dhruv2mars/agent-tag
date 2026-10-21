@@ -110,7 +110,12 @@ if (operatorCommand !== undefined) {
     try {
       const service = (await readServiceState(config.dataDir)) ?? null;
       // No network: the access mode only; `doctor` reads channel membership.
-      console.log(JSON.stringify({ ...store.operationalStatus(new Date().toISOString()), service, accessMode: config.access.mode }, null, 2));
+      console.log(JSON.stringify({
+        ...store.operationalStatus(new Date().toISOString()),
+        lifecycle: store.lifecycleCounts(),
+        service,
+        accessMode: config.access.mode,
+      }, null, 2));
     } finally {
       store.close();
     }
