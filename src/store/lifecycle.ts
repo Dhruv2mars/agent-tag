@@ -32,7 +32,8 @@ const QUIET_SQL = `
     AND i.state IN ('pending', 'response-pending', 'inflight'))
   AND NOT EXISTS (SELECT 1 FROM slack_outbox x WHERE x.task_id = t.task_id AND x.status IN ('pending', 'inflight'))
   AND NOT EXISTS (SELECT 1 FROM slack_reactions r WHERE r.task_id = t.task_id AND r.status IN ('pending', 'inflight'))
-  AND NOT EXISTS (SELECT 1 FROM pr_sync_jobs j WHERE j.task_id = t.task_id AND j.status IN ('pending', 'inflight'))`;
+  AND NOT EXISTS (SELECT 1 FROM pr_sync_jobs j WHERE j.task_id = t.task_id AND j.status IN ('pending', 'inflight'))
+  AND t.restart_requested_at IS NULL`;
 
 const DUE_SQL = `t.state = 'active' AND (t.close_requested_at IS NOT NULL OR ${ACTIVITY_SQL} <= ?) AND ${QUIET_SQL}`;
 
@@ -53,6 +54,60 @@ export function listCloseCandidates(database: Database, input: ListCloseCandidat
     )
     .all(idleBefore, limit)
     .map((row) => row.task_id);
+}
+
+/** The task columns a retired-thread row is built from. */
+export const retirableTaskSchema = z.object({
+  session_generation: z.number().int().positive(),
+  t3_project_id: nonEmpty.nullable(),
+  t3_thread_id: nonEmpty.nullable(),
+  t3_thread_started_at: isoDateTime.nullable(),
+  repository_root: nonEmpty,
+});
+
+/**
+ * Records the task's current T3 thread in task_retired_t3_threads (generation, branch and stable
+ * command ids for the session stop and PR-N2's cleanup), inside the caller's transaction. A thread
+ * that never started has nothing in T3 or git, so its row is already complete.
+ */
+export function retireCurrentThread(
+  database: Database,
+  input: {
+    readonly taskId: string;
+    readonly task: z.infer<typeof retirableTaskSchema>;
+    readonly reason: TaskCloseReason | "restart";
+    readonly now: string;
+  },
+): void {
+  const { taskId, task, now } = input;
+  if (task.t3_project_id === null || task.t3_thread_id === null) return;
+  const generation = task.session_generation;
+  const created = task.t3_thread_started_at !== null;
+  database
+    .query(
+      `INSERT INTO task_retired_t3_threads (
+        task_id, generation, t3_project_id, t3_thread_id, repository_root, branch, reason, retired_at,
+        thread_created, session_stop_command_id, delete_command_id, worktree_state, branch_state, completed_at, pr_url
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+        (SELECT pr_url FROM task_pull_requests WHERE task_id = ?))`,
+    )
+    .run(
+      taskId,
+      generation,
+      task.t3_project_id,
+      task.t3_thread_id,
+      task.repository_root,
+      taskBranchName(taskId, generation),
+      input.reason,
+      now,
+      created ? 1 : 0,
+      `${taskId}:g${generation}:session.stop`,
+      `${taskId}:g${generation}:thread.delete`,
+      created ? "unknown" : "none",
+      created ? "unknown" : "deleted",
+      created ? null : now,
+      taskId,
+    );
 }
 
 export interface CloseTaskInput {
@@ -86,13 +141,8 @@ export function closeTask(database: Database, input: CloseTaskInput): CloseTaskR
   const fallbackReason = z.enum(TASK_CLOSE_REASONS).parse(input.reason);
   const idleBefore = input.idleBefore === undefined ? null : isoDateTime.parse(input.idleBefore);
   return database.transaction((): CloseTaskResult => {
-    const task = z.object({
+    const task = retirableTaskSchema.extend({
       state: z.enum(["active", "closed"]),
-      session_generation: z.number().int().positive(),
-      t3_project_id: nonEmpty.nullable(),
-      t3_thread_id: nonEmpty.nullable(),
-      t3_thread_started_at: isoDateTime.nullable(),
-      repository_root: nonEmpty,
       close_reason: z.enum(TASK_CLOSE_REASONS).nullable(),
       close_requested_at: isoDateTime.nullable(),
     }).nullable().parse(
@@ -112,34 +162,7 @@ export function closeTask(database: Database, input: CloseTaskInput): CloseTaskR
     if (due?.count !== 1) return { kind: "busy" };
     const reason = task.close_requested_at === null ? fallbackReason : (task.close_reason ?? fallbackReason);
     const generation = task.session_generation;
-    if (task.t3_project_id !== null && task.t3_thread_id !== null) {
-      const created = task.t3_thread_started_at !== null;
-      database
-        .query(
-          `INSERT INTO task_retired_t3_threads (
-            task_id, generation, t3_project_id, t3_thread_id, repository_root, branch, reason, retired_at,
-            thread_created, session_stop_command_id, delete_command_id, worktree_state, branch_state, completed_at, pr_url
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-            (SELECT pr_url FROM task_pull_requests WHERE task_id = ?))`,
-        )
-        .run(
-          taskId,
-          generation,
-          task.t3_project_id,
-          task.t3_thread_id,
-          task.repository_root,
-          taskBranchName(taskId, generation),
-          reason,
-          now,
-          created ? 1 : 0,
-          `${taskId}:g${generation}:session.stop`,
-          `${taskId}:g${generation}:thread.delete`,
-          created ? "unknown" : "none",
-          created ? "unknown" : "deleted",
-          created ? null : now,
-          taskId,
-        );
-    }
+    retireCurrentThread(database, { taskId, task, reason, now });
     database
       .query(
         `UPDATE tasks SET state = 'closed', closed_at = ?, close_reason = ?, close_requested_at = NULL, updated_at = ?

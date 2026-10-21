@@ -19,6 +19,7 @@
     }
   },
   "access": {
+    "mode": "allowlist",
     "allowedUserIds": ["U0EXAMPLE"],
     "allowedChannelIds": ["C0EXAMPLE"]
   },

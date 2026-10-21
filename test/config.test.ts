@@ -36,7 +36,7 @@ const baseConfig = {
 describe("Agent Tag config", () => {
   test("defaults and validates the !command settings", () => {
     const parsed = agentTagConfigSchema.parse(baseConfig);
-    expect(parsed.commands).toEqual({ enabled: true, disabled: [], adminOnly: [] });
+    expect(parsed.commands).toEqual({ enabled: true, disabled: [], adminOnly: [], restartTimeoutSeconds: 120 });
     expect(parsed.access.adminUserIds).toEqual([]);
     expect(
       agentTagConfigSchema.parse({
@@ -44,7 +44,8 @@ describe("Agent Tag config", () => {
         access: { ...baseConfig.access, adminUserIds: ["U123"] },
         commands: { disabled: ["mute"], adminOnly: ["unmute"] },
       }).commands,
-    ).toEqual({ enabled: true, disabled: ["mute"], adminOnly: ["unmute"] });
+    ).toEqual({ enabled: true, disabled: ["mute"], adminOnly: ["unmute"], restartTimeoutSeconds: 120 });
+    expect(() => agentTagConfigSchema.parse({ ...baseConfig, commands: { restartTimeoutSeconds: 5 } })).toThrow();
     // Admins must be allowed users.
     expect(() =>
       agentTagConfigSchema.parse({ ...baseConfig, access: { ...baseConfig.access, adminUserIds: ["U999"] } }),
@@ -623,5 +624,80 @@ describe("t3 config", () => {
         expect(rotationAccepts(rotation)).toBe(false);
       }
     });
+  });
+});
+
+describe("access modes (Q1)", () => {
+  const profile = baseConfig.profiles[0]!;
+
+  test("the old config shape parses unchanged, in allowlist mode with routed-only DMs", () => {
+    const parsed = agentTagConfigSchema.parse(baseConfig);
+    expect(parsed.access).toEqual({
+      mode: "allowlist",
+      allowedUserIds: ["U123"],
+      allowedChannelIds: ["C123"],
+      adminUserIds: [],
+      membership: { ttlSeconds: 300, maxStaleSeconds: 3_600, maxMembers: 5_000, guests: "deny" },
+      directMessages: { mode: "routed-only" },
+    });
+  });
+
+  test("channel-members parses with an empty allowedUserIds; allowlist mode still needs one user", () => {
+    const parsed = agentTagConfigSchema.parse({
+      ...baseConfig,
+      access: { mode: "channel-members", allowedUserIds: [], allowedChannelIds: ["C123"] },
+    });
+    expect(parsed.access.mode).toBe("channel-members");
+    expect(parsed.access.allowedUserIds).toEqual([]);
+    expect(() =>
+      agentTagConfigSchema.parse({ ...baseConfig, access: { allowedUserIds: [], allowedChannelIds: ["C123"] } }),
+    ).toThrow("access.allowedUserIds must list at least one user in");
+  });
+
+  test("DM auto-route requires a configured profile with privateDm memory", () => {
+    const autoRoute = (memoryPrivateDm: boolean, autoRouteProfileId?: string) => ({
+      ...baseConfig,
+      access: {
+        ...baseConfig.access,
+        directMessages: { mode: "auto-route", ...(autoRouteProfileId === undefined ? {} : { autoRouteProfileId }) },
+      },
+      profiles: [{ ...profile, memory: { ...profile.memory, privateDm: memoryPrivateDm } }],
+    });
+    expect(agentTagConfigSchema.parse(autoRoute(true, "engineering")).access.directMessages).toEqual({
+      mode: "auto-route",
+      autoRouteProfileId: "engineering",
+    });
+    expect(() => agentTagConfigSchema.parse(autoRoute(false, "engineering"))).toThrow(
+      "the auto-route DM profile must enable privateDm memory isolation",
+    );
+    expect(() => agentTagConfigSchema.parse(autoRoute(true))).toThrow(
+      "needs autoRouteProfileId naming a configured profile",
+    );
+    expect(() => agentTagConfigSchema.parse(autoRoute(true, "missing"))).toThrow(
+      "needs autoRouteProfileId naming a configured profile",
+    );
+  });
+
+  test("membership and DM keys are bounded and strict", () => {
+    const withAccess = (access: Record<string, unknown>) => ({ ...baseConfig, access: { ...baseConfig.access, ...access } });
+    expect(
+      agentTagConfigSchema.parse(withAccess({ membership: { ttlSeconds: 60, guests: "steer-only" } })).access.membership,
+    ).toEqual({ ttlSeconds: 60, maxStaleSeconds: 3_600, maxMembers: 5_000, guests: "steer-only" });
+    expect(() => agentTagConfigSchema.parse(withAccess({ mode: "everyone" }))).toThrow();
+    expect(() => agentTagConfigSchema.parse(withAccess({ membership: { ttlSeconds: 5 } }))).toThrow();
+    expect(() => agentTagConfigSchema.parse(withAccess({ membership: { maxMembers: 50_000 } }))).toThrow();
+    expect(() => agentTagConfigSchema.parse(withAccess({ membership: { guests: "approve" } }))).toThrow();
+    expect(() => agentTagConfigSchema.parse(withAccess({ membership: { refresh: true } }))).toThrow();
+    expect(() => agentTagConfigSchema.parse(withAccess({ directMessages: { mode: "everyone" } }))).toThrow();
+    expect(agentTagConfigSchema.parse(withAccess({ directMessages: { mode: "off" } })).access.directMessages.mode).toBe("off");
+  });
+
+  test("admin users must stay in allowedUserIds in channel-members mode too", () => {
+    expect(() =>
+      agentTagConfigSchema.parse({
+        ...baseConfig,
+        access: { mode: "channel-members", allowedUserIds: [], allowedChannelIds: ["C123"], adminUserIds: ["U123"] },
+      }),
+    ).toThrow("admin user is not in access.allowedUserIds");
   });
 });

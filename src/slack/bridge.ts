@@ -3,15 +3,27 @@ import { z } from "zod";
 
 import { AgentTagCommands, type CommandReplySender } from "../commands/handler.ts";
 import type { AgentTagConfig } from "../config.ts";
+import { ACCESS_DENIAL_REASONS, bindMembership } from "../policy/access.ts";
 import { readSecretFile } from "../security/secret-file.ts";
 import type { ServiceLogger } from "../service.ts";
 import type { AgentTagStore } from "../store/store.ts";
+import {
+  actionSubject,
+  auditAccessDenial,
+  DirectMessageAutoRouter,
+  eventEnvelope,
+  eventSubject,
+  isExplicitEvent,
+  warmAccess,
+} from "./access-ingress.ts";
+import { actionPurpose } from "./actions.ts";
 import { SLACK_ACTION_IDS, SlackActionRouter, USER_INPUT_MODAL_CALLBACK_ID, type SlackActionResult } from "./actions.ts";
 import { renderInteractionCard } from "./cards.ts";
 import type { SlackContextSource } from "./context-source.ts";
 import { THREAD_CONTEXT_TIMEOUT_MS, type SlackRepliesPage } from "./context.ts";
-import { SlackEventRouter } from "./events.ts";
+import { SlackEventRouter, type SlackIngressResult } from "./events.ts";
 import { downloadSlackFile, parseSlackFileInfo, type SlackFileClient } from "./files.ts";
+import { ChannelMembershipCache, membershipChannels, type ChannelMembershipStatus } from "./membership.ts";
 import { SlackMemoryCommands } from "./memory-commands.ts";
 import { deliverNextSlackOutbox, type RefreshRenderers, type SlackOutboxOutcome } from "./outbox.ts";
 import { renderStatusMessage } from "./status.ts";
@@ -20,7 +32,8 @@ import { ROUTINE_CANCEL_ACTION_ID } from "./routine-replies.ts";
 import { SlackRoutines } from "./routines.ts";
 import { deliverNextSlackReaction, type SlackReactionOutcome } from "./reactions.ts";
 import { installUndiciWebSocketCompat } from "./undici-compat.ts";
-import { SlackUserDirectory, slackErrorCode } from "./users.ts";
+import { slackUploadClient, type SlackUploadClient } from "./uploads.ts";
+import { SlackUserDirectory, slackErrorCode, type SlackUserKind } from "./users.ts";
 import { ConversationVisibilityResolver } from "./visibility.ts";
 
 const authTestSchema = z.object({
@@ -92,6 +105,60 @@ export const SLACK_CONTEXT_CLIENT_OPTIONS = {
   maxRequestConcurrency: 2,
   timeout: THREAD_CONTEXT_TIMEOUT_MS,
 } as const;
+
+/**
+ * Options for the client that walks channel membership (`conversations.members`, Tier 4). Its own queue,
+ * so a large channel's page walk never delays outbox sends, lookups or history reads.
+ */
+export const SLACK_MEMBERSHIP_CLIENT_OPTIONS = {
+  retryConfig: { retries: 0 },
+  rejectRateLimitedCalls: true,
+  maxRequestConcurrency: 2,
+  timeout: 10_000,
+} as const;
+
+/** How long startup waits for the first membership snapshots in `channel-members` mode. */
+export const MEMBERSHIP_STARTUP_WAIT_MS = 15_000;
+/** How long an event or a click waits for a membership refresh and a kind lookup before deciding. */
+export const ACCESS_WARMUP_EVENT_MS = 10_000;
+/** Clicks wait less: a modal's trigger id expires 3 s after the click. */
+export const ACCESS_WARMUP_ACTION_MS = 2_000;
+
+/** `conversations.members` on its own Web API client (see SLACK_MEMBERSHIP_CLIENT_OPTIONS). */
+export async function createSlackMembershipCache(input: {
+  readonly botToken: string;
+  readonly config: AgentTagConfig;
+  readonly store: Pick<AgentTagStore, "recordAccessAudit">;
+  readonly users: { cachedKind(userId: string): SlackUserKind };
+  readonly logger?: ServiceLogger;
+  /** Tests point this at a local fake. */
+  readonly slackApiUrl?: string;
+}): Promise<ChannelMembershipCache> {
+  const { LogLevel, webApi } = await import("@slack/bolt");
+  const client = new webApi.WebClient(input.botToken, {
+    ...SLACK_MEMBERSHIP_CLIENT_OPTIONS,
+    retryConfig: { ...SLACK_MEMBERSHIP_CLIENT_OPTIONS.retryConfig },
+    logLevel: LogLevel.WARN,
+    ...(input.slackApiUrl === undefined ? {} : { slackApiUrl: input.slackApiUrl }),
+  });
+  return new ChannelMembershipCache({
+    list: (args) => client.conversations.members({ ...args }),
+    settings: input.config.access.membership,
+    users: input.users,
+    ...(input.logger === undefined ? {} : { logger: input.logger }),
+    onDegraded: ({ conversationId, state, errorCode }) => {
+      input.store.recordAccessAudit({
+        action: "access.membership.degraded",
+        actorId: "agent-tag",
+        conversationId,
+        result: state,
+        source: conversationId,
+        metadata: { errorCode },
+        createdAt: new Date().toISOString(),
+      });
+    },
+  });
+}
 
 /** `conversations.replies` on its own Web API client (see SLACK_CONTEXT_CLIENT_OPTIONS). */
 export async function createSlackRepliesReader(input: {
@@ -216,6 +283,14 @@ export function createCommandReplySender(
   };
 }
 
+/** Access hooks around the synchronous routers (see access-ingress.ts). */
+export interface SlackIngressAccess {
+  /** Warms membership and the account kind; never rejects. */
+  warmEvent(body: unknown): Promise<void>;
+  /** Audits an explicit request the router ignored, when the access policy denied it. */
+  auditEvent(body: unknown, result: SlackIngressResult): void;
+}
+
 /**
  * Routes one Slack event; a `!command`, routine request or memory phrase is executed after the
  * router returns (never inside ingest).
@@ -225,15 +300,90 @@ export async function handleSlackEvent(
     readonly router: Pick<SlackEventRouter, "ingest">;
     readonly commands: Pick<AgentTagCommands, "execute">;
     readonly routines?: Pick<SlackRoutines, "handle">;
+    readonly access?: SlackIngressAccess;
     readonly memory?: Pick<SlackMemoryCommands, "handle">;
   },
   body: unknown,
 ): Promise<void> {
+  await input.access?.warmEvent(body);
   const result = input.router.ingest(body);
+  input.access?.auditEvent(body, result);
   if (result.kind === "command") await input.commands.execute(result);
   if (result.kind === "routine") await input.routines?.handle(result);
   if (result.kind === "memory") await input.memory?.handle(result);
 }
+
+/** Builds the ingress access hooks for a config, a store and (in `channel-members` mode) a cache. */
+export function slackIngressAccess(input: {
+  readonly config: AgentTagConfig;
+  readonly store: Pick<AgentTagStore, "recordAccessAudit">;
+  readonly membership: ChannelMembershipCache | null;
+  readonly users: { kind(userId: string, signal?: AbortSignal): Promise<SlackUserKind> };
+  readonly logger?: ServiceLogger;
+  readonly now?: () => string;
+}): SlackIngressAccess & {
+  warmAction(body: unknown): Promise<void>;
+  auditAction(body: unknown, result: SlackActionResult): void;
+} {
+  const now = input.now ?? (() => new Date().toISOString());
+  const audit = (record: () => void): void => {
+    // An audit row is evidence, not control flow: a failed write never changes what the user sees.
+    try {
+      record();
+    } catch (error) {
+      input.logger?.({ level: "warn", event: "access.audit.failed", at: now(), errorCode: error instanceof Error ? error.name : "unknown" });
+    }
+  };
+  return {
+    warmEvent: (body) =>
+      warmAccess({ config: input.config, membership: input.membership, users: input.users, deadlineMs: ACCESS_WARMUP_EVENT_MS }, eventSubject(body)),
+    warmAction: (body) =>
+      warmAccess({ config: input.config, membership: input.membership, users: input.users, deadlineMs: ACCESS_WARMUP_ACTION_MS }, actionSubject(body)),
+    auditEvent(body, result) {
+      if (result.kind !== "ignored" || !isExplicitEvent(body)) return;
+      const subject = eventSubject(body);
+      const envelope = eventEnvelope(body);
+      if (subject === null || envelope === null) return;
+      audit(() =>
+        auditAccessDenial({
+          config: input.config,
+          store: input.store,
+          workspaceId: envelope.workspaceId,
+          subject,
+          purpose: "steer",
+          source: envelope.eventId,
+          now: now(),
+        })
+      );
+    },
+    auditAction(body, result) {
+      if (result.kind !== "ignored" || !ACCESS_IGNORED_REASONS.has(result.reason)) return;
+      const subject = actionSubject(body);
+      const parsed = actionAuditSchema.safeParse(body);
+      if (subject === null || !parsed.success) return;
+      const action = parsed.data.actions[0];
+      if (action === undefined) return;
+      audit(() =>
+        auditAccessDenial({
+          config: input.config,
+          store: input.store,
+          workspaceId: parsed.data.team.id,
+          subject,
+          purpose: actionPurpose(action.action_id),
+          source: `${parsed.data.team.id}:${subject.user}:${action.action_ts}:${action.action_id}`,
+          now: now(),
+        })
+      );
+    },
+  };
+}
+
+const ACCESS_IGNORED_REASONS: ReadonlySet<string> = new Set(ACCESS_DENIAL_REASONS);
+
+const actionAuditSchema = z.object({
+  team: z.object({ id: z.string().min(1) }),
+  actions: z.array(z.object({ action_id: z.string(), action_ts: z.string() })),
+});
 
 /** Delivery-time renderers for outbox refresh rows, by refresh kind. PR-F adds "status-message". */
 export function refreshRenderers(store: AgentTagStore, config: AgentTagConfig): RefreshRenderers {
@@ -304,14 +454,23 @@ export class SlackSocketBridge {
   readonly #refreshRenderers: RefreshRenderers;
   /** Read-only Slack lookups for turn composition (speaker labels, thread window). */
   readonly contextSource: SlackContextSource;
+  /** Channel membership snapshots; null unless `access.mode` is `channel-members`. */
+  readonly membership: ChannelMembershipCache | null;
   /** Shared-file reads for the coordinator (PR-L1). */
   readonly files: SlackFileClient;
+  /**
+   * Agent file shares (PR-L2) over the outbox's client: no SDK retries, so the upload worker owns
+   * every retry and a completed share is never repeated. Needs `files:write` (and `files:read` for
+   * the crash-recovery share check).
+   */
+  readonly uploads: SlackUploadClient;
 
   private constructor(
     app: SlackApp,
     store: AgentTagStore,
     config: AgentTagConfig,
     contextSource: SlackContextSource,
+    membership: ChannelMembershipCache | null,
     files: SlackFileClient,
   ) {
     this.#app = app;
@@ -319,7 +478,9 @@ export class SlackSocketBridge {
     this.#config = config;
     this.#refreshRenderers = refreshRenderers(store, config);
     this.contextSource = contextSource;
+    this.membership = membership;
     this.files = files;
+    this.uploads = slackUploadClient(app.client);
   }
 
   static async create(input: {
@@ -347,12 +508,14 @@ export class SlackSocketBridge {
       );
     }
     const selfBotId = await resolveSelfBotId(auth, (user) => app.client.users.info({ user }));
-    const router = new SlackEventRouter({
-      config: input.config,
-      store: input.store,
-      botUserId: auth.user_id,
-      ...(selfBotId === undefined ? {} : { selfBotId }),
-    });
+    const eventRouter = (config: AgentTagConfig): SlackEventRouter =>
+      new SlackEventRouter({
+        config,
+        store: input.store,
+        botUserId: auth.user_id,
+        ...(selfBotId === undefined ? {} : { selfBotId }),
+      });
+    const router = new DirectMessageAutoRouter({ config: input.config, base: eventRouter(input.config), create: eventRouter });
     const commandReplies = createCommandReplySender(app.client as unknown as CommandReplyClient);
     const commands = new AgentTagCommands({
       config: () => input.config,
@@ -361,9 +524,27 @@ export class SlackSocketBridge {
       ...(auth.user === undefined ? {} : { botName: auth.user }),
       ...(input.logger === undefined ? {} : { logger: input.logger }),
     });
-    // users:read: speaker labels for thread context, and the requester's zone for routines.
+    // users:read: speaker labels for thread context, the requester's zone for routines, guest/bot kind.
     const users = await createSlackUserDirectory({
       botToken: botToken.exposeToBoundary(),
+      ...(input.logger === undefined ? {} : { logger: input.logger }),
+    });
+    // channels:read / groups:read: who is in an allowed channel, only in channel-members mode.
+    const membership = input.config.access.mode === "channel-members"
+      ? await createSlackMembershipCache({
+        botToken: botToken.exposeToBoundary(),
+        config: input.config,
+        store: input.store,
+        users,
+        ...(input.logger === undefined ? {} : { logger: input.logger }),
+      })
+      : null;
+    if (membership !== null) bindMembership(input.config, membership);
+    const access = slackIngressAccess({
+      config: input.config,
+      store: input.store,
+      membership,
+      users,
       ...(input.logger === undefined ? {} : { logger: input.logger }),
     });
     const routines = new SlackRoutines({
@@ -391,24 +572,27 @@ export class SlackSocketBridge {
     });
     const actions = new SlackActionRouter({ config: input.config, store: input.store });
     app.event("app_mention", async ({ body }) => {
-      await handleSlackEvent({ router, commands, routines, memory }, body);
+      await handleSlackEvent({ router, commands, routines, access, memory }, body);
     });
     app.event("message", async ({ body }) => {
-      await handleSlackEvent({ router, commands, routines, memory }, body);
+      await handleSlackEvent({ router, commands, routines, access, memory }, body);
     });
     app.action(ROUTINE_CANCEL_ACTION_ID, async ({ ack, body, respond }) => {
       await ack();
+      await access.warmAction(body);
       await routines.cancelFromAction(body, (text) => respond({ response_type: "ephemeral", replace_original: false, text }));
     });
     for (const actionId of SLACK_ACTION_IDS) {
       app.action(actionId, async ({ ack, body, client, respond }) => {
         await ack();
-        await handleBlockAction({
+        await access.warmAction(body);
+        const result = await handleBlockAction({
           actions,
           openView: (triggerId, view) => client.views.open({ trigger_id: triggerId, view }),
           respond,
           ...(input.logger === undefined ? {} : { logger: input.logger }),
         }, body);
+        access.auditAction(body, result);
       });
     }
     app.view(USER_INPUT_MODAL_CALLBACK_ID, async ({ ack, body }) => {
@@ -427,10 +611,24 @@ export class SlackSocketBridge {
       replies,
     };
     const files = await createSlackFileClient({ botToken });
-    return new SlackSocketBridge(app, input.store, input.config, contextSource, files);
+    return new SlackSocketBridge(app, input.store, input.config, contextSource, membership, files);
+  }
+
+  /** Refreshes every due routed channel; the service's membership worker calls this each tick. */
+  async refreshMembership(): Promise<void> {
+    await this.membership?.refreshAll(membershipChannels(this.#config));
+  }
+
+  /** Per routed channel snapshot state, for doctor and logs. Empty in `allowlist` mode. */
+  membershipStatus(): ReadonlyArray<ChannelMembershipStatus> {
+    const membership = this.membership;
+    return membership === null ? [] : membershipChannels(this.#config).map((id) => membership.status(id));
   }
 
   async start(): Promise<void> {
+    // Read channel membership before the service's workers re-check queued work, so a restart does not
+    // deny members for `membership-unknown`. Bounded: a slow Slack never holds startup.
+    await Promise.race([this.refreshMembership(), Bun.sleep(MEMBERSHIP_STARTUP_WAIT_MS)]);
     await this.#app.start();
   }
 

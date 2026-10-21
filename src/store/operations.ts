@@ -5,6 +5,7 @@ import { z } from "zod";
 import { type T3ModelSelection, t3ModelSelectionSchema } from "../t3/gateway.ts";
 
 import { writeAudit } from "./audit.ts";
+import { type FileUploadsInput, recordFileUploads } from "./file-uploads.ts";
 import { type StoreContext, requiredId, parseStoredJson } from "./context.ts";
 import { OPERATION_SETTLED, closeOperationInteractions } from "./interactions.ts";
 import { leaseExpiry, requireLeaseHeld } from "./lease.ts";
@@ -98,6 +99,11 @@ export function claimNextOperation(
                  AND interrupt.kind = 'cancel'
                  AND interrupt.state IN ('response-pending', 'inflight')
                  AND interrupt.request_id LIKE 'interrupt:%'
+             )
+             -- A pending \`!restart\` holds the queue: the next turn waits for the fresh session (PR-H2).
+             AND NOT EXISTS (
+               SELECT 1 FROM tasks restart
+               WHERE restart.task_id = o.task_id AND restart.restart_requested_at IS NOT NULL
              )
            ORDER BY o.source_order_key, o.operation_id
            LIMIT 1`,
@@ -474,6 +480,8 @@ export interface CompleteOperationWithOutboxInput {
   readonly prSync?: PrSyncInput;
   /** The requesting user, recorded on a PR job. Required with `prSync`. */
   readonly actorUserId?: string;
+  /** Files the reply shares (PR-L2), queued behind its last chunk (file-uploads.ts). */
+  readonly uploads?: FileUploadsInput;
   readonly now: string;
 }
 
@@ -562,6 +570,20 @@ export function completeOperationWithOutbox(
         prSync: input.prSync,
         now,
         noticeAt: new Date(new Date(now).getTime() + texts.length).toISOString(),
+      });
+    }
+    const last = outboxIds.at(-1);
+    if (input.uploads !== undefined && last !== undefined) {
+      recordFileUploads(database, {
+        operationId,
+        taskId,
+        workerId: input.workerId,
+        conversationId: input.conversationId,
+        threadTs: input.threadTs,
+        uploads: input.uploads,
+        afterOutboxId: last.outboxId,
+        now,
+        noticeAt: new Date(new Date(now).getTime() + texts.length + 1).toISOString(),
       });
     }
     writeAudit(database, {

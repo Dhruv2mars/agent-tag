@@ -319,3 +319,26 @@ describe("SlackUserDirectory", () => {
     expect(slackErrorCode("nope")).toBe("unknown_error");
   });
 });
+
+describe("cachedKind", () => {
+  test("a kind seen once outlives the label TTL and a failed refresh (execution-time re-checks)", async () => {
+    let fail = false;
+    const { directory, advance } = fixture({
+      lookup: async (id) => {
+        if (fail) throw platformError("ratelimited");
+        return userResponse(id, id === "UG" ? { is_restricted: true } : {});
+      },
+    });
+    expect(directory.cachedKind("U1")).toBe("unknown");
+    await directory.kind("U1");
+    await directory.kind("UG");
+    expect([directory.cachedKind("U1"), directory.cachedKind("UG")]).toEqual(["member", "guest"]);
+    advance(2 * 3_600_000);
+    fail = true;
+    await directory.kind("U1");
+    await directory.kind("UG");
+    expect([directory.cachedKind("U1"), directory.cachedKind("UG")]).toEqual(["member", "guest"]);
+    expect(directory.cachedKind("U2")).toBe("unknown");
+  });
+});
+

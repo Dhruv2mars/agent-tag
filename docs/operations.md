@@ -43,6 +43,36 @@ bun run onboard -- --yes --accept-risk \
   --t3-issue-token --install-service
 ```
 
+## Access modes
+
+`access.mode` decides who may use Agent Tag in a routed channel. Every check (mentions, button clicks, `!commands`, routines, memory, and the re-check before each queued turn, interaction response and schedule run) goes through one predicate, `isSteeringAllowed` in `src/policy/access.ts`.
+
+- `allowlist` (default): only users in `access.allowedUserIds`. Existing configs keep this mode.
+- `channel-members`: users in `allowedUserIds`, plus any current member of a channel in `access.allowedChannelIds`, the way Claude Tag works. `allowedUserIds` may be empty. Membership never adds a channel: `allowedChannelIds` and `routes` still decide where the agent works.
+
+In `channel-members` mode Agent Tag reads each routed channel's members with `conversations.members` (`channels:read` for public channels, `groups:read` for private ones) and keeps an in-memory snapshot per channel:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `access.membership.ttlSeconds` | 300 | A snapshot older than this is refreshed in the background and before a non-allowlisted user's event. |
+| `access.membership.maxStaleSeconds` | 3600 | Past this age (for example while Slack rate-limits the refresh) the snapshot answers "unknown": non-allowlisted users are denied with `membership-unknown`, and their due routines wait instead of being cancelled. |
+| `access.membership.maxMembers` | 5000 | A larger channel is not snapshotted; only the allowlist works there. |
+| `access.membership.guests` | `deny` | Guests (restricted accounts) never approve, answer or cancel. `steer-only` lets them start and steer turns. |
+
+Other bots never get access through membership. A user whose account kind cannot be read may steer but not approve. The service reads membership once at startup (up to 15 s) before it resumes queued work. When a scope is missing, Agent Tag writes one `access.membership.degraded` audit row and one warning per channel, then works allowlist-only in that channel. Someone who leaves a channel loses access within one TTL, and their queued turns, interaction responses and schedules are revoked at execution like an allowlist removal. Denied mentions and clicks write `access.denied` audit rows with the reason (`user-denied`, `approver-denied`, `guest-denied`, `membership-unknown`, `dm-owner-denied`, `dm-disabled`).
+
+Approval, answer and cancel buttons follow the same predicate with their own purpose: in `channel-members` mode any non-guest channel member may approve. `commands.adminOnly` still uses `access.adminUserIds` and never membership.
+
+Thread context windows still mark only `allowedUserIds` as `"steeringAllowed": true`; other members' earlier replies are included as context.
+
+`access.directMessages.mode` controls DMs. Membership never grants a DM.
+
+- `routed-only` (default): only DM routes listed in `routes`; see [DM routes](#dm-routes).
+- `auto-route`: a DM from any user in `allowedUserIds` gets a private route owned by that user on `autoRouteProfileId`, which must name a profile with `memory.privateDm: true`. The route is recorded on the task, so the owner must still be allowlisted when queued work runs.
+- `off`: every DM is ignored with `dm-disabled`, and queued DM work is revoked.
+
+`agent-tag doctor --json` reports an `access` block: the mode, each routed channel's `membership` (`ok`, `missing_scope`, `error`, …), member count and snapshot age, the DM routing summary, and `missingScopes`. `agent-tag status` prints `accessMode` only and does not contact Slack.
+
 ## Doctor
 
 Run a live dependency check before starting:
@@ -438,21 +468,26 @@ A message that starts with `@Agent Tag !<command>` runs a command instead of a r
 | `!status` | anywhere | In a thread: whether the agent is working, waiting on an approval or question, or has requests queued, plus the thread's model and mute state. At the top level: a count across the channel's threads. Only the sender sees it. |
 | `!mute` | a thread the agent is part of | Stops the agent answering unmentioned replies in that thread. Posts a public notice. |
 | `!unmute` | a thread the agent is part of | Reverses `!mute`. Any message that mentions the agent in a muted thread also unmutes it. |
+| `!stop` | a thread the agent is working in | Stops the running turn, the same way as the status message's Stop button: the status message turns into "Stopped by @you". Requests in that thread sent before `!stop` and not started yet are dropped, with one public note saying how many. Requests sent after it still run. |
+| `!restart` | a thread the agent is part of | Starts a fresh T3 session for the thread: a new T3 thread on a new worktree branch (`agent-tag/<task>-g2`, `-g3`, ...) from the profile's base branch. With nothing running it happens at once. Otherwise the running turn is stopped first, new messages wait, and the agent confirms in the thread once the fresh session is ready (after at most `commands.restartTimeoutSeconds`, default 120; past that the old turn may still post a late reply). The first request on the fresh session rereads the earlier thread messages (without `!commands` and the agent's own replies) when `threadContext` is enabled. |
 
-Commands never create a T3 turn and never store the message text. Each run is recorded once per Slack message in `slack_command_events` and audited as `slack.command.executed` or `slack.command.denied`; mute changes are audited as `thread.muted` and `thread.unmuted`. Other `!words` (for example `!model`) are still treated as ordinary requests until their commands ship.
+Commands never create a T3 turn and never store the message text. Each run is recorded once per Slack message in `slack_command_events` and audited as `slack.command.executed` or `slack.command.denied`; mute changes are audited as `thread.muted` and `thread.unmuted`, `!stop` as `task.stop.requested`, and `!restart` as `task.restart.requested` and `task.session.rotated`. Other `!words` (for example `!model`) are still treated as ordinary requests until their commands ship.
+
+The retired T3 thread of a restart (or of an idle-closed task) is kept, with its worktree, for later cleanup; the service stops its provider session with `thread.session.stop` and audits `task.session.stopped`. Uncommitted work in it stays in the retired worktree.
 
 Configure commands under `commands`:
 
 ```json
 {
   "access": { "allowedUserIds": ["U0EXAMPLE"], "allowedChannelIds": ["C0EXAMPLE"], "adminUserIds": ["U0EXAMPLE"] },
-  "commands": { "enabled": true, "disabled": [], "adminOnly": ["mute", "unmute"] }
+  "commands": { "enabled": true, "disabled": [], "adminOnly": ["mute", "unmute", "restart"], "restartTimeoutSeconds": 120 }
 }
 ```
 
 - `enabled: false` turns every `!word` back into an ordinary request.
 - `disabled` answers with an only-you "not enabled" note. `!help` cannot be disabled.
 - `adminOnly` limits a command to `access.adminUserIds`, which must also be in `access.allowedUserIds`. `!help` and `!status` cannot be admin-only.
+- `restartTimeoutSeconds` (10–3600, default 120) is how long a `!restart` waits for the stopped turn to end before it switches sessions anyway.
 
 Only-you replies use `chat.postEphemeral` (covered by the existing `chat:write` scope). They are sent at most once, with one retry after a rate limit.
 

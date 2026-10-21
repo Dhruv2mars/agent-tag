@@ -30,7 +30,7 @@ This is the only deployment Agent Tag supports and tests today. The config must 
 Assumptions:
 
 - Agent Tag, T3 Code, and every agent process run as **the same OS user** on one host.
-- Every user in `access.allowedUserIds` is trusted with shell access to that account. This covers everything the account can read or write: other repositories, `~/.ssh`, cloud credentials, browser profiles, and Agent Tag's own secret files and database.
+- Every user in `access.allowedUserIds` is trusted with shell access to that account. With `access.mode: "channel-members"`, so is every non-guest member of every channel in `access.allowedChannelIds`: anyone who can join such a channel can run code as the host user. This covers everything the account can read or write: other repositories, `~/.ssh`, cloud credentials, browser profiles, and Agent Tag's own secret files and database.
 - Repository content and Slack thread text are untrusted input to the model. Prompt injection from a file, issue, or message can steer the agent within the authority above.
 - The host, the OS account, and the T3 server are trusted and patched.
 
@@ -55,14 +55,15 @@ Even in tier 2, the agent can still push to anything its own credentials reach, 
 
 ### What Agent Tag protects
 
-- **Who can start work.** Only users in `access.allowedUserIds`, in conversations listed in `access.allowedChannelIds` and bound by a route. DM routes are bound to a single owner. Authority is checked again before every queued turn, interaction response, schedule run, and Slack reply. Removing a user or route stops queued work after a restart.
-- **Who can run commands.** `!commands` use the same user, channel, route, and DM-owner checks as requests, then the task's execution authority in a bound thread. `commands.disabled` and `commands.adminOnly` narrow them further. Command replies other than mute notices are visible only to the sender, and commands never store or echo message text.
+- **Who can start work.** Only users in `access.allowedUserIds` (plus current channel members in `channel-members` mode; guests never approve, other bots never qualify, and unreadable or stale membership fails closed), in conversations listed in `access.allowedChannelIds` and bound by a route. DM routes, configured or auto-routed, are bound to a single allowlisted owner; membership never grants a DM. Authority is checked again before every queued turn, interaction response, schedule run, and Slack reply. Removing a user or route stops queued work after a restart.
+- **Who can run commands.** `!commands` use the same user, channel, route, and DM-owner checks as requests, then the task's execution authority in a bound thread. `commands.disabled` and `commands.adminOnly` narrow them further. Command replies other than mute, stop and restart notices are visible only to the sender, and commands never store or echo message text.
 - **Who can manage routines.** Routine requests from Slack need an explicit mention or the DM owner, and pass the same user, channel, route, and task checks as prompts. A channel's routines can be cancelled by any allowed user there; DM routines only by the owner. Button clicks are re-checked against the loaded config. A routine runs later without anyone watching, under the profile of the thread it was created in, so routines on a `full-access` profile run autonomously.
 - **Which repositories a task uses.** Each route is pinned to one root in its profile's `repositoryRoots`. This is a routing guarantee, not a filesystem sandbox.
 - **Secrets at rest from other local users.** Owner and mode checks cover the secret files, their parent directory, the data directory, and the database.
 - **Secrets in the audit trail.** Audit metadata passes through a redactor for known credential shapes (Slack, GitHub, AWS, Anthropic, OpenAI) before it is written. The audit log never stores Slack message bodies.
 - **Least privilege toward T3.** Agent Tag uses an exact-scope restricted token. Enrollment checks that T3's administrative endpoints deny it.
 - **Data minimisation.** The optional `retention` config replaces stored message bodies with a marker, and deletes old audit rows, after a set number of days (see [operations](docs/operations.md#data-retention)).
+- **Files the agent shares to Slack.** A reply line `[[agent-tag:upload <path>]]` shares a file only from the task's own worktree, only into the task's own thread, after the task's authority is re-checked. Absolute, `~`, `..` and hidden paths (`.env`, `.ssh/`, `.git/`) are refused, and so is a symlink that resolves outside the worktree or onto a hidden file. Every file is scanned for the known credential shapes (text and the readable runs of binary files) and held back with a thread notice on a match; the audit row records the credential class and the file's extension, never its content or name. Compressed content (zip, xlsx, image data) is not inspected, and the agent can still copy any file it can read into its worktree first, so this is defence in depth, not a boundary. Set `files.outbound.enabled` to `false` to turn sharing off.
 - **Detection.** `agent-tag security audit` checks the controls above and fails on high-severity findings.
 
 ### What Agent Tag does not protect

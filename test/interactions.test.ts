@@ -10,12 +10,14 @@ import { agentTagConfigSchema } from "../src/config.ts";
 import { questionMessage } from "../src/coordinator.ts";
 import {
   DEFAULT_INTERACTION_RETRY_POLICY,
+  interactionPurpose,
   InteractionWorker,
   type InteractionWorkerOutcome,
   NO_LONGER_PENDING_NOTICE,
   interactionRetryDelayMs,
   type T3InteractionGateway,
 } from "../src/interaction-worker.ts";
+import { bindMembership } from "../src/policy/access.ts";
 import { SlackActionRouter } from "../src/slack/actions.ts";
 import { AgentTagStore } from "../src/store/store.ts";
 import type { T3Command, T3ThreadSnapshot } from "../src/t3/gateway.ts";
@@ -457,6 +459,47 @@ describe("durable interactions", () => {
         ),
       ).toEqual({ kind: "ignored", reason: "interaction-denied" });
       expect(store.claimNextInteractionResponse({ workerId: "worker", now, leaseMs: 10_000 })).toBeNull();
+    });
+  });
+
+  test("channel-members mode: a guest's approval click is ignored with approver-denied; a member's is honoured", async () => {
+    await withStore(async ({ store }) => {
+      const membersConfig = agentTagConfigSchema.parse({ ...config, access: { ...config.access, mode: "channel-members" } });
+      bindMembership(membersConfig, {
+        lookup: (conversationId, userId) =>
+          conversationId === "C1" && (userId === "U5" || userId === "U7") ? "member" : "not-member",
+        userKind: (userId) => (userId === "U7" ? "guest" : "member"),
+      });
+      const seeded = seedOperation(store);
+      const pending = store.recordPendingInteraction({
+        ...seeded,
+        requestId: "approval-members",
+        kind: "approval",
+        prompt: { requestKind: "command" },
+        conversationId: "C1",
+        threadTs: "1000.000001",
+        message: () => ({ text: "approval" }),
+        now,
+      });
+      const router = new SlackActionRouter({ config: membersConfig, store, now: () => now });
+      expect(
+        router.ingest(actionBody({ actionId: "agent-tag.approval.accept", value: pending.interactionId, userId: "U7" })),
+      ).toEqual({ kind: "ignored", reason: "approver-denied" });
+      expect(store.claimNextInteractionResponse({ workerId: "worker", now, leaseMs: 10_000 })).toBeNull();
+      // The allowlist-mode router refuses the same non-allowlisted member.
+      expect(
+        new SlackActionRouter({ config, store, now: () => now }).ingest(
+          actionBody({ actionId: "agent-tag.approval.accept", value: pending.interactionId, userId: "U5", actionTs: "1000.000021" }),
+        ),
+      ).toEqual({ kind: "ignored", reason: "user-denied" });
+      expect(store.claimNextInteractionResponse({ workerId: "worker", now, leaseMs: 10_000 })).toBeNull();
+      expect(
+        router.ingest(actionBody({ actionId: "agent-tag.approval.accept", value: pending.interactionId, userId: "U5", actionTs: "1000.000022" })).kind,
+      ).toBe("accepted");
+      expect(store.claimNextInteractionResponse({ workerId: "worker", now, leaseMs: 10_000 })).toMatchObject({
+        interactionId: pending.interactionId,
+        actorUserId: "U5",
+      });
     });
   });
 
@@ -1885,3 +1928,12 @@ describe("interaction retries and cancellation", () => {
     });
   });
 });
+
+test("interaction responses re-check the purpose of the action; a turn-policy interrupt is never gated on the requester", () => {
+  expect(interactionPurpose({ kind: "approval", requestId: "approval-1" })).toBe("approve");
+  expect(interactionPurpose({ kind: "user-input", requestId: "input-1" })).toBe("answer");
+  expect(interactionPurpose({ kind: "cancel", requestId: "cancel:op-1" })).toBe("cancel");
+  // A ceiling or expired-wait interrupt must fire even after the requester left the channel or lost access.
+  expect(interactionPurpose({ kind: "cancel", requestId: "interrupt:op-1" })).toBeNull();
+});
+

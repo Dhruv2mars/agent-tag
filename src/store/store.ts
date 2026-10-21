@@ -62,8 +62,10 @@ import * as pullRequests from "./pull-requests.ts";
 import * as commands from "./commands.ts";
 import * as reactions from "./reactions.ts";
 import * as attachments from "./attachments.ts";
+import * as fileUploads from "./file-uploads.ts";
 import * as status from "./status.ts";
 import * as lifecycle from "./lifecycle.ts";
+import * as restart from "./restart.ts";
 
 export type { AuditAction } from "./schema.ts";
 export type {
@@ -212,6 +214,7 @@ export type {
   SettleReactionInput,
 } from "./reactions.ts";
 export type { InboundSkipReason, OperationAttachment, RecordOperationAttachmentInput } from "./attachments.ts";
+export type { ClaimedFileUpload, FileUploadRequest, FileUploadsInput } from "./file-uploads.ts";
 export type { EnqueueMessageEditInput, EnqueueMessageRefreshInput, MessageEditResult } from "./message-edits.ts";
 
 export class AgentTagStore {
@@ -237,6 +240,10 @@ export class AgentTagStore {
 
   static restoreBackup(input: files.RestoreBackupInput): Promise<void> {
     return files.restoreBackup(input);
+  }
+
+  recordAccessAudit(input: audit.RecordAccessAuditInput): void {
+    audit.recordAccessAudit(this.#database, input);
   }
 
   listAuditRecords(input: audit.ListAuditRecordsInput = {}): ReadonlyArray<AuditRecord> {
@@ -287,6 +294,10 @@ export class AgentTagStore {
     return memory.expireMemory(this.#database, nowInput);
   }
 
+  findTaskConversation(taskId: string): ReturnType<typeof tasks.findTaskConversation> {
+    return tasks.findTaskConversation(this.#database, taskId);
+  }
+
   taskBelongsToContext(input: tasks.TaskBelongsToContextInput): boolean {
     return tasks.taskBelongsToContext(this.#database, input);
   }
@@ -321,6 +332,34 @@ export class AgentTagStore {
 
   recordOperationAttachment(input: attachments.RecordOperationAttachmentInput): attachments.OperationAttachment {
     return attachments.recordOperationAttachment(this.#context, input);
+  }
+
+  claimNextFileUpload(input: Parameters<typeof fileUploads.claimNextFileUpload>[1]): fileUploads.ClaimedFileUpload | null {
+    return fileUploads.claimNextFileUpload(this.#context, input);
+  }
+
+  markFileUploadStarted(input: Parameters<typeof fileUploads.markFileUploadStarted>[1]): void {
+    fileUploads.markFileUploadStarted(this.#database, input);
+  }
+
+  clearFileUploadStart(input: Parameters<typeof fileUploads.clearFileUploadStart>[1]): void {
+    fileUploads.clearFileUploadStart(this.#database, input);
+  }
+
+  markFileUploadDelivered(input: Parameters<typeof fileUploads.markFileUploadDelivered>[1]): void {
+    fileUploads.markFileUploadDelivered(this.#database, input);
+  }
+
+  retryFileUpload(input: Parameters<typeof fileUploads.retryFileUpload>[1]): void {
+    fileUploads.retryFileUpload(this.#database, input);
+  }
+
+  releaseFileUpload(input: Parameters<typeof fileUploads.releaseFileUpload>[1]): void {
+    fileUploads.releaseFileUpload(this.#database, input);
+  }
+
+  failFileUpload(input: Parameters<typeof fileUploads.failFileUpload>[1]): void {
+    fileUploads.failFileUpload(this.#database, input);
   }
 
   recordThreadNote(input: threadNotes.RecordThreadNoteInput): threadNotes.RecordThreadNoteResult {
@@ -540,6 +579,32 @@ export class AgentTagStore {
 
   getConversationStatus(input: { readonly workspaceId: string; readonly conversationId: string }): commands.ConversationWorkStatus {
     return commands.getConversationStatus(this.#database, input);
+  }
+
+  /** `!stop` (PR-H2): stop, reply and command settlement in one transaction. */
+  stopTaskCommand(input: Parameters<typeof restart.stopTaskCommand>[1]): restart.StopTaskResult {
+    return restart.stopTaskCommand(this.#database, input);
+  }
+
+  /** `!restart` (PR-H2): rotate now, or stop the turn and gate the queue until the worker rotates. */
+  restartTaskCommand(input: Parameters<typeof restart.restartTaskCommand>[1]): restart.RequestTaskRestartResult {
+    return restart.restartTaskCommand(this.#database, input);
+  }
+
+  listPendingRestarts(input: { readonly now: string; readonly limit: number }): readonly restart.PendingRestart[] {
+    return restart.listPendingRestarts(this.#database, input);
+  }
+
+  completeTaskRestart(input: restart.CompleteTaskRestartInput): boolean {
+    return restart.completeTaskRestart(this.#database, input);
+  }
+
+  listPendingSessionStops(input: { readonly now: string; readonly limit: number }): readonly restart.PendingSessionStop[] {
+    return restart.listPendingSessionStops(this.#database, input);
+  }
+
+  recordSessionStop(input: restart.RecordSessionStopInput): void {
+    restart.recordSessionStop(this.#database, input);
   }
 
   findTaskForThread(input: tasks.FindTaskForThreadInput): ActiveTaskBinding | null {

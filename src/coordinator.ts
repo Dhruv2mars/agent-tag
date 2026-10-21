@@ -40,6 +40,7 @@ import {
   t3AttachmentUploader,
   turnFiles,
 } from "./slack/files.ts";
+import { parseUploadDirectives, rejectedUploadsNotice, uploadInstruction } from "./slack/uploads.ts";
 
 export interface T3CoordinatorGateway {
   /** Implementations should stop the RPC (closing its socket) when `signal` aborts. */
@@ -483,7 +484,7 @@ export class AgentTagCoordinator {
     if (frozen !== null) return frozen;
     const files = await this.#materializeFiles(operation, signal);
     const { actorUserId, text, origin } = operation.payload;
-    const window = await this.#readThreadWindow(operation, profile, signal);
+    const window = await this.#readThreadWindow(operation, this.#windowSeed(operation, task, profile), profile, signal);
     // Updates since the last turn are context for the next human turn; schedule runs leave them pending.
     const notes = origin === "slack" ? this.#store.listPendingThreadNotes(operation.taskId) : [];
     const memory = this.#memoryForTurn(task, profile, operation.taskId, actorUserId);
@@ -527,6 +528,7 @@ export class AgentTagCoordinator {
           limits: { maxChars: profile.threadContext.maxChars, maxMessageChars: profile.threadContext.maxMessageChars },
         },
       memory: memory.block,
+      ...(this.#config.files.outbound.enabled ? { uploadInstruction: uploadInstruction(this.#config.files.outbound) } : {}),
     });
     const prNote = this.#pullRequests === undefined ? null : pullRequestTurnNote(profile, task.repositoryRoot, taskBranchName(task.taskId, task.sessionGeneration));
     const proposedText = prNote === null ? turnText : `${turnText}\n\n${prNote}`;
@@ -641,15 +643,32 @@ export class AgentTagCoordinator {
   }
 
   /**
+   * The thread window to read: the ingest seed (a first mention partway into a thread, or a reopen),
+   * or, for the first turn of a session a `!restart` started, the thread before this message, so the
+   * fresh session rereads it (PR-H2). Requests queued during the restart were ingested unseeded.
+   */
+  #windowSeed(
+    operation: ClaimedOperation,
+    task: TaskExecutionBinding,
+    profile: AgentTagProfile,
+  ): ClaimedOperation["payload"]["threadContext"] {
+    const { threadContext, messageTs, threadTs, origin } = operation.payload;
+    if (threadContext !== undefined) return threadContext;
+    if (task.threadStarted || task.sessionGeneration === 1 || !profile.threadContext.enabled) return undefined;
+    if (origin !== "slack" || messageTs === undefined || messageTs === threadTs) return undefined;
+    return { rootTs: threadTs, beforeTs: messageTs };
+  }
+
+  /**
    * Reads the earlier thread messages for a first mention in an existing thread. Fails open: any
    * Slack error or timeout becomes an "unavailable" window (and an audit row); only shutdown aborts.
    */
   async #readThreadWindow(
     operation: ClaimedOperation,
+    seed: ClaimedOperation["payload"]["threadContext"],
     profile: AgentTagProfile,
     signal: AbortSignal | undefined,
   ): Promise<TurnWindow | null> {
-    const seed = operation.payload.threadContext;
     if (seed === undefined || this.#slackContext === undefined) return null;
     const source = this.#slackContext;
     let window: TurnWindow;
@@ -784,7 +803,7 @@ export class AgentTagCoordinator {
       ...(task.threadStarted ? {} : { bootstrap: this.#threadBootstrap(task, operation, profile, modelSelection) }),
       createdAt: this.#now().toISOString(),
     }, signal), signal);
-    this.#store.markT3ThreadStarted({ taskId: task.taskId, now: this.#now().toISOString() });
+    this.#store.markT3ThreadStarted({ taskId: task.taskId, threadId: task.threadId, now: this.#now().toISOString() });
     // Watching from the receipt's sequence skips the initial snapshot frame; the loop's first fetch
     // reads the thread anyway.
     polling.watch = this.#watcher?.acquire(task.threadId, { afterSequence: turn.sequence }) ?? null;
@@ -1042,7 +1061,19 @@ export class AgentTagCoordinator {
           }
           continue;
         }
-        const prSync = await this.#preparePullRequest(operation, task, profile, snapshot, assistant.text, turnActiveMs, signal);
+        // Agent file shares (PR-L2): directive lines leave the reply and become upload rows.
+        const outbound = this.#config.files.outbound;
+        const shares = outbound.enabled ? parseUploadDirectives(assistant.text, outbound.maxFilesPerTurn) : null;
+        const replyText = shares?.text ?? assistant.text;
+        const uploads = shares === null || shares.requests.length + shares.rejected.length === 0
+          ? undefined
+          : {
+            t3ThreadId: snapshot.thread.id,
+            workspaceRoot: snapshot.thread.worktreePath ?? task.repositoryRoot,
+            requests: shares.requests,
+            rejectedNotice: rejectedUploadsNotice(shares.rejected, outbound),
+          };
+        const prSync = await this.#preparePullRequest(operation, task, profile, snapshot, replyText, turnActiveMs, signal);
         const completedAt = this.#now();
         const footer =
           this.#config.slack.ui.footer === "none"
@@ -1055,9 +1086,10 @@ export class AgentTagCoordinator {
           resultSequence: Math.max(turn.sequence, snapshot.snapshotSequence),
           conversationId: operation.payload.conversationId,
           threadTs: operation.payload.threadTs,
-          text: finalReplyChunks(markdownToMrkdwn(assistant.text), footer),
+          text: finalReplyChunks(markdownToMrkdwn(replyText), footer),
           ...turnFilesChanged(snapshot),
           ...(prSync === undefined ? {} : { prSync, actorUserId: operation.payload.actorUserId }),
+          ...(uploads === undefined ? {} : { uploads }),
           now: completedAt.toISOString(),
         });
         return { kind: "completed", operationId: operation.operationId, outboxId };

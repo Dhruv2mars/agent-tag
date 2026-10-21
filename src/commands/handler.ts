@@ -1,5 +1,6 @@
 // Executes routed `!commands` (PR-H §3.2): ledger claim (dedup), authority, action, reply.
 import type { AgentTagConfig } from "../config.ts";
+import { resolveRoute } from "../policy/access.ts";
 import { effectiveSelection } from "../policy/models.ts";
 import type { ServiceLogger } from "../service.ts";
 import { slackErrorCode } from "../slack/users.ts";
@@ -106,6 +107,10 @@ export class AgentTagCommands {
         case "mute":
         case "unmute":
           return await this.#mute(ctx, name === "mute", settle);
+        case "stop":
+          return await this.#stop(ctx, settle);
+        case "restart":
+          return await this.#restart(ctx, settle);
       }
     } catch (error) {
       this.#log("command.failed", name, error instanceof Error ? error.name : "unknown");
@@ -166,6 +171,7 @@ export class AgentTagCommands {
         workingForMs: since(status.workingSince),
         waitingForMs: since(status.waitingSince),
         queued: status.queued,
+        restarting: status.restarting,
         model: this.#threadModel(config, ctx.binding.taskId),
       });
     }
@@ -178,7 +184,7 @@ export class AgentTagCommands {
     const task = this.#store.getTaskExecution(taskId);
     const profile = config.profiles.find((candidate) => candidate.id === task.profileId);
     if (profile === undefined) return null;
-    const route = config.routes.find((candidate) => candidate.conversationId === task.conversationId);
+    const route = resolveRoute(config, task.conversationId, task.ownerUserId);
     const effective = effectiveSelection({
       task: { desired: task.desiredModelSelection, applied: task.appliedModelSelection },
       profile,
@@ -219,6 +225,65 @@ export class AgentTagCommands {
     });
     if (result === "changed") return { kind: "executed", outcome: "succeeded" };
     await this.#ephemeral(ctx, muted ? replies.ALREADY_MUTED : replies.NOT_MUTED);
+    return { kind: "executed", outcome: "rejected" };
+  }
+
+  /** `!stop` (PR-H2): the Stop button's path, plus queued requests sent before the command. */
+  async #stop(ctx: CommandContext, settle: (outcome: "rejected", reason: string | null) => void): Promise<CommandExecution> {
+    if (ctx.threadTs === null || ctx.binding === null) {
+      settle("rejected", ctx.threadTs === null ? "top-level" : "unbound-thread");
+      await this.#ephemeral(ctx, ctx.threadTs === null ? replies.STOP_TOP_LEVEL : replies.STOP_NOTHING);
+      return { kind: "executed", outcome: "rejected" };
+    }
+    const result = this.#store.stopTaskCommand({
+      taskId: ctx.binding.taskId,
+      workspaceId: ctx.workspaceId,
+      conversationId: ctx.conversationId,
+      threadTs: ctx.threadTs,
+      actorUserId: ctx.actorUserId,
+      commandKey: ctx.eventKey,
+      commandOrderKey: ctx.messageTs,
+      profileId: ctx.profileId,
+      droppedReply: (stop) =>
+        stop.dropped === 0
+          ? null
+          : replies.stopDroppedReply({ actorUserId: ctx.actorUserId, dropped: stop.dropped, interrupting: stop.kind === "interrupting" }),
+      now: this.#now().toISOString(),
+    });
+    if (result.kind !== "nothing") return { kind: "executed", outcome: "succeeded" };
+    await this.#ephemeral(ctx, replies.STOP_NOTHING);
+    return { kind: "executed", outcome: "rejected" };
+  }
+
+  /** `!restart` (PR-H2): a fresh T3 session now, or once the running turn has stopped. */
+  async #restart(ctx: CommandContext, settle: (outcome: "rejected", reason: string | null) => void): Promise<CommandExecution> {
+    if (ctx.threadTs === null || ctx.binding === null) {
+      settle("rejected", ctx.threadTs === null ? "top-level" : "unbound-thread");
+      await this.#ephemeral(ctx, ctx.threadTs === null ? replies.RESTART_TOP_LEVEL : replies.RESTART_UNBOUND);
+      return { kind: "executed", outcome: "rejected" };
+    }
+    const profile = this.#config().profiles.find((candidate) => candidate.id === ctx.profileId);
+    const result = this.#store.restartTaskCommand({
+      taskId: ctx.binding.taskId,
+      workspaceId: ctx.workspaceId,
+      conversationId: ctx.conversationId,
+      threadTs: ctx.threadTs,
+      actorUserId: ctx.actorUserId,
+      commandKey: ctx.eventKey,
+      commandOrderKey: ctx.messageTs,
+      profileId: ctx.profileId,
+      replies: {
+        ready: replies.restartReadyReply({
+          actorUserId: ctx.actorUserId,
+          rereads: profile?.threadContext.enabled ?? false,
+          forced: false,
+        }),
+        restarting: replies.restartingReply(ctx.actorUserId),
+      },
+      now: this.#now().toISOString(),
+    });
+    if (result.kind === "rotated" || result.kind === "pending") return { kind: "executed", outcome: "succeeded" };
+    await this.#ephemeral(ctx, result.kind === "closed" ? replies.RESTART_CLOSED : replies.RESTART_PENDING);
     return { kind: "executed", outcome: "rejected" };
   }
 

@@ -6,11 +6,14 @@ import { PrWorker, pullRequestsEnabled } from "./git/pr-worker.ts";
 import { createGitRunner } from "./git/runner.ts";
 import { InteractionWorker } from "./interaction-worker.ts";
 import { LifecycleWorker } from "./lifecycle-worker.ts";
+import { SessionStopWorker, TaskRestartWorker } from "./restart-worker.ts";
 import { reportAllowedModels, validateConfiguredProviders } from "./policy/provider.ts";
 import { createScheduleWorkers } from "./scheduler.ts";
 import { createServiceLogWorker } from "./service-logs.ts";
 import type { ServiceStateRecorder } from "./service-state.ts";
 import { SlackSocketBridge } from "./slack/bridge.ts";
+import { createMembershipWorker } from "./slack/membership.ts";
+import { FileUploadWorker } from "./slack/uploads.ts";
 import { createRetentionWorker } from "./store/retention.ts";
 import { AgentTagStore } from "./store/store.ts";
 import { isT3CredentialRejection } from "./t3/auth.ts";
@@ -78,6 +81,8 @@ export interface ServiceLogRecord {
   readonly instanceId?: string;
   readonly model?: string;
   readonly reactionKey?: string;
+  /** Slack channel a membership refresh was for. */
+  readonly conversationId?: string;
 }
 
 export type ServiceLogger = (record: ServiceLogRecord) => void;
@@ -481,6 +486,10 @@ export async function createAgentTagService(input: {
         },
         createRetentionWorker({ databasePath, policy: input.config.retention, now }),
         new LifecycleWorker({ store, policy: input.config.lifecycle, now }),
+        new TaskRestartWorker({ store, config: () => input.config, now }),
+        new SessionStopWorker({ store, dispatch: (command) => t3.dispatch(command), now }),
+        // Agent file shares (PR-L2); with files.outbound off it fails any queued row.
+        new FileUploadWorker({ config: input.config, store, slack: bridge.uploads, now }),
         {
           processNext: async () => {
             const current = now();
@@ -495,6 +504,7 @@ export async function createAgentTagService(input: {
             return { kind: "idle" };
           },
         },
+        ...(bridge.membership === null ? [] : [createMembershipWorker({ refresh: () => bridge.refreshMembership(), now })]),
         createT3GateWorker({ gate, now }),
         createT3CredentialWorker({ credentials }),
         createProviderCatalogWorker({ catalog, now }),
