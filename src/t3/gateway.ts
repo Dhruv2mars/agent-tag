@@ -245,6 +245,13 @@ const sessionSchema = z
   })
   .nullable();
 
+/** A turn's checkpoint diff (T3 `thread.turn-diff-completed`); only the changed-file list is read. */
+const checkpointSchema = z.object({
+  turnId: id,
+  status: z.enum(["ready", "missing", "error"]),
+  files: z.array(z.object({ path: z.string() })),
+});
+
 export const threadSnapshotSchema = z.object({
   snapshotSequence: z.number().int().nonnegative(),
   thread: z.object({
@@ -259,6 +266,8 @@ export const threadSnapshotSchema = z.object({
     latestTurn: latestTurnSchema,
     messages: z.array(messageSchema),
     activities: z.array(activitySchema),
+    /** Absent from test fixtures and older servers; T3 0.0.45 always sends it. */
+    checkpoints: z.array(checkpointSchema).optional(),
     session: sessionSchema,
   }),
 });

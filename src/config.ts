@@ -47,9 +47,17 @@ const slackUiSchema = z
     statusUpdateIntervalMs: z.number().int().min(1_000).max(60_000).default(2_000),
     /** Budget for progress edits across all status messages (chat.update is rate limited per workspace). */
     statusUpdatesPerMinute: z.number().int().min(1).max(600).default(40),
+    /** The final reply's last chunk ends with "model · instance · elapsed"; "none" leaves replies plain. */
+    footer: z.enum(["model", "none"]).default("model"),
   })
   .strict()
-  .default({ ackReaction: "eyes", statusProgress: true, statusUpdateIntervalMs: 2_000, statusUpdatesPerMinute: 40 });
+  .default({
+    ackReaction: "eyes",
+    statusProgress: true,
+    statusUpdateIntervalMs: 2_000,
+    statusUpdatesPerMinute: 40,
+    footer: "model",
+  });
 
 const isolationSchema = z.discriminatedUnion("mode", [
   z.object({

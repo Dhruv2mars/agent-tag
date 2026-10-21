@@ -8,7 +8,8 @@ import type { SlackContextSource } from "./slack/context-source.ts";
 import { fetchThreadWindow, SlackContextUnavailable, THREAD_CONTEXT_TIMEOUT_MS } from "./slack/context.ts";
 import { approvalMessage, describeDuration, questionMessage } from "./slack/cards.ts";
 import { collectMentionedUserIds, type SpeakerIdentity } from "./slack/markup.ts";
-import { escapeSlackText, markdownToMrkdwn, splitForSlack } from "./slack/render.ts";
+import { finalReplyChunks, replyFooter, turnFilesChanged } from "./slack/footer.ts";
+import { escapeSlackText, markdownToMrkdwn } from "./slack/render.ts";
 import { renderStatusMessage } from "./slack/status.ts";
 import { EMPTY_PROGRESS, progressActivity, TurnProgress } from "./progress.ts";
 import { slackErrorCode, unresolvedSpeaker } from "./slack/users.ts";
@@ -78,6 +79,9 @@ export interface CoordinatorProviderCatalog {
 
 /** Budget for refreshing a stale catalog before planning a model switch. */
 const CATALOG_REFRESH_BUDGET_MS = 3_000;
+/** Waits for a completed turn's checkpoint diff before settling without a file count (PR-F4). */
+const CHECKPOINT_WAITS = 3;
+const CHECKPOINT_WAIT_MS = 1_000;
 
 export interface CoordinatorOptions {
   readonly config: AgentTagConfig;
@@ -840,6 +844,7 @@ export class AgentTagCoordinator {
     let progressMarker: string | null = null;
     let progressAt = loopStartedAt;
     let renewAt = loopStartedAt + Math.floor(this.#leaseMs / 2);
+    let checkpointWaits = 0;
     while (true) {
       if (signal?.aborted) throw new CoordinatorAborted();
       if (this.#now().getTime() >= renewAt) {
@@ -1024,7 +1029,25 @@ export class AgentTagCoordinator {
             !message.streaming,
         );
         if (assistant === undefined) throw new Error("completed T3 turn has no final assistant message");
+        // T3 records the turn's diff (thread.turn-diff-completed) about 200 ms after the turn completes.
+        // With a thread watch, wait a little for it so the status can say how many files changed.
+        if (
+          polling.watch !== null &&
+          checkpointWaits < CHECKPOINT_WAITS &&
+          snapshot.thread.checkpoints?.some((checkpoint) => checkpoint.turnId === latestTurn.turnId) !== true
+        ) {
+          checkpointWaits += 1;
+          if (snapshot.snapshotSequence >= polling.watch.lastSequence) {
+            await abortable(polling.watch.next(CHECKPOINT_WAIT_MS, signal), signal);
+          }
+          continue;
+        }
         const prSync = await this.#preparePullRequest(operation, task, profile, snapshot, assistant.text, turnActiveMs, signal);
+        const completedAt = this.#now();
+        const footer =
+          this.#config.slack.ui.footer === "none"
+            ? null
+            : replyFooter(snapshot, this.#store.getStatusMessageView(operation.operationId)?.startedAt, completedAt);
         const outboxId = this.#store.completeOperationWithOutbox({
           operationId: operation.operationId,
           taskId: operation.taskId,
@@ -1032,9 +1055,10 @@ export class AgentTagCoordinator {
           resultSequence: Math.max(turn.sequence, snapshot.snapshotSequence),
           conversationId: operation.payload.conversationId,
           threadTs: operation.payload.threadTs,
-          text: splitForSlack(markdownToMrkdwn(assistant.text)),
+          text: finalReplyChunks(markdownToMrkdwn(assistant.text), footer),
+          ...turnFilesChanged(snapshot),
           ...(prSync === undefined ? {} : { prSync, actorUserId: operation.payload.actorUserId }),
-          now: this.#now().toISOString(),
+          now: completedAt.toISOString(),
         });
         return { kind: "completed", operationId: operation.operationId, outboxId };
       }
