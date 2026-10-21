@@ -43,6 +43,36 @@ bun run onboard -- --yes --accept-risk \
   --t3-issue-token --install-service
 ```
 
+## Access modes
+
+`access.mode` decides who may use Agent Tag in a routed channel. Every check (mentions, button clicks, `!commands`, routines, memory, and the re-check before each queued turn, interaction response and schedule run) goes through one predicate, `isSteeringAllowed` in `src/policy/access.ts`.
+
+- `allowlist` (default): only users in `access.allowedUserIds`. Existing configs keep this mode.
+- `channel-members`: users in `allowedUserIds`, plus any current member of a channel in `access.allowedChannelIds`, the way Claude Tag works. `allowedUserIds` may be empty. Membership never adds a channel: `allowedChannelIds` and `routes` still decide where the agent works.
+
+In `channel-members` mode Agent Tag reads each routed channel's members with `conversations.members` (`channels:read` for public channels, `groups:read` for private ones) and keeps an in-memory snapshot per channel:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `access.membership.ttlSeconds` | 300 | A snapshot older than this is refreshed in the background and before a non-allowlisted user's event. |
+| `access.membership.maxStaleSeconds` | 3600 | Past this age (for example while Slack rate-limits the refresh) the snapshot answers "unknown", and non-allowlisted users are denied with `membership-unknown`. |
+| `access.membership.maxMembers` | 5000 | A larger channel is not snapshotted; only the allowlist works there. |
+| `access.membership.guests` | `deny` | Guests (restricted accounts) never approve, answer or cancel. `steer-only` lets them start and steer turns. |
+
+Other bots never get access through membership. A user whose account kind cannot be read may steer but not approve. When a scope is missing, Agent Tag writes one `access.membership.degraded` audit row and one warning per channel, then works allowlist-only in that channel. Someone who leaves a channel loses access within one TTL, and their queued turns, interaction responses and schedules are revoked at execution like an allowlist removal. Denied mentions and clicks write `access.denied` audit rows with the reason (`user-denied`, `approver-denied`, `guest-denied`, `membership-unknown`, `dm-owner-denied`, `dm-disabled`).
+
+Approval, answer and cancel buttons follow the same predicate with their own purpose: in `channel-members` mode any non-guest channel member may approve. `commands.adminOnly` still uses `access.adminUserIds` and never membership.
+
+Thread context windows still mark only `allowedUserIds` as `"steeringAllowed": true`; other members' earlier replies are included as context.
+
+`access.directMessages.mode` controls DMs. Membership never grants a DM.
+
+- `routed-only` (default): only DM routes listed in `routes`; see [DM routes](#dm-routes).
+- `auto-route`: a DM from any user in `allowedUserIds` gets a private route owned by that user on `autoRouteProfileId`, which must name a profile with `memory.privateDm: true`. The route is recorded on the task, so the owner must still be allowlisted when queued work runs.
+- `off`: every DM is ignored with `dm-disabled`, and queued DM work is revoked.
+
+`agent-tag doctor --json` reports an `access` block: the mode, each routed channel's `membership` (`ok`, `missing_scope`, `error`, …), member count and snapshot age, the DM routing summary, and `missingScopes`. `agent-tag status` prints `accessMode` only and does not contact Slack.
+
 ## Doctor
 
 Run a live dependency check before starting:
