@@ -420,7 +420,8 @@ export async function createAgentTagService(input: {
     await waitForReachableT3(startupWait);
     const server = await waitForRunnableProviders({
       ...startupWait,
-      inspect: () => inspectT3(t3Config),
+      // The signal lets a stop request end a stalled probe; SIGTERM no longer kills us during startup.
+      inspect: () => inspectT3(t3Config, input.signal),
       validate: (candidate) => validateConfiguredProviders(input.config, candidate),
     });
     for (const record of allowedModelLogRecords(input.config, server, now().toISOString())) logger(record);
