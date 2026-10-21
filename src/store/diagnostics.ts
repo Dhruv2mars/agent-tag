@@ -1,6 +1,7 @@
 // Read-only table counts and operational status for doctor/status.
 import type { Database } from "bun:sqlite";
 
+import { type LifecycleCounts, lifecycleCounts } from "./cleanup.ts";
 import { activeOutboxRateLimit } from "./outbox.ts";
 import { isoDateTime } from "./schema.ts";
 import type { OperationalStatus } from "./types.ts";
@@ -17,6 +18,7 @@ export interface StoreDiagnostics {
   readonly schedulesAutoDisabled: number;
   readonly ambientDecisions: number;
   readonly auditRecords: number;
+  readonly lifecycle: LifecycleCounts;
 }
 
 export function diagnostics(database: Database): StoreDiagnostics {
@@ -51,6 +53,7 @@ export function diagnostics(database: Database): StoreDiagnostics {
     schedulesAutoDisabled: autoDisabledSchedules(database),
     ambientDecisions: count("ambient_decisions"),
     auditRecords: count("audit_log"),
+    lifecycle: lifecycleCounts(database),
   };
 }
 

@@ -1,5 +1,6 @@
 import { join } from "node:path";
 
+import { CleanupWorker } from "./cleanup-worker.ts";
 import type { AgentTagConfig } from "./config.ts";
 import { AgentTagCoordinator } from "./coordinator.ts";
 import { PrWorker, pullRequestsEnabled } from "./git/pr-worker.ts";
@@ -488,6 +489,8 @@ export async function createAgentTagService(input: {
         new LifecycleWorker({ store, policy: input.config.lifecycle, now }),
         new TaskRestartWorker({ store, config: () => input.config, now }),
         new SessionStopWorker({ store, dispatch: (command) => t3.dispatch(command), now }),
+        // Retired threads (PR-N2): delete in T3, remove the worktree, delete an empty branch.
+        new CleanupWorker({ store, t3, git: createGitRunner(), policy: input.config.lifecycle, dataDir: input.config.dataDir, now }),
         // Agent file shares (PR-L2); with files.outbound off it fails any queued row.
         new FileUploadWorker({ config: input.config, store, slack: bridge.uploads, now }),
         {

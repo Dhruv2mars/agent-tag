@@ -12,7 +12,14 @@ import { taskBranchName } from "../src/store/tasks.ts";
 
 const startedAt = "2026-10-01T00:00:00.000Z";
 const weekLater = "2026-10-08T00:00:01.000Z";
-const policy = { closeIdleAfterHours: 168, sweepIntervalSeconds: 60, maxClosesPerSweep: 20 } as const;
+const policy = {
+  closeIdleAfterHours: 168,
+  sweepIntervalSeconds: 60,
+  maxClosesPerSweep: 20,
+  dirtyWorktreeRetentionDays: 14,
+  deleteEmptyBranches: true,
+  maxCleanupsPerSweep: 5,
+} as const;
 
 function slackEvent(overrides: Partial<SlackEventInput> = {}): SlackEventInput {
   return {

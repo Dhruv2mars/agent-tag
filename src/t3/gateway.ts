@@ -150,6 +150,17 @@ const threadSessionStopCommand = z.object({
 });
 
 /**
+ * T3 0.0.45 `thread.delete` (contracts orchestration.ts ThreadDeleteCommand; it has no `createdAt`).
+ * T3 stops the thread's provider session; it leaves the worktree unless its own storage cleanup
+ * settings say otherwise, so the cleanup worker removes it (PR-N2). T3 rejects an unknown thread.
+ */
+const threadDeleteCommand = z.object({
+  type: z.literal("thread.delete"),
+  commandId: id,
+  threadId: id,
+});
+
+/**
  * T3 0.0.45 `thread.meta.update` (contracts orchestration.ts ThreadMetaUpdateCommand). Only the
  * `modelSelection` field is used; it is what updates the projected `thread.modelSelection`.
  */
@@ -170,6 +181,7 @@ export const t3CommandSchema = z.discriminatedUnion("type", [
   userInputRespondCommand,
   userInputDismissCommand,
   threadSessionStopCommand,
+  threadDeleteCommand,
 ]);
 export type T3Command = z.infer<typeof t3CommandSchema>;
 
@@ -510,9 +522,63 @@ const attachmentDeleteRpc = Rpc.make("attachments.delete", {
 const assetUrlRpc = Rpc.make("assets.createUrl", {
   payload: Schema.Unknown, success: Schema.Unknown, error: Schema.Unknown,
 });
+// PR-N2 worktree cleanup. `vcs.refreshStatus` and the archived shell need orchestration:read,
+// `vcs.removeWorktree` orchestration:operate (T3 0.0.45 RpcAuthorization), so no new token scope.
+const vcsRefreshStatusRpc = Rpc.make("vcs.refreshStatus", {
+  payload: Schema.Unknown, success: Schema.Unknown, error: Schema.Unknown,
+});
+const vcsRemoveWorktreeRpc = Rpc.make("vcs.removeWorktree", {
+  payload: Schema.Unknown, error: Schema.Unknown,
+});
+const archivedShellRpc = Rpc.make("orchestration.getArchivedShellSnapshot", {
+  payload: Schema.Struct({}), success: Schema.Unknown, error: Schema.Unknown,
+});
 export const rpcGroup = RpcGroup.make(
   probeRpc, configRpc, dispatchRpc, subscribeThreadRpc, attachmentUploadRpc, attachmentDeleteRpc, assetUrlRpc,
+  vcsRefreshStatusRpc, vcsRemoveWorktreeRpc, archivedShellRpc,
 );
+
+/**
+ * The fields of T3 0.0.45 `VcsStatusResult` the cleanup worker reads. `aheadOfDefaultCount` is
+ * optional in T3's contract (unknown without a default ref), and `pr` is the branch's change request.
+ */
+export const t3VcsStatusSchema = z.object({
+  isRepo: z.boolean(),
+  refName: id.nullable(),
+  hasWorkingTreeChanges: z.boolean(),
+  aheadOfDefaultCount: z.number().int().nonnegative().optional(),
+  pr: z.object({ state: z.string(), url: z.string() }).nullable().optional(),
+});
+export type T3VcsStatus = z.infer<typeof t3VcsStatusSchema>;
+
+/** One T3 thread's worktree binding, from the shell snapshots (live and archived). */
+export interface T3WorktreeBinding {
+  readonly threadId: string;
+  readonly worktreePath: string | null;
+}
+
+const shellSnapshotSchema = z.object({
+  threads: z.array(z.object({ id, worktreePath: id.nullable() })),
+});
+
+/** Parses a shell snapshot (`/api/orchestration/shell` or the archived shell RPC) to bindings. */
+export function parseT3ShellWorktrees(raw: unknown): readonly T3WorktreeBinding[] {
+  return shellSnapshotSchema.parse(raw).threads.map((thread) => ({ threadId: thread.id, worktreePath: thread.worktreePath }));
+}
+
+/** GET `/api/orchestration/shell` with a token whose session the caller has already checked. */
+export async function requestT3ShellWorktrees(input: {
+  readonly baseUrl: string;
+  readonly token: SecretString;
+  readonly signal?: AbortSignal;
+}): Promise<readonly T3WorktreeBinding[]> {
+  const response = await fetch(new URL("/api/orchestration/shell", input.baseUrl), {
+    headers: { authorization: `Bearer ${input.token.exposeToBoundary()}` },
+    ...signalOption(input.signal),
+  });
+  if (!response.ok) throw new T3HttpError("shell snapshot", response.status);
+  return parseT3ShellWorktrees(await response.json());
+}
 
 export interface T3ConnectionConfig {
   readonly baseUrl: string;
