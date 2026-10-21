@@ -507,6 +507,32 @@ const accessDirectMessagesSchema = z
   .strict()
   .prefault({});
 
+/** T3's per-turn and per-attachment caps (src/t3/gateway.ts `t3AttachmentSchema`, `turnStartCommand`). */
+const T3_MAX_TURN_ATTACHMENTS = 8;
+const T3_MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+const T3_MAX_FILE_BYTES = 50 * 1024 * 1024;
+
+/**
+ * Slack files shared with a request (PR-L). Inbound files become T3 attachments for that turn; the caps
+ * may be lowered, never raised past T3's. Every key defaults, so existing configs stay valid.
+ */
+const filesSchema = z
+  .object({
+    inbound: z
+      .object({
+        enabled: z.boolean().default(true),
+        maxFilesPerMessage: z.number().int().min(1).max(T3_MAX_TURN_ATTACHMENTS).default(5),
+        maxImageBytes: z.number().int().min(1).max(T3_MAX_IMAGE_BYTES).default(T3_MAX_IMAGE_BYTES),
+        maxFileBytes: z.number().int().min(1).max(T3_MAX_FILE_BYTES).default(25 * 1024 * 1024),
+        /** Extensions never downloaded, lowercase without the dot (`"exe"`). */
+        deniedExtensions: z.array(z.string().regex(/^[a-z0-9]{1,16}$/)).max(100).default([]),
+      })
+      .strict()
+      .prefault({}),
+  })
+  .strict()
+  .prefault({});
+
 /**
  * Task lifecycle (PR-N). A task idle this long closes; the next reply in its thread reopens it as a
  * new T3 session. Every key defaults, so existing configs stay valid.
@@ -559,6 +585,7 @@ export const agentTagConfigSchema = z
     routines: routinesSchema,
     lifecycle: lifecycleSchema,
     github: githubSchema.optional(),
+    files: filesSchema,
   })
   .superRefine((config, context) => {
     const profiles = new Map(config.profiles.map((profile) => [profile.id, profile]));

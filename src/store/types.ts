@@ -18,7 +18,8 @@ export type StoreFaultPoint =
   | "operation-claim.after-update"
   | "outbox-enqueue.after-insert"
   | "outbox-claim.after-update"
-  | "schedule-outcome.after-record";
+  | "schedule-outcome.after-record"
+  | "attachment.after-record";
 
 export interface StoreOpenOptions {
   readonly faultInjector?: (point: StoreFaultPoint) => void;
@@ -46,6 +47,11 @@ export interface SlackEventInput {
   readonly ackReaction?: string;
   /** A direct mention in a bound thread: clears its mute on the accepted path (PR-H). */
   readonly unmuteThread?: boolean;
+  /**
+   * Slack file objects shared with the message, as Slack sent them. The payload keeps a ref (id and
+   * metadata) for each one with a valid file id; see `inboundFileRefs`.
+   */
+  readonly files?: readonly unknown[];
 }
 
 /** The task bound to a Slack thread (`findTaskForThread`). A closed task reopens on its next accepted event. */

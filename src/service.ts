@@ -459,6 +459,7 @@ export async function createAgentTagService(input: {
           config: input.config,
           store,
           slackContext: bridge.contextSource,
+          inboundFiles: { slack: bridge.files },
           t3,
           catalog,
           ...(watcher === undefined ? {} : { watcher }),
