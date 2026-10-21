@@ -1,4 +1,4 @@
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
 
 import { loadConfig } from "../src/config.ts";
 import { readSecretFile } from "../src/security/secret-file.ts";
@@ -27,6 +27,11 @@ if (configPath !== undefined) {
     { name: "slack-bot-token", path: config.slack.botTokenFile },
   ];
   configuredRoots.push(config.dataDir, ...config.profiles.flatMap((profile) => profile.repositoryRoots));
+  if (config.t3.mode === "managed") {
+    // The verified T3 release (its binary and web bundle match credential shapes) and T3's own key
+    // pair are not leaks; T3's logs and database under homeDir are still scanned with the canaries.
+    excludedPaths.push(config.t3.managed.runtimeDir, join(config.t3.managed.homeDir, "userdata", "secrets"));
+  }
   for (const secretFile of secretFiles) {
     const secret = await readSecretFile(secretFile.path);
     canaries.push({ name: secretFile.name, secret });

@@ -29,7 +29,7 @@ Hosts installed with `install.sh` run a standalone binary from `~/.local/bin/age
 1. Acknowledge that agents run as your OS user with access to the configured repositories, so only users you would trust with a shell should be allowed. Non-interactive runs require `--accept-risk`.
 2. Choose the Agent Tag home (`--dir`, default `$AGENT_TAG_HOME` or `~/.agent-tag`). It creates `data/` and `secrets/` at mode `0700`. An existing home directory is left as is, and an existing config is replaced only with `--force` or after an interactive confirmation.
 3. Create the Slack app. The wizard prints `config/slack-manifest.example.json` together with a `https://api.slack.com/apps?new_app=1&manifest_json=...` link that opens Slack's create-from-manifest flow. It then reads the app-level token (`xapp-`) and the bot token (`xoxb-`) from a hidden prompt, from `AGENT_TAG_SLACK_APP_TOKEN` / `AGENT_TAG_SLACK_BOT_TOKEN`, or from token files that already exist. It writes them to `secrets/` at mode `0600` and runs `auth.test` to learn the workspace ID (`--skip-slack-check` skips this check).
-4. Connect T3. The wizard reads `<T3 base dir>/userdata/server-runtime.json` (`--t3-base-dir`, else `$T3CODE_HOME` or `~/.t3`, the same order T3 uses) to find the server URL (`--t3-url` overrides it) and probes it with the same environment check as `doctor`. When that check fails, because T3 is unreachable or does not speak orchestration protocol `1` (for example a nightly or `main` build), the wizard skips token minting and provider discovery and does not install the service. With `--t3-issue-token` or `--t3-admin-token-file` it stops with an error instead. Run the T3 version pinned in `t3.lock.json`. If no restricted token exists yet, it can run `t3 auth session issue --base-dir D --ttl 10m --label agent-tag-onboard --json` (`--t3-issue-token`, `--t3-bin`) or use `--t3-admin-token-file`. It issues a session only when the base dir's running server is the one at the T3 URL. If you pass `--t3-url` for an isolated instance, also pass that instance's `--t3-base-dir`; otherwise the session would come from another instance with different signing keys, so the wizard refuses (or stops, with `--t3-issue-token`). In both cases it mints a restricted token with the same checks as `bun run enroll:t3`. The administrative token is used once and never written. A session the wizard issued is revoked with `t3 auth session revoke` right after enrollment, whether enrollment succeeded or not. If revocation fails, the wizard prints the session ID and the revoke command; the session (administrative scopes, label `agent-tag-onboard`) expires on its own after 10 minutes. A token passed with `--t3-admin-token-file` belongs to you and is not revoked; issue it with a short `--ttl`.
+4. Connect T3. With `--t3-managed`, or by default when no T3 server is running and no external T3 flag (`--t3-url`, `--t3-base-dir`, `--t3-bin`, `--t3-admin-token-file`, `--t3-issue-token`) is given, the wizard sets up [managed T3](#managed-t3): it writes `t3: {mode: "managed", port, tokenFile}` (`--t3-port`, default `37841`), downloads and verifies the pinned T3 into `<dataDir>/t3/runtime`, starts it, mints the restricted token, lists providers (waiting up to 30 s while a fresh T3 probes them), and stops it again; the service starts it from then on. Interactive runs ask before choosing managed mode. A failed start stops the run with `--t3-managed` and only warns otherwise. On a platform without a pinned T3 build (Intel macOS) the wizard stays on external T3. Otherwise the wizard reads `<T3 base dir>/userdata/server-runtime.json` (`--t3-base-dir`, else `$T3CODE_HOME` or `~/.t3`, the same order T3 uses) to find the server URL (`--t3-url` overrides it) and probes it with the same environment check as `doctor`. When that check fails, because T3 is unreachable or does not speak orchestration protocol `1` (for example a nightly or `main` build), the wizard skips token minting and provider discovery and does not install the service. With `--t3-issue-token` or `--t3-admin-token-file` it stops with an error instead. Run the T3 version pinned in `t3.lock.json`. If no restricted token exists yet, it can run `t3 auth session issue --base-dir D --ttl 10m --label agent-tag-onboard --json` (`--t3-issue-token`, `--t3-bin`) or use `--t3-admin-token-file`. It issues a session only when the base dir's running server is the one at the T3 URL. If you pass `--t3-url` for an isolated instance, also pass that instance's `--t3-base-dir`; otherwise the session would come from another instance with different signing keys, so the wizard refuses (or stops, with `--t3-issue-token`). In both cases it mints a restricted token with the same checks as `bun run enroll:t3`. The administrative token is used once and never written. A session the wizard issued is revoked with `t3 auth session revoke` right after enrollment, whether enrollment succeeded or not. If revocation fails, the wizard prints the session ID and the revoke command; the session (administrative scopes, label `agent-tag-onboard`) expires on its own after 10 minutes. A token passed with `--t3-admin-token-file` belongs to you and is not revoked; issue it with a short `--ttl`.
 5. Set the repositories (`--repo`, comma-separated absolute paths), `--base-branch`, `--provider` (by default the first ready T3 provider) and `--model` (by default T3's default model for the selected provider; required when T3 reports none), `--runtime-mode`, and `--profile`.
 6. Set the allowed users (`--users U…`) and channels (`--channels C…`), plus `--max-concurrent-tasks`. Each channel gets a route to the profile. DM routes stay manual; see [DM routes](#dm-routes).
 7. Validate the result with the config schema and write `agent-tag.json` atomically at mode `0600`. Then offer to install the service (`--install-service` / `--no-install-service`).
@@ -41,6 +41,14 @@ AGENT_TAG_SLACK_APP_TOKEN=... AGENT_TAG_SLACK_BOT_TOKEN=... \
 bun run onboard -- --yes --accept-risk \
   --repo /srv/agent/repo --users U0123ABC --channels C0123ABC \
   --t3-issue-token --install-service
+```
+
+On a host without its own T3, drop `--t3-issue-token` (or pass `--t3-managed`) and Agent Tag runs T3 itself:
+
+```sh
+AGENT_TAG_SLACK_APP_TOKEN=... AGENT_TAG_SLACK_BOT_TOKEN=... \
+agent-tag onboard --yes --accept-risk --t3-managed \
+  --repo /srv/agent/repo --users U0123ABC --channels C0123ABC --install-service
 ```
 
 ## Doctor
@@ -61,6 +69,7 @@ Doctor reports each check as `PASS`, `WARN`, `FAIL`, or `SKIP` and exits non-zer
 - T3 is reachable, and `/.well-known/t3/environment` reports orchestration protocol `1`. A missing field counts as `1`, and an older server without the endpoint gives a warning. A managed T3 that is down while the service is not running is a warning, since the service starts it.
 - The T3 server version matches `t3.lock.json`. A mismatch is a warning.
 - The restricted T3 session has exactly the orchestration scopes, has not expired, and warns within 7 days of expiry.
+- Managed T3 only (`t3-runtime`): the pinned T3 is installed and every file still matches its install record, and the server on the managed port is the one in `<homeDir>/userdata/server-runtime.json`, serving the pinned version, as a child of the running service. A missing install is a warning while the service can still download it (`autoInstall`), a tampered install or a foreign server on the port fails, and a T3 running without the service (a foreground `t3 serve`, or an orphan the next start reaps) is a warning. External mode skips this check.
 - Managed T3 only (`t3-token-rotation`): the last token rotation and how many replaced tokens still await revocation, from `<runtimeDir>/credential-state.json`. A replaced token still pending an hour after its grace period is a warning. External mode skips this check.
 - Every profile's provider and model are ready in T3.
 - Slack `auth.test` belongs to the configured workspace, and the app token can open a Socket Mode connection.
@@ -109,6 +118,42 @@ With `t3.watch.enabled`, coordinators subscribe to each running T3 thread's even
 | `lingerMs` | `30000` (0–600000) | How long a thread's subscription stays open after its turn ends, so a follow-up turn reuses it. |
 
 Every 60 s the service logs `t3.connection.stats` with the counters `sessionInspects`, `wsTickets`, `wsConnects`, `snapshotFetches`, `rpcCalls`, and `watchedThreads`. Other connection events are `t3.connection.opened`, `t3.connection.reconnect`, `t3.connection.lost`, `t3.connection.rotated` (the token file changed, so the socket is replaced after the new token passes inspection), and `t3.connection.closed`; watch events are `t3.watch.subscribed`, `t3.watch.ended`, `t3.watch.failed`, `t3.watch.resync`, and `t3.watch.released`. Logs never contain the token or the WebSocket ticket URL.
+
+## Managed T3
+
+With `t3.mode: "managed"`, Agent Tag owns its T3 server. Every key except `mode` and `tokenFile` is optional:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `t3.port` | `37841` | Loopback port for `t3 serve`; `baseUrl` becomes `http://127.0.0.1:<port>`. |
+| `t3.homeDir` | `<dataDir>/t3/home` | T3's `--base-dir` (its SQLite, logs, environment id). Must not be the desktop T3's `~/.t3` or `$T3CODE_HOME`. |
+| `t3.runtimeDir` | `<dataDir>/t3/runtime` | Verified binaries, `state.json` (downgrade guard) and `credential-state.json`. |
+| `t3.autoInstall` | `true` | Download the pinned T3 at startup when it is missing or does not verify. |
+| `t3.downloadBaseUrl` | GitHub releases | https mirror laid out as `<base>/<tag>/<asset>`. |
+| `t3.rotation` | see [T3 token rotation](#t3-token-rotation) | Token rotation thresholds. |
+
+**Install.** The only trust root is the sha256 in `t3.lock.json`. The archive is streamed to a private staging directory (256 MiB cap) and hashed. Every tar entry must be a regular file or directory under the one expected top directory, which is checked before anything is extracted. `t3 --version` must print the pinned version. The tree is then renamed into `versions/<version>/` with a record of every file's hash. Each start re-hashes the install; a changed file logs `t3.install.tampered` and is reinstalled. The pinned version and the newest one other version are kept; older ones are pruned. Each version is about 205 MB.
+
+**Downgrade guard.** T3 migrates its database forward only. Once a version has started against `homeDir`, a build pinned to an older T3 refuses to start (`T3DowngradeError`) rather than open that database. Keep the newer Agent Tag, or point `homeDir` at a fresh directory.
+
+**Supervision.** The service starts `t3 serve --host 127.0.0.1 --port <port> --base-dir <homeDir>` before anything else. It waits up to 60 s for `/.well-known/t3/environment` to report the pinned version and protocol `1`, and for `server-runtime.json` to name the pid it spawned. T3 inherits your environment (`HOME`, `PATH`, provider logins) minus every `AGENT_TAG_*` and `T3CODE_*` variable. Its stdout, which carries a pairing credential, is discarded. Its stderr is redacted, rate-limited, and logged as `t3.runtime.stderr`. If something else already listens on the port, startup fails with `T3PortInUseError`; Agent Tag never sends a token to a server it did not start. When T3 exits unexpectedly it is restarted with backoff (1 s doubling to 60 s), logged as `t3.runtime.restarted`. Five restarts within 10 minutes log `t3.runtime.crashloop` and stop the service with exit code 75, so launchd or systemd restarts it. If Agent Tag itself is killed, the next start finds the orphaned `t3 serve` through `server-runtime.json` and `ps`, stops it (`t3.runtime.orphan_reaped`), and starts a fresh one. Stopping the service stops its workers first, then T3 (SIGTERM, SIGKILL after 15 s).
+
+**Gate.** Every 60 s (every 10 s while closed, and after each restart) the service re-reads the environment descriptor. Another protocol, another version, a changed environment id, or no answer closes the gate (`t3.gate.closed`). While it is closed, coordinators, interaction workers and schedules pause; Slack ingestion, the outbox and maintenance keep running, so mentions queue and drain once the gate reopens (`t3.gate.opened`).
+
+**Commands.**
+
+```sh
+agent-tag t3 install CONFIG   # download and verify only; prints {version, binary, sha256, downloaded}
+agent-tag t3 status CONFIG    # install, runtime and token as JSON; never starts T3 or prints a token
+agent-tag t3 serve CONFIG     # the managed T3 in the foreground without Slack, for debugging
+agent-tag t3 pair CONFIG      # a 5-minute link that pairs a browser with the managed T3's web UI
+```
+
+`t3 status` prints `mode`, `version`, `binarySha256Verified`, `filesVerified`, `pid`, `protocol`, `runtime` and `token.{expiresAt, daysRemaining, label, rotatedAt, pendingRevocations}`. Agent threads live in the managed T3, not your desktop T3. Open them with `t3 pair`, which prints the link only to a terminal (pass `--allow-non-tty` to override). Treat that link like a password until it expires.
+
+Configure providers once in the managed T3 (through `t3 pair`) if T3's defaults are not enough. Provider logins under `HOME` (`~/.codex`, Claude) are shared with your own use.
+
+Managed mode was verified live on macOS arm64 ([evidence](evidence/2026-10-21-t3-managed.md)). The Linux x64 and arm64 artifacts are pinned and their digests are checked by `bun run verify:t3-pin`, but they have not had a live run yet.
 
 ## T3 token rotation
 
@@ -278,7 +323,7 @@ Add `--config` to load the three configured service credentials as exact canarie
 bun run scan:secrets -- --config /absolute/path/to/agent-tag.json /absolute/path/to/agent-tag
 ```
 
-The JSON report names only the file, credential class, and configured canary label. It never returns matched values. The command skips `.git` and `node_modules`. A file or directory that cannot be read (for example `EACCES`) does not stop the scan: findings from every readable file are still reported, and the unreadable paths are listed under `skippedEntries` with an error code. A finding, skipped symbolic link, or skipped entry sets a nonzero exit code, so a release check cannot silently claim a partial clean scan. The scan re-lists the tree after reading it and reads any file it has not seen yet or whose size or modification time changed, so a log rotated or appended to mid-scan is still checked; a file that is still changing after four passes is reported as `changed during the scan`. Keep source secret files outside scanned roots when practical; if they are inside, the configured scan excludes those exact files and scans their siblings.
+The JSON report names only the file, credential class, and configured canary label. It never returns matched values. The command skips `.git` and `node_modules`. A file or directory that cannot be read (for example `EACCES`) does not stop the scan: findings from every readable file are still reported, and the unreadable paths are listed under `skippedEntries` with an error code. A finding, skipped symbolic link, or skipped entry sets a nonzero exit code, so a release check cannot silently claim a partial clean scan. The scan re-lists the tree after reading it and reads any file it has not seen yet or whose size or modification time changed, so a log rotated or appended to mid-scan is still checked; a file that is still changing after four passes is reported as `changed during the scan`. Keep source secret files outside scanned roots when practical; if they are inside, the configured scan excludes those exact files and scans their siblings. With managed T3, the configured scan also skips `t3.runtimeDir` (the verified T3 release, whose binary and web bundle contain credential-shaped strings) and `<homeDir>/userdata/secrets` (T3's own key pair). T3's logs and database under `homeDir` are still scanned for the canaries.
 
 ## Security audit
 

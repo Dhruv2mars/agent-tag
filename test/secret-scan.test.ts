@@ -240,3 +240,47 @@ test("scanTextForSecrets reports line numbers and classes, never values", () => 
   expect(serialized).not.toContain(canary);
   expect(scanTextForSecrets("nothing to see\nhere")).toEqual([]);
 });
+
+test("the configured scan of a managed install skips T3's release and key pair but still scans its logs", async () => {
+  const directory = await realpath(await mkdtemp(join(tmpdir(), "agent-tag-secret-scan-managed-")));
+  try {
+    const dataDir = join(directory, "data");
+    const secrets = join(directory, "secrets");
+    const home = join(dataDir, "t3", "home");
+    const runtime = join(dataDir, "t3", "runtime");
+    await mkdir(join(runtime, "versions", "0.0.45"), { recursive: true, mode: 0o700 });
+    await mkdir(join(home, "userdata", "secrets"), { recursive: true, mode: 0o700 });
+    await mkdir(join(home, "userdata", "logs"), { recursive: true, mode: 0o700 });
+    await mkdir(secrets, { recursive: true, mode: 0o700 });
+    await chmod(directory, 0o700);
+    await chmod(dataDir, 0o700);
+    const t3Token = "t3-restricted-canary-value-0123456789";
+    await writeFile(join(secrets, "t3-token"), t3Token, { mode: 0o600 });
+    await writeFile(join(secrets, "slack-app-token"), "xapp-1-canary-app", { mode: 0o600 });
+    await writeFile(join(secrets, "slack-bot-token"), "xoxb-canary-bot", { mode: 0o600 });
+    const pem = ["-----BEGIN", "PRIVATE KEY-----"].join(" ");
+    await writeFile(join(runtime, "versions", "0.0.45", "t3"), `${pem}\n`);
+    await writeFile(join(home, "userdata", "secrets", "cloud-link-ed25519-key-pair.bin"), `${pem}\n`);
+    await writeFile(join(home, "userdata", "logs", "server.log"), `bearer ${t3Token}\n`);
+    const template = await Bun.file(join(import.meta.dir, "..", "config", "agent-tag.example.json")).json();
+    const configPath = join(directory, "agent-tag.json");
+    await writeFile(configPath, JSON.stringify({
+      ...template,
+      dataDir,
+      t3: { mode: "managed", port: 37_899, tokenFile: join(secrets, "t3-token") },
+      slack: { ...template.slack, appTokenFile: join(secrets, "slack-app-token"), botTokenFile: join(secrets, "slack-bot-token") },
+      profiles: template.profiles.map((profile: Record<string, unknown>) => ({ ...profile, repositoryRoots: [directory] })),
+      routes: template.routes.map((route: Record<string, unknown>) => ({ ...route, repositoryRoot: directory })),
+    }), { mode: 0o600 });
+
+    const run = Bun.spawnSync(["bun", "run", join(import.meta.dir, "..", "scripts", "scan-secrets.ts"), "--config", configPath], { stdout: "pipe", stderr: "pipe" });
+    if (run.stdout.toString().length === 0) throw new Error(run.stderr.toString());
+    const report = JSON.parse(run.stdout.toString());
+    expect(report.findings.map((finding: { path: string; kind: string }) => [finding.path, finding.kind])).toEqual([
+      [join(home, "userdata", "logs", "server.log"), "exact-secret"],
+    ]);
+    expect(run.stdout.toString()).not.toContain(t3Token);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});

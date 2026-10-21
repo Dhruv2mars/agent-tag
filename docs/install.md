@@ -1,6 +1,6 @@
 # Install
 
-Agent Tag ships three ways. Each one still needs a running T3 Code `0.0.45` server (orchestration protocol 1; `0.0.42`–`0.0.45` are accepted) and the Slack app from [Slack setup](slack-setup.md).
+Agent Tag ships three ways. Each one needs the Slack app from [Slack setup](slack-setup.md) and T3 Code `0.0.45` (orchestration protocol 1), which runs the agents. On macOS arm64 and Linux x64/arm64 Agent Tag installs and runs that T3 itself; see [T3: managed or external](#t3-managed-or-external).
 
 No release has been tagged yet, so the binary and Docker commands below fail until the first prerelease is published. Until then, use a [source checkout](#source-checkout).
 
@@ -9,6 +9,26 @@ No release has been tagged yet, so the binary and Docker commands below fail unt
 | Prebuilt binary (`install.sh`) | macOS arm64/x64, Linux x64/arm64 (glibc) | `agent-tag update` |
 | Docker image | Linux containers (amd64) | pull a newer image tag |
 | Source checkout | anything Bun supports | `git pull && bun install --frozen-lockfile` |
+
+## T3: managed or external
+
+Agent Tag needs a T3 Code server on loopback. There are two ways to get one.
+
+**Managed (recommended).** Agent Tag downloads the T3 release pinned in `t3.lock.json`, checks its sha256, runs `t3 serve` on `127.0.0.1`, mints and rotates its own token, and restarts T3 if it crashes. You never install T3 or copy a token. `agent-tag onboard` sets this up when no T3 server is running, or when you pass `--t3-managed`:
+
+```sh
+agent-tag onboard --t3-managed            # interactive; add --t3-port N if 37841 is taken
+```
+
+The resulting config has a three-line `t3` block. Everything else has a default under `dataDir`:
+
+```json
+"t3": { "mode": "managed", "port": 37841, "tokenFile": "/home/me/.agent-tag/secrets/t3-token" }
+```
+
+Managed mode needs a pinned artifact for the host: macOS arm64, Linux x64 and Linux arm64. T3 `0.0.45` ships no Intel macOS build, so Intel Macs use external mode. The first start downloads about 70 MB from GitHub (`downloadBaseUrl` points at a mirror instead), and each installed version takes about 205 MB on disk. The coding agents themselves (Codex, Claude) run under your OS user and use the logins in your home directory, so sign in to them once as that user. See [operations](operations.md#managed-t3) for `agent-tag t3 status|pair|serve|install`.
+
+**External.** Run T3 yourself and point Agent Tag at it with `"t3": { "baseUrl": "http://127.0.0.1:3773", "tokenFile": "..." }` (a config without `t3.mode` is external). Onboarding picks this when it finds a running T3 in `~/.t3` (or `$T3CODE_HOME`), or when you pass `--t3-url`. The Docker image always uses external mode, because the container does not run T3.
 
 ## Prebuilt binary
 
