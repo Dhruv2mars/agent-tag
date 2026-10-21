@@ -20,9 +20,9 @@ Dhruv's rule (2026-10-21): an install that answers in Slack runs only `codex` / 
 - no route `defaultModel`;
 - `allowedModels` on every profile: `{ "instanceId": "codex", "model": "gpt-6-luna", "label": "Luna", "aliases": ["luna"] }` and `{ "instanceId": "claudeAgent", "model": "claude-haiku-5-5", "label": "Haiku 5.5", "aliases": ["haiku"] }`.
 
-T3 0.0.45 does not list `claude-haiku-5-5` (its `claudeAgent` catalog stops at `claude-haiku-4-5`, checked 2026-10-21), so the session runs on the T3 v0.1.1 pin from lane T1. `claude-haiku-4-5` is never a substitute.
+The pinned T3 0.0.45 lists `claude-haiku-5-5` only after its remote model manifest refreshes, so preflight restarts managed T3 once after its first boot. `claude-haiku-4-5` is never a substitute.
 
-The agent keeps `agent-tag audit CONFIG` running into a file for the whole session and quotes only action names, IDs and timestamps from it in evidence: never message text, tokens or file contents.
+`agent-tag audit CONFIG` prints the whole audit log as JSON lines and exits. The agent notes the session start time (UTC) in preflight, and after each step runs `agent-tag audit CONFIG > <session dir>/audit.jsonl` and reads only records whose `createdAt` is at or after that time. Evidence quotes only action names, IDs and timestamps from it: never message text, tokens or file contents.
 
 ## Prerequisites
 
@@ -41,15 +41,15 @@ Run them in this order. Step 1 starts first because its routines need time to fi
 
 - **Matrix rows:** OPS-01, T3-05, SEC-01, AUD-01, GA-01
 - **Who:** agent
-- **Do:** install `v0.1.0-rc.N` on the host with the pinned installer (`AGENT_TAG_VERSION=0.1.0-rc.N`, see `docs/install.md`), then `agent-tag service upgrade CONFIG`.
+- **Do:** note the session start time (UTC). Install `v0.1.0-rc.N` on the host with the pinned installer (`AGENT_TAG_VERSION=0.1.0-rc.N`, see `docs/install.md`), then `agent-tag service upgrade CONFIG`. Restart managed T3 once (`agent-tag service restart CONFIG`) so its model manifest refreshes.
 - **Expect:**
   - `agent-tag version --json` names the rc build.
   - `agent-tag doctor CONFIG --json`: every check passes and there is no `missing_scope`.
-  - `agent-tag t3 status CONFIG` reports the pinned T3 `v0.1.1` (the version in `t3.lock.json`), installed and verified.
+  - `agent-tag t3 status CONFIG` reports the pinned T3 `0.0.45` (the version in `t3.lock.json`), installed and verified.
   - `agent-tag security audit CONFIG --json` has no findings. `bun run scan:secrets` passes on the release commit.
   - `agent-tag service status CONFIG` shows the service running.
   - The model rule holds: `jq '[.profiles[] | [.defaultProviderInstanceId, .defaultModel]], [.profiles[].allowedModels[]? | [.instanceId, .model]], [.routes[].defaultModel? | select(. != null)]' CONFIG` prints only `codex`/`gpt-6-luna` and `claudeAgent`/`claude-haiku-5-5`, and no route default.
-  - T3 lists both slugs and can serve them: `agent-tag doctor CONFIG --json` reports both `allowedModels` entries as `available` (doctor checks each against the live T3 catalog). If either is unavailable, stop the session.
+  - After the restart, the T3 catalog lists `gpt-6-luna` and `claude-haiku-5-5`: `agent-tag doctor CONFIG --json` reports both `allowedModels` entries as `available` (doctor checks each against the live T3 catalog). If either is unavailable, stop the session.
 - **Agent captures:** the outputs above, with any secret-looking values redacted → `docs/evidence/<date>-owner-preflight.md`. The Build string for every row in this session comes from `version --json`.
 - **Fallback:** if `doctor` fails, stop the session and fix that first. Nothing after this step is valid on a broken install.
 
@@ -58,9 +58,9 @@ Run them in this order. Step 1 starts first because its routines need time to fi
 - **Matrix rows:** JOB-01, JOB-02
 - **Who:** agent (config), agent-CU (Slack, owner account)
 - **Preconditions:** `routines.autoDisable.minFailureSpanSeconds` lowered to `600` for the session; restart.
-- **Failing routine (agent):** a run counts as failed only when its operation fails, and a prompt that merely reports an error succeeds. So the agent adds a profile `routine-fail` (on `codex`/`gpt-6-luna`, like every profile) whose only repository root is a throwaway git repository with `baseBranch` set to a branch that does not exist, restarts, and adds an every-5-minutes routine on that profile with `agent-tag schedule-add CONFIG <task> <owner user id> routine-fail <spec file>` (5 minutes is the shortest interval). Three failed runs over at least 10 minutes turn it off. Rehearse this on a private T3 before the session; if the run does not fail there, pick another persistent start failure and record which one in the evidence.
+- **Failing routine (agent):** a run counts as failed only when its operation fails, and a prompt that merely reports an error succeeds. So the agent adds a profile `routine-fail` (on `codex`/`gpt-6-luna`, like every profile) whose only repository root is a throwaway git repository with `baseBranch` set to a branch that does not exist, points the owner's DM route (`D0C4MK74G02`) at `routine-fail`, and restarts. A routine binds to the task of the thread it is requested in, and that task takes the route's profile. Agent-CU sends the DM `every 5 minutes say ok` (5 minutes is the shortest interval) and waits for the confirmation. The agent then points the DM route back at its own profile and restarts; the routine keeps its `routine-fail` task. Three failed runs over at least 10 minutes turn it off. Rehearse this on a private T3 before the session; if the run does not fail there, pick another persistent start failure and record which one in the evidence.
 - **Send, in order:**
-  1. (none: the failing routine above is added from the CLI)
+  1. (the failing routine above, in the DM)
   2. `@Agent Tag every weekday at 9am summarize open PRs`
   3. `@Agent Tag remind me in 10 minutes to check the deploy`
   4. `@Agent Tag every day at 9am standup notes in Europe/London`
@@ -68,7 +68,7 @@ Run them in this order. Step 1 starts first because its routines need time to fi
   6. `@Agent Tag cancel routine <id from step 5>`
   7. Press **Cancel** on another routine's card.
   8. DM: `list routines`
-- **Expect:** each creation is confirmed with its next run time in the right zone (step 4 in Europe/London). The reminder fires about 10 minutes later. The list matches what was created. Both cancels are confirmed and the routine stops appearing. The DM list shows only DM routines. The failing routine is turned off after its third failure, with a notice in its thread. Remove the `routine-fail` profile in step 12.
+- **Expect:** each creation is confirmed with its next run time in the right zone (step 4 in Europe/London). The reminder fires about 10 minutes later. The list matches what was created. Both cancels are confirmed and the routine stops appearing. The DM list shows only DM routines, including the failing one until it is turned off. The failing routine is turned off after its third failure, with a notice in its thread. Remove the `routine-fail` profile in step 12.
 - **Agent captures:** `schedule.created`, `schedule.cancelled`, `schedule.run.outcome`, `schedule.auto-disabled` → fill in `docs/evidence/2026-10-21-routines-slack.md` §Owner session.
 - **Fallback:** a failed check sets JOB-01 or JOB-02 to `FAIL` with the evidence file, and the session continues.
 
@@ -84,6 +84,15 @@ Run them in this order. Step 1 starts first because its routines need time to fi
 - **Expect:** 1: the second mention gets 👀 within 2 s while the first is still running. 2: one status message per turn, at least 3 visible edits to a status message, a `Done in …` line, and a footer with the model and provider on each reply (`gpt-6-luna · codex`; any other model in a footer stops the session). 3: the status reads "Stopped by @Dhruv" and no final reply is posted.
 - **Agent captures:** `slack.reaction.added` time vs `slack.event.ingested` time, `status.opened` / `status.terminal`, `task.stop.requested` → `docs/evidence/<date>-owner-f.md`. Restore `maxConcurrentTasks`.
 - **Fallback:** `FAIL` SLK-06 with the evidence, continue.
+
+### 2a. Close and reopen (N)
+
+- **Matrix rows:** LIFE-01
+- **Who:** agent (CLI), agent-CU (owner account)
+- **Do:** after step 2 finishes, the agent finds the three-turn task from step 2.2 with `agent-tag tasks list CONFIG --state active --json` and closes it with `agent-tag tasks close <task id> CONFIG`. Then the owner replies in that thread: `@Agent Tag how many files did you list?`
+- **Expect:** `tasks list --state closed` shows the task closed. The reply reopens it with a new generation and a new T3 thread, and the turn completes in the same Slack thread.
+- **Agent captures:** `task.closed`, `task.reopened` (with `generation`), `operation.completed` → `docs/evidence/<date>-owner-n.md`.
+- **Fallback:** `FAIL` LIFE-01, continue.
 
 ### 3. Thread context and two humans (G)
 
@@ -118,8 +127,11 @@ Run them in this order. Step 1 starts first because its routines need time to fi
   2. Repeat with `notes/expiry-test.txt`, and do not answer for 60 s.
   3. Repeat with `notes/restart-test.txt`. While the card is pending, the agent runs `agent-tag service restart CONFIG`. After the service is back, press **Allow once**.
   4. Repeat with `notes/decline-test.txt` and press **Decline**.
-- **Expect:** 1: the card updates to the decision within 2 s and the turn completes. 2: the card shows Expired. 3: the click after the restart is honoured exactly once and the turn completes. 4: the card shows the decline and the turn ends without the file.
-- **Agent captures:** `interaction.approval.requested`, `interaction.response.*`, `interaction.expired`, `interaction.adopted` → `docs/evidence/<date>-owner-i.md`. Restore `runtimeMode` and `interactionExpirySeconds`.
+  5. In a new thread: `@Agent Tag use haiku: use your question tool to ask me whether the file should be called red.txt or blue.txt, then create notes/<answer>`. Press **blue.txt** on the question card, then **Allow once** on the approval card.
+  6. Repeat 5 with `green.txt or gold.txt`, and press **Stop** while the question card is pending.
+- **Expect:** 1: the card updates to the decision within 2 s and the turn completes. 2: the card shows Expired. 3: the click after the restart is honoured exactly once and the turn completes. 4: the card shows the decline and the turn ends without the file. 5: the question card lists both choices, updates to the answer, and the turn creates `notes/blue.txt` on `claude-haiku-5-5`. 6: the question card closes and the turn stops without a file.
+- **Agent captures:** `interaction.approval.requested`, `interaction.user-input.requested`, `interaction.response.*`, `interaction.expired`, `interaction.adopted`, `interaction.closed`, `task.stop.requested` → `docs/evidence/<date>-owner-i.md`. Restore `runtimeMode` and `interactionExpirySeconds`.
+- **Rehearsal:** Codex asks questions only in plan mode, which Agent Tag never uses, so the question comes from Haiku 5.5. Rehearse 5 on a private T3 first. If no question card appears there, the question half of SLK-04 stays `UNCONFIRMED`; record that.
 - **Fallback:** `FAIL` the row, continue. SLK-04 also has an automated-real half that fails on `ee1eaf8` (`docs/evidence/2026-10-21-t3-live-main.md`); it must pass again before SLK-04 can pass.
 
 ### 6. Memory (K)
@@ -144,7 +156,7 @@ Run them in this order. Step 1 starts first because its routines need time to fi
 
 - **Matrix rows:** SLK-08, PR-01
 - **Who:** agent (config, live test), agent-CU (owner account)
-- **Preconditions:** P2 done. The profile's `pullRequests` is `{ "mode": "auto", "repositories": [{ "root": "<sandbox checkout>", "repo": "<owner/name>" }] }` and the top-level `github.auth` is `{ "type": "token", "tokenFile": "<0600 file>" }`. `agent-tag doctor CONFIG` shows `github-access` passing. Restart.
+- **Preconditions:** P2 done. The sandbox checkout is added to the profile's `repositoryRoots`, and the `C0C2RHJ1BUP` route's `repositoryRoot` is set to it, so turns in the test channel run there. The profile's `pullRequests` is `{ "mode": "auto", "repositories": [{ "root": "<sandbox checkout>", "repo": "<owner/name>" }] }` and the top-level `github.auth` is `{ "type": "token", "tokenFile": "<0600 file>" }`. `agent-tag doctor CONFIG` shows `github-access` passing. Restart.
 - **Send:** the three steps in `docs/evidence/TEMPLATE-github-draft-pr.md` §2: `@Agent Tag fix the typo in README`; a follow-up in the same thread asking for one more small change; `@Agent Tag what does README say?` in a new thread.
 - **Expect:** a draft PR card with "View PR"; the follow-up pushes to the same PR; the question opens no PR. The agent also runs the template's §1 live test and its §3 credential checks.
 - **Agent captures:** copy the template to `docs/evidence/<date>-github-draft-pr.md` and fill in every section.
@@ -157,7 +169,7 @@ Run them in this order. Step 1 starts first because its routines need time to fi
 - **Models:** only the two in [Models](#models-slack-model-rule). With one allowed model per driver, a same-driver switch in place cannot run in Slack; that half of MOD-01 rests on the live T3 run in `docs/evidence/2026-10-21-model-switch.md`.
 - **Send:**
   1. In a new thread: `@Agent Tag use luna: reply with exactly ok`.
-  2. In that thread, now started: `@Agent Tag use opus`. Opus is not in `allowedModels`, so this is refused and runs nothing.
+  2. In that thread, now started: `@Agent Tag use gpt-6-sol`. The T3 catalog lists it but `allowedModels` does not, so this is refused and runs nothing. (A name that is neither an allowed alias nor a full catalog slug, such as `opus`, is not read as a model switch at all.)
   3. In a new thread: `@Agent Tag use haiku: reply with exactly ok`.
   4. In the started Codex thread from 1: `@Agent Tag use haiku`.
 - **Expect:** 1: the reply's footer reads `gpt-6-luna · codex`. 2: refused as not allowed, the reply lists Luna and Haiku 5.5, and the thread keeps `gpt-6-luna`. 3: the turn runs on `claudeAgent`/`claude-haiku-5-5` and its footer says so. 4: refused as a cross-driver switch on a started thread; the thread keeps `gpt-6-luna`.

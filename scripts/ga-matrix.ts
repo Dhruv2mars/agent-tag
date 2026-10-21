@@ -129,17 +129,16 @@ export function checkGaMatrix(inputs: MatrixInputs): string[] {
     }
 
     if (row.Status === "PASS") {
-      // A PASS needs at least one cited file whose actor matches one of the row's Kinds,
-      // and only fixture-allowed rows may pass on fixture evidence.
-      const allowedActors = new Set(
-        kinds
-          .filter((kind) => kind !== "automated-fixture" || (FIXTURE_ALLOWED_ROWS as readonly string[]).includes(row.ID))
-          .map((kind) => ACTOR_FOR_KIND[kind as (typeof KINDS)[number]]),
-      );
-      const qualifying = paths.filter((path) => indexed.get(path)?.actor.some((actor) => allowedActors.has(actor as never)));
-      if (qualifying.length === 0) problems.push(`${where} is PASS without evidence from an allowed actor (${[...allowedActors].join(", ")})`);
-      if (kinds.includes("owner-session") && !paths.some((path) => indexed.get(path)?.actor.includes("human"))) {
-        problems.push(`${where} is PASS but its owner-session half has no human evidence`);
+      // Every Kind the row declares needs a cited file that the index lists for this row, from that
+      // Kind's actor. A disallowed fixture Kind is reported above and proves nothing.
+      for (const kind of kinds) {
+        const actor = ACTOR_FOR_KIND[kind as (typeof KINDS)[number]];
+        if (actor === undefined || (kind === "automated-fixture" && !(FIXTURE_ALLOWED_ROWS as readonly string[]).includes(row.ID))) continue;
+        const covered = paths.some((path) => {
+          const entry = indexed.get(path);
+          return entry !== undefined && entry.rows.includes(row.ID) && entry.actor.includes(actor);
+        });
+        if (!covered) problems.push(`${where} is PASS without ${actor} evidence indexed for ${row.ID}`);
       }
       if (row.Build === "—") problems.push(`${where} is PASS without a Build`);
     } else {

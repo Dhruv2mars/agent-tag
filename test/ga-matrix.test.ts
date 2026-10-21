@@ -99,19 +99,34 @@ describe("GA matrix", () => {
       withRow(fixture(), "docs/evidence/2026-01-01-real.md | automated-real |", "docs/evidence/2026-01-01-fixture.md | automated-fixture |"),
     );
     expect(problems).toContain("matrix row T3-01 (line 5): Kind automated-fixture is only allowed for DOC-01, REL-01");
-    expect(problems).toContain("matrix row T3-01 (line 5) is PASS without evidence from an allowed actor ()");
   });
 
   test("a real-Kind PASS on fixture-only evidence fails", () => {
     const problems = checkGaMatrix(withRow(fixture(), "docs/evidence/2026-01-01-real.md | automated-real |", "docs/evidence/2026-01-01-fixture.md | automated-real |"));
-    expect(problems).toContain("matrix row T3-01 (line 5) is PASS without evidence from an allowed actor (automated-real)");
+    expect(problems).toContain("matrix row T3-01 (line 5) is PASS without automated-real evidence indexed for T3-01");
   });
 
   test("an owner-session PASS needs human evidence", () => {
     const problems = checkGaMatrix(
       withRow(fixture(), "| — | owner-session | PENDING-OWNER-SESSION | — |", "| docs/evidence/2026-01-01-real.md | owner-session; automated-real | PASS | 0.1.0-rc.1 |"),
     );
-    expect(problems).toContain("matrix row SLK-01 (line 6) is PASS but its owner-session half has no human evidence");
+    expect(problems).toContain("matrix row SLK-01 (line 6) is PASS without human evidence indexed for SLK-01");
+  });
+
+  test("a PASS needs evidence the index lists for that row", () => {
+    const inputs = fixture();
+    const problems = checkGaMatrix({ ...inputs, index: inputs.index.replace("automated-real\tT3-01", "automated-real\tDOC-01") });
+    expect(problems).toContain("matrix row T3-01 (line 5) is PASS without automated-real evidence indexed for T3-01");
+  });
+
+  test("a PASS row with two Kinds needs evidence for each", () => {
+    const inputs = withRow(fixture(), "| — | owner-session | PENDING-OWNER-SESSION | — |", "| docs/evidence/2026-01-01-human.md | owner-session; automated-real | PASS | 0.1.0-rc.1 |");
+    const problems = checkGaMatrix({
+      ...inputs,
+      index: `${inputs.index}\ndocs/evidence/2026-01-01-human.md\t2026-01-01\tabc\tdarwin-arm64\t0.0.45\tcodex\thuman\tSLK-01`,
+      evidenceFiles: [...inputs.evidenceFiles, "docs/evidence/2026-01-01-human.md"],
+    });
+    expect(problems).toEqual(["matrix row SLK-01 (line 6) is PASS without automated-real evidence indexed for SLK-01"]);
   });
 
   test("PENDING passes without the gate and fails under it", () => {
