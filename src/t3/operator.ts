@@ -3,7 +3,7 @@ import { join } from "node:path";
 
 import { z } from "zod";
 
-import type { CommandRunner } from "../command.ts";
+import { type CommandRunner, runCommand } from "../command.ts";
 import type { ResolvedT3Config } from "../config.ts";
 import { readSecretFile } from "../security/secret-file.ts";
 import type { ServiceLogger } from "../service.ts";
@@ -12,6 +12,7 @@ import { inspectInstalledT3 } from "./install.ts";
 import type { T3Pin } from "./pin.ts";
 import { type EnvironmentFetch, fetchT3EnvironmentDescriptor, t3DescriptorProblem } from "./protocol.ts";
 import {
+  isManagedServeCommand,
   type ManagedT3Binary,
   prepareManagedT3Binary,
   redactT3Output,
@@ -84,6 +85,65 @@ export async function runManagedT3Serve(input: {
     return reason === "fatal" ? T3_FATAL_EXIT_CODE : 0;
   } finally {
     await runtime.stop();
+  }
+}
+
+export interface TransientManagedT3 {
+  readonly version: string | undefined;
+  /** "enrolled" when the restricted token was missing or rejected and a new one was minted. */
+  readonly token: "kept" | "enrolled";
+  readonly stop: () => Promise<void>;
+}
+
+/**
+ * Onboarding's managed T3: installs the pinned release, starts it, and makes sure the restricted token
+ * exists, the same steps as service startup. The caller lists providers, then calls `stop`.
+ */
+export async function startTransientManagedT3(input: {
+  readonly t3: ManagedT3Config;
+  readonly pin: T3Pin;
+  readonly logger: ServiceLogger;
+  /** Tests: skip install with an already verified binary, and tune the runtime (env, timing). */
+  readonly installed?: ManagedT3Binary;
+  readonly runtimeOptions?: Partial<Omit<T3ManagedRuntimeOptions, "settings" | "installed" | "logger">>;
+  readonly run?: CommandRunner;
+}): Promise<TransientManagedT3> {
+  // Starting would reap a live runtime in this home as an orphan, taking T3 away from a running service.
+  // It counts as live when it answers on the port or still runs our `t3 serve` for this home (the
+  // supervisor's orphan test); a stale server-runtime.json whose pid was recycled passes.
+  const { managed } = input.t3;
+  const live = await inspectManagedT3Runtime({ t3: input.t3, pinnedVersion: input.pin.version });
+  const servesThisHome = async (pid: number): Promise<boolean> => {
+    const args = (await (input.run ?? runCommand)(["ps", "-ww", "-o", "args=", "-p", String(pid)])).stdout.trim();
+    const binary = input.installed?.binary ?? join(managed.runtimeDir, "versions", input.pin.version, "t3");
+    return isManagedServeCommand(args, { homeDir: managed.homeDir, runtimeDir: managed.runtimeDir, binary });
+  };
+  if (live.pid !== null && (live.protocol !== null || (await servesThisHome(live.pid)))) {
+    throw new Error(
+      `managed T3 is already running in ${input.t3.managed.homeDir} (pid ${live.pid}); stop the Agent Tag service (or \`agent-tag t3 serve\`) first, or \`kill ${live.pid}\` if neither is running`,
+    );
+  }
+  const installed = input.installed
+    ?? (await prepareManagedT3Binary({ settings: input.t3.managed, pin: input.pin, logger: input.logger }));
+  const runtime = new T3ManagedRuntime({
+    ...input.runtimeOptions,
+    settings: input.t3.managed,
+    installed,
+    logger: input.logger,
+  });
+  const descriptor = await runtime.start();
+  try {
+    const credentials = managedT3Credentials({
+      t3: input.t3,
+      binary: installed.binary,
+      logger: input.logger,
+      ...(input.run === undefined ? {} : { run: input.run }),
+    });
+    const token = await credentials.ensureToken();
+    return { version: descriptor.serverVersion, token, stop: () => runtime.stop() };
+  } catch (error) {
+    await runtime.stop();
+    throw error;
   }
 }
 

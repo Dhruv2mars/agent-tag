@@ -81,10 +81,14 @@ async function writeT3Config(): Promise<{ configPath: string; dataDir: string }>
   const home = await mkdtemp(join(tmpdir(), "agent-tag-cli-t3-"));
   const dataDir = join(home, "data");
   const configPath = join(home, "agent-tag.json");
+  // A port nothing listens on: 37841 is managed T3's default, so a live host's T3 may answer there.
+  const probe = Bun.listen({ hostname: "127.0.0.1", port: 0, socket: { data() {} } });
+  const port = probe.port;
+  probe.stop(true);
   await writeFile(configPath, JSON.stringify({
     version: 1,
     dataDir,
-    t3: { baseUrl: "http://127.0.0.1:37841", tokenFile: join(home, "t3-token") },
+    t3: { baseUrl: `http://127.0.0.1:${port}`, tokenFile: join(home, "t3-token") },
     slack: { workspaceId: "T123", appTokenFile: join(home, "app"), botTokenFile: join(home, "bot") },
     access: { allowedUserIds: ["U123"], allowedChannelIds: ["C123"] },
     profiles: [{

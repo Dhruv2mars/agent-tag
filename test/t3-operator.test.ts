@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -12,6 +12,7 @@ import {
   requireManagedT3,
   runManagedT3Pair,
   runManagedT3Serve,
+  startTransientManagedT3,
   T3_FATAL_EXIT_CODE,
 } from "../src/t3/operator.ts";
 import type { EnvironmentFetch } from "../src/t3/protocol.ts";
@@ -268,6 +269,93 @@ describe("runManagedT3Pair with the fake T3 CLI", () => {
       expect(printed[1]).toBe(`${config.baseUrl}/pair#token=${FAKE_PAIRING_TOKEN}`);
     } finally {
       await runtime.stop();
+    }
+  });
+});
+
+describe("startTransientManagedT3 with the fake T3 CLI", () => {
+  test("stops the runtime it started when the token cannot be minted", async () => {
+    const config = await liveManagedConfig();
+    const logs: string[] = [];
+    await expect(
+      startTransientManagedT3({
+        t3: { ...config, tokenFile: join(config.managed.homeDir, "missing-token") },
+        pin: PINNED_T3,
+        logger: (record) => logs.push(JSON.stringify(record)),
+        installed: { binary: FAKE_T3_BINARY, version: PINNED_T3.version },
+        runtimeOptions: { timing: FAST },
+      }),
+    ).rejects.toThrow();
+    const { pid } = JSON.parse(await readFile(join(config.managed.homeDir, "userdata", "server-runtime.json"), "utf8"));
+    expect(alive(pid)).toBe(false);
+    expect(logs.join("\n")).toContain("t3.runtime.stopped");
+    expect(logs.join("\n")).not.toContain(FAKE_PAIRING_TOKEN);
+  });
+});
+
+describe("startTransientManagedT3 next to a running managed T3", () => {
+  test("refuses to start, leaving the running T3 alone", async () => {
+    const config = await liveManagedConfig();
+    const installed = { binary: FAKE_T3_BINARY, version: PINNED_T3.version };
+    const running = new T3ManagedRuntime({ settings: config.managed, installed, logger: () => {}, timing: FAST });
+    await running.start();
+    try {
+      const pid = running.status().pid as number;
+      await expect(
+        startTransientManagedT3({ t3: config, pin: PINNED_T3, logger: () => {}, installed, runtimeOptions: { timing: FAST } }),
+      ).rejects.toThrow(`managed T3 is already running in ${config.managed.homeDir} (pid ${pid}); stop the Agent Tag service`);
+      expect(alive(pid)).toBe(true);
+    } finally {
+      await running.stop();
+    }
+  });
+});
+
+describe("startTransientManagedT3 with a server-runtime.json pid that is not answering", () => {
+  async function recordPid(config: ManagedT3Config): Promise<ReturnType<typeof Bun.spawn>> {
+    const child = Bun.spawn(["sleep", "30"]);
+    await mkdir(join(config.managed.homeDir, "userdata"), { recursive: true });
+    await writeFile(join(config.managed.homeDir, "userdata", "server-runtime.json"), JSON.stringify({ pid: child.pid }));
+    return child;
+  }
+
+  test("a recycled pid (not our t3 serve) neither blocks the start nor gets killed", async () => {
+    const config = await liveManagedConfig();
+    const child = await recordPid(config);
+    try {
+      // The start gets past the guard and the runtime starts; it then fails only at minting, since the fake T3 has no auth.
+      await expect(
+        startTransientManagedT3({
+          t3: { ...config, tokenFile: join(config.managed.homeDir, "missing-token") },
+          pin: PINNED_T3,
+          logger: () => {},
+          installed: { binary: FAKE_T3_BINARY, version: PINNED_T3.version },
+          runtimeOptions: { timing: FAST },
+        }),
+      ).rejects.toThrow("t3 auth session issue");
+      expect(alive(child.pid)).toBe(true);
+    } finally {
+      child.kill();
+    }
+  });
+
+  test("our own t3 serve that does not answer yet still blocks the start", async () => {
+    const config = await liveManagedConfig();
+    const child = await recordPid(config);
+    try {
+      const args = `${FAKE_T3_BINARY} serve --host 127.0.0.1 --port ${config.managed.port} --base-dir ${config.managed.homeDir}`;
+      await expect(
+        startTransientManagedT3({
+          t3: config,
+          pin: PINNED_T3,
+          logger: () => {},
+          installed: { binary: FAKE_T3_BINARY, version: PINNED_T3.version },
+          run: async () => ({ exitCode: 0, stdout: `${args}\n`, stderr: "" }),
+        }),
+      ).rejects.toThrow(`managed T3 is already running in ${config.managed.homeDir} (pid ${child.pid})`);
+      expect(alive(child.pid)).toBe(true);
+    } finally {
+      child.kill();
     }
   });
 });

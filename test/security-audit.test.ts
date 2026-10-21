@@ -354,6 +354,16 @@ describe("config checks", () => {
     expect(readAuditInputs([]).secretFiles).toEqual([]);
   });
 
+  test("a managed T3 with explicit home and runtime dirs is excluded even when dataDir is unusable", () => {
+    const inputs = readAuditInputs({
+      dataDir: "relative/data",
+      t3: { mode: "managed", tokenFile: "/s/t3", homeDir: "/t3/home", runtimeDir: "/t3/runtime" },
+    });
+    expect(inputs.dataDir).toBeUndefined();
+    expect(inputs.scanExclusions).toEqual(["/t3/runtime/versions", "/t3/runtime/downloads", "/t3/home/userdata/secrets"]);
+    expect(readAuditInputs({ t3: { mode: "managed", homeDir: "/t3/home" } }).scanExclusions).toEqual([]);
+  });
+
   test("sorts findings and fails only on high severity", () => {
     const report = summarizeFindings(
       [
@@ -692,6 +702,27 @@ describe("security audit run", () => {
       const store = atRest.find((finding) => finding.path?.endsWith("agent-tag.sqlite"));
       expect(store?.remediation).toContain("#purging-content-from-the-store");
       expect(atRest.find((finding) => finding.path?.endsWith(".log"))?.remediation).not.toContain("VACUUM");
+    });
+  });
+
+  test("a managed T3's release and key pair are not leaks, but its logs are still scanned", async () => {
+    await withHost(async ({ root, configPath, config }) => {
+      const data = join(root, "data");
+      await writeFile(configPath, JSON.stringify({ ...config, t3: { mode: "managed", port: 37_899, tokenFile: join(root, "secrets", "t3-token") } }), { mode: 0o600 });
+      const pem = ["-----BEGIN", "PRIVATE KEY-----"].join(" ");
+      for (const directory of [join(data, "t3", "runtime", "versions", "0.0.45"), join(data, "t3", "home", "userdata", "secrets"), join(data, "t3", "home", "userdata", "logs")]) {
+        await mkdir(directory, { recursive: true, mode: 0o700 });
+      }
+      await writeFile(join(data, "t3", "runtime", "versions", "0.0.45", "t3"), `${pem}\n`, { mode: 0o600 });
+      await writeFile(join(data, "t3", "home", "userdata", "secrets", "cloud-link-ed25519-key-pair.bin"), `${pem}\n`, { mode: 0o600 });
+      const options = { configPath, now: new Date(now), home: "/nonexistent-home", offline: true, logDirectory: join(root, "logs"), logFiles: [] };
+      expect(ids((await runSecurityAudit(options)).findings).filter((id) => id.startsWith("high:"))).toEqual([]);
+
+      await writeFile(join(data, "t3", "home", "userdata", "logs", "server.log"), `x xoxb-${"C3".repeat(15)} x`, { mode: 0o600 });
+      const leaky = await runSecurityAudit(options);
+      expect(leaky.findings.filter((finding) => finding.id === "secret-at-rest").map((finding) => finding.path)).toEqual([
+        join(await realpath(data), "t3", "home", "userdata", "logs", "server.log"),
+      ]);
     });
   });
 
