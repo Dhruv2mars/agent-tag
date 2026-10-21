@@ -87,6 +87,7 @@ export const operationRowSchema = z.object({
   attempts: z.number().int().nonnegative(),
   lease_expires_at: isoDateTime,
   turn_active_ms: z.number().int().nonnegative(),
+  t3_thread_id: nonEmpty.nullable(),
 });
 
 /**

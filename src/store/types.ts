@@ -111,6 +111,8 @@ export interface ClaimedOperation {
   readonly leaseExpiresAt: string;
   /** Milliseconds this turn has already spent being polled, summed over earlier claims. */
   readonly turnActiveMs: number;
+  /** The T3 thread an earlier claim sent this turn to; `null` until it is first dispatched. */
+  readonly threadId: string | null;
 }
 
 export interface OperationalStatus {

@@ -753,4 +753,27 @@ export const STORE_MIGRATIONS: readonly StoreMigration[] = [
       CREATE INDEX slack_file_uploads_ready_idx ON slack_file_uploads(state, created_at);
     `,
   },
+  {
+    // `!restart` follow-up (PR-H2): the T3 thread a turn was sent to, pinned when it is first
+    // dispatched. A turn left on a thread that `!restart` retired is never replayed against the fresh
+    // thread, and the retired thread's session stop waits for it (it may still create the thread).
+    // Backfill: a turn last sent at or before a thread's `retired_at` belongs to the first such
+    // thread, any later one to the task's current thread. A retired thread recorded as never created
+    // that a turn was sent to goes back to the session stop and N2's cleanup as possibly created.
+    // Touches only the new column and retired rows, so it applies in any order relative to other versions.
+    version: 28,
+    sql: `
+      ALTER TABLE operations ADD COLUMN t3_thread_id TEXT;
+      UPDATE operations SET t3_thread_id = COALESCE(
+          (SELECT r.t3_thread_id FROM task_retired_t3_threads r
+           WHERE r.task_id = operations.task_id AND r.retired_at >= operations.t3_turn_dispatched_at
+           ORDER BY r.generation LIMIT 1),
+          (SELECT t.t3_thread_id FROM tasks t WHERE t.task_id = operations.task_id))
+        WHERE t3_turn_dispatched_at IS NOT NULL;
+      UPDATE task_retired_t3_threads SET thread_created = 1, worktree_state = 'unknown', branch_state = 'unknown',
+          completed_at = NULL
+        WHERE thread_created = 0 AND EXISTS (SELECT 1 FROM operations o
+          WHERE o.task_id = task_retired_t3_threads.task_id AND o.t3_thread_id = task_retired_t3_threads.t3_thread_id);
+    `,
+  },
 ];

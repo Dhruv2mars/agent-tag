@@ -35,6 +35,15 @@ Usage:
                                        List tasks with their session generation and last activity
   agent-tag tasks close TASK_ID [CONFIG]
                                        Close a task now (or once its work settles); a reply reopens it
+  agent-tag memory-list CONFIG [--conversation ID] [--scope channel|workspace|dm|operator|task] [--json]
+                                       List every stored note (no Slack visibility filter)
+  agent-tag memory-add CONFIG --scope channel|workspace|operator --content TEXT [--conversation ID] [--profile ID]
+                                       Save a note as the operator
+  agent-tag memory-edit CONFIG MEMORY_ID --content TEXT
+                                       Replace a note's text; MEMORY_ID may be its 8-character ref
+  agent-tag memory-forget CONFIG MEMORY_ID
+  agent-tag memory-forget CONFIG --conversation ID --all [--yes]
+                                       Forget one note, or every note stored for a conversation
   agent-tag security audit CONFIG [--json] [--offline] [--log-dir DIR]
                                        Check permissions, config, T3 token, and leaked credentials
   agent-tag prune CONFIG [--dry-run]   Delete data older than the retention windows

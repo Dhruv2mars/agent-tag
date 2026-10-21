@@ -113,6 +113,8 @@ export type {
   CreateMemoryInput,
   ListVisibleMemoryInput,
   FindMemoryByRefInput,
+  ListMemoryEntriesInput,
+  MemoryAuditActor,
   MemoryStoreKey,
   UpdateMemoryInput,
   ForgetMemoryInput,
@@ -301,6 +303,14 @@ export class AgentTagStore {
 
   forgetMemory(input: memory.ForgetMemoryInput): void {
     memory.forgetMemory(this.#database, input);
+  }
+
+  forgetMemoryEntries(input: Parameters<typeof memory.forgetMemoryEntries>[1]): void {
+    memory.forgetMemoryEntries(this.#database, input);
+  }
+
+  listMemoryEntries(input: memory.ListMemoryEntriesInput): ReadonlyArray<MemoryRecord> {
+    return memory.listMemoryEntries(this.#database, input);
   }
 
   expireMemory(nowInput: string): number {
@@ -517,8 +527,8 @@ export class AgentTagStore {
   }
 
   /** Records that `thread.turn.start` is about to be sent, before its outcome is known. */
-  markOperationTurnDispatched(input: operations.MarkOperationTurnDispatchedInput): void {
-    operations.markOperationTurnDispatched(this.#database, input);
+  markOperationTurnDispatched(input: operations.MarkOperationTurnDispatchedInput): boolean {
+    return operations.markOperationTurnDispatched(this.#database, input);
   }
 
   /** Records that the operation's T3 turn was dispatched (and its turn id once known). */

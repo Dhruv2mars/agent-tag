@@ -1,7 +1,7 @@
 import type { AgentTagConfig } from "./config.ts";
 import { type AccessDecision, isAllowlisted, isSteeringAllowed } from "./policy/access.ts";
 import { containsKnownSecret } from "./security/redact.ts";
-import { normalizeMemoryRef, type MemoryStoreKey } from "./store/memory.ts";
+import { normalizeMemoryRef, type MemoryAuditActor, type MemoryStoreKey } from "./store/memory.ts";
 import type { AgentTagStore, MemoryRecord } from "./store/store.ts";
 
 // Scope model (PR-K): channel notes → `channel` (keyed by conversation), workspace notes → `shared`,
@@ -52,6 +52,26 @@ export interface MemoryGroups {
 }
 
 type Profile = AgentTagConfig["profiles"][number];
+
+/** User-facing store names, as Slack and the operator CLI say them, mapped to stored scopes. */
+export const MEMORY_SCOPE_NAMES = {
+  channel: "channel",
+  workspace: "shared",
+  dm: "private",
+  operator: "profile",
+  task: "task",
+} as const satisfies Record<string, MemoryRecord["scope"]>;
+export type MemoryScopeName = keyof typeof MEMORY_SCOPE_NAMES;
+
+/** An operator (the `memory-*` CLI): bypasses Slack access and visibility, but not the workspace. */
+export interface OperatorContext {
+  readonly workspaceId: string;
+  /** The local account running the CLI; recorded as author and audit actor. */
+  readonly operatorId: string;
+}
+
+const OPERATOR_ACTOR: MemoryAuditActor = { type: "operator", authority: "operator-cli" };
+const SLACK_CHANNEL_ID = /^[CG][A-Z0-9]+$/;
 
 const EMPTY_GROUPS: MemoryGroups = { channel: [], dm: [], operator: [], task: [], workspace: [] };
 
@@ -300,6 +320,176 @@ export class AgentTagMemory {
     return { kind: "accepted" };
   }
 
+  /**
+   * Notes stored for the operator view: every scope, no visibility filter. `conversationId` narrows to
+   * that channel's notes, or, for a DM route, its owner's DM notes on that profile.
+   */
+  operatorList(input: {
+    readonly context: OperatorContext;
+    readonly scope?: MemoryScopeName;
+    readonly conversationId?: string;
+    readonly now: string;
+  }): ReadonlyArray<MemoryRecord> {
+    if (!this.#operatorWorkspace(input.context)) return [];
+    const scope = input.scope === undefined ? undefined : MEMORY_SCOPE_NAMES[input.scope];
+    let key: Omit<MemoryStoreKey, "workspaceId"> | null = scope === undefined ? null : { scope };
+    if (input.conversationId !== undefined) {
+      const stored = this.#conversationStore(input.conversationId);
+      if (scope !== undefined && scope !== stored.scope) return [];
+      key = stored;
+    }
+    return this.#store.listMemoryEntries({ workspaceId: input.context.workspaceId, ...key, now: input.now });
+  }
+
+  /**
+   * Saves a note as the operator. Skips Slack visibility and the per-store caps; keeps the length,
+   * secret and duplicate checks. Retention and length come from `profileId`, else the channel's
+   * route, else the only profile.
+   */
+  operatorCreate(input: {
+    readonly context: OperatorContext;
+    readonly scope: "channel" | "workspace" | "operator";
+    readonly content: string;
+    readonly conversationId?: string;
+    readonly profileId?: string;
+    readonly now: string;
+  }): RememberResult {
+    const { context } = input;
+    const deny = (reason: string) => this.#operatorDeny(context, "operator-cli", reason, input.now);
+    if (!this.#operatorWorkspace(context)) return deny("workspace-denied");
+    if (input.scope === "channel" && (input.conversationId === undefined || !SLACK_CHANNEL_ID.test(input.conversationId))) {
+      return deny("channel-conversation-required");
+    }
+    if (input.scope !== "channel" && input.conversationId !== undefined) return deny("conversation-not-allowed");
+    const profile = this.#operatorProfile(input.profileId, input.scope === "channel" ? input.conversationId : undefined);
+    if (profile === null) return deny(input.profileId === undefined ? "profile-required" : "profile-denied");
+    const key: MemoryStoreKey =
+      input.scope === "channel"
+        ? { workspaceId: context.workspaceId, scope: "channel", conversationId: input.conversationId! }
+        : input.scope === "workspace"
+          ? { workspaceId: context.workspaceId, scope: "shared" }
+          : { workspaceId: context.workspaceId, scope: "profile", profileId: profile.id };
+    const content = input.content.trim();
+    const checked = this.#checkContent(profile, content);
+    if (checked !== null) return deny(checked);
+    const duplicate = this.#store.findDuplicateMemory({ ...key, content, now: input.now });
+    if (duplicate !== null) return { kind: "duplicate", memory: duplicate };
+    const memory = this.#store.createMemory({
+      ...key,
+      content,
+      sourceType: "operator-cli",
+      sourceId: "operator-cli",
+      actorUserId: context.operatorId,
+      actor: OPERATOR_ACTOR,
+      expiresAt: this.#expiresAt(profile, input.now),
+      now: input.now,
+    });
+    return { kind: "accepted", memory };
+  }
+
+  /** Replaces a note's text as the operator, keeping its expiry. `ref` is a memory ID or its prefix. */
+  operatorEdit(input: {
+    readonly context: OperatorContext;
+    readonly ref: string;
+    readonly content: string;
+    readonly now: string;
+  }): MemoryRefMutationResult {
+    const target = this.#operatorResolve(input.context, input.ref, input.now);
+    if (target.kind !== "found") return target;
+    const content = input.content.trim();
+    const profile = this.#operatorProfile(target.memory.profileId ?? undefined, target.memory.conversationId ?? undefined);
+    const checked = this.#checkContent(profile, content);
+    if (checked !== null) return this.#operatorDeny(input.context, target.memory.memoryId, checked, input.now);
+    return {
+      kind: "accepted",
+      memory: this.#store.updateMemory({
+        memoryId: target.memory.memoryId,
+        actorUserId: input.context.operatorId,
+        actor: OPERATOR_ACTOR,
+        content,
+        now: input.now,
+      }),
+    };
+  }
+
+  operatorForget(input: { readonly context: OperatorContext; readonly ref: string; readonly now: string }): MemoryRefMutationResult {
+    const target = this.#operatorResolve(input.context, input.ref, input.now);
+    if (target.kind !== "found") return target;
+    this.#store.forgetMemory({
+      memoryId: target.memory.memoryId,
+      actorUserId: input.context.operatorId,
+      actor: OPERATOR_ACTOR,
+      now: input.now,
+    });
+    return { kind: "accepted", memory: target.memory };
+  }
+
+  /** Forgets every note stored for a conversation (see operatorList) in one transaction. */
+  operatorForgetConversation(input: {
+    readonly context: OperatorContext;
+    readonly conversationId: string;
+    readonly now: string;
+  }): ReadonlyArray<MemoryRecord> {
+    const notes = this.operatorList(input);
+    if (notes.length > 0) {
+      this.#store.forgetMemoryEntries({
+        memoryIds: notes.map((memory) => memory.memoryId),
+        actorUserId: input.context.operatorId,
+        actor: OPERATOR_ACTOR,
+        now: input.now,
+      });
+    }
+    return notes;
+  }
+
+  #operatorWorkspace(context: OperatorContext): boolean {
+    return context.workspaceId === this.#config.slack.workspaceId;
+  }
+
+  /** A DM route's notes are its owner's DM notes on its profile; any other conversation's are its channel notes. */
+  #conversationStore(conversationId: string): Omit<MemoryStoreKey, "workspaceId"> {
+    const route = this.#config.routes.find((candidate) => candidate.conversationId === conversationId);
+    if (route?.conversationType === "dm") {
+      return { scope: "private", profileId: route.profileId, ownerUserId: route.ownerUserId };
+    }
+    return { scope: "channel", conversationId };
+  }
+
+  #operatorProfile(profileId: string | undefined, conversationId: string | undefined): Profile | null {
+    const id =
+      profileId ??
+      this.#config.routes.find((route) => route.conversationId === conversationId)?.profileId ??
+      (this.#config.profiles.length === 1 ? this.#config.profiles[0]?.id : undefined);
+    return this.#config.profiles.find((profile) => profile.id === id) ?? null;
+  }
+
+  #operatorResolve(context: OperatorContext, ref: string, now: string):
+    | { readonly kind: "found"; readonly memory: MemoryRecord }
+    | { readonly kind: "not-found" }
+    | { readonly kind: "ambiguous"; readonly candidates: readonly string[] }
+    | { readonly kind: "denied"; readonly reason: string } {
+    const prefix = normalizeMemoryRef(ref);
+    if (!this.#operatorWorkspace(context)) return this.#operatorDeny(context, prefix ?? "invalid-ref", "workspace-denied", now);
+    if (prefix === null) return { kind: "not-found" };
+    const matches = this.#store.findMemoryByRef({ workspaceId: context.workspaceId, refPrefix: prefix, now });
+    const [only] = matches;
+    if (only === undefined) return { kind: "not-found" };
+    if (matches.length > 1) return { kind: "ambiguous", candidates: matches.map((memory) => memory.memoryId) };
+    return { kind: "found", memory: only };
+  }
+
+  #operatorDeny(context: OperatorContext, sourceId: string, reason: string, now: string): { readonly kind: "denied"; readonly reason: string } {
+    this.#store.recordMemoryDenial({
+      actorUserId: context.operatorId,
+      sourceId,
+      reason,
+      workspaceId: context.workspaceId,
+      actor: OPERATOR_ACTOR,
+      now,
+    });
+    return { kind: "denied", reason };
+  }
+
   #listVisible(context: MemoryContext, profile: Profile, now: string, limit: number): ReadonlyArray<MemoryRecord> {
     const inChannel = context.conversationType === "channel";
     return this.#store.listVisibleMemory({
@@ -339,9 +529,10 @@ export class AgentTagMemory {
   }
 
   /** A denial reason for note content, or null when it may be stored. */
-  #checkContent(profile: Profile, content: string): string | null {
+  #checkContent(profile: Profile | null, content: string): string | null {
     if (content === "") return "entry-empty";
-    if (content.length > profile.memory.maxEntryChars) return "entry-too-long";
+    // Without a profile (an operator edit of a workspace note), the highest `maxEntryChars` config allows.
+    if (content.length > (profile?.memory.maxEntryChars ?? 2_000)) return "entry-too-long";
     if (containsKnownSecret(content)) return "secret-detected";
     return null;
   }
