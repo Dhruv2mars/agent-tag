@@ -756,7 +756,7 @@ describe("agent-tag onboard with managed T3", () => {
     const written = JSON.parse(await readFile(result.configPath, "utf8"));
     expect(written.t3).toEqual({ mode: "managed", port: 37900, tokenFile });
     expect(agentTagConfigSchema.parse(written).t3).toEqual(result.config.t3);
-    expect(fake.started.map((t3) => t3.managed)).toEqual([result.config.t3.mode === "managed" ? result.config.t3.managed : undefined]);
+    expect(fake.started).toEqual([result.config.t3 as ManagedT3Config]);
     expect(fake.stopped).toBe(1);
     expect(seen).toEqual(["http://127.0.0.1:37900", "http://127.0.0.1:37900"]);
     expect(sleeps).toEqual([2_000]);
