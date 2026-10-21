@@ -686,11 +686,32 @@ export const STORE_MIGRATIONS: readonly StoreMigration[] = [
     `,
   },
   {
+    // Slack files in (PR-L1): one row per file ref in an operation's payload, written as each file is
+    // attached to T3 or skipped. A replayed operation reuses these rows instead of downloading or
+    // uploading again, so its `thread.turn.start` carries the same attachment ids. Metadata only: file
+    // bytes never touch SQLite. New table only, so it applies in any order relative to other versions.
+    version: 25,
+    sql: `
+      CREATE TABLE operation_attachments (
+        operation_id TEXT NOT NULL REFERENCES operations(operation_id) ON DELETE CASCADE,
+        ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+        slack_file_id TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('attached', 'skipped')),
+        t3_attachment_json TEXT,
+        skip_reason TEXT,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (operation_id, ordinal),
+        CHECK ((state = 'attached') = (t3_attachment_json IS NOT NULL)),
+        CHECK ((state = 'skipped') = (skip_reason IS NOT NULL))
+      );
+    `,
+  },
+  {
     // `!restart` (PR-H2): a restart requested while a turn holds the old session. The claim gate
     // (claimNextOperation) holds the task's queue while it is set; the restart worker rotates the T3
     // thread once the turn ends (or after `commands.restartTimeoutSeconds`) and clears it. The
     // retired thread goes to N1's task_retired_t3_threads. New columns only, so any order applies.
-    version: 25,
+    version: 26,
     sql: `
       ALTER TABLE tasks ADD COLUMN restart_requested_at TEXT;
       ALTER TABLE tasks ADD COLUMN restart_requested_by TEXT;

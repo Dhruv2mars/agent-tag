@@ -90,7 +90,7 @@ function seedVersionOne(database: Database): void {
 
 test("upgrades every historical SQLite schema while preserving existing work", async () => {
   const versions = STORE_MIGRATIONS.map((migration) => migration.version);
-  expect(versions).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25]);
+  expect(versions).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26]);
   // Each historical prefix, plus a store that applied 14 (from main) before 13 existed: applied
   // versions are tracked as a set, so 13 must still apply on top of it.
   const startingSets: ReadonlyArray<{ readonly label: string; readonly applied: ReadonlyArray<number> }> = [
@@ -611,6 +611,8 @@ test("D12: an operation payload written before messageTs, origin and threadConte
       threadTs: "1000.000001",
       profileId: "engineering",
       repositoryRoot: "/srv/repos/example",
+      // Payloads from before PR-L1 parse with no shared files.
+      files: [],
     };
     expect(operationPayloadSchema.parse(JSON.parse(legacyJson))).toEqual(legacyPayload);
 
@@ -823,7 +825,7 @@ test("N1: migration 24 backfills task activity and creates the retired-thread ta
   }
 });
 
-test("H2: migration 25 adds the restart request columns to a database holding tasks", async () => {
+test("H2: migration 26 adds the restart request columns to a database holding tasks", async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-tag-migration-restart-"));
   const path = join(directory, "agent-tag.sqlite");
   try {
@@ -833,7 +835,7 @@ test("H2: migration 25 adds the restart request columns to a database holding ta
     applyMigration(historical, 1);
     seedVersionOne(historical);
     for (const migration of STORE_MIGRATIONS) {
-      if (migration.version > 1 && migration.version < 25) applyMigration(historical, migration.version);
+      if (migration.version > 1 && migration.version < 26) applyMigration(historical, migration.version);
     }
     historical.close();
     (await AgentTagStore.open(path)).close();
@@ -842,7 +844,7 @@ test("H2: migration 25 adds the restart request columns to a database holding ta
 
     const database = new Database(path, { strict: true });
     expect(
-      database.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM schema_migrations WHERE version = 25").get(),
+      database.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM schema_migrations WHERE version = 26").get(),
     ).toEqual({ count: 1 });
     expect(
       database
