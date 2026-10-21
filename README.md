@@ -25,7 +25,7 @@ It is modelled on [Claude Tag](https://claude.com/docs/claude-tag/users/getting-
 
 | You are | Read |
 | --- | --- |
-| Setting it up | [Install](docs/install.md), [Slack setup](docs/slack-setup.md) (including the scope table for your Slack admin), [operations](docs/operations.md), [troubleshooting](docs/troubleshooting.md) |
+| Setting it up | [Install](docs/install.md), [Slack setup](docs/slack-setup.md) (including the scope table for your Slack admin), [operations](docs/operations.md), [configuration reference](docs/configuration.md), [troubleshooting](docs/troubleshooting.md) |
 | Using it in Slack | [Using Agent Tag in Slack](docs/slack-usage.md) |
 | Reviewing its security | [SECURITY.md](SECURITY.md), [provider access and licensing](docs/provider-licensing.md) |
 | Comparing it with Claude Tag | [Parity](docs/parity.md) |

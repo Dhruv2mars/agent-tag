@@ -12,7 +12,9 @@ import {
   headingAnchors,
   helpCommands,
   readDocs,
+  readLinkedDocs,
 } from "../scripts/docs-drift.ts";
+import { configKeys, generateConfigDocs } from "../scripts/gen-config-docs.ts";
 
 const REPOSITORY = resolve(import.meta.dir, "..");
 const docs = readDocs(REPOSITORY);
@@ -41,8 +43,27 @@ describe("docs drift", () => {
     expect(checkAgentCommands(read("docs/slack-usage.md"), IMPLEMENTED_COMMANDS)).toEqual([]);
   });
 
-  test("relative links and anchors resolve", () => {
-    expect(checkLinks(docs, REPOSITORY, readIfExists)).toEqual([]);
+  test("relative links and anchors resolve in every doc, evidence included", () => {
+    const linked = readLinkedDocs(REPOSITORY);
+    expect(linked.length).toBeGreaterThan(docs.length);
+    expect(checkLinks(linked, REPOSITORY, readIfExists)).toEqual([]);
+  });
+
+  test("docs/configuration.md is what `bun run docs:config` generates", () => {
+    expect(read("docs/configuration.md")).toBe(generateConfigDocs(REPOSITORY));
+  });
+
+  test("the config reference lists every schema key exactly once", () => {
+    const keys = configKeys(JSON.parse(read("config/agent-tag.example.json")));
+    // The count when the generator landed; a generator branch that silently drops keys fails here.
+    expect(keys.length).toBeGreaterThanOrEqual(127);
+    const reference = read("docs/configuration.md");
+    for (const key of ["limits.stalledTurn.timeoutSeconds", "profiles[].memory.retentionDays", "routes[].ownerUserId", "t3.rotation.rotateBeforeDays"]) {
+      expect(keys.map((entry) => entry.path)).toContain(key);
+    }
+    for (const { path } of keys) {
+      expect(reference.split(`| \`${path}\` |`).length - 1).toBe(1);
+    }
   });
 });
 

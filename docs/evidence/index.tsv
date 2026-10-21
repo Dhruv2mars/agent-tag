@@ -24,6 +24,7 @@ docs/evidence/2026-09-29-store-upgrades.md	2026-09-29	d2de6ae	darwin-arm64	none	
 docs/evidence/2026-09-30-authority-revocation.md	2026-09-30	9b23de7	darwin-arm64	0.0.42	codex	automated-real,automated-fixture	ACL-01
 docs/evidence/2026-09-30-t3-attachments.md	2026-09-30	c681907	darwin-arm64	0.0.42	none	automated-real,automated-fixture	SLK-05
 docs/evidence/2026-10-06-t3-0.0.45.md	2026-10-06	496e875	darwin-arm64	0.0.45	codex,claudeAgent	automated-real	T3-01,T3-04
+docs/evidence/2026-10-21-docs-drift.md	2026-10-21	feat/u1-docs-ga-matrix	darwin-arm64	none	none	automated-fixture	DOC-01
 docs/evidence/2026-10-21-memory-slack.md	2026-10-21	pending	darwin-arm64	0.0.45	none	human	MEM-01
 docs/evidence/2026-10-21-model-switch.md	2026-10-21	feat/p2c-model-switch-slack	darwin-arm64	0.0.45	codex,claudeAgent	automated-real	MOD-01
 docs/evidence/2026-10-21-pr-f-live.md	2026-10-21	feat/f4-footer+efff6c1	darwin-arm64	0.0.45	claudeAgent	automated-real	SLK-06

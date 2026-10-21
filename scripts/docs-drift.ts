@@ -13,6 +13,13 @@ export function readDocs(repository: string): DocFile[] {
   return paths.map((path) => ({ path, text: readFileSync(join(repository, path), "utf8") }));
 }
 
+/** Every page whose links must resolve: README, SECURITY, CHANGELOG when present, and every .md under docs/, evidence included. */
+export function readLinkedDocs(repository: string): DocFile[] {
+  const paths = ["README.md", "SECURITY.md", "CHANGELOG.md"].filter((path) => existsSync(join(repository, path)));
+  paths.push(...[...new Bun.Glob("docs/**/*.md").scanSync(repository)].sort());
+  return paths.map((path) => ({ path, text: readFileSync(join(repository, path), "utf8") }));
+}
+
 function fencedBlocks(markdown: string, language?: string): string[] {
   const blocks: string[] = [];
   for (const match of markdown.matchAll(/^```([a-z]*)\n([\s\S]*?)^```$/gm)) {

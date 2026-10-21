@@ -35,7 +35,8 @@
     "verify:clean-install": "bun run scripts/verify-clean-install.ts",
     "check": "bun run typecheck && bun run test",
     "build:release": "bun run scripts/build-release.ts",
-    "verify:slack-authority": "bun run scripts/verify-slack-authority.ts"
+    "verify:slack-authority": "bun run scripts/verify-slack-authority.ts",
+    "docs:config": "bun run scripts/gen-config-docs.ts"
   },
   "dependencies": {
     "@slack/bolt": "5.1.0",

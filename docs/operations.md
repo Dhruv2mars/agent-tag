@@ -6,6 +6,8 @@ Commands that take `CONFIG` fall back to `$AGENT_TAG_CONFIG` and then to `~/.age
 
 Complete the [Slack setup](slack-setup.md) before running live checks.
 
+Every config key, with its type, limits and default, is in the generated [configuration reference](configuration.md).
+
 Before enabling a provider for other Slack users, complete the [provider access and licensing review](provider-licensing.md). T3 readiness proves connectivity only; it does not prove that a personal subscription or session may be shared.
 
 ## Clean-checkout verification
@@ -652,6 +654,14 @@ Then use the task, actor, and profile IDs from the private audit export:
 bun run schedule:add -- CONFIG TASK_ID USER_ID PROFILE_ID SPEC.json
 bun run schedule:list -- CONFIG TASK_ID USER_ID PROFILE_ID
 bun run schedule:cancel -- CONFIG TASK_ID USER_ID PROFILE_ID SCHEDULE_ID
+```
+
+From the standalone binary the same commands are:
+
+```sh
+agent-tag schedule-add CONFIG TASK_ID USER_ID PROFILE_ID SPEC.json
+agent-tag schedule-list CONFIG TASK_ID USER_ID PROFILE_ID
+agent-tag schedule-cancel CONFIG TASK_ID USER_ID PROFILE_ID SCHEDULE_ID
 ```
 
 `kind: "agent"` adds a normal durable T3 operation when due. `kind: "reminder"` sends `Reminder: ...` through the durable Slack outbox without running a provider. Cadence is optional for a one-shot schedule and must be at least 60 seconds when present. Workspace active schedules are capped by `limits.maxActiveSchedules`.
