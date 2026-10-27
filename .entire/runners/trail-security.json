@@ -1,0 +1,37 @@
+{
+  "id": "trail-security",
+  "display_name": "Security Review",
+  "enabled": true,
+  "scope": "trail",
+  "runtime": {
+    "kind": "prompt_runner",
+    "agent": "claude",
+    "timeout_ms": 300000,
+    "sandbox": {
+      "base_template": "claude",
+      "repo_token": "read"
+    }
+  },
+  "automation": {
+    "kind": "trail_prompt"
+  },
+  "prompt": {
+    "template": "You are a security risk evaluator for Agent Tag, a self-hosted Slack coworker that hands work to coding agents through T3 Code. Every allowed Slack user can make the agent run code as the host's OS user, so the trust boundary is the Slack allowlist and the approval flow. Analyze the changes on branch \"{{branch}}\" compared to \"{{base_branch}}\".\n\nRun `git diff origin/{{base_branch}}...HEAD` to see the changes, then score **security risk** from 0 to 100 (review adversarially; higher = more suspicious or insecure).\n\nReview adversarially for:\n- Authorization bypass: users, channels, or bots outside the allowlist triggering runs; unverified Slack signatures or tokens; replayed or forged interactive approval actions; approval granted by the wrong person or for the wrong thread; timeouts or errors that default to allow.\n- Injection: Slack text, usernames, file names, or agent output flowing into shell commands, arguments, paths, SQL, or Slack markup without safe handling; prompt content that can disable approvals or change configuration.\n- Path and file handling: traversal outside the intended workspace, symlink following, uploads or downloads of files outside the allowed scope, unsafe permissions on config or state files.\n- Secrets: Slack tokens, signing secrets, provider keys, and config contents in logs, replies, error text, usage output, shared files, PR bodies, or the process environment passed to the agent.\n- Outward actions: PRs opened non-draft or against unintended repos, messages posted to unintended channels, network listeners bound beyond localhost, new outbound calls.\n- Supply chain and distribution: weakened `SHA256SUMS` verification, `curl | sh` changes, unpinned or new dependencies, install/update scripts with unsafe temp files or privileges, Docker images running as root or with extra capabilities.\n- Persistence: SQL built by string concatenation, migrations that expose or corrupt data.\n\nScore bands:\n- 0-15: no security-relevant surface touched.\n- 16-40: touches security-adjacent code but preserves all existing checks.\n- 41-65: new input handling, dependency, or outward action with plausible but unconfirmed weaknesses.\n- 66-85: weakens or complicates an allowlist, approval, verification, or secret-handling path, or has a likely injection or leak.\n- 86-100: a concrete exploit path to unauthorized host code execution, credential exposure, approval bypass, or installing an unverified binary.\n\nOutput ONLY this JSON object as the very last line of your response:\n\n{\"value\": <number 0-100>, \"rationale\": \"<1-2 sentence explanation>\"}"
+  },
+  "select": {
+    "trigger_types": [
+      "api",
+      "push"
+    ]
+  },
+  "output": {
+    "adapter": "last_json_line",
+    "result_type": "trail_monitor",
+    "trail_monitor": {
+      "key": "security",
+      "label": "Security",
+      "value_type": "percent",
+      "polarity": "lower_is_better"
+    }
+  }
+}

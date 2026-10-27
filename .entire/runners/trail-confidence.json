@@ -1,0 +1,37 @@
+{
+  "id": "trail-confidence",
+  "display_name": "Confidence Eval",
+  "enabled": true,
+  "scope": "trail",
+  "runtime": {
+    "kind": "prompt_runner",
+    "agent": "claude",
+    "timeout_ms": 300000,
+    "sandbox": {
+      "base_template": "claude",
+      "repo_token": "read"
+    }
+  },
+  "automation": {
+    "kind": "trail_prompt"
+  },
+  "prompt": {
+    "template": "You are a confidence evaluator for Agent Tag, a self-hosted Slack coworker that hands work to coding agents through T3 Code on the host machine. Analyze the changes on branch \"{{branch}}\" compared to \"{{base_branch}}\".\n\nRun `git diff origin/{{base_branch}}...HEAD` to see the changes, then score **confidence** from 0 to 100 (higher = more confident the changes are correct and well-tested).\n\nWeigh these dimensions:\n- Tests in `test/` that exercise the changed behavior, including failure paths, not just the happy path.\n- Slack event handling: thread routing, duplicate or retried deliveries, allowlist checks, and approval flows (approve, deny, timeout).\n- T3 Code integration: provider/model selection, session lifecycle, and agent errors or disconnects.\n- SQLite state: migrations, existing rows, concurrent writes, and restart recovery for routines, notes, and threads.\n- Config and onboarding: changes to `~/.agent-tag/agent-tag.json` handling, flags, and `doctor` checks stay backward compatible.\n- Install, release, and service scripts: checksum verification, platform coverage (macOS arm64/x64, Linux x64/arm64), Docker.\n- Docs that claim behavior (parity, GA acceptance) match what the code does.\n\nScore bands:\n- 85-100: behavior is covered by tests that would fail if it broke, edge and error paths are handled, and nothing is left unverified.\n- 60-84: core path is tested, but some error, retry, or restart paths rely on reading the code.\n- 30-59: meaningful logic in Slack handling, approvals, persistence, or process execution is untested or only loosely covered.\n- 0-29: security-relevant or data-affecting changes (approval gating, user allowlist, migrations, install scripts) have no tests, or the diff appears incorrect.\n\nOutput ONLY this JSON object as the very last line of your response:\n\n{\"value\": <number 0-100>, \"rationale\": \"<1-2 sentence explanation>\"}"
+  },
+  "select": {
+    "trigger_types": [
+      "api",
+      "push"
+    ]
+  },
+  "output": {
+    "adapter": "last_json_line",
+    "result_type": "trail_monitor",
+    "trail_monitor": {
+      "key": "confidence",
+      "label": "Confidence",
+      "value_type": "percent",
+      "polarity": "higher_is_better"
+    }
+  }
+}

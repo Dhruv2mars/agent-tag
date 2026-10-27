@@ -1,0 +1,37 @@
+{
+  "id": "trail-risk",
+  "display_name": "Risk Eval",
+  "enabled": true,
+  "scope": "trail",
+  "runtime": {
+    "kind": "prompt_runner",
+    "agent": "claude",
+    "timeout_ms": 300000,
+    "sandbox": {
+      "base_template": "claude",
+      "repo_token": "read"
+    }
+  },
+  "automation": {
+    "kind": "trail_prompt"
+  },
+  "prompt": {
+    "template": "You are a risk evaluator for Agent Tag, a self-hosted Slack coworker that hands work to coding agents through T3 Code, running code as the host's OS user. Analyze the changes on branch \"{{branch}}\" compared to \"{{base_branch}}\".\n\nRun `git diff origin/{{base_branch}}...HEAD` to see the changes, then score **risk** from 0 to 100 (higher = more potential damage if something is wrong).\n\nWeigh these dimensions, roughly in order of importance:\n1. Host execution and authorization: Slack allowlist checks, approval gating for risky steps, signature verification, workspace/path scoping, and anything that lets an unauthorized or unapproved request run code on the host.\n2. Secrets and data exposure: Slack tokens, signing secrets, provider keys, and config contents reaching logs, replies, shared files, or PRs.\n3. Persistent state: SQLite schema changes and migrations, writes to existing notes, routines, and thread data, restart recovery.\n4. Outward-facing actions: pull request creation, file sharing, messages posted to Slack, routine scheduling.\n5. Distribution and operations: `install.sh`, release and checksum handling, background service setup, Docker, onboarding and config format compatibility.\n6. Agent integration: T3 Code session handling, provider/model selection, error and timeout paths.\n7. Docs, tests, and cosmetic changes: lowest risk, unless they change documented safety guarantees.\n\nScore bands:\n- 0-15: docs, comments, tests, or refactors with no behavior change.\n- 16-40: small, contained behavior change in non-security paths (formatting, messages, doctor output) with tests.\n- 41-65: changes to agent session flow, routines, file sharing, PR creation, or config handling; or schema changes that are additive.\n- 66-85: changes to approval logic, allowlist or Slack event verification, command or path construction, migrations touching existing data, or install/update scripts.\n- 86-100: weakens or bypasses authorization or approvals, can leak credentials, allows arbitrary host command or file access, or can destroy data or ship an unverified binary.\n\nOutput ONLY this JSON object as the very last line of your response:\n\n{\"value\": <number 0-100>, \"rationale\": \"<1-2 sentence explanation>\"}"
+  },
+  "select": {
+    "trigger_types": [
+      "api",
+      "push"
+    ]
+  },
+  "output": {
+    "adapter": "last_json_line",
+    "result_type": "trail_monitor",
+    "trail_monitor": {
+      "key": "risk",
+      "label": "Risk",
+      "value_type": "percent",
+      "polarity": "lower_is_better"
+    }
+  }
+}

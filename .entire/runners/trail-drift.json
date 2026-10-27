@@ -1,0 +1,37 @@
+{
+  "id": "trail-drift",
+  "display_name": "Drift Eval",
+  "enabled": true,
+  "scope": "trail",
+  "runtime": {
+    "kind": "prompt_runner",
+    "agent": "claude",
+    "timeout_ms": 300000,
+    "sandbox": {
+      "base_template": "claude",
+      "repo_token": "read"
+    }
+  },
+  "automation": {
+    "kind": "trail_prompt"
+  },
+  "prompt": {
+    "template": "You are a drift evaluator for Agent Tag, a self-hosted Slack coworker that hands work to coding agents through T3 Code. Analyze the changes on branch \"{{branch}}\" compared to \"{{base_branch}}\".\n\nRun `git diff origin/{{base_branch}}...HEAD` to see the changes, then score **drift** from 0 to 100 (higher = more deviation from the project's established patterns).\n\nCompare the diff against the surrounding code and look for:\n- Layout: new code placed outside the existing `src/`, `test/`, `config/`, `scripts/`, `docs/` structure, or new top-level concepts that duplicate existing modules.\n- Conventions: naming, error handling, logging, config loading, and SQLite access that differ from neighboring code; new dependencies where the codebase already has a helper.\n- Architecture: bypassing the established Slack-to-T3 Code path, calling agent providers directly, or hard-coding a provider or model instead of using configuration.\n- Safety patterns: skipping the existing allowlist, approval, or secret-redaction helpers rather than reusing them.\n- Tests and docs: tests not following the existing `test/` style; behavior changes without matching updates to docs that describe them (parity, operations, install, GA acceptance).\n- Parity with the Claude Tag model: undocumented deviations from the documented differences.\n\nScore bands:\n- 0-20: follows existing patterns and reuses existing helpers.\n- 21-50: minor stylistic or structural differences that are easy to align.\n- 51-80: a new pattern is introduced where an established one exists, or safety helpers are bypassed.\n- 81-100: wholesale departure from the architecture or conventions, e.g. a parallel implementation of an existing subsystem.\n\nOutput ONLY this JSON object as the very last line of your response:\n\n{\"value\": <number 0-100>, \"rationale\": \"<1-2 sentence explanation>\"}"
+  },
+  "select": {
+    "trigger_types": [
+      "api",
+      "push"
+    ]
+  },
+  "output": {
+    "adapter": "last_json_line",
+    "result_type": "trail_monitor",
+    "trail_monitor": {
+      "key": "drift",
+      "label": "Drift",
+      "value_type": "percent",
+      "polarity": "lower_is_better"
+    }
+  }
+}
