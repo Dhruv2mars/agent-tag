@@ -1,24 +1,15 @@
 name: Release
 
 # Pushing a tag matching v* publishes a GitHub Release with four standalone binaries plus
-# SHA256SUMS. Pull requests and manual (workflow_dispatch) runs execute the same build and
-# native smoke tests as a dry run and never publish anything, even when dispatched on a tag.
+# SHA256SUMS. Manual (workflow_dispatch) runs execute the same build and native smoke tests
+# as a dry run and never publish anything, even when dispatched on a tag. Tags reach GitHub
+# through the one-way mirror of the Entire repo (git ship / git mirror).
 # Publishing requires both a `push` event and a `refs/tags/v*` ref; the version job computes
 # that once and the publish/image jobs re-check it.
 
 on:
   push:
     tags: ["v*"]
-  pull_request:
-    paths:
-      - ".github/workflows/release.yml"
-      - "scripts/build-release.ts"
-      - "src/**"
-      - "install.sh"
-      - "Dockerfile"
-      - ".dockerignore"
-      - "package.json"
-      - "bun.lock"
   workflow_dispatch:
 
 permissions:
@@ -26,7 +17,7 @@ permissions:
 
 concurrency:
   group: release-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: false
 
 jobs:
   version:

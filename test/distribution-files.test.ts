@@ -71,7 +71,8 @@ test("the Dockerfile bundle step yields a runnable container build outside the r
 test("the release workflow builds, smoke-tests, and publishes every target", async () => {
   const workflow = await Bun.file(join(repository, ".github", "workflows", "release.yml")).text();
   expect(workflow).toContain('tags: ["v*"]');
-  expect(workflow).toContain("pull_request:");
+  // The GitHub mirror has no pull requests; only tags and manual runs start a release build.
+  expect(workflow).not.toContain("pull_request");
   expect(workflow).toContain(`bun-version: ${bunVersion}`);
   for (const target of RELEASE_TARGETS) {
     expect(workflow).toContain(`target: ${target}`);
@@ -104,7 +105,7 @@ async function loadReleaseWorkflow() {
   ) as { readonly jobs: Readonly<Record<string, WorkflowJob>> };
 }
 
-test("only a pushed v* tag publishes; manual runs on a tag and pull requests stay dry runs", async () => {
+test("only a pushed v* tag publishes; manual runs, even on a tag, stay dry runs", async () => {
   const workflow = await loadReleaseWorkflow();
   const script = workflow.jobs.version?.steps[0]?.run;
   expect(script).toBeDefined();
@@ -124,7 +125,6 @@ test("only a pushed v* tag publishes; manual runs on a tag and pull requests sta
   expect(await resolve("push", "refs/tags/v0.1.0-rc.1")).toEqual({ version: "0.1.0-rc.1", publish: "true" });
   expect(await resolve("workflow_dispatch", "refs/tags/v0.1.0-rc.1")).toEqual({ version: "0.1.0-rc.1", publish: "false" });
   expect(await resolve("workflow_dispatch", "refs/heads/main")).toEqual({ version: "0.0.0-dryrun.42", publish: "false" });
-  expect(await resolve("pull_request", "refs/pull/7/merge")).toEqual({ version: "0.0.0-dryrun.42", publish: "false" });
 
   // Every job that can create a release or push an image re-checks the event and ref itself.
   const publishers = Object.entries(workflow.jobs)

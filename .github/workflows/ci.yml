@@ -1,20 +1,22 @@
 name: CI
 
+# GitHub is a one-way mirror of the Entire repo (git mirror); this runs on every mirrored push. report.yml reports
+# each run to the Entire trail, whose merge gate requires it.
 on:
   push:
-  pull_request:
+    branches-ignore: ['archive/**']
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   check:
     name: ${{ matrix.os }}
-    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     strategy:
@@ -24,6 +26,8 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
       - name: Install Bun
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
