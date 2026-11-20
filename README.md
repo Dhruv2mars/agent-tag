@@ -1,5 +1,7 @@
 # Agent Tag
 
+<sub>Developed on <a href="https://entire.com/et/dhruv2mars/agent-tag">Entire</a>. The GitHub copy is a read-only mirror for CI; open issues and changes on Entire.</sub>
+
 Agent Tag is a Slack coworker you host yourself. Mention it in a thread and it hands the work to a coding agent (Codex or Claude, or any provider T3 Code supports) running through [T3 Code](https://github.com/pingdotgg/t3code) on your own machine. It replies in the thread, asks before risky steps when you want it to, remembers notes, runs routines, shares files and can open draft pull requests.
 
 It is modelled on [Claude Tag](https://claude.com/docs/claude-tag/users/getting-started), with two differences: you choose the agent and model, and it runs on your host instead of a hosted sandbox. [Parity](docs/parity.md) lists every difference.
