@@ -6,7 +6,7 @@
 #
 # See docs/install.md for volumes, secrets, and reaching T3 on the host.
 
-ARG BUN_VERSION=1.3.13
+ARG BUN_VERSION=1.4.4
 
 FROM oven/bun:${BUN_VERSION} AS build
 WORKDIR /src

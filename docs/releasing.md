@@ -8,7 +8,7 @@ For maintainers. Installing a published release is in [Install](install.md).
 2. For a stable (unhyphenated) version only: run `AGENT_TAG_GA_GATE=1 bun run scripts/ga-matrix.ts`. It exits 1 while any row of the [GA acceptance matrix](ga-acceptance.md) is `PENDING-*` or `FAIL`. `release.yml` does not run this gate yet.
 3. Tag and push: `git tag v0.1.0-rc.1 && git ship origin v0.1.0-rc.1`. `git ship` pushes to Entire and then runs `git mirror`, which copies the tag to the GitHub mirror where the workflow runs.
 4. `.github/workflows/release.yml` then runs these jobs:
-   - cross-compiles the four binaries with `scripts/build-release.ts`. The macOS binaries are built on macOS so they carry Bun's ad-hoc signature.
+   - cross-compiles the four binaries with `scripts/build-release.ts`. The macOS binaries are built on macOS, where the script re-signs them ad hoc with `codesign`, because macOS kills a binary whose code signature is invalid.
    - runs a smoke test of each binary on a native runner (`macos-15`, `macos-15-intel`, `ubuntu-24.04`, `ubuntu-24.04-arm`). The test runs `--help`, `version --json`, and `install.sh` against a local `file://` mirror.
    - builds the Docker image and checks it.
    - writes `SHA256SUMS` and publishes the GitHub Release once the typecheck, tests, smoke tests, and image checks have passed. A hyphenated version is published as a prerelease.

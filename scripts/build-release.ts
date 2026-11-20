@@ -106,6 +106,17 @@ export function compileCommand(input: {
   ];
 }
 
+/**
+ * Re-signs a macOS binary ad hoc. `bun build --compile` appends the bundle to a copy of Bun, and a darwin-x64
+ * binary built on Apple silicon keeps the stale signature of that copy. macOS kills a binary at exec when a page does
+ * not match its signature (SIGKILL, "Code Signature Invalid"), so every darwin binary is signed afresh. Only macOS
+ * has `codesign`, which is why the release builds darwin targets there.
+ */
+export async function adHocSign(path: string): Promise<void> {
+  if (process.platform !== "darwin") return;
+  await run(["codesign", "--force", "--sign", "-", path]);
+}
+
 async function smokeTest(path: string, version: string, target: ReleaseTarget): Promise<void> {
   const help = await run([path, "--help"]);
   if (!help.includes("agent-tag version")) throw new Error(`${path} --help did not print usage`);
@@ -139,8 +150,11 @@ export async function buildRelease(options: BuildReleaseOptions): Promise<string
       const outfile = join(options.outdir, releaseAssetName(target));
       await rm(outfile, { force: true });
       await run(compileCommand({ bunPath: process.execPath, target, version: options.version, commit, outfile }));
-      // The sourcemap is embedded in the executable; drop the side file so it is never published.
+      // The sourcemap is embedded in the executable; drop the side file (Bun 1.3 names it cli.js.map, Bun 1.4
+      // <outfile>.map) so it is never published or summed.
       await rm(join(options.outdir, "cli.js.map"), { force: true });
+      await rm(`${outfile}.map`, { force: true });
+      if (target.startsWith("darwin-")) await adHocSign(outfile);
       if (options.smoke && target === host) await smokeTest(outfile, options.version, target);
       console.error(`built ${outfile}${target === host && options.smoke ? " (smoke-tested)" : ""}`);
     }

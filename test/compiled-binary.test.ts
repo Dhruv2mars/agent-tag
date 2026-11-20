@@ -129,6 +129,22 @@ test.skipIf(host === undefined)(
   180_000,
 );
 
+// macOS kills a binary at exec when a page does not match its code signature (exit 137), so both darwin release
+// binaries, including darwin-x64 cross-compiled on Apple silicon, must pass a strict signature check.
+test.skipIf(process.platform !== "darwin")(
+  "every darwin release binary carries a valid code signature",
+  async () => {
+    const signedDir = join(outdir, "signed");
+    await buildRelease({ targets: ["darwin-arm64", "darwin-x64"], version: "0.0.1", outdir: signedDir, sumsOnly: false, smoke: false });
+    expect((await readdir(signedDir)).sort()).toEqual(["SHA256SUMS", "agent-tag-darwin-arm64", "agent-tag-darwin-x64"]);
+    for (const name of ["agent-tag-darwin-arm64", "agent-tag-darwin-x64"]) {
+      const verify = await run(["/usr/bin/codesign", "--verify", "--strict", join(signedDir, name)]);
+      expect({ name, exitCode: verify.exitCode, stderr: verify.stderr }).toEqual({ name, exitCode: 0, stderr: "" });
+    }
+  },
+  180_000,
+);
+
 test.skipIf(host === undefined)(
   "bundles the undici Socket Mode transport into compiled binaries",
   async () => {
