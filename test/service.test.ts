@@ -492,11 +492,12 @@ describe("instant ack", () => {
       }, logs);
       await service.start();
       await eventually(() => calls === 2 && logs.filter((record) => record.event === "slack.reaction.failed").length === 2);
-      // The operations are still queued for a coordinator (stop closes the store, so check first).
-      for (const operationId of operations) {
-        expect(store.claimNextOperation({ workerId: "w", now: new Date().toISOString(), leaseMs: 1_000, maxConcurrentTasks: 2 })?.operationId)
-          .toBe(operationId);
-      }
+      // The operations are still queued for a coordinator (stop closes the store, so check first). Both mentions can
+      // share one receivedAt millisecond, and then the claim order falls back to the random operation id.
+      const claimed = operations.map(
+        () => store.claimNextOperation({ workerId: "w", now: new Date().toISOString(), leaseMs: 1_000, maxConcurrentTasks: 2 })?.operationId,
+      );
+      expect(claimed.toSorted()).toEqual(operations.toSorted());
       await service.stop();
       const failures = logs.filter((record) => record.event === "slack.reaction.failed");
       expect(failures.map((record) => [record.level, record.errorCode])).toEqual([
